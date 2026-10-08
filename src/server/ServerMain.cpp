@@ -37,10 +37,13 @@ void Usage() {
                  "  --backend NAME              qwen3_nf4 (default), qwen35_nf4, qwen35_bf16 or qwen4exp_nf4\n"
                  "  --port N                    Local 127.0.0.1 port (8080)\n"
                  "  --model-id NAME             HTTP model name (qwen3 / qwen3.5)\n"
-                 "  --context N                 Session capacity, 32..4096 (4096)\n"
+                 "  --context N                 Session capacity, 32..262144 (4096)\n"
+                 "  --prefill-chunk-size N       Prefill work per scheduler step, 1..4096 (512)\n"
+                 "  --reuse-sessions N           Reuse exact completed token prefixes, 0/1 (0)\n"
                  "  --sessions N                Concurrent requests, 1..4 (4)\n"
                  "  --decode-batch-size N       Compatible decode rows, 1..4 and <= sessions (1)\n"
-                 "  --max-new-tokens N          Per-request generation limit, 1..1024 (1024)\n"
+                 "  --max-new-tokens N          Per-request generation limit, 1..32768 (1024)\n"
+                 "  --max-body-bytes N           Request body and rendered prompt limit (65536)\n"
                  "  --max-output-bytes N        Per-request serialized output limit (262144)\n"
                  "  --max-device-bytes N         Worker explicit USM device ceiling (0=unlimited)\n"
                  "  --max-pinned-host-bytes N    Worker pinned host ceiling (0=unlimited)\n"
@@ -71,10 +74,13 @@ int main(int argc, char** argv) {
             else if (name == "--backend") options.backend = value;
             else if (name == "--model-id") { options.modelId = value; modelIdProvided = true; }
             else if (name == "--port") options.port = static_cast<uint16_t>(Number(value, 1, 65535, name));
-            else if (name == "--context") options.contextTokens = static_cast<uint32_t>(Number(value, 32, 4096, name));
+            else if (name == "--context") options.contextTokens = static_cast<uint32_t>(Number(value, 32, 262144, name));
+            else if (name == "--prefill-chunk-size") options.prefillChunkSize = static_cast<uint32_t>(Number(value, 1, 4096, name));
+            else if (name == "--reuse-sessions") options.reuseSessions = Number(value, 0, 1, name) != 0;
             else if (name == "--sessions") options.maxSessions = static_cast<uint32_t>(Number(value, 1, 4, name));
             else if (name == "--decode-batch-size") options.maxDecodeBatchSize = static_cast<uint32_t>(Number(value, 1, 4, name));
-            else if (name == "--max-new-tokens") options.maxNewTokens = static_cast<uint32_t>(Number(value, 1, 1024, name));
+            else if (name == "--max-new-tokens") options.maxNewTokens = static_cast<uint32_t>(Number(value, 1, 32768, name));
+            else if (name == "--max-body-bytes") options.maxBodyBytes = static_cast<size_t>(Number(value, 65536, 4 * 1024 * 1024, name));
             else if (name == "--max-output-bytes") options.maxOutputBytes = static_cast<size_t>(Number(value, 4096, 4 * 1024 * 1024, name));
             else if (name == "--max-device-bytes") options.maxDeviceBytes = Number(value, 0, (std::numeric_limits<uint64_t>::max)(), name);
             else if (name == "--max-pinned-host-bytes") options.maxPinnedHostBytes = Number(value, 0, (std::numeric_limits<uint64_t>::max)(), name);

@@ -28,6 +28,7 @@ Qwen4ExpPle& Qwen4ExpPle::operator=(Qwen4ExpPle&& other) noexcept {
     ctx_ = other.ctx_;
     ple_layer_id_ = other.ple_layer_id_;
     max_tokens_ = other.max_tokens_;
+    compute_capacity_ = other.compute_capacity_;
     eps_ = other.eps_;
 
     layer_multipliers_ = other.layer_multipliers_;
@@ -114,6 +115,7 @@ void Qwen4ExpPle::cleanup() {
     norm_conv_w_ = Tensor();
     owned_conv1d_w_ = Tensor();
     initialized_ = false;
+    compute_capacity_ = 0;
 }
 
 namespace {
@@ -313,16 +315,9 @@ bool Qwen4ExpPle::init(Context& ctx,
         return false;
     }
 
-    // 9. Pre-allocated device tensors for forward execution (hot path zero-alloc)
-    key_buf_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-    value_buf_ = Tensor::allocate(ctx, {max_tokens_, EMBED_DIM}, dnnl::memory::data_type::bf16);
-    key_normed_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-    query_normed_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-    gv_buf_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-    gv_normed_ = Tensor::allocate(ctx, {max_tokens_, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-
-    scratch_key_.ensure(ctx, max_tokens_, EMBED_DIM, HC_HIDDEN_SIZE, false);
-    scratch_val_.ensure(ctx, max_tokens_, EMBED_DIM, EMBED_DIM, false);
+    // PLE intermediates hold one forward's rows, not the retained context.
+    // Reserve decode up front and grow only when a larger prefill arrives.
+    ensure_compute_capacity(ctx, std::min(max_tokens_, 64));
 
     try {
         copy_q_ = std::make_unique<sycl::queue>(
@@ -572,6 +567,24 @@ void Qwen4ExpPle::worker_loop() {
     }
 }
 
+void Qwen4ExpPle::ensure_compute_capacity(Context& ctx, int rows) {
+    if (rows <= 0 || rows > max_tokens_)
+        throw std::invalid_argument("Qwen4ExpPle: forward exceeds PLE capacity");
+    if (rows <= compute_capacity_) return;
+    // These tensors are read only by the compute queue. The background
+    // gather/DMA worker owns separate staging banks which never move here.
+    ctx.synchronize();
+    key_buf_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    value_buf_ = Tensor::allocate(ctx, {rows, EMBED_DIM}, dnnl::memory::data_type::bf16);
+    key_normed_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    query_normed_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    gv_buf_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    gv_normed_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    scratch_key_.ensure(ctx, rows, EMBED_DIM, HC_HIDDEN_SIZE, false);
+    scratch_val_.ensure(ctx, rows, EMBED_DIM, EMBED_DIM, false);
+    compute_capacity_ = rows;
+}
+
 void Qwen4ExpPle::wait_task(uint64_t task_id) {
     if (task_id == 0) return;
     std::unique_lock<std::mutex> lock(done_mutex_);
@@ -600,6 +613,8 @@ PleTicket Qwen4ExpPle::prepare(
     int start_pos) {
     PleTicket ticket;
     if (num_tokens <= 0) return ticket;
+    if (num_tokens > max_tokens_)
+        throw std::invalid_argument("Qwen4ExpPle: prepare exceeds PLE capacity");
 
     int slot = (next_staging_slot_++) % kNumStagingSlots;
     ticket.staging_slot = slot;
@@ -688,6 +703,7 @@ void Qwen4ExpPle::consume(
     }
 
     const int num_tokens = ticket.num_tokens;
+    ensure_compute_capacity(ctx, num_tokens);
     Tensor& dev_embed = dev_embed_slots_[ticket.staging_slot];
 
     // 3. Projections

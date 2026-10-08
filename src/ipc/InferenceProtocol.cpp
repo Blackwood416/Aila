@@ -563,12 +563,43 @@ Limits extended_generation_limits() noexcept {
     limits.maxGeneratedTokens = kExtendedMaxGeneratedTokens;
     return limits;
 }
+Limits extended_context_limits() noexcept {
+    auto limits = hard_limits();
+    limits.maxPromptTokens = kExtendedMaxPromptTokens;
+    limits.maxAttachmentBytes = kExtendedMaxAttachmentBytes;
+    limits.maxPrefillChunkSize = kExtendedMaxPrefillChunkSize;
+    limits.maxOutstandingTokens = kExtendedMaxOutstandingTokens;
+    return limits;
+}
+// Each optional extension raises a disjoint set of fields, and every field's
+// bound is independent of the others. The elementwise maximum therefore admits
+// either extension alone or both together without widening a single field past
+// its own designed ceiling.
+Limits absolute_limits() noexcept {
+    const auto generation = extended_generation_limits();
+    const auto context = extended_context_limits();
+    auto limits = hard_limits();
+#define AILA_ABSOLUTE_LIMIT(field) limits.field = (std::max)(generation.field, context.field);
+    AILA_V2_LIMIT_FIELDS(AILA_ABSOLUTE_LIMIT)
+#undef AILA_ABSOLUTE_LIMIT
+    return limits;
+}
 Limits configure_limits_ceiling(const Limits& offered,
                                 const std::vector<std::string>& requiredCapabilities) {
     auto ceiling = offered;
+    const auto defaults = hard_limits();
     if (ceiling.maxGeneratedTokens == hard_limits().maxGeneratedTokens &&
-        std::find(requiredCapabilities.begin(), requiredCapabilities.end(), "extended_generation_v1") != requiredCapabilities.end()) {
+        std::find(requiredCapabilities.begin(), requiredCapabilities.end(), kExtendedGenerationCapability) != requiredCapabilities.end()) {
         ceiling.maxGeneratedTokens = kExtendedMaxGeneratedTokens;
+    }
+    // The context extension owns four fields and each is raised only from its
+    // untouched default, so a Worker that deliberately offered a smaller value
+    // keeps it and a larger one is never silently clamped back down.
+    if (std::find(requiredCapabilities.begin(), requiredCapabilities.end(), kExtendedContextCapability) != requiredCapabilities.end()) {
+        if (ceiling.maxPromptTokens == defaults.maxPromptTokens) ceiling.maxPromptTokens = kExtendedMaxPromptTokens;
+        if (ceiling.maxAttachmentBytes == defaults.maxAttachmentBytes) ceiling.maxAttachmentBytes = kExtendedMaxAttachmentBytes;
+        if (ceiling.maxPrefillChunkSize == defaults.maxPrefillChunkSize) ceiling.maxPrefillChunkSize = kExtendedMaxPrefillChunkSize;
+        if (ceiling.maxOutstandingTokens == defaults.maxOutstandingTokens) ceiling.maxOutstandingTokens = kExtendedMaxOutstandingTokens;
     }
     return ceiling;
 }
@@ -588,6 +619,7 @@ std::vector<std::string> supported_capabilities() {
     capabilities.emplace_back("host_sampling_v1");
     capabilities.emplace_back("legacy_prefill_logits_v1");
     capabilities.emplace_back("extended_generation_v1");
+    capabilities.emplace_back("extended_context_v1");
     capabilities.emplace_back("worker_log_control_v1");
     capabilities.emplace_back("runtime_memory_v1");
     capabilities.emplace_back("continuous_batching_v1");
@@ -614,7 +646,7 @@ bool validate_decode_batch_size(uint32_t size, const Limits& limits, ValidationE
 
 bool validate_limits(const Limits& requested, ValidationError& error, const Limits& ceiling) {
     return Guard(error, [&] {
-        const Limits absolute = extended_generation_limits();
+        const Limits absolute = absolute_limits();
 #define AILA_CHECK_LIMIT(field) \
         if constexpr (std::string_view(#field) != std::string_view("maxSessionCacheBytes")) { \
             if (requested.field == 0 || requested.field > ceiling.field || ceiling.field > absolute.field) \
@@ -651,7 +683,7 @@ bool negotiate(const Limits& requested, const std::vector<std::string>& required
                const Limits& offered, const std::vector<std::string>& availableCapabilities,
                Limits& selected, ValidationError& error) {
     return Guard(error, [&] {
-        if (!validate_limits(offered, error, extended_generation_limits()) ||
+        if (!validate_limits(offered, error, absolute_limits()) ||
             !Capabilities(requiredCapabilities, error, ErrorCode::InvalidArgument) ||
             !Capabilities(availableCapabilities, error, ErrorCode::InvalidArgument)) return false;
         for (const auto& required : requiredCapabilities) {
@@ -904,7 +936,7 @@ bool ReadDecodeBatchSize(Object object, uint32_t& size, const Limits& limits,
 
 bool make_command(const Command& command, Frame& frame, ValidationError& error, const Limits& limits) {
     return Guard(error, [&] {
-        if (!validate_limits(limits, error, extended_generation_limits())) return false;
+        if (!validate_limits(limits, error, absolute_limits())) return false;
         Frame candidate = BaseFrame("request", to_string(command.method), command.rpcId);
         Json json(limits.maxHeaderBytes);
         json.String("epoch", command.epoch);

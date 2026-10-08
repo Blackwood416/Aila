@@ -25,7 +25,11 @@ namespace aila::server {
 namespace {
 namespace wire = ipc::v2;
 
-constexpr size_t kMaxBodyBytes = 1024 * 1024;
+// Absolute protocol-floor ceiling for a request body and its rendered prompt.
+// The per-request limit is ChatSettings::maxBodyBytes, which the server CLI may
+// raise from the 64 KiB floor up to this ceiling.
+constexpr size_t kProtocolMaxBodyBytes = 4 * 1024 * 1024;
+constexpr size_t kMinimumBodyBytes = 64 * 1024;
 constexpr size_t kMaxMessages = 256;
 constexpr size_t kMaxTools = 128;
 constexpr size_t kMaxToolArgumentBytes = 64 * 1024;
@@ -109,8 +113,8 @@ void ValidateJsonScalars(const Json::Value& value) {
     }
 }
 
-Json::Value ParseBody(std::string_view body) {
-    if (body.size() > kMaxBodyBytes) throw ApiError(413, "request_too_large", "Chat request body exceeds 1 MiB");
+Json::Value ParseBody(std::string_view body, size_t maxBytes = kProtocolMaxBodyBytes) {
+    if (body.size() > maxBytes) throw ApiError(413, "request_too_large", "Chat request body exceeds the configured byte limit");
     if (body.empty() || !ValidUtf8(body)) throw ApiError(400, "invalid_json", "Request body must be a UTF-8 JSON object");
     // JsonCpp's strict settings still accept some non-JSON lexical forms,
     // including unescaped controls in strings and leading-zero numbers.
@@ -157,7 +161,7 @@ void Fields(const Json::Value& object, std::initializer_list<std::string_view> a
     }
 }
 
-std::string String(const Json::Value& value, const std::string& param, bool empty = true, size_t maxBytes = kMaxBodyBytes) {
+std::string String(const Json::Value& value, const std::string& param, bool empty = true, size_t maxBytes = kProtocolMaxBodyBytes) {
     if (!value.isString()) Invalid(param, "Expected a string");
     auto text = value.asString();
     if ((!empty && text.empty()) || text.size() > maxBytes) Invalid(param, "String is empty or exceeds its allowed length");
@@ -386,7 +390,7 @@ chat::ChatToolCall ParseToolEvent(const chat::StructuredStreamEvent& event, cons
         const auto inner = Trim(std::string_view(text).substr(open.size(), text.size() - open.size() - close.size()));
         chat::ChatToolCall call;
         if (!inner.empty() && inner.front() == '{') {
-            const auto json = ParseBody(inner);
+            const auto json = ParseBody(inner, kProtocolMaxBodyBytes);
             Fields(json, {"id", "name", "arguments"});
             if (json.isMember("id")) Identifier(json["id"], "id", 160);
             call.function.name = Identifier(json["name"], "name");
@@ -441,11 +445,12 @@ bool StartsInReasoning(const std::string& prompt) {
     return prompt.find_first_not_of(" \t\r\n", open + 7) == std::string::npos;
 }
 
-Json::Value Usage(uint64_t prompt, uint64_t generated) {
+Json::Value Usage(uint64_t prompt, uint64_t generated, uint64_t cached) {
     Json::Value usage(Json::objectValue);
     usage["prompt_tokens"] = Json::UInt64(prompt);
     usage["completion_tokens"] = Json::UInt64(generated);
     usage["total_tokens"] = Json::UInt64(prompt + generated);
+    if (cached) usage["prompt_tokens_details"]["cached_tokens"] = Json::UInt64(cached);
     return usage;
 }
 
@@ -476,18 +481,39 @@ std::string ApiError::ToJson() const {
 }
 
 PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, const ChatSettings& settings) {
-    const auto hard = wire::hard_limits();
+    // The published absolute profile is the elementwise maximum of both
+    // optional extensions, so a server may be configured for either or both.
+    const auto absolute = wire::absolute_limits();
     if (settings.modelId.empty() || settings.modelId.size() > 256 || !ValidUtf8(settings.modelId) ||
         settings.maxContextTokens == 0 || settings.maxContextTokens > static_cast<uint32_t>((std::numeric_limits<int>::max)()) ||
-        settings.maxPromptTokens == 0 || settings.maxPromptTokens > hard.maxPromptTokens ||
-        settings.maxNewTokens == 0 || settings.maxNewTokens > hard.maxGeneratedTokens || settings.maxOutputBytes < kMinimumOutputBytes) {
+        settings.maxPromptTokens == 0 || settings.maxPromptTokens > absolute.maxPromptTokens ||
+        settings.maxNewTokens == 0 || settings.maxNewTokens > absolute.maxGeneratedTokens ||
+        settings.prefillChunkSize == 0 || settings.prefillChunkSize > absolute.maxPrefillChunkSize ||
+        settings.maxBodyBytes < kMinimumBodyBytes || settings.maxBodyBytes > kProtocolMaxBodyBytes ||
+        settings.maxOutputBytes < kMinimumOutputBytes) {
         throw ApiError(500, "invalid_server_configuration", "Server chat limits or model identity are invalid");
     }
-    const auto root = ParseBody(body);
+    const auto root = ParseBody(body, settings.maxBodyBytes);
     Fields(root, {"model", "messages", "stream", "stream_options", "max_tokens", "max_completion_tokens",
                   "temperature", "top_p", "top_k", "seed", "repetition_penalty", "presence_penalty",
                   "frequency_penalty", "n", "enable_thinking", "max_thinking_tokens",
-                  "thinking_budget", "thinking_budget_tokens", "tools", "tool_choice", "parallel_tool_calls"});
+                  "thinking_budget", "thinking_budget_tokens", "tools", "tool_choice", "parallel_tool_calls",
+                  "store", "reasoning_effort"});
+    // The PI coding agent (openai-completions) always sends store:false, which
+    // this stateless server ignores. Storing a conversation is not supported,
+    // so store:true is rejected rather than silently dropped. reasoning_effort
+    // only switches the template's enable_thinking channel; it is not a
+    // thinking-token budget.
+    if (root.isMember("store") && !root["store"].isNull() && Boolean(root["store"], "store")) {
+        throw ApiError(400, "unsupported_parameter", "Server-side response storage is not supported", "store");
+    }
+    if (root.isMember("reasoning_effort") && !root["reasoning_effort"].isNull()) {
+        static const std::unordered_set<std::string> efforts = {
+            "off", "none", "minimal", "low", "medium", "high", "xhigh", "max"};
+        if (!efforts.count(String(root["reasoning_effort"], "reasoning_effort", false, 16))) {
+            Invalid("reasoning_effort", "Expected off, minimal, low, medium, high, xhigh or max");
+        }
+    }
     const auto requestedModel = String(root["model"], "model", false, 256);
     if (requestedModel != settings.modelId) throw ApiError(404, "model_not_found", "Requested model is not served by this process", "model");
     ValidateMessages(root["messages"]);
@@ -543,6 +569,12 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     }
     bool thinking = root.isMember("enable_thinking") ? Boolean(root["enable_thinking"], "enable_thinking")
         : thinkingBudget && *thinkingBudget > 0;
+    // An explicit request effort enables reasoning unless it is explicitly off,
+    // matching the checkpoint template's enable_thinking gate.
+    if (!root.isMember("enable_thinking") && root.isMember("reasoning_effort") && !root["reasoning_effort"].isNull()) {
+        const auto effort = root["reasoning_effort"].asString();
+        thinking = effort != "off" && effort != "none";
+    }
     if (thinkingBudget && *thinkingBudget == 0) thinking = false;
 
     // Only this normalized object reaches the existing permissive ChatJson
@@ -564,6 +596,16 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     if (thinkingBudget) generationConfig.thinking_budget_tokens = static_cast<int>(*thinkingBudget);
     if (!chat::parse_chat_request_json(JsonText(normalized), generationConfig, prepared.chatRequest, &error)) {
         throw ApiError(400, "invalid_messages", "Could not parse validated chat messages", "messages");
+    }
+    // PI's openai-completions client labels the leading instruction message
+    // "developer". Only the leading one is an instruction: the trusted Qwen
+    // checkpoint template rejects a later developer message, and the service
+    // fallbacks accept a leading system message. A leading developer therefore
+    // becomes that system message; an interior developer stays a developer for
+    // the Hybrid template and keeps its original rejection elsewhere.
+    if (!prepared.chatRequest.messages.empty() &&
+        prepared.chatRequest.messages.front().role == chat::ChatRole::Developer) {
+        prepared.chatRequest.messages.front().role = chat::ChatRole::System;
     }
     if (tokenizer.vocab_size() <= 0) throw ApiError(500, "tokenizer_unavailable", "Server tokenizer is not loaded");
 
@@ -590,7 +632,7 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     if (!chat::ChatFormatter{}.render_text(input, true, rendered, &error) || !ValidUtf8(rendered.text)) {
         throw ApiError(500, "chat_template_failed", "The model chat template could not render this text request");
     }
-    if (rendered.text.size() > kMaxBodyBytes) throw ApiError(413, "prompt_too_large", "Rendered prompt exceeds the server byte limit", "messages");
+    if (rendered.text.size() > settings.maxBodyBytes) throw ApiError(413, "prompt_too_large", "Rendered prompt exceeds the server byte limit", "messages");
     prepared.startsInReasoning = StartsInReasoning(rendered.text);
     const auto ids = tokenizer.encode(rendered.text);
     if (ids.empty() || ids.size() > settings.maxPromptTokens) {
@@ -626,7 +668,7 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
         }
         prepared.options.thinkingBudget = std::move(budget);
     }
-    prepared.options.prefillChunkSize = std::min(hard.maxPrefillChunkSize, settings.maxPromptTokens);
+    prepared.options.prefillChunkSize = std::min(settings.prefillChunkSize, settings.maxPromptTokens);
     return prepared;
 }
 
@@ -646,6 +688,7 @@ struct ChatOutput::State {
     bool includeUsage;
     bool startsInReasoning;
     uint64_t promptTokens;
+    uint64_t cachedPromptTokens;
     uint32_t maxGenerated;
     size_t maximum;
     size_t normalLimit;
@@ -671,6 +714,7 @@ struct ChatOutput::State {
     State(ChatIdentity value, const PreparedChat& prepared, size_t limit)
         : identity(std::move(value)), stream(prepared.stream), includeUsage(prepared.includeUsage),
           startsInReasoning(prepared.startsInReasoning), promptTokens(prepared.promptIds.size()),
+          cachedPromptTokens(prepared.cachedPromptTokens),
           maxGenerated(prepared.options.generation.maxNewTokens), maximum(limit), normalLimit(limit - kErrorReserveBytes),
           extractTools(!prepared.chatRequest.tools.empty() && prepared.chatRequest.tool_choice != chat::ToolChoice::None),
           parallelToolCalls(prepared.parallelToolCalls),
@@ -871,7 +915,14 @@ struct ChatOutput::State {
         if (failure) return Fail(*failure);
         if (localFailure || summary.status != wire::RequestStatus::Completed) return Fail(CompletionError(summary, localFailure));
         wire::ValidationError validation;
-        if (!wire::validate_summary(summary, validation) || summary.promptTokensProcessed != promptTokens || summary.generatedTokens > maxGenerated) {
+        // A long-context request exceeds the default/hello wire bounds, so the
+        // summary is validated against the prepared prompt and generation
+        // capacities instead of the legacy 4096/1024 defaults.
+        wire::Limits summaryLimits;
+        summaryLimits.maxPromptTokens = static_cast<uint32_t>(std::min<uint64_t>(promptTokens,
+            (std::numeric_limits<uint32_t>::max)()));
+        summaryLimits.maxGeneratedTokens = maxGenerated;
+        if (!wire::validate_summary(summary, validation, summaryLimits) || summary.promptTokensProcessed != promptTokens || summary.generatedTokens > maxGenerated) {
             return Fail(ApiError(502, "invalid_completion_summary", "Worker completion counts or status do not match the request"));
         }
         if (!pendingUtf8.empty() && summary.endReason != wire::EndReason::Length) {
@@ -915,7 +966,7 @@ struct ChatOutput::State {
             choice["message"] = std::move(message);
             choice["finish_reason"] = reason;
             value["choices"].append(std::move(choice));
-            value["usage"] = Usage(promptTokens, summary.generatedTokens);
+            value["usage"] = Usage(promptTokens, summary.generatedTokens, cachedPromptTokens);
             ChatCompletion result;
             result.json = JsonText(value);
             if (result.json.size() > normalLimit) throw ApiError(502, "output_limit_exceeded", "Serialized chat output exceeds the configured byte limit");
@@ -923,7 +974,7 @@ struct ChatOutput::State {
                 AddDelta(Json::Value(Json::objectValue), frames, reason);
                 if (includeUsage) {
                     auto usageChunk = Envelope(true);
-                    usageChunk["usage"] = Usage(promptTokens, summary.generatedTokens);
+                    usageChunk["usage"] = Usage(promptTokens, summary.generatedTokens, cachedPromptTokens);
                     AddFrame(usageChunk, frames);
                 }
                 const size_t doneBytes = std::char_traits<char>::length(kDoneFrame);

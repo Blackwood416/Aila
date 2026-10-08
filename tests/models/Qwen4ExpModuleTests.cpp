@@ -2932,9 +2932,10 @@ void test_supports_interior_checkpoint_whitelist(Context& ctx) {
     std::cout << "[PASS] X2 interior checkpoint eligibility\n";
 }
 
-void test_real_model_ple_and_cache_if_present(Context& ctx) {
+void test_real_model_ple_and_cache_if_present(Context& ctx, bool pleOnly = false) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
+        expect(!pleOnly, "--ple-only requires a real model");
         std::cout << "[Test] Real model directory " << model_dir << " not found, skipping real model tests.\n";
         return;
     }
@@ -2945,7 +2946,7 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
     // 1. Verify PLE indexing on real model
     Qwen4ExpPle ple;
     std::string ple_err;
-    bool ple_ok = ple.init(ctx, weights, /*ple_layer_id=*/1, /*max_tokens=*/64, 1e-6f, &ple_err);
+    bool ple_ok = ple.init(ctx, weights, /*ple_layer_id=*/1, /*max_tokens=*/128, 1e-6f, &ple_err);
     expect(ple_ok, "real model ple.init failed: " + ple_err);
 
     expect(ple.layer_multipliers()[0] == 23703573157769LL, "real model layer_multipliers[0] mismatch");
@@ -2957,25 +2958,31 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
     std::cout << "[PASS] Real model PLE initialized successfully. 128 shards indexed.\n";
 
     // 1b. Verify real model PLE Ticket pipeline (prepare -> consume -> commit) matches forward() bit-exact
-    {
+    std::vector<bf16> beforeGrowth;
+    for (int rows : {4, 65, 4, 1}) {
         Qwen4ExpPleState s_fwd, s_pipe;
         ple.init_state(ctx, s_fwd);
         ple.init_state(ctx, s_pipe);
 
-        std::vector<int> test_tokens = {101, 202, 303, 404};
-        Tensor hidden_dev = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-        Tensor out_fwd = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-        Tensor out_pipe = Tensor::allocate(ctx, {4, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-        std::vector<bf16> hidden_h(4 * Qwen4ExpPle::HC_HIDDEN_SIZE, bf16(0.02f));
+        std::vector<int> test_tokens(rows);
+        for (int i = 0; i < rows; ++i) test_tokens[i] = (i + 1) * 101;
+        Tensor hidden_dev = Tensor::allocate(ctx, {rows, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        Tensor out_fwd = Tensor::allocate(ctx, {rows, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        Tensor out_pipe = Tensor::allocate(ctx, {rows, Qwen4ExpPle::HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+        std::vector<bf16> hidden_h(rows * Qwen4ExpPle::HC_HIDDEN_SIZE, bf16(0.02f));
         ctx.memcpy_h2d(hidden_dev.data(), hidden_h.data(), hidden_h.size() * sizeof(bf16));
 
         // Legacy forward
-        ple.forward(ctx, s_fwd, test_tokens.data(), 4,
+        ple.forward(ctx, s_fwd, test_tokens.data(), rows,
                     static_cast<const bf16*>(hidden_dev.data()),
                     static_cast<bf16*>(out_fwd.data()), nullptr);
 
         // Ticket pipeline
-        PleTicket ticket = ple.prepare(ctx, s_pipe, test_tokens.data(), 4, &s_pipe, 1, 0);
+        const auto allocations = ctx.device_allocation_count();
+        const auto deviceLimit = ctx.device_allocation_limit();
+        const auto hostLimit = ctx.pinned_host_allocation_limit();
+        if (rows == 1) ctx.set_allocation_limits(ctx.current_allocated_bytes(), ctx.current_pinned_host_bytes());
+        PleTicket ticket = ple.prepare(ctx, s_pipe, test_tokens.data(), rows, &s_pipe, 1, 0);
         ple.consume(ctx, ticket, s_pipe,
                     static_cast<const bf16*>(hidden_dev.data()),
                     static_cast<bf16*>(out_pipe.data()), nullptr);
@@ -2983,8 +2990,12 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
         ctx.synchronize();
 
         expect(s_fwd.prev_tokens == s_pipe.prev_tokens, "Real model PLE ticket prev_tokens mismatch");
-        std::vector<bf16> fwd_res(4 * Qwen4ExpPle::HC_HIDDEN_SIZE);
-        std::vector<bf16> pipe_res(4 * Qwen4ExpPle::HC_HIDDEN_SIZE);
+        if (rows == 1) {
+            ctx.set_allocation_limits(deviceLimit, hostLimit);
+            expect(ctx.device_allocation_count() == allocations, "PLE decode allocated USM");
+        }
+        std::vector<bf16> fwd_res(rows * Qwen4ExpPle::HC_HIDDEN_SIZE);
+        std::vector<bf16> pipe_res(rows * Qwen4ExpPle::HC_HIDDEN_SIZE);
         ctx.memcpy_d2h(fwd_res.data(), out_fwd.data(), fwd_res.size() * sizeof(bf16));
         ctx.memcpy_d2h(pipe_res.data(), out_pipe.data(), pipe_res.size() * sizeof(bf16));
 
@@ -2995,8 +3006,14 @@ void test_real_model_ple_and_cache_if_present(Context& ctx) {
                 throw std::runtime_error("Real model PLE Ticket vs forward bit-exact mismatch at " + std::to_string(i));
             }
         }
-        std::cout << "[PASS] Real model PLE Ticket pipeline bit-exact parity with forward verified.\n";
+        if (rows == 4) {
+            if (beforeGrowth.empty()) beforeGrowth = fwd_res;
+            else expect(std::memcmp(beforeGrowth.data(), fwd_res.data(), fwd_res.size() * sizeof(bf16)) == 0,
+                        "PLE output changed after workspace growth");
+        }
+        std::cout << "[PASS] Real model PLE Ticket pipeline bit-exact parity rows=" << rows << "\n";
     }
+    if (pleOnly) return;
 
     // 2. Verify ExpertCache initialization on real model with small memory
     Qwen4ExpExpertCache cache;
@@ -5818,10 +5835,15 @@ void test_predictive_gating_logic_and_session_isolation(Context& ctx) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     aila::env::enable_l0_copy_engine();
     try {
         Context ctx;
+        if (argc == 2 && std::string(argv[1]) == "--ple-only") {
+            test_real_model_ple_and_cache_if_present(ctx, true);
+            std::cout << "AilaQwen4ExpModuleTests: PLE PASSED\n";
+            return 0;
+        }
         test_decode_pending_mlp_residual(ctx);
         test_hc_decode_scheduling_bitwise(ctx);
         test_expert_cache_lru_and_dequant(ctx, false);

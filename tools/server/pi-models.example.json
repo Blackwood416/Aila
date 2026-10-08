@@ -1,0 +1,20 @@
+{
+  "providers": {
+    "aila": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "aila-local",
+      "models": [
+        {
+          "id": "qwen4exp",
+          "name": "Qwen3.8-Flash-Next (Aila)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 2048,
+          "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+        }
+      ]
+    }
+  }
+}

@@ -193,6 +193,7 @@ public:
 
 private:
     void cleanup();
+    void ensure_compute_capacity(Context& ctx, int rows);
     void dequant_to_staging(const int64_t* ids, int num_tokens, int slot);
     void execute_prepare_slot(int slot, int num_tokens, const std::array<int, 2>& prev_tokens);
     void worker_loop();
@@ -201,6 +202,7 @@ private:
     Context* ctx_ = nullptr;
     int ple_layer_id_ = 1;
     int max_tokens_ = 2048;
+    int compute_capacity_ = 0;
     float eps_ = 1e-6f;
 
     std::array<int64_t, 3> layer_multipliers_{};

@@ -1,0 +1,9 @@
+{
+  "defaultProvider": "aila",
+  "defaultModel": "qwen4exp",
+  "compaction": {
+    "modelOverrides": {
+      "aila/qwen4exp": {"reserveTokens": 4096, "keepRecentTokens": 8192}
+    }
+  }
+}

@@ -1176,7 +1176,7 @@ std::shared_ptr<InferenceClient> InferenceClient::Start(
 std::shared_ptr<InferenceClient> InferenceClient::Connect(
     std::shared_ptr<InferenceTransport> transport, ExpectedInferenceIdentity identity, InferenceClientOptions options) {
     wire::ValidationError error;
-    if (!transport || !wire::validate_limits(options.limits, error, wire::extended_generation_limits()) ||
+    if (!transport || !wire::validate_limits(options.limits, error, wire::absolute_limits()) ||
         !wire::validate_decode_batch_size(options.maxDecodeBatchSize, options.limits, error) || options.handshakeTimeout <= 0ms ||
         options.commandTimeout <= 0ms || options.shutdownTimeout <= 0ms) {
         throw InferenceClientError(ClientErrorCode::RemoteError, "Invalid inference client configuration: " + error.message,
@@ -1185,6 +1185,17 @@ std::shared_ptr<InferenceClient> InferenceClient::Connect(
     if (options.limits.maxGeneratedTokens > wire::hard_limits().maxGeneratedTokens &&
         std::find(options.requiredCapabilities.begin(), options.requiredCapabilities.end(), "extended_generation_v1") == options.requiredCapabilities.end()) {
         options.requiredCapabilities.emplace_back("extended_generation_v1");
+    }
+    // The context extension is a separate capability, so it is auto-required
+    // only when the caller widened one of its four fields past the default.
+    // A peer without it is rejected before the configure command is written.
+    const wire::Limits defaults;
+    if ((options.limits.maxPromptTokens > defaults.maxPromptTokens ||
+         options.limits.maxAttachmentBytes > defaults.maxAttachmentBytes ||
+         options.limits.maxPrefillChunkSize > defaults.maxPrefillChunkSize ||
+         options.limits.maxOutstandingTokens > defaults.maxOutstandingTokens) &&
+        std::find(options.requiredCapabilities.begin(), options.requiredCapabilities.end(), "extended_context_v1") == options.requiredCapabilities.end()) {
+        options.requiredCapabilities.emplace_back("extended_context_v1");
     }
     if (options.maxDecodeBatchSize > 1 &&
         std::find(options.requiredCapabilities.begin(), options.requiredCapabilities.end(), "continuous_batching_v1") == options.requiredCapabilities.end()) {

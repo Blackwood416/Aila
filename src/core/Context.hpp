@@ -10,6 +10,7 @@
 #include <memory>
 #include <typeindex>
 #include "memory/AllocationBudget.hpp"
+#include "memory/LargePages.hpp"
 #include "core/AsyncErrorState.hpp"
 #include "core/ExecutionTrace.hpp"
 
@@ -66,6 +67,25 @@ public:
         return allocate(bytes, true);
     }
 
+    // Explicitly resident CPU storage. This pointer is not USM and must not be
+    // dereferenced by a kernel. Account the rounded physical allocation.
+    void* alloc_large_host(size_t bytes) {
+        async_errors_->Rethrow();
+        CheckTrace();
+        bytes = aila::memory::LargePageAllocationSize(bytes);
+        host_budget_.Check(bytes, "Large-page host");
+        void* ptr = aila::memory::AllocateLargePages(bytes);
+        try {
+            alloc_bytes_.emplace(ptr, Allocation{bytes, true, true});
+            host_budget_.Acquire(bytes, "Large-page host");
+            return ptr;
+        } catch (...) {
+            alloc_bytes_.erase(ptr);
+            aila::memory::FreeLargePages(ptr);
+            throw;
+        }
+    }
+
     void free_device(void* ptr) {
         if (!ptr) return;
         auto it = alloc_bytes_.find(ptr);
@@ -76,12 +96,14 @@ public:
                                             : aila::diagnostics::TraceMemory::Device;
         }
         TraceScope stage(trace_, TraceStage::UsmFree, fields);
+        const bool large_pages = it != alloc_bytes_.end() && it->second.large_pages;
         if (it != alloc_bytes_.end()) {
             auto& budget = it->second.host ? host_budget_ : device_budget_;
             budget.Release(it->second.bytes);
             alloc_bytes_.erase(it);
         }
-        sycl::free(ptr, q_);
+        if (large_pages) aila::memory::FreeLargePages(ptr);
+        else sycl::free(ptr, q_);
         stage.Complete(); // Never throw a trace error from a resource free.
     }
 
@@ -206,7 +228,7 @@ private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
-    struct Allocation { size_t bytes; bool host; };
+    struct Allocation { size_t bytes; bool host; bool large_pages = false; };
     std::unordered_map<void*, Allocation> alloc_bytes_;
     aila::memory::AllocationBudget device_budget_, host_budget_;
     std::unordered_map<std::type_index, std::shared_ptr<void>> workspaces_;

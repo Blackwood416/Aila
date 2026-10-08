@@ -37,6 +37,7 @@ COMMON_CASES = (
     "multiturn_text_thinking_json_sse", "connection_close_expect_continue", "same_socket_reuse_pipeline",
     "thinking_budget_json_sse_and_concurrency",
     "disconnect_isolates_other_request", "graceful_shutdown_with_active_requests",
+    "serial_turn_handoff",
 )
 FAKE_CASES = (
     "slow_reader_resume_and_peer", "slow_reader_stall_cleanup", "admission_429_and_slot_reuse",
@@ -573,9 +574,10 @@ class ServerProcess:
         self.command = [
             str(args.server), "--worker", str(args.worker), "--model", str(model),
             "--backend", args.backend, "--model-id", args.model_id, "--port", str(self.port), "--context", str(getattr(args, "context", 512)),
-            "--sessions", "4", "--max-new-tokens", "256", "--max-output-bytes", str(OUTPUT_LIMIT),
+            "--sessions", str(getattr(args, "sessions", 4)),
+            "--max-new-tokens", str(getattr(args, "max_new_tokens", 256)), "--max-output-bytes", str(OUTPUT_LIMIT),
             "--stream-buffer-bytes", str(STREAM_LIMIT), "--stream-stall-ms", "5000",
-            "--request-timeout-ms", "120000", "--shutdown-file", str(self.shutdown_file),
+            "--request-timeout-ms", str(getattr(args, "request_timeout_ms", 120000)), "--shutdown-file", str(self.shutdown_file),
             "--report", str(self.report_file),
         ]
         if getattr(args, "memory_sample_ms", 0):
@@ -583,6 +585,9 @@ class ServerProcess:
         if getattr(args, "decode_batch_size", None) is not None:
             self.command += ["--decode-batch-size", str(args.decode_batch_size)]
         for attribute, flag in (("max_device_bytes", "--max-device-bytes"),
+                                ("prefill_chunk_size", "--prefill-chunk-size"),
+                                ("max_body_bytes", "--max-body-bytes"),
+                                ("reuse_sessions", "--reuse-sessions"),
                                 ("max_pinned_host_bytes", "--max-pinned-host-bytes"),
                                 ("max_session_host_bytes", "--max-session-host-bytes")):
             if getattr(args, attribute, None) is not None:
@@ -667,6 +672,8 @@ class Runner:
         self.responses.mkdir(parents=True, exist_ok=True)
         self.result = result
         self.read_timeout = 15.0 if self.mode == "fake" else 125.0
+        if getattr(args, "request_timeout_ms", None):
+            self.read_timeout = args.request_timeout_ms / 1000.0 + 5
         self.clients = []
         self.clients_lock = threading.Lock()
         self.ids = set()
@@ -1181,6 +1188,28 @@ class Runner:
         self.idle()
         return {"scenarios": results}
 
+    def serial_turn_handoff(self):
+        # Retain prior sockets after their complete responses. Their bounded
+        # TCP drain must not occupy an inference slot on the next serial turn.
+        held, turns = [], []
+        before = self.health()["counters"]["rejected"]
+        try:
+            for index in range(6):
+                client = self.stream(f"serial-handoff-{index}",
+                                     self.chat("Name a programming language.", 8, stream=True))
+                held.append(client)
+                stats = client.complete()
+                self.remember_id(stats["id"])
+                turns.append(stats)
+            check(self.health()["counters"]["rejected"] == before, "Serial tool-style handoff was rejected")
+        finally:
+            for client in held:
+                client.close()
+        self.idle()
+        for turn in turns:
+            check(self.wait_record(turn["id"])["status"] == "completed", "Handoff lost a completed outcome")
+        return {"turns": turns, "held_response_sockets": len(held)}
+
     def disconnect(self):
         maximum = 40 if self.mode == "fake" else 24
         prompt = "Explain one benefit of clear written instructions."
@@ -1411,6 +1440,7 @@ def parse_arguments():
     parser.add_argument("--mode", choices=("fake", "gpu"), required=True)
     parser.add_argument("--backend", choices=tuple(MODEL_IDS), default="qwen3_nf4")
     parser.add_argument("--model-id", help="Explicit HTTP model name; defaults to qwen3 or qwen3.5 for the selected backend")
+    parser.add_argument("--sessions", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument("--decode-batch-size", type=int, choices=(1, 2, 3, 4),
                         help="Opt in to the configured compatible decode batch bound.")
     parser.add_argument("--case", action="append", choices=COMMON_CASES + FAKE_CASES,
@@ -1483,6 +1513,7 @@ def main():
             ("connection_close_expect_continue", runner.close_and_expect),
             ("same_socket_reuse_pipeline", runner.ownership),
             ("disconnect_isolates_other_request", runner.disconnect),
+            ("serial_turn_handoff", runner.serial_turn_handoff),
         ]
         if args.mode == "fake":
             planned.extend([

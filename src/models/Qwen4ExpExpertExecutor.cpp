@@ -72,6 +72,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         const int* route_ids = nullptr;
         const int* route_selected = nullptr;
         const ops::MoeExpertSlotHost* route_sources = nullptr;
+        bool route_sources_resident = false;
         std::array<bool,512> route_cpu_eligible{};
         int route_top_k = 0, route_experts = 0;
         bool resident_prepared = false;
@@ -431,7 +432,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                         if (!source.gate_up_packed || !source.down_packed) continue;
                         const int c = current.count++;
                         current.tasks[c] = {source,rank / current.route_top_k};
-                        current.mapped_tasks[c] = true;
+                        current.mapped_tasks[c] = !current.route_sources_resident;
                         completed.route_ranks[c] = rank;
                         completed.route_ids[c] = id;
                     }
@@ -678,6 +679,7 @@ void Qwen4ExpExpertExecutor::PrepareAsyncResidentSources(int layers, int experts
         !cpu_mmap_cold_ || cache_->cpu_packed_source_slots() ||
         hidden_size_ != ops::cpu::kHiddenDim || intermediate_size_ != ops::cpu::kIntermediateDim) return;
     async_route_experts_=experts;
+    if (cache_->large_page_resident()) return; // Use its live ownership table, never cached mmap descriptors.
     async_route_sources_.resize(size_t(layers)*experts);
     for (int l=0;l<layers;++l) for (int e=0;e<experts;++e)
         async_route_sources_[size_t(l)*experts+e]=cache_->MappedExpertHostSource(l,e);
@@ -688,7 +690,7 @@ bool Qwen4ExpExpertExecutor::CanStartAsyncResidentRoute(int layer) const {
         cpu_mmap_cold_ && cold_policy_==1 && top_k_<=16 && max_cpu_credits_>=top_k_ &&
         !cache_->cpu_packed_source_slots() && !verify_async_rows_ && !cold_count_ && !async_route_pending_ && !async_route_collected_ && !cpu_host_result_active_ &&
         layer>=0 && async_route_experts_==512 &&
-        (size_t(layer)+1)*async_route_experts_<=async_route_sources_.size();
+        (cache_->ResidentLayerSources(layer) || (size_t(layer)+1)*async_route_experts_<=async_route_sources_.size());
 }
 
 void Qwen4ExpExpertExecutor::StartAsyncResidentRoute(int layer, const int* ids, const int* selected,
@@ -710,7 +712,9 @@ void Qwen4ExpExpertExecutor::StartAsyncResidentRoute(int layer, const int* ids, 
         job.transfer_reader=transferReader;
         job.route_ids=ids;job.route_selected=selected;
         job.route_top_k=top_k_;job.route_experts=async_route_experts_;
-        job.route_sources=async_route_sources_.data()+size_t(layer)*async_route_experts_;
+        job.route_sources_resident=cache_->large_page_resident();
+        job.route_sources=job.route_sources_resident ? cache_->ResidentLayerSources(layer)
+            : async_route_sources_.data()+size_t(layer)*async_route_experts_;
         // Cache and leases remain coordinator-owned. Frozen/no-prefetch/no-swap
         // dispatch cannot turn these misses into GPU-ready inputs while in flight.
         for(int e=0;e<async_route_experts_;++e) {
@@ -834,17 +838,22 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     const auto result=cpu_worker_->finish();
     if (async_route_pending_) {
         // finish() is the publication fence for rank/source metadata and CPU output.
-        cold_count_=result.route_count;cold_mapped_count_=cold_count_;cold_cached_count_=0;
+        cold_count_=result.route_count;
+        cold_cached_count_=cache_->large_page_resident() ? cold_count_ : 0;
+        cold_mapped_count_=cold_count_-cold_cached_count_;
         std::copy_n(result.route_ranks.begin(), cold_count_, cold_ranks_.begin());
         std::copy_n(result.route_ids.begin(), cold_count_, cold_ids_.begin());
         for(int c=0;c<cold_count_;++c)
-            cold_source_slots_[c]=async_route_sources_[size_t(cold_layer_)*async_route_experts_+cold_ids_[c]];
+            cold_source_slots_[c]=cache_->large_page_resident()
+                ? cache_->CpuExpertHostSource(cold_layer_,cold_ids_[c])
+                : async_route_sources_[size_t(cold_layer_)*async_route_experts_+cold_ids_[c]];
         async_route_ranks_=cold_ranks_;async_route_ids_=cold_ids_;async_route_count_=cold_count_;
         async_route_pending_=false;async_route_collected_=true;
         ++stats_.cpu_route_async_layers;
         stats_.cpu_route_wait_ns+=result.route_end_ns-result.route_begin_ns;
         stats_.cold_eligible+=cold_count_;
-        stats_.cpu_tasks_dispatched+=cold_count_;stats_.cpu_mapped_tasks_dispatched+=cold_count_;
+        stats_.cpu_tasks_dispatched+=cold_count_;stats_.cpu_mapped_tasks_dispatched+=cold_mapped_count_;
+        stats_.cpu_cached_tasks_dispatched+=cold_cached_count_;
         cache_->TraceColdCpu(cold_layer_,cold_ids_.data(),cold_ranks_.data(),cold_count_);
         if(cache_->tracing())cache_->trace_host_interval("cold_cpu_route_wait",cold_layer_,result.route_begin_ns,result.route_end_ns);
     }
@@ -978,7 +987,9 @@ void Qwen4ExpExpertExecutor::StartAsyncVerifyRoute(int layer, int rows, const in
     job.activation=resident_input_event_; job.route_event=route_event;
     job.output_reader=cpu_output_reader_event_; job.transfer_reader=prev_cpu_h2d_ev_;
     job.route_ids=ids; job.route_top_k=top_k_; job.route_experts=async_route_experts_;
-    job.route_sources=async_route_sources_.data()+size_t(layer)*async_route_experts_;
+    job.route_sources_resident=cache_->large_page_resident();
+    job.route_sources=job.route_sources_resident ? cache_->ResidentLayerSources(layer)
+        : async_route_sources_.data()+size_t(layer)*async_route_experts_;
     // Eligibility is captured on the coordinator. The worker reads only this
     // immutable table and mapped weights; it never acquires cache leases.
     for (int e=0;e<async_route_experts_;++e) job.route_cpu_eligible[e]=!cache_->IsDirectReady(layer,e);
@@ -1015,11 +1026,11 @@ sycl::event Qwen4ExpExpertExecutor::ExecuteVerifyRows(Context& ctx, int layer, c
     job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_;
     job.resident_prepared = true;
     for (int c = 0; c < job.count; ++c) {
-        auto source = cache_->MappedExpertHostSource(layer, route.cold_ids[c]);
+        auto source = cache_->CpuExpertHostSource(layer, route.cold_ids[c]);
         if (!source.gate_up_packed || !source.down_packed)
             throw std::logic_error("CPU verification row has no mapped expert source");
         job.tasks[c] = {source, route.cold_ranks[c] / top_k};
-        job.mapped_tasks[c] = true;
+        job.mapped_tasks[c] = !cache_->large_page_resident();
     }
     if (job.count) {
         job.activation = async_verify ? resident_input_event_ : ctx.queue().memcpy(x_host_, x, size_t(rows) * hidden_size_ * sizeof(bf16));

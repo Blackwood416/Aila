@@ -5,6 +5,7 @@
 #include "profile/Profiling.hpp"
 #include "runtime/InferenceClient.hpp"
 #include "utils/Tokenizer.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <drogon/drogon.h>
 #include <trantor/net/TcpConnection.h>
@@ -36,6 +37,36 @@ constexpr size_t ClosingChunkBytes = 5;
 constexpr size_t MaxConnections = 128;
 constexpr size_t RecentRecords = 64;
 constexpr int SocketSendBuffer = 16 * 1024;
+
+// Optional diagnostic drain. No file or thread exists for normal serving.
+class WorkerLogCapture {
+public:
+    explicit WorkerLogCapture(std::shared_ptr<host::InferenceClient> client) {
+        const auto path = aila::env::read_string("AILA_SERVER_WORKER_LOG", "");
+        if (path.empty()) return;
+        file.open(std::filesystem::u8path(path), std::ios::binary);
+        if (!file) throw std::runtime_error("Cannot open worker diagnostic log");
+        client->SetLogLevel(1);
+        reader = std::thread([this, client] {
+            try {
+                uint64_t dropped = 0;
+                for (;;) {
+                    const auto entry = client->ReadLog(stopping.load() ? 0ms : 50ms);
+                    dropped = entry.droppedLogs;
+                    if (entry.event) file << entry.event->message << '\n';
+                    if (entry.status == host::InferenceReadStatus::Closed ||
+                        (stopping.load() && entry.status == host::InferenceReadStatus::Timeout)) break;
+                }
+                file << "[WorkerLogCapture] host_dropped=" << dropped << '\n';
+            } catch (const std::exception& e) { file << "[WorkerLogCapture] error=" << e.what() << '\n'; }
+        });
+    }
+    ~WorkerLogCapture() { stopping.store(true); if (reader.joinable()) reader.join(); }
+private:
+    std::ofstream file;
+    std::atomic<bool> stopping{false};
+    std::thread reader;
+};
 
 std::string JsonText(const Json::Value& value) {
     Json::StreamWriterBuilder writer;
@@ -131,6 +162,7 @@ public:
     const std::string& Id() const { return identity.id; }
     const trantor::TcpConnection* Key() const { return key; }
     bool Reclaimable() const { return jobDone.load() && ioDone.load(); }
+    bool UsesInferenceSlot() const { return !inferenceDone.load(); }
 
 private:
     bool Alive();
@@ -161,7 +193,7 @@ private:
     std::string stagedFrame;
     std::string cancellationReason;
     bool framePending = false;
-    std::atomic<bool> cancelled{false}, jobDone{false}, ioDone{false}, ioFailed{false}, deliveryComplete{false};
+    std::atomic<bool> cancelled{false}, jobDone{false}, ioDone{false}, ioFailed{false}, deliveryComplete{false}, inferenceDone{false};
     bool responseStarted = false; // Request job only.
     bool streaming = false;       // Request job only.
     // These fields are accessed only on the connection's I/O loop.
@@ -177,6 +209,7 @@ struct Record {
     std::string status = "running";
     std::optional<uint64_t> generated;
     uint64_t peakPending = 0, pauses = 0;
+    uint64_t cachedPromptTokens = 0;
     Json::Value ToJson() const {
         Json::Value value;
         value["id"] = id;
@@ -184,25 +217,66 @@ struct Record {
         value["generated_tokens"] = generated ? Json::Value(Json::UInt64(*generated)) : Json::Value();
         value["peak_pending_bytes"] = Json::UInt64(peakPending);
         value["pause_ticks"] = Json::UInt64(pauses);
+        value["cached_prompt_tokens"] = Json::UInt64(cachedPromptTokens);
         return value;
     }
 };
 
 class Service final : public std::enable_shared_from_this<Service> {
 public:
+    struct CachedSession {
+        std::shared_ptr<host::InferenceSession> session;
+        std::vector<int32_t> tokens;
+    };
     Service(ServerOptions options, std::shared_ptr<host::InferenceClient> client,
             std::shared_ptr<host::InferenceModel> model, std::shared_ptr<const Tokenizer> tokenizer)
         : options(std::move(options)), client(std::move(client)), model(std::move(model)),
           tokenizer(std::move(tokenizer)), pool(this->options.maxSessions) {
         chat.modelId = this->options.modelId;
-        chat.maxContextTokens = this->options.contextTokens;
-        chat.maxPromptTokens = std::min<uint32_t>(4096, this->options.contextTokens);
+        chat.maxContextTokens = this->model->Info().maxSequenceLength;
+        chat.maxPromptTokens = chat.maxContextTokens;
+        chat.prefillChunkSize = std::min(this->options.prefillChunkSize, chat.maxPromptTokens);
+        chat.maxBodyBytes = this->options.maxBodyBytes;
         chat.maxNewTokens = this->options.maxNewTokens;
         chat.maxOutputBytes = this->options.maxOutputBytes;
         chat.family = this->options.backend == "qwen3_nf4" ? ModelFamily::Qwen3Dense
             : this->options.backend == "qwen4exp_nf4" ? ModelFamily::Qwen4Exp : ModelFamily::Qwen35Hybrid;
     }
     ~Service() { StopMemorySampling(); }
+
+    // Only whole completed states are reusable: recurrent models cannot roll
+    // back to an arbitrary common prefix. Remove a lease under the CPU lock;
+    // all RPC, reset and teardown work stays on the request job.
+    CachedSession TakeSession(const std::vector<int32_t>& prompt) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!options.reuseSessions || cachedSessions.empty()) return {};
+        size_t selected = 0, longest = 0;
+        for (size_t i = 0; i < cachedSessions.size(); ++i) {
+            const auto& tokens = cachedSessions[i].tokens;
+            if (tokens.size() > longest && tokens.size() < prompt.size() &&
+                std::equal(tokens.begin(), tokens.end(), prompt.begin())) {
+                selected = i; longest = tokens.size();
+            }
+        }
+        auto result = std::move(cachedSessions[selected]);
+        cachedSessions.erase(cachedSessions.begin() + selected);
+        if (!longest) result.tokens.clear(); // Caller resets before reusing storage.
+        return result;
+    }
+
+    void KeepSession(CachedSession value) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (options.reuseSessions && !stopping.load() && cachedSessions.size() < options.maxSessions)
+            cachedSessions.push_back(std::move(value));
+    }
+
+    void ObserveCache(const RequestRun* run, uint64_t count) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto found = active.find(run);
+        if (found != active.end()) found->second.record.cachedPromptTokens = count;
+        cachedPromptTokens += count;
+        if (count) ++prefixHits;
+    }
 
     void StartMemorySampling() {
         if (options.memorySampleInterval == 0ms) return;
@@ -321,7 +395,12 @@ public:
                                                std::string(request->body()), std::move(identity));
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (stopping.load() || active.size() >= options.maxSessions) {
+            // A completed response can still be draining its TCP connection.
+            // Keep its bounded transport lifetime, but release inference
+            // admission so an agent can immediately submit its tool result.
+            const auto occupied = std::count_if(active.begin(), active.end(),
+                [](const auto& entry) { return entry.second.run->UsesInferenceSlot(); });
+            if (stopping.load() || occupied >= options.maxSessions) {
                 ++rejected;
                 throw ApiError(429, "server_busy", "All request slots are occupied; retry after a request finishes");
             }
@@ -422,6 +501,14 @@ public:
         value["model"] = options.modelId;
         value["backend"] = options.backend;
         value["max_decode_batch_size"] = options.maxDecodeBatchSize;
+        value["context_tokens"] = chat.maxContextTokens;
+        value["max_new_tokens"] = chat.maxNewTokens;
+        value["prefill_chunk_size"] = chat.prefillChunkSize;
+        value["max_body_bytes"] = Json::UInt64(chat.maxBodyBytes);
+        value["prefix_cache"]["enabled"] = options.reuseSessions;
+        value["prefix_cache"]["idle_sessions"] = Json::UInt64(cachedSessions.size());
+        value["prefix_cache"]["hits"] = Json::UInt64(prefixHits);
+        value["prefix_cache"]["reused_tokens"] = Json::UInt64(cachedPromptTokens);
         if (model->Info().memory) {
             const auto& memory = *model->Info().memory;
             auto& budget = value["memory"];
@@ -473,6 +560,7 @@ public:
         transport["pause_ticks"] = Json::UInt64(pauseTicks);
         auto& ipc = value["ipc"];
         ipc["status"] = std::string(wire::to_string(snapshot.status)); ipc["epoch"] = snapshot.epoch;
+        if (!snapshot.error.empty()) ipc["error"] = snapshot.error;
         ipc["outstanding_requests"] = Json::UInt64(snapshot.outstandingRequests);
         ipc["pending_commands"] = Json::UInt64(snapshot.pendingCommands);
         auto& sockets = value["connections"];
@@ -504,6 +592,8 @@ private:
     std::map<const trantor::TcpConnection*, Connection> connections;
     std::map<const RequestRun*, Active> active;
     std::deque<Record> recent;
+    std::vector<CachedSession> cachedSessions;
+    uint64_t prefixHits = 0, cachedPromptTokens = 0;
     std::atomic<uint64_t> nextId{0};
     uint64_t admitted = 0, rejected = 0, completed = 0, failed = 0, cancelled = 0;
     uint64_t disconnectCancellations = 0, slowCancellations = 0;
@@ -755,20 +845,44 @@ void RequestRun::Execute() noexcept {
     std::shared_ptr<host::InferenceRequest> request;
     std::unique_ptr<ChatOutput> output;
     std::optional<uint64_t> generated;
+    std::vector<int32_t> completedTokens;
+    uint64_t cachedPromptTokens = 0;
     std::string outcome = "failed";
+    auto releaseInference = [&] {
+        // Release stays on the request job, never the HTTP loop. Publish the
+        // reusable session before the terminal tells the agent to continue.
+        if (request) { request->Release(); request.reset(); }
+        if (session && service && service->options.reuseSessions && outcome == "completed" &&
+            !cancelled.load() && !ioFailed.load()) {
+            try {
+                const auto state = session->Query(2s);
+                if (!state.busy && state.contextLength && *state.contextLength == completedTokens.size())
+                    service->KeepSession({std::move(session), std::move(completedTokens)});
+            } catch (...) { /* A cache miss does not invalidate generated output. */ }
+        }
+        if (session) { session->Release(); session.reset(); }
+        inferenceDone.store(true);
+    };
     try {
         if (!service || !Alive()) throw ApiError(503, "server_stopping", "Request cancelled before preparation");
         auto prepared = PrepareChat(body, *service->tokenizer, service->chat);
         body.clear(); body.shrink_to_fit();
         streaming = prepared.stream;
-        output = std::make_unique<ChatOutput>(identity, prepared, service->options.maxOutputBytes);
+        if (service->options.reuseSessions) {
+            completedTokens = prepared.promptIds;
+            completedTokens.reserve(prepared.promptIds.size() + prepared.options.generation.maxNewTokens);
+        }
         // Session release is asynchronous. A just-finished predecessor can
         // still own its final lifecycle task; permit a short bounded retry.
         const auto createDeadline = std::min(deadline, Clock::now() + 2s);
-        while (Alive()) {
+        while (!session && Alive()) {
             try {
                 const auto budget = std::max(1ms, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
-                session = service->model->CreateSession(budget);
+                auto cached = service->TakeSession(prepared.promptIds);
+                session = std::move(cached.session);
+                cachedPromptTokens = cached.tokens.size();
+                if (session && !cachedPromptTokens) session->Reset(budget);
+                if (!session) session = service->model->CreateSession(budget);
                 break;
             }
             catch (const host::InferenceClientError& error) {
@@ -777,6 +891,11 @@ void RequestRun::Execute() noexcept {
             }
         }
         if (!session || !Alive()) throw ApiError(503, "request_cancelled", "Request cancelled before submit");
+        prepared.cachedPromptTokens = cachedPromptTokens;
+        output = std::make_unique<ChatOutput>(identity, prepared, service->options.maxOutputBytes);
+        if (cachedPromptTokens) prepared.promptIds.erase(prepared.promptIds.begin(),
+            prepared.promptIds.begin() + static_cast<size_t>(cachedPromptTokens));
+        service->ObserveCache(this, cachedPromptTokens);
         const auto submitBudget = std::max(1ms, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()));
         request = session->Submit(std::move(prepared.promptIds), prepared.options, submitBudget);
         if (Alive() && streaming) { SendHeaders(); OfferAll(output->Begin()); }
@@ -787,12 +906,18 @@ void RequestRun::Execute() noexcept {
                 throw ApiError(502, "incomplete_inference", "Worker closed the request without a terminal event");
             if (next.event->terminal) {
                 generated = next.event->summary.generatedTokens;
-                auto completion = output->Finish(next.event->summary, next.event->localFailure || next.event->deliveryAbandoned);
+                auto summary = next.event->summary;
+                // HTTP usage covers the complete rendered prompt; IPC accounts
+                // only for the uncached suffix submitted to this Request.
+                summary.promptTokensProcessed += cachedPromptTokens;
+                auto completion = output->Finish(summary, next.event->localFailure || next.event->deliveryAbandoned);
                 outcome = completion.failed ? "failed" : "completed";
+                releaseInference();
                 if (streaming) { if (OfferAll(std::move(completion.sseFrames))) EndStream(); }
                 else SendJson(std::move(completion.json), completion.httpStatus);
                 break;
             }
+            if (service->options.reuseSessions) completedTokens.push_back(next.event->tokenId);
             auto frames = output->PushText(DecodeChatToken(*service->tokenizer, prepared, next.event->tokenId));
             if (streaming && !OfferAll(std::move(frames))) break;
         }
@@ -807,10 +932,7 @@ void RequestRun::Execute() noexcept {
         try { SendError(ApiError(500, "inference_error", "Unknown request failure"), output.get()); }
         catch (...) { Cancel("response_failed"); }
     }
-    // Release is nonblocking: the connection privately cancels/drains/ACKs.
-    // No GPU resource is destroyed on an HTTP loop or socket callback.
-    if (request) { request->Release(); request.reset(); }
-    if (session) { session->Release(); session.reset(); }
+    releaseInference();
     if (cancelled.load()) outcome = CancellationReason();
     else if (ioFailed.load()) outcome = "failed";
     if (service) service->Outcome(this, std::move(outcome), generated);
@@ -835,6 +957,13 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     if (!tokenizer->load(options.modelDirectory.u8string())) throw std::runtime_error("Could not load the model tokenizer");
     host::InferenceClientOptions clientOptions;
     clientOptions.limits.maxActiveRequests = options.maxSessions;
+    clientOptions.limits.maxPromptTokens = options.contextTokens;
+    clientOptions.limits.maxAttachmentBytes = std::max(clientOptions.limits.maxAttachmentBytes,
+        options.contextTokens * uint32_t{sizeof(int32_t)});
+    clientOptions.limits.maxGeneratedTokens = options.maxNewTokens;
+    clientOptions.limits.maxPrefillChunkSize = std::min(options.prefillChunkSize, options.contextTokens);
+    clientOptions.limits.maxOutstandingTokens = std::max(clientOptions.limits.maxOutstandingTokens,
+        uint64_t(options.maxSessions) * (options.contextTokens + options.maxNewTokens));
     clientOptions.maxDecodeBatchSize = options.maxDecodeBatchSize;
     clientOptions.handshakeTimeout = 10s;
     clientOptions.commandTimeout = 120s;
@@ -842,9 +971,11 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     if (std::find(clientOptions.requiredCapabilities.begin(), clientOptions.requiredCapabilities.end(), capability) ==
         clientOptions.requiredCapabilities.end()) clientOptions.requiredCapabilities.emplace_back(capability);
     clientOptions.requiredCapabilities.emplace_back("allocation_limits_v1");
+    if (options.reuseSessions) clientOptions.requiredCapabilities.emplace_back("session_context_v1");
     if (options.memorySampleInterval != 0ms) clientOptions.requiredCapabilities.emplace_back("runtime_memory_v1");
     auto client = host::InferenceClient::Start(options.workerExecutable.parent_path(), options.workerExecutable,
                                               options.expectedBuildId, clientOptions);
+    WorkerLogCapture workerLog(client);
     host::InferenceModelOptions modelOptions;
     modelOptions.maxSequenceLength = options.contextTokens;
     modelOptions.maxSessions = options.maxSessions;
@@ -854,7 +985,9 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     if (options.backend == "qwen3_nf4") model = client->LoadQwen3(options.modelDirectory.u8string(), modelOptions);
     else if (options.backend == "qwen35_nf4") model = client->LoadQwen35(options.modelDirectory.u8string(), modelOptions);
     else if (options.backend == "qwen35_bf16") model = client->LoadQwen35Bf16(options.modelDirectory.u8string(), modelOptions);
-    else if (options.backend == "qwen4exp_nf4") model = client->LoadQwen4Exp(options.modelDirectory.u8string(), modelOptions);
+    // Complete physical residency preloads the CPU complement as well as GPU
+    // weights. Its startup deadline is separate from ordinary control RPCs.
+    else if (options.backend == "qwen4exp_nf4") model = client->LoadQwen4Exp(options.modelDirectory.u8string(), modelOptions, 10min);
     else throw std::invalid_argument("Unsupported server model backend: " + options.backend);
     if (tokenizer->vocab_size() <= 0 || static_cast<uint32_t>(tokenizer->vocab_size()) > model->Info().vocabSize)
         throw std::runtime_error("Tokenizer vocabulary does not fit the loaded model");
@@ -900,6 +1033,8 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
         Json::Value item;
         item["id"] = service->options.modelId; item["object"] = "model";
         item["created"] = Json::Int64(0); item["owned_by"] = "aila";
+        item["context_length"] = service->chat.maxContextTokens;
+        item["max_completion_tokens"] = service->chat.maxNewTokens;
         value["data"] = Json::Value(Json::arrayValue); value["data"].append(item);
         reply(JsonResponse(JsonText(value)));
     }, {drogon::Get});

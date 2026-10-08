@@ -21,6 +21,8 @@ struct ServerOptions {
     uint32_t maxSessions = 4;
     uint32_t maxDecodeBatchSize = 1;
     uint32_t contextTokens = 4096;
+    uint32_t prefillChunkSize = 512;
+    bool reuseSessions = false;
     uint32_t maxNewTokens = 1024;
     size_t maxBodyBytes = 65536;
     size_t maxOutputBytes = 262144;

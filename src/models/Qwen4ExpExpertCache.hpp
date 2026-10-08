@@ -468,6 +468,16 @@ public:
     // synthetic refs) must outlive the cache and every CPU executor using it.
     // Returns an empty view for invalid geometry, dtype or metadata bounds.
     ops::MoeExpertSlotHost MappedExpertHostSource(int layer, int expert_id) const;
+    // One nonpageable source for CPU experts and GPU staging. GPU-only experts
+    // keep their sole payload until an eviction exchanges it with a host slot.
+    void InitializeLargePageResidency(HostTensorView* embedding = nullptr);
+    bool large_page_resident() const { return resident_data_ != nullptr; }
+    size_t resident_bytes() const { return resident_bytes_; }
+    uint64_t resident_exchange_bytes() const { return resident_exchange_bytes_; }
+    const ops::MoeExpertSlotHost* ResidentLayerSources(int layer) const {
+        return resident_data_ && layer >= 0 && layer < num_layers_
+            ? resident_sources_.data() + size_t(layer) * num_experts_per_layer_ : nullptr;
+    }
     // Coordinator-only before CPU work starts, or after every CPU reader drains.
     // Owns a bounded immutable copy of packed NF4 bytes; nested metadata still
     // borrows ModelWeights. This is separate from the expanded host/GPU pool.
@@ -511,6 +521,10 @@ private:
     void bind_slot_nested_metadata(int slot, int layer, int expert_id);
     void RefreshHotsetColdSlots();
     void TouchHotsetColdSlot(int slot, bool front);
+    void BindResidentSource(int key, int host_slot);
+    bool ExchangeResidentVictim(int gpu_slot, int incoming_key);
+    void ExchangeResidentOwnership(int incoming_key, int outgoing_slot);
+    void NormalizeResidentCore(const std::vector<int>& keys);
     // Fills part [part, nparts) of every slot segment for one expert.
     void load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
                                 int part = 0, int nparts = 1, uint64_t slot_gen = 0);
@@ -613,6 +627,14 @@ private:
         bool valid = false;
     };
     std::vector<LayerWeights> layer_weights_;
+    uint8_t* resident_data_ = nullptr;
+    size_t resident_bytes_ = 0;
+    size_t resident_gpu_only_count_ = 0;
+    std::vector<uint8_t*> resident_chunks_;
+    std::vector<uint8_t*> resident_slot_bases_;
+    std::vector<int> resident_host_slots_; // -1: the GPU owns the only payload
+    std::vector<ops::MoeExpertSlotHost> resident_sources_;
+    uint64_t resident_exchange_bytes_ = 0;
     std::vector<uint8_t> cpu_packed_source_data_;
     std::vector<int> cpu_packed_source_indices_;
     std::vector<std::array<const uint8_t*,2>> cpu_packed_source_originals_;
@@ -706,6 +728,7 @@ private:
         int expert_id;
         int slot_id;
         const uint8_t* prefilled; // staged by prefetch_async, or null
+        bool resident_exchange = false; // payload already uploaded during ownership exchange
     };
 
     // Preallocated scratch to avoid hot-path heap allocations

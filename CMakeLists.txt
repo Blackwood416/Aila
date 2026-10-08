@@ -179,6 +179,7 @@ set(LIB_SOURCES
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
     src/memory/KVCache.cpp
+    src/memory/LargePages.cpp
     src/core/ExecutionTrace.cpp
     src/inference/Model.cpp
     src/inference/Session.cpp

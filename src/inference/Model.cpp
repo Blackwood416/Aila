@@ -50,7 +50,11 @@ struct DeviceState {
     const char* FaultMessage() const noexcept { return fault.Message(); }
 
     void RecordFaultNoThrow(const char* message) noexcept {
+        const bool first = !fault.Faulted();
         fault.Record(message);
+        if (first) {
+            try { AILA_LOG_ERROR("[Aila RuntimeFault] %s", fault.Message()); } catch (...) {}
+        }
     }
 
     void DrainNoThrow() noexcept {
@@ -241,12 +245,35 @@ public:
     ExecutionResult Forward(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
                             bool captureLogits) override {
+        return ForwardImpl(tokenIds, sampling, captureLogits, -1);
+    }
+
+    // Prompt-phase entry point. MTP AfterForward needs complete target hidden
+    // rows, so while an MTP runtime is loaded the phase close-out stays off and
+    // the existing path is used unchanged.
+    ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
+                                   const SamplingInput* sampling,
+                                   bool captureLogits,
+                                   int prefillRemaining) override {
+        const int remaining = model->mtp ? -1 : prefillRemaining;
+        return ForwardImpl(tokenIds, sampling, captureLogits, remaining);
+    }
+
+private:
+    ExecutionResult ForwardImpl(const std::vector<int>& tokenIds,
+                                const SamplingInput* sampling,
+                                bool captureLogits,
+                                int prefillRemaining) {
         aila::ScopedLogDeferral deferLogs;
         auto& device = *model->device;
         std::lock_guard<std::mutex> lock(device.mutex);
         device.CheckUsable();
         auto& context = device.context;
         auto& slot = *model->workspace;
+        static const bool workSummary = std::is_same_v<Backend, Qwen4ExpBnb4Backend> &&
+            aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
+        using WorkClock = std::chrono::steady_clock;
+        const auto workStart = workSummary ? WorkClock::now() : WorkClock::time_point{};
         auto fields = TraceFields();
         fields.tokenCount = static_cast<int64_t>(tokenIds.size());
         fields.position = cache->CurrentLength();
@@ -258,6 +285,7 @@ public:
             context.memcpy_h2d_async(slot.tokenIds.data(), tokenIds.data(),
                                      tokenIds.size() * sizeof(int));
             Tensor* forwardedLogits = nullptr;
+            const auto backendStart = workSummary ? WorkClock::now() : WorkClock::time_point{};
             {
                 ExecutionScope submitted(device.trace.get(), ExecutionStage::BackendForward);
                 if constexpr (!std::is_same_v<Backend, Qwen3Bnb4Backend>) {
@@ -272,20 +300,39 @@ public:
                     }
                 }
                 if (!forwardedLogits) {
-                    forwardedLogits = &ModelBackend().Forward(
-                        context, *cache, slot.tokenIds.data_as<int>(),
-                        static_cast<int>(tokenIds.size()));
+                    if constexpr (std::is_same_v<Backend, Qwen4ExpBnb4Backend>) {
+                        ForwardOptions options;
+                        // Intermediate prompt chunks and the final pending
+                        // token only update state; their LM head is never read.
+                        options.need_logits = sampling != nullptr || captureLogits;
+                        options.prefill_remaining = prefillRemaining;
+                        forwardedLogits = &ModelBackend().Forward(context, *cache,
+                            slot.tokenIds.data_as<int>(), static_cast<int>(tokenIds.size()), options);
+                    } else {
+                        forwardedLogits = &ModelBackend().Forward(
+                            context, *cache, slot.tokenIds.data_as<int>(),
+                            static_cast<int>(tokenIds.size()));
+                    }
                 }
                 submitted.Complete(); // Host return, not proof that the GPU finished.
             }
             Tensor& logits = *forwardedLogits;
+            const auto backendEnd = workSummary ? WorkClock::now() : WorkClock::time_point{};
 
             auto result = ReadOutput(logits, sampling, captureLogits);
+            const auto sampleEnd = workSummary ? WorkClock::now() : WorkClock::time_point{};
             if (model->mtp) model->mtp->AfterForward(*mtpState,
                 cache->CurrentLength() - static_cast<int>(tokenIds.size()), tokenIds);
             // No device work may still refer to borrowed input or mutable
             // bindings when the caller destroys/switches the session.
             context.synchronize();
+            if (workSummary) {
+                const auto end = WorkClock::now();
+                const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b-a).count(); };
+                AILA_LOG_INFO("[Q4E ForwardWall] pos=%d count=%d remaining=%d sample=%d total_ms=%.6f prepare_ms=%.6f backend_ms=%.6f sample_ms=%.6f drain_ms=%.6f",
+                    cache->CurrentLength()-int(tokenIds.size()), int(tokenIds.size()), prefillRemaining, int(sampling!=nullptr),
+                    ms(workStart,end), ms(workStart,backendStart), ms(backendStart,backendEnd), ms(backendEnd,sampleEnd), ms(sampleEnd,end));
+            }
             stage.Complete();
             device.CheckUsable();
             return result;
@@ -314,6 +361,7 @@ public:
         }
     }
 
+public:
     std::vector<ExecutionResult> ForwardDecodeBatch(
         const std::vector<BackendDecodeInput>& rows) override {
         if (rows.empty() || rows.size() > MaxDecodeBatchSize) {

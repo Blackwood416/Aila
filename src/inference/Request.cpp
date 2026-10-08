@@ -265,8 +265,12 @@ StepResult RequestState::StepLocked(size_t outputSlots) {
                 std::min(remaining, static_cast<size_t>(options.prefillChunkSize));
             const auto first = promptIds.begin() + snapshot.promptTokensProcessed;
             const bool finalChunk = chunkSize == remaining;
+            // Prompt tokens still queued after this chunk; 0 marks the last
+            // prefill slice so phase-aware backends can close the prefill.
+            const int prefillRemaining = static_cast<int>(remaining - chunkSize);
             result = session->Execute(std::vector<int>(first, first + chunkSize),
-                                      finalChunk ? nextSample : nullptr);
+                                      finalChunk ? nextSample : nullptr,
+                                      false, prefillRemaining);
             snapshot.promptTokensProcessed += chunkSize;
             if (cancelRequested.load(std::memory_order_acquire)) {
                 return Finish(RequestStatus::Cancelled);

@@ -1,0 +1,574 @@
+{
+  "hardware": {
+    "gpu": "Intel Arc A770 16 GiB",
+    "driver": "32.0.101.8724",
+    "cpu": "Xeon E5-2696 v3, 18C/18T",
+    "ram_gib": 63.91,
+    "oneapi": "2026.1.0 Build 20260617",
+    "onednn": "3.11"
+  },
+  "configuration": {
+    "context": 32768,
+    "chunk": 4096,
+    "reserve_mb": 3584,
+    "cpu_expert_threads": 18,
+    "kv": "BF16",
+    "mtp": false,
+    "concurrency": 1,
+    "prefix_reuse": false,
+    "diagnostics": false,
+    "native_large_page_bytes": 57776537600
+  },
+  "scope": "One paired same-binary HTTP sequence, fixed natural inputs, no OS cache flush. Startup includes preloading; short output rate is not a steady decode benchmark.",
+  "binary_sha256": {
+    "build-refactor-server\\AilaServer.exe": "89390ec846a41d2021dd072edab823ffe0d45b5739e09d57847e94ec748f8f8f",
+    "build-refactor\\AilaWorker.exe": "75d61c32362f51ede1e33667314f5e7b575a4b82e0ed03084ab25cebea89d3be"
+  },
+  "fixture": {
+    "version": 1,
+    "sources": [
+      {
+        "path": "AGENTS.md",
+        "first_line": 1,
+        "last_line": 100,
+        "file_sha256": "5f287013f3a11b3c0ce371cdfec0a85cd3574c067c22361c3b3d3f0c19b6791c",
+        "excerpt_sha256": "39a9a47db8c8c9172e9e66580b41314dca4e6a6184c71ea9f03f98893da40bb7"
+      },
+      {
+        "path": "src/inference/Model.cpp",
+        "first_line": 131,
+        "last_line": 330,
+        "file_sha256": "64f25f31948a1f206acb3b1da8a9cbc60496c0bbad1e33e07f09a78727d888a2",
+        "excerpt_sha256": "f8df36ac83d31887bd97f34c8df97741a9be1e79c7bf472e7819e598a1318af4"
+      },
+      {
+        "path": "src/inference/Session.cpp",
+        "first_line": 1,
+        "last_line": 210,
+        "file_sha256": "568aa765e80f3cbcdc877c9ab151d3102aa987dd85854d7ae0ec5ef9b172940b",
+        "excerpt_sha256": "ca174cb84540a1f04482b9dd219c3d9979f249c4f9683431646983351428d4e3"
+      },
+      {
+        "path": "src/server/HttpServer.cpp",
+        "first_line": 421,
+        "last_line": 690,
+        "file_sha256": "2e95cd515f15f75fc35ff9bc00c4556c5fdedb7bd380552c5f8e768805f9f8b0",
+        "excerpt_sha256": "0a4eac815f0598fbd8e49d476c6cbe6587bec2c96e3c6fc5dca8aa8e65ed1d3f"
+      },
+      {
+        "path": "src/models/Qwen4ExpExpertCache.cpp",
+        "first_line": 2011,
+        "last_line": 2220,
+        "file_sha256": "b899ef0982e54b5e7f17472e80a670e66409579e1b8c71f4a4fec56327e7c5ca",
+        "excerpt_sha256": "074ac8496be01be4817e3e393a1112a7290ac1e9f707ec9c74360c035c6b389a"
+      },
+      {
+        "path": "src/models/Qwen4ExpBnb4Backend.cpp",
+        "first_line": 1731,
+        "last_line": 1900,
+        "file_sha256": "c5499a0d5e0c9c1442783727d5026a3735ada7e077218b097a335b5a1762b470",
+        "excerpt_sha256": "a69ff8ea64e6bd0ffa49dc4e5ddfca26b0e39742288ff0b0d54945d032bfabda"
+      },
+      {
+        "path": "docs/plans/qwen38-bottleneck-2026-10-07.md",
+        "first_line": 1,
+        "last_line": 120,
+        "file_sha256": "e45b8f420b3c07b13568cbae5835c9c9914c3a699577b0d0f8ed13449a95b615",
+        "excerpt_sha256": "cc4411fca25da5fba60a074bfc9eaa4b8ea744ec302809ac9b7355343c3b2d5b"
+      },
+      {
+        "path": "tmp/q4e-htoff-base-worker.log",
+        "first_line": 901,
+        "last_line": 950,
+        "file_sha256": "0f42046d7d500bc11408948693511a3d22c9e77b99b5c00554359e25da15fe2f",
+        "excerpt_sha256": "b864338c57e4a060651940165805f979d80d34beeb786cb51ecb54228f5ec8f4"
+      }
+    ],
+    "corpus_tokens": 20966,
+    "inputs": [
+      {
+        "target": 6000,
+        "file": "context-6000.txt",
+        "tokens": 5932,
+        "sha256": "6437d29f146179e55e71c0d08da55dfd905c0e672dbfd9fb3bfe9310735221be",
+        "token_sha256": "7f12af8ca2e23eb7ff2c16ec94846d2675ab5f49f5c9850dfa0dd70cd97206ba"
+      },
+      {
+        "target": 14000,
+        "file": "context-14000.txt",
+        "tokens": 13932,
+        "sha256": "aa3169bf2689bedcfcad3e0e0f9c30142a4dfae0bf8a215b7fe1a39259417ea3",
+        "token_sha256": "3d56c146ef45bc71d411d924617fe02642bc15ecd9f714ea0ee23cba293cf886"
+      }
+    ],
+    "marker": "AILA_FIXED_AGENT_READ_20261007",
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "runs": {
+    "baseline": {
+      "source": "tmp/q4e-largepages-a4/result.json",
+      "startup_s": 16.336137999998755,
+      "load_disk0_read_gib": 10.711897850036621,
+      "available_after_load_gib": 52.42936325073242,
+      "startup_min_available_gib": 52.421478271484375,
+      "first_task_including_startup_s": 128.32220940000116,
+      "sequence_including_startup_s": 340.83657250000033,
+      "worker_exit_code": 0,
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 109.695850600001,
+          "total_s": 111.9860714000024,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 46.67805576324463,
+          "min_available_gib": 43.4026985168457,
+          "max_worker_ws_gib": 11.481391906738281,
+          "short_output_tokens_s": 6.549586834592885,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 31.93094619999829,
+          "total_s": 33.23904659999971,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.15848016738891602,
+          "min_available_gib": 42.9849967956543,
+          "max_worker_ws_gib": 11.820880889892578,
+          "short_output_tokens_s": 11.4670097188134,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "3-context-14000",
+          "ttft_s": 103.12276500000007,
+          "total_s": 104.88929449999705,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 10.288914680480957,
+          "min_available_gib": 40.39649200439453,
+          "max_worker_ws_gib": 14.736286163330078,
+          "short_output_tokens_s": 8.491225309300335,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        },
+        {
+          "label": "4-context-14000",
+          "ttft_s": 73.10780380000142,
+          "total_s": 74.38602200000241,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 2.9570765495300293,
+          "min_available_gib": 39.816226959228516,
+          "max_worker_ws_gib": 14.928695678710938,
+          "short_output_tokens_s": 11.735085605875705,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        }
+      ]
+    },
+    "resident": {
+      "source": "tmp/q4e-largepages-b8/result.json",
+      "startup_s": 79.17488420000154,
+      "load_disk0_read_gib": 64.96623706817627,
+      "available_after_load_gib": 5.434108734130859,
+      "startup_min_available_gib": 3.9982757568359375,
+      "first_task_including_startup_s": 153.99739160000172,
+      "sequence_including_startup_s": 366.3445845999995,
+      "worker_exit_code": 0,
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 73.17769899999985,
+          "total_s": 74.82250740000018,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 6.5385613441467285,
+          "min_available_gib": 4.678630828857422,
+          "max_worker_ws_gib": 0.7625274658203125,
+          "short_output_tokens_s": 9.119603231596457,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 32.63401530000192,
+          "total_s": 33.930964300001506,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.0026612281799316406,
+          "min_available_gib": 4.730712890625,
+          "max_worker_ws_gib": 0.75384521484375,
+          "short_output_tokens_s": 11.565605124029387,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "3-context-14000",
+          "ttft_s": 101.56048879999798,
+          "total_s": 103.15473949999796,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 7.422080039978027,
+          "min_available_gib": 4.035907745361328,
+          "max_worker_ws_gib": 1.2131614685058594,
+          "short_output_tokens_s": 9.408808790236213,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        },
+        {
+          "label": "4-context-14000",
+          "ttft_s": 73.94996149999861,
+          "total_s": 75.26148919999832,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.04476213455200195,
+          "min_available_gib": 3.839832305908203,
+          "max_worker_ws_gib": 1.2087020874023438,
+          "short_output_tokens_s": 11.43704399076227,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        }
+      ]
+    },
+    "resident_1gib": {
+      "source": "tmp/q4e-largepages-b4/result.json",
+      "startup_s": 88.6484032999997,
+      "load_disk0_read_gib": 65.38962078094482,
+      "available_after_load_gib": 6.283805847167969,
+      "startup_min_available_gib": 0.1612091064453125,
+      "first_task_including_startup_s": 165.34082330000092,
+      "sequence_including_startup_s": 378.0006587000007,
+      "worker_exit_code": 0,
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 75.06965280000077,
+          "total_s": 76.69242000000122,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 6.776870250701904,
+          "min_available_gib": 5.3457183837890625,
+          "max_worker_ws_gib": 0.75628662109375,
+          "short_output_tokens_s": 9.243470043020226,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 32.62993100000131,
+          "total_s": 33.91071850000117,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.20960569381713867,
+          "min_available_gib": 5.2184600830078125,
+          "max_worker_ws_gib": 0.7595481872558594,
+          "short_output_tokens_s": 11.711544655145085,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "3-context-14000",
+          "ttft_s": 102.05721410000115,
+          "total_s": 103.62487359999977,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 7.285323143005371,
+          "min_available_gib": 4.701560974121094,
+          "max_worker_ws_gib": 1.2161445617675781,
+          "short_output_tokens_s": 9.568404363328352,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        },
+        {
+          "label": "4-context-14000",
+          "ttft_s": 73.83055309999872,
+          "total_s": 75.12424329999885,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.024770736694335938,
+          "min_available_gib": 4.676704406738281,
+          "max_worker_ws_gib": 1.2130508422851562,
+          "short_output_tokens_s": 11.594738833144529,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        }
+      ]
+    },
+    "rejected_batch": {
+      "source": "tmp/q4e-largepages-b6/result.json",
+      "startup_s": 66.481898,
+      "load_disk0_read_gib": 59.83950185775757,
+      "available_after_load_gib": 4.6686248779296875,
+      "startup_min_available_gib": 0.1691436767578125,
+      "first_task_including_startup_s": 141.68351129999974,
+      "sequence_including_startup_s": 354.8426141,
+      "worker_exit_code": 0,
+      "requests": [
+        {
+          "label": "1-context-6000",
+          "ttft_s": 73.58835460000046,
+          "total_s": 75.20161329999974,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 6.872030258178711,
+          "min_available_gib": 3.9647064208984375,
+          "max_worker_ws_gib": 1.5828742980957031,
+          "short_output_tokens_s": 9.297950787438314,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "2-context-6000",
+          "ttft_s": 32.53925890000028,
+          "total_s": 33.83587140000054,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 5968,
+            "total_tokens": 5984
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.06758356094360352,
+          "min_available_gib": 3.9448471069335938,
+          "max_worker_ws_gib": 1.554962158203125,
+          "short_output_tokens_s": 11.568606657730768,
+          "messages_sha256": "30c9efa7b59721372d0fd7ed9a9ee004a596861b32e9dc2dc85b3fee621f3317",
+          "output_sha256": "20f768029da504ee02b8d44e2ac657416064d23d7b30a492bf427f518ea47404"
+        },
+        {
+          "label": "3-context-14000",
+          "ttft_s": 102.1202501000007,
+          "total_s": 103.72963309999977,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 7.197757720947266,
+          "min_available_gib": 3.83935546875,
+          "max_worker_ws_gib": 1.5810317993164062,
+          "short_output_tokens_s": 9.320342019276124,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        },
+        {
+          "label": "4-context-14000",
+          "ttft_s": 74.2683167999985,
+          "total_s": 75.59359829999994,
+          "usage": {
+            "completion_tokens": 16,
+            "prompt_tokens": 13979,
+            "total_tokens": 13995
+          },
+          "cached_tokens": 0,
+          "disk0_read_gib": 0.035488128662109375,
+          "min_available_gib": 3.9462852478027344,
+          "max_worker_ws_gib": 1.3850936889648438,
+          "short_output_tokens_s": 11.318350101456728,
+          "messages_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "b2166baac5d032b1e9c1f0597121f51ccc76faee696449f19f75579baae3f79d"
+        }
+      ]
+    }
+  },
+  "comparisons": [
+    {
+      "label": "1-context-6000",
+      "total_improvement_percent": 33.185880650512246,
+      "output_matches": true
+    },
+    {
+      "label": "2-context-6000",
+      "total_improvement_percent": -2.0816412345647795,
+      "output_matches": true
+    },
+    {
+      "label": "3-context-14000",
+      "total_improvement_percent": 1.653700702505101,
+      "output_matches": true
+    },
+    {
+      "label": "4-context-14000",
+      "total_improvement_percent": -1.1769243420435727,
+      "output_matches": true
+    }
+  ],
+  "agent_validation": {
+    "source": "tmp/q4e-largepages-agent-handoff/result.json",
+    "startup_s": 77.04909820000103,
+    "pi": {
+      "passed": true,
+      "seconds": 90.27346779999789,
+      "calls": [
+        {
+          "type": "tool_execution_start",
+          "toolCallId": "call_chatcmpl-bd2f4ba1d329-1_0",
+          "toolName": "read",
+          "args": {
+            "path": "smoke-marker.txt"
+          }
+        }
+      ],
+      "answer": "AILA_FIXED_AGENT_READ_20261007",
+      "work_dir": "E:\\RiderProjects\\Aila\\tmp\\q4e-agent-corpus-v1\\pi-work",
+      "marker": "AILA_FIXED_AGENT_READ_20261007",
+      "prompt": "The attached background text is already included in this message; it requires no file reads. Your only task and only tool call is the following: Read the file smoke-marker.txt in the current directory with the read tool once, then reply with only its exact contents and no other text.",
+      "usage": [
+        {
+          "input": 6931,
+          "output": 26,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 6957,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        {
+          "input": 32,
+          "output": 14,
+          "cacheRead": 6957,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7003,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        }
+      ]
+    },
+    "startup_plus_pi_s": 167.32256599999891,
+    "cancel_recover": {
+      "victim": {
+        "cached_prompt_tokens": 0,
+        "generated_tokens": null,
+        "id": "chatcmpl-bd2f4ba1d329-3",
+        "pause_ticks": 0,
+        "peak_pending_bytes": 0,
+        "status": "disconnect"
+      },
+      "passed": true,
+      "disconnect_cancellations": 1
+    },
+    "requests": [
+      {
+        "label": "after-cancel",
+        "ttft_s": 0.986132699999871,
+        "total_s": 1.5105118999999831,
+        "usage": {
+          "completion_tokens": 1,
+          "prompt_tokens": 17,
+          "total_tokens": 18
+        },
+        "cached_tokens": 0,
+        "after_first_content_tokens_s": 0.0
+      },
+      {
+        "label": "context-14000",
+        "ttft_s": 101.72134110000115,
+        "total_s": 106.72871560000203,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 13979,
+          "total_tokens": 14043
+        },
+        "cached_tokens": 0,
+        "after_first_content_tokens_s": 12.581443628789687
+      },
+      {
+        "label": "context-14000-continue",
+        "ttft_s": 1.7010451999994984,
+        "total_s": 6.406723899999633,
+        "usage": {
+          "completion_tokens": 64,
+          "prompt_tokens": 14067,
+          "prompt_tokens_details": {
+            "cached_tokens": 14043
+          },
+          "total_tokens": 14131
+        },
+        "cached_tokens": 14043,
+        "after_first_content_tokens_s": 13.388079385870139
+      }
+    ],
+    "counters": {
+      "admitted": 6,
+      "cancelled": 1,
+      "completed": 5,
+      "disconnect_cancellations": 1,
+      "failed": 0,
+      "rejected": 0,
+      "slow_client_cancellations": 0
+    }
+  },
+  "functional_binary_sha256": {
+    "build-refactor/AilaWorker.exe": "75d61c32362f51ede1e33667314f5e7b575a4b82e0ed03084ab25cebea89d3be",
+    "build-refactor-server/AilaServer.exe": "7b3020cb8de62189a58bab17ddaf39bc9e19576caf2b9958b14a1fb4483553dd"
+  },
+  "functional_scope": "After the matched HTTP pair, Server alone was changed to release inference admission before terminal delivery while retaining TCP drain bounds. Verified with six serial fake turns and real PI; Worker unchanged. PI task wording clarified; do not claim a before/after PI speedup.",
+  "decision": "Keep explicit large-page support; do not enable it in the default launcher yet. Runtime reads fall substantially, but warm time is similar and preload makes first-task total slower. Batched ownership return was withdrawn. Decode 20+ is not reached."
+}

@@ -403,6 +403,18 @@ Qwen4ExpExpertCache& Qwen4ExpExpertCache::operator=(Qwen4ExpExpertCache&& other)
     resident_descriptor_upload_ = std::move(other.resident_descriptor_upload_);
     resident_index_uploads_ = std::move(other.resident_index_uploads_);
     stats_ = other.stats_;
+    resident_data_ = other.resident_data_;
+    resident_bytes_ = other.resident_bytes_;
+    resident_gpu_only_count_ = other.resident_gpu_only_count_;
+    resident_chunks_ = std::move(other.resident_chunks_);
+    resident_slot_bases_ = std::move(other.resident_slot_bases_);
+    resident_host_slots_ = std::move(other.resident_host_slots_);
+    resident_sources_ = std::move(other.resident_sources_);
+    resident_exchange_bytes_ = other.resident_exchange_bytes_;
+    other.resident_data_ = nullptr;
+    other.resident_bytes_ = 0;
+    other.resident_gpu_only_count_ = 0;
+    other.resident_exchange_bytes_ = 0;
     cost_aware_eviction_ = other.cost_aware_eviction_;
     host_complement_ = other.host_complement_;
     host_complement_scan_ = other.host_complement_scan_;
@@ -506,6 +518,7 @@ void Qwen4ExpExpertCache::cleanup() {
         if (copy_q_) {
             try { copy_q_->wait_and_throw(); } catch (...) {}
         }
+        for (auto* chunk : resident_chunks_) ctx_->free_host(chunk);
         for (uint8_t* meta : layer_meta_allocs_) {
             if (meta) ctx_->free_device(meta);
         }
@@ -525,6 +538,14 @@ void Qwen4ExpExpertCache::cleanup() {
         }
     }
     dev_pool_chunks_.clear();
+    resident_data_ = nullptr;
+    resident_bytes_ = 0;
+    resident_gpu_only_count_ = 0;
+    resident_chunks_.clear();
+    resident_slot_bases_.clear();
+    resident_host_slots_.clear();
+    resident_sources_.clear();
+    resident_exchange_bytes_ = 0;
     resident_descriptors_dev_ = Tensor{};
     resident_indices_dev_ = Tensor{};
     resident_descriptors_host_.clear();
@@ -1533,6 +1554,7 @@ void Qwen4ExpExpertCache::InstallHotset(const std::vector<int>& keys) {
             offset+=n;
         }
     }
+    if (resident_data_) NormalizeResidentCore(keys);
     for(int s=0;s<num_slots_;++s)if(!frozen_slots_[s])DiscardTransient(&s,1);
     frozen_descriptors_published_=false;std::fill(frozen_indices_published_.begin(),frozen_indices_published_.end(),false);
     stats_.epoch_refill_bytes+=stats_.total_transferred_bytes-bytes0;
@@ -1811,6 +1833,8 @@ void Qwen4ExpExpertCache::RetirePrefillSlots(const int* slots, int count) {
             auto target=std::find(hotset_keys_.begin(),hotset_keys_.end(),old_key);
             if(target==hotset_keys_.end() || std::find(hotset_keys_.begin(),hotset_keys_.end(),flat)!=hotset_keys_.end())continue;
             if(std::find(hotset_prefill_keys_.begin(),hotset_prefill_keys_.end(),flat)!=hotset_prefill_keys_.end())continue;
+            if (resident_data_ && resident_host_slots_[old_key] < 0)
+                ExchangeResidentOwnership(flat, victim);
             // Swap tier ownership only. Both payloads, generations and outstanding
             // reader/DMA fences survive; demoted reuse follows acquire's fences.
             *target=flat;
@@ -1845,6 +1869,11 @@ void Qwen4ExpExpertCache::DiscardTransient(const int* slots, int count) {
         auto& record=gpu_slot_records_[s];
         if (record.direct_leases) throw std::logic_error("Cannot discard a leased slot");
         const auto key=slot_to_key_[s];
+        // Adoption and epoch installation must return a demoted sole copy to
+        // RAM before a transient binding can disappear. Never fall back to disk.
+        if (resident_data_ && key != UINT64_MAX &&
+            resident_host_slots_[expert_flat_index(int(key >> 32), int(uint32_t(key)))] < 0)
+            throw std::logic_error("Discard would lose a GPU-only resident expert");
         if(cache_trace_ && key!=UINT64_MAX) {
             cache_trace_->Row("discard")<<",\"slot\":"<<s;cache_trace_->End();
         }
@@ -2315,6 +2344,13 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
 
         // Validate the descriptor before mutating the cache's LRU and key maps.
         bind_slot_nested_metadata(victim_slot, layer, expert);
+        bool resident_exchange = false;
+        if (resident_data_) {
+            // The incoming cold expert is excluded from CPU work by the route
+            // partition. The outgoing GPU-only expert cannot have CPU readers.
+            guard.dma_submitted = true;
+            resident_exchange = ExchangeResidentVictim(victim_slot, flat_idx);
+        }
 
         // Evict old key if bound
         uint64_t old_key = slot_to_key_[victim_slot];
@@ -2340,7 +2376,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         batch_reserved_slots_scratch_.push_back(victim_slot);
 
         out_slots[i] = victim_slot;
-        misses_scratch_.push_back({i, layer, expert, victim_slot, nullptr});
+        misses_scratch_.push_back({i, layer, expert, victim_slot, nullptr, resident_exchange});
         ++stats_.miss_count;
     }
 
@@ -2372,6 +2408,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
         to_fill_scratch_.clear();
 
         for (const auto& miss : misses_scratch_) {
+            if (miss.resident_exchange) continue;
             // Check if this miss matches an in-flight prefetch item
             int matched_pf = -1;
             for (size_t p = 0; p < prefetch_items_.size(); ++p) {
@@ -2415,7 +2452,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
             }
 
             if(mapped_dma) {
-                const auto source=MappedExpertHostSource(miss.layer,miss.expert_id);
+                const auto source=CpuExpertHostSource(miss.layer,miss.expert_id);
                 if(source.gate_up_packed && source.down_packed &&
                     source.gate_up_nested.codes && source.down_nested.codes) {
                     // Original model spans are immutable and outlive this cache.
@@ -2672,6 +2709,7 @@ sycl::event Qwen4ExpExpertCache::acquire_impl(int layer, const int* expert_ids,
 }
 
 void Qwen4ExpExpertCache::prefetch_async(int layer, const int* expert_ids, int count, int quota) {
+    if (resident_data_) return; // All cold sources are already physically resident.
     if (!initialized_ || count <= 0 || expert_ids == nullptr) {
         return;
     }
@@ -2920,6 +2958,14 @@ void fill_expert_matrix(const Bnb4BitHostWeightRef& ref, int expert_id,
 
 void Qwen4ExpExpertCache::load_expert_to_staging(int layer, int expert_id, uint8_t* staging_slot,
                                                  int part, int nparts, uint64_t slot_gen) {
+    if (resident_data_) {
+        const int host_slot = resident_host_slots_.at(expert_flat_index(layer, expert_id));
+        if (host_slot < 0) throw std::logic_error("GPU-only expert requested as a host source");
+        size_t begin = 0, end = 0;
+        part_range(slot_bytes_, part, nparts, begin, end);
+        std::memcpy(staging_slot + begin, resident_slot_bases_[host_slot] + begin, end - begin);
+        return;
+    }
     if (reader_) {
         reader_->read_expert_slice(layer, expert_id, staging_slot, part, nparts, slot_gen);
         return;
@@ -3372,6 +3418,218 @@ ops::MoeExpertSlotHost Qwen4ExpExpertCache::get_slot_host(int hslot) const {
     return slot;
 }
 
+void Qwen4ExpExpertCache::InitializeLargePageResidency(HostTensorView* embedding) {
+    if (!initialized_ || faulted_ || resident_data_ || !compact_nested_ || !frozen_ ||
+        host_pool_enabled_ || !cpu_packed_source_data_.empty() || hotset_keys_.empty() || hotset_swaps_)
+        throw std::logic_error("Large-page residency requires a ready NF4 hotset, zero duplicate host pools and no online swaps");
+    cancel_prefetch();
+    ctx_->synchronize();
+    copy_q_->wait_and_throw();
+    const auto start = std::chrono::steady_clock::now();
+    const size_t total = size_t(num_layers_) * num_experts_per_layer_;
+    // Keep the initial prefill lending region backed in RAM. Only the retained
+    // GPU core is excluded; later hotset changes exchange ownership on eviction.
+    const size_t gpu_only = hotset_borrow_
+        ? std::min(hotset_keys_.size(), size_t(std::max(1, num_slots_ - num_experts_per_layer_)))
+        : hotset_keys_.size();
+    std::vector<int> host_slots(total, 0);
+    for (size_t i = 0; i < gpu_only; ++i) {
+        const int key = hotset_keys_[i], slot = layer_expert_to_slot_[key];
+        if (slot < 0 || !frozen_slots_[slot] || get_slot_state(slot) != ExpertSlotState::Ready)
+            throw std::logic_error("Large-page complement has an incomplete GPU owner");
+        host_slots[key] = -1;
+    }
+    int host_count = 0;
+    std::vector<ops::MoeExpertSlotHost> sources(total);
+    for (size_t key = 0; key < total; ++key) {
+        sources[key] = MappedExpertHostSource(int(key) / num_experts_per_layer_, int(key) % num_experts_per_layer_);
+        if (!sources[key].gate_up_packed || !sources[key].down_packed ||
+            !sources[key].gate_up_nested.codes || !sources[key].down_nested.codes)
+            throw std::logic_error("Large-page residency requires valid original nested NF4 sources");
+        if (host_slots[key] >= 0) host_slots[key] = host_count++;
+    }
+    const size_t payload_bytes = size_t(host_count) * slot_bytes_;
+    size_t metadata_bytes = 0;
+    for (const auto& layer : layer_weights_) for (const auto* ref : {&layer.gate_up, &layer.down})
+        metadata_bytes += ref->nested_absmax.bytes + ref->nested_quant_map.bytes;
+    const size_t embedding_offset = (metadata_bytes + 63) / 64 * 64;
+    const size_t embedding_bytes = embedding && embedding->valid() ? embedding->bytes : 0;
+    const size_t metadata_allocation_bytes = aila::memory::LargePageAllocationSize(embedding_offset + embedding_bytes);
+    const int slots_per_chunk = std::max(1, int((size_t(256) << 20) / slot_bytes_));
+    size_t bytes = metadata_allocation_bytes;
+    for (int first = 0; first < host_count; first += slots_per_chunk)
+        bytes += aila::memory::LargePageAllocationSize(size_t(std::min(slots_per_chunk, host_count - first)) * slot_bytes_);
+
+    // Uploaded mmap pages are reclaimable. Return them to standby before sizing
+    // physical residency, rather than treating the loader's working set as live weights.
+    SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));
+    MEMORYSTATUSEX memory{}; memory.dwLength = sizeof(memory);
+    if (!GlobalMemoryStatusEx(&memory)) throw std::runtime_error("Cannot read physical memory budget");
+    constexpr size_t runtime_room = size_t(2) << 30;
+    if (bytes > memory.ullAvailPhys || memory.ullAvailPhys - bytes < runtime_room)
+        throw std::runtime_error("Complete large-page complement needs " + std::to_string(bytes) +
+            " bytes plus 2 GiB runtime room; available=" + std::to_string(memory.ullAvailPhys));
+    AILA_LOG_INFO("[Q4E LargePages] allocating_bytes=%llu available_bytes=%llu gpu_only=%zu host_experts=%d lend_backed=%zu",
+        (unsigned long long)bytes, (unsigned long long)memory.ullAvailPhys, gpu_only, host_count, hotset_keys_.size() - gpu_only);
+    auto release = [this](uint8_t* ptr) { ctx_->free_host(ptr); };
+    using Chunk = std::unique_ptr<uint8_t, decltype(release)>;
+    std::vector<Chunk> chunks;chunks.reserve((host_count + slots_per_chunk - 1) / slots_per_chunk + 1);
+    std::vector<uint8_t*> bases(host_count);
+    resident_chunks_.reserve(chunks.capacity());
+    // Fragmented physical memory can reject even a 1 GiB request with 1450.
+    // This machine accepts the full capacity in 256 MiB large-page chunks.
+    // Allocate contiguous embedding/metadata first; experts never straddle an
+    // allocation. Every chunk is MEM_LARGE_PAGES, with no pageable fallback.
+    chunks.emplace_back(static_cast<uint8_t*>(ctx_->alloc_large_host(metadata_allocation_bytes)), release);
+    auto* arena = chunks.back().get();
+    for (int first = 0; first < host_count; first += slots_per_chunk) {
+        const int count = std::min(slots_per_chunk, host_count - first);
+        chunks.emplace_back(static_cast<uint8_t*>(ctx_->alloc_large_host(size_t(count) * slot_bytes_)), release);
+        for (int i = 0; i < count; ++i) bases[first + i] = chunks.back().get() + size_t(i) * slot_bytes_;
+    }
+
+    // Copy nested metadata too: CPU scale reads must not retain hidden mmap dependencies.
+    size_t offset = 0;
+    for (int layer = 0; layer < num_layers_; ++layer) {
+        for (int matrix = 0; matrix < 2; ++matrix) {
+            const auto& ref = matrix ? layer_weights_[layer].down : layer_weights_[layer].gate_up;
+            auto* scales = reinterpret_cast<float*>(arena + offset);
+            std::memcpy(scales, ref.nested_absmax.ptr, ref.nested_absmax.bytes);
+            offset += ref.nested_absmax.bytes;
+            auto* qmap = reinterpret_cast<float*>(arena + offset);
+            std::memcpy(qmap, ref.nested_quant_map.ptr, ref.nested_quant_map.bytes);
+            offset += ref.nested_quant_map.bytes;
+            const size_t blocks = (matrix ? dn_absmax_count_ : gu_absmax_count_) / ref.quant_state.nested_blocksize;
+            for (int expert = 0; expert < num_experts_per_layer_; ++expert) {
+                auto& source = sources[expert_flat_index(layer, expert)];
+                auto& nested = matrix ? source.down_nested : source.gate_up_nested;
+                nested.nested_absmax = scales + size_t(expert) * blocks;
+                nested.nested_quant_map = qmap;
+            }
+        }
+        fill_pool_->run(num_experts_per_layer_, [&](int expert) {
+            const int key = expert_flat_index(layer, expert), host_slot = host_slots[key];
+            if (host_slot < 0) return;
+            auto* dst = bases[host_slot];
+            const auto& src = sources[key];
+            std::memcpy(dst + gu_packed_offset_, src.gate_up_packed, gu_packed_bytes_);
+            std::memcpy(dst + gu_absmax_offset_, src.gate_up_nested.codes, gu_absmax_bytes_);
+            std::memcpy(dst + dn_packed_offset_, src.down_packed, dn_packed_bytes_);
+            std::memcpy(dst + dn_absmax_offset_, src.down_nested.codes, dn_absmax_bytes_);
+        });
+        // Native large pages are outside the working set. Return each copied
+        // layer's mmap source pages to standby now, instead of retaining a
+        // second pageable copy until the entire 54 GiB preload has finished.
+        SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));
+    }
+    if (embedding_bytes) std::memcpy(arena + embedding_offset, embedding->ptr, embedding_bytes);
+    resident_host_slots_ = std::move(host_slots);
+    resident_sources_ = std::move(sources);
+    resident_slot_bases_ = std::move(bases);
+    for (auto& chunk : chunks) resident_chunks_.push_back(chunk.release());
+    resident_data_ = arena;
+    resident_bytes_ = bytes;
+    resident_gpu_only_count_ = gpu_only;
+    for (size_t key = 0; key < total; ++key) BindResidentSource(int(key), resident_host_slots_[key]);
+    if (embedding_bytes) embedding->ptr = resident_data_ + embedding_offset;
+    reader_.reset(); // No expert file-reader fallback once residency is published.
+    SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));
+    GlobalMemoryStatusEx(&memory);
+    AILA_LOG_INFO("[Q4E LargePagesReady] bytes=%llu payload_bytes=%llu metadata_bytes=%llu embedding_bytes=%llu available_bytes=%llu preload_ms=%.3f backing=MEM_LARGE_PAGES",
+        (unsigned long long)bytes, (unsigned long long)payload_bytes, (unsigned long long)metadata_bytes,
+        (unsigned long long)embedding_bytes, (unsigned long long)memory.ullAvailPhys,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+}
+
+void Qwen4ExpExpertCache::BindResidentSource(int key, int host_slot) {
+    resident_host_slots_[key] = host_slot;
+    auto& source = resident_sources_[key];
+    const auto* base = host_slot >= 0 ? resident_slot_bases_[host_slot] : nullptr;
+    source.gate_up_packed = base ? base + gu_packed_offset_ : nullptr;
+    source.gate_up_nested.codes = base ? base + gu_absmax_offset_ : nullptr;
+    source.down_packed = base ? base + dn_packed_offset_ : nullptr;
+    source.down_nested.codes = base ? base + dn_absmax_offset_ : nullptr;
+}
+
+bool Qwen4ExpExpertCache::ExchangeResidentVictim(int gpu_slot, int incoming_key) {
+    const auto old = slot_to_key_[gpu_slot];
+    if (old == UINT64_MAX) return false;
+    const int outgoing_key = expert_flat_index(int(old >> 32), int(uint32_t(old)));
+    if (resident_host_slots_[outgoing_key] >= 0) return false;
+    const int host_slot = resident_host_slots_[incoming_key];
+    if (host_slot < 0) throw std::logic_error("Resident exchange has no incoming host owner");
+    auto& record = gpu_slot_records_[gpu_slot];
+    if (record.direct_leases) throw std::logic_error("Resident exchange has active GPU readers");
+    // Reuse the existing staging allocation. Neither the previous H2D nor the
+    // victim's final GPU reader may overlap its reuse or the ownership change.
+    if (last_dma_event_ != sycl::event{}) last_dma_event_.wait_and_throw();
+    if (record.consumer_fence != sycl::event{}) record.consumer_fence.wait_and_throw();
+    auto* host = resident_slot_bases_[host_slot];
+    std::memcpy(pinned_staging_ptr_, host, slot_bytes_);
+    try {
+        copy_q_->memcpy(pinned_staging_ptr_ + slot_bytes_, slot_dev_base_[gpu_slot], slot_bytes_).wait_and_throw();
+        record.dma_event = copy_q_->memcpy(slot_dev_base_[gpu_slot], pinned_staging_ptr_, slot_bytes_);
+        record.dma_event.wait_and_throw();
+    } catch (...) {
+        faulted_ = true;
+        try { copy_q_->wait(); } catch (...) {}
+        throw;
+    }
+    std::memcpy(host, pinned_staging_ptr_ + slot_bytes_, slot_bytes_);
+    BindResidentSource(outgoing_key, host_slot);
+    BindResidentSource(incoming_key, -1);
+    resident_exchange_bytes_ += slot_bytes_;
+    stats_.total_transferred_bytes += slot_bytes_;
+    return true;
+}
+
+void Qwen4ExpExpertCache::ExchangeResidentOwnership(int incoming_key, int outgoing_slot) {
+    const auto old = slot_to_key_[outgoing_slot];
+    const int outgoing_key = expert_flat_index(int(old >> 32), int(uint32_t(old)));
+    const int host_slot = resident_host_slots_[incoming_key];
+    const int incoming_slot = layer_expert_to_slot_[incoming_key];
+    if (host_slot < 0 || incoming_slot < 0 || resident_host_slots_[outgoing_key] >= 0 ||
+        gpu_slot_records_[outgoing_slot].direct_leases)
+        throw std::logic_error("Invalid resident ownership exchange");
+    if (last_dma_event_ != sycl::event{}) last_dma_event_.wait_and_throw();
+    auto& outgoing = gpu_slot_records_[outgoing_slot];
+    if (outgoing.consumer_fence != sycl::event{}) outgoing.consumer_fence.wait_and_throw();
+    // acquire's aggregate barrier above covers every H2D, including the
+    // incoming payload. Do not wait again on old per-slot memcpy events after
+    // their command lists have been retired: the 2026.1 Level Zero adapter can
+    // terminate in urEventWait here. The outgoing compute reader still fences
+    // the D2H below; neither readiness nor staging reuse loses a dependency.
+    // Keep the large arena CPU-only; the existing small USM staging buffer is
+    // the driver's DMA destination, avoiding registration of a 54 GiB region.
+    try {
+        copy_q_->memcpy(pinned_staging_ptr_, slot_dev_base_[outgoing_slot], slot_bytes_).wait_and_throw();
+    } catch (...) {
+        faulted_ = true;
+        try { copy_q_->wait(); } catch (...) {}
+        throw;
+    }
+    std::memcpy(resident_slot_bases_[host_slot], pinned_staging_ptr_, slot_bytes_);
+    BindResidentSource(outgoing_key, host_slot);
+    BindResidentSource(incoming_key, -1);
+    resident_exchange_bytes_ += slot_bytes_;
+}
+
+void Qwen4ExpExpertCache::NormalizeResidentCore(const std::vector<int>& keys) {
+    if (keys.size() < resident_gpu_only_count_)
+        throw std::logic_error("Hotset is too small for the resident complement");
+    std::vector<bool> core(resident_host_slots_.size(), false);
+    for (size_t i = 0; i < resident_gpu_only_count_; ++i) core[keys[i]] = true;
+    size_t incoming = 0;
+    for (size_t key = 0; key < core.size(); ++key) {
+        if (core[key] || resident_host_slots_[key] >= 0) continue;
+        while (incoming < resident_gpu_only_count_ && resident_host_slots_[keys[incoming]] < 0) ++incoming;
+        const int slot = layer_expert_to_slot_[key];
+        if (incoming == resident_gpu_only_count_ || slot < 0)
+            throw std::logic_error("Resident complement lost a GPU owner");
+        ExchangeResidentOwnership(keys[incoming++], slot);
+    }
+}
+
 void Qwen4ExpExpertCache::BuildCpuPackedSourceCache(size_t budget_bytes,const std::vector<int>& ordered_keys) {
     if(!initialized_ || faulted_ || budget_bytes>(size_t(8192)<<20))
         throw std::invalid_argument("Invalid CPU packed source cache budget/state");
@@ -3446,6 +3704,12 @@ uint64_t Qwen4ExpExpertCache::RefreshCpuPackedSourceCache(const std::vector<int>
 
 ops::MoeExpertSlotHost Qwen4ExpExpertCache::CpuExpertHostSource(int layer,int expert_id,bool* cached) const {
     if(cached)*cached=false;
+    if (resident_data_) {
+        const auto* sources = ResidentLayerSources(layer);
+        if (!sources || expert_id < 0 || expert_id >= num_experts_per_layer_ || faulted_) return {};
+        if (cached) *cached = sources[expert_id].gate_up_packed != nullptr;
+        return sources[expert_id];
+    }
     auto source=MappedExpertHostSource(layer,expert_id);
     if(!source.gate_up_packed || cpu_packed_source_indices_.empty())return source;
     const int slot=cpu_packed_source_indices_[size_t(layer)*num_experts_per_layer_+expert_id];

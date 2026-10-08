@@ -13,8 +13,17 @@
 #include <cstring>
 #include <thread>
 #include <limits>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 struct Qwen4ExpResidentTestAccess {
+    static void LargePages(Qwen4ExpExpertCache& cache) {
+        cache.hotset_swaps_=0;cache.InitializeLargePageResidency();
+    }
+    static void ResidentHotset(Qwen4ExpExpertCache& cache,const std::vector<int>& keys) {
+        cache.hotset_keys_=keys;cache.InstallHotset(keys);
+    }
+    static uint8_t* ResidentData(Qwen4ExpExpertCache& cache) { return cache.resident_data_; }
     static void GpuMappedDma(Qwen4ExpExpertCache& cache,bool enabled) {
         cache.gpu_mmap_dma_enabled_=enabled;
         if(enabled) {
@@ -54,8 +63,13 @@ struct Qwen4ExpResidentTestAccess {
     static void Prompt(Qwen4ExpExpertCache& cache) {cache.hotset_prompt_=true;cache.hotset_prompt_swaps_=2;}
     static void PromptPrefill(Qwen4ExpExpertCache& cache) {Prompt(cache);cache.hotset_prompt_prefill_=true;}
     static void Adaptive(Qwen4ExpExpertCache& cache,const std::vector<int>& keys) {
-        cache.hotset_policy_.Init(2,8);cache.hotset_keys_=keys;cache.hotset_swaps_=1;
+        cache.hotset_policy_.Init(cache.num_layers_,cache.num_experts_per_layer_);cache.hotset_keys_=keys;cache.hotset_swaps_=1;
         cache.adaptive_hotset_=true;cache.hotset_borrow_=true;cache.InstallHotset(keys);
+    }
+    static void LargePagePrompt(Qwen4ExpExpertCache& cache) {
+        cache.hotset_prompt_=true;cache.hotset_prompt_swaps_=512;
+        cache.hotset_adopt_ready_=true;cache.hotset_adopt_limit_=4096;
+        cache.staging_buffer_bytes_=52*cache.slot_bytes_;
     }
     static void HoldCopy(Qwen4ExpExpertCache& cache, int slot, std::shared_future<void> signal) {
         cache.gpu_slot_records_[slot].state = ExpertSlotState::Copying;
@@ -101,11 +115,11 @@ struct SyntheticExpertWeights {
     Bnb4BitHostWeightRef gu_ref;
     Bnb4BitHostWeightRef dn_ref;
 
-    SyntheticExpertWeights() {
-        const size_t total_gu_packed = num_experts_per_layer * gu_packed_per_exp;
-        const size_t total_gu_absmax = num_experts_per_layer * gu_absmax_per_exp;
-        const size_t total_dn_packed = num_experts_per_layer * dn_packed_per_exp;
-        const size_t total_dn_absmax = num_experts_per_layer * dn_absmax_per_exp;
+    explicit SyntheticExpertWeights(int experts = num_experts_per_layer) {
+        const size_t total_gu_packed = experts * gu_packed_per_exp;
+        const size_t total_gu_absmax = experts * gu_absmax_per_exp;
+        const size_t total_dn_packed = experts * dn_packed_per_exp;
+        const size_t total_dn_absmax = experts * dn_absmax_per_exp;
 
         gu_packed_host.resize(total_gu_packed);
         gu_absmax_codes.resize(total_gu_absmax);
@@ -133,7 +147,7 @@ struct SyntheticExpertWeights {
         gu_ref.name = "gu";
         gu_ref.packed_weight.ptr = gu_packed_host.data();
         gu_ref.packed_weight.bytes = total_gu_packed;
-        gu_ref.packed_weight.shape = {num_experts_per_layer * gu_rows, hidden_size / 2};
+        gu_ref.packed_weight.shape = {experts * gu_rows, hidden_size / 2};
         gu_ref.packed_weight.dtype = DT_U8;
         gu_ref.absmax.ptr = gu_absmax_codes.data();
         gu_ref.absmax.bytes = total_gu_absmax;
@@ -151,7 +165,7 @@ struct SyntheticExpertWeights {
         gu_ref.nested_quant_map.dtype = DT_F32;
         gu_ref.quant_state.quant_type = "nf4";
         gu_ref.quant_state.dtype = "bfloat16";
-        gu_ref.quant_state.shape = {num_experts_per_layer, gu_rows, hidden_size};
+        gu_ref.quant_state.shape = {experts, gu_rows, hidden_size};
         gu_ref.quant_state.blocksize = blocksize;
         gu_ref.quant_state.nested = true;
         gu_ref.quant_state.nested_blocksize = 256;
@@ -160,7 +174,7 @@ struct SyntheticExpertWeights {
         dn_ref.name = "dn";
         dn_ref.packed_weight.ptr = dn_packed_host.data();
         dn_ref.packed_weight.bytes = total_dn_packed;
-        dn_ref.packed_weight.shape = {num_experts_per_layer * dn_rows, intermediate_size / 2};
+        dn_ref.packed_weight.shape = {experts * dn_rows, intermediate_size / 2};
         dn_ref.packed_weight.dtype = DT_U8;
         dn_ref.absmax.ptr = dn_absmax_codes.data();
         dn_ref.absmax.bytes = total_dn_absmax;
@@ -178,7 +192,7 @@ struct SyntheticExpertWeights {
         dn_ref.nested_quant_map.dtype = DT_F32;
         dn_ref.quant_state.quant_type = "nf4";
         dn_ref.quant_state.dtype = "bfloat16";
-        dn_ref.quant_state.shape = {num_experts_per_layer, dn_rows, intermediate_size};
+        dn_ref.quant_state.shape = {experts, dn_rows, intermediate_size};
         dn_ref.quant_state.blocksize = blocksize;
         dn_ref.quant_state.nested = true;
         dn_ref.quant_state.nested_blocksize = 256;
@@ -1939,6 +1953,178 @@ void test_host_complement(Context& ctx) {
     std::cout<<"[HOST COMPLEMENT PASS] bounded_scan=1 default_compatibility=1 cpu_lease=1 reservation=1 source_fence=1 dma_fence=1 copying=1 key_identity=1 thaw=1 borrowed_slot=1 generation=1 move=1 payload=1\n";
 }
 
+void test_large_page_residency(Context& ctx) {
+    _putenv_s("AILA_TEST_Q4E_HOST_SLOTS","0");
+    _putenv_s("AILA_Q4E_HOT_RAM_MB","0");
+    const auto host_bytes=ctx.current_pinned_host_bytes(),host_count=ctx.pinned_host_allocation_count();
+    {
+        SyntheticExpertWeights synth;ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+        const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+        std::vector<std::vector<uint8_t>> expected(8,std::vector<uint8_t>(bytes));
+        for(int expert=0;expert<8;++expert) {
+            size_t at=0;
+            auto append=[&](const std::vector<uint8_t>& data,size_t n){
+                std::memcpy(expected[expert].data()+at,data.data()+expert*n,n);at+=n;
+            };
+            append(synth.gu_packed_host,synth.gu_packed_per_exp);append(synth.gu_absmax_codes,synth.gu_absmax_per_exp);
+            append(synth.dn_packed_host,synth.dn_packed_per_exp);append(synth.dn_absmax_codes,synth.dn_absmax_per_exp);
+        }
+        const auto scales=synth.gu_nested_absmax,qmap=synth.gu_nested_qmap;
+        expect(cache.init(ctx,weights,2,12*bytes,8,256,64,64,&error,true),error);
+        for(int layer=0;layer<2;++layer)cache.set_layer_expert_ref(layer,synth.gu_ref,synth.dn_ref);
+        Qwen4ExpResidentTestAccess::Adaptive(cache,{0,1,2,3,8,9,10,11});
+        const auto before=ctx.current_pinned_host_bytes();
+        Qwen4ExpResidentTestAccess::LargePages(cache);
+        expect(ctx.current_pinned_host_bytes()==before+cache.resident_bytes(),"Large-page ledger omitted rounded bytes");
+        auto* arena=Qwen4ExpResidentTestAccess::ResidentData(cache);
+        PSAPI_WORKING_SET_EX_INFORMATION page{};page.VirtualAddress=arena;
+        expect(QueryWorkingSetEx(GetCurrentProcess(),&page,sizeof(page)) && page.VirtualAttributes.Valid &&
+            page.VirtualAttributes.LargePage,"Arena is not backed by actual Windows large pages");
+        MEMORY_BASIC_INFORMATION region{};
+        expect(VirtualQuery(arena,&region,sizeof(region))==sizeof(region),"Cannot query large-page region");
+        auto* guard=arena+region.RegionSize-64;std::memset(guard,0xa7,64);
+        // Poison every original source. Subsequent CPU reads, GPU uploads and
+        // ownership exchanges must all use the two resident tiers.
+        for(auto* data:{&synth.gu_packed_host,&synth.gu_absmax_codes,&synth.dn_packed_host,&synth.dn_absmax_codes})
+            std::fill(data->begin(),data->end(),0);
+        std::fill(synth.gu_nested_absmax.begin(),synth.gu_nested_absmax.end(),0);
+        std::fill(synth.gu_nested_qmap.begin(),synth.gu_nested_qmap.end(),0);
+        const auto allocations=ctx.pinned_host_allocation_count();
+        auto check=[&](Qwen4ExpExpertCache& current){
+            std::vector<uint8_t> payload(bytes);int gpu_only=0;
+            for(int layer=0;layer<2;++layer)for(int expert=0;expert<8;++expert) {
+                const auto source=current.CpuExpertHostSource(layer,expert);
+                if(source.gate_up_packed) {
+                    expect(!std::memcmp(source.gate_up_packed,expected[expert].data(),bytes),"Resident CPU payload changed");
+                    expect(source.gate_up_nested.nested_absmax[0]==scales[expert*2] &&
+                        !std::memcmp(source.gate_up_nested.nested_quant_map,qmap.data(),qmap.size()*sizeof(float)),
+                        "CPU nested metadata still reads original storage");
+                } else {
+                    ++gpu_only;expect(current.IsDirectReady(layer,expert),"GPU-only expert lost its ready owner");
+                }
+                const auto placement=current.query_residency(layer,expert);
+                if(placement.gpu_resident) {
+                    ctx.memcpy_d2h(payload.data(),current.get_slot_dev(placement.gpu_slot).gate_up_packed,bytes);
+                    expect(payload==expected[expert],"Resident GPU payload changed");
+                }
+            }
+            expect(gpu_only==4,"Complement capacity changed");
+            for(int i=0;i<64;++i)expect(guard[i]==0xa7,"Large-page tail guard changed");
+            expect(ctx.pinned_host_allocation_count()==allocations,"Residency allocated in a hotset transition");
+        };
+        check(cache);
+        Qwen4ExpResidentTestAccess::ResidentHotset(cache,{4,12,13,14,5,6,7,15});
+        check(cache);
+        Qwen4ExpResidentTestAccess::Adopt(cache,4);
+        cache.BeginHotsetForward(0,128,0);
+        // Only one layer-0 core slot remains after lending. Increasing scores
+        // make each new adoption evict the preceding one inside the same batch.
+        for(int expert=0;expert<4;++expert) {
+            int route[16];std::fill_n(route,4*(expert+1),expert);
+            cache.ObserveHotsetRoute(0,route,4*(expert+1),1);
+        }
+        const int ids[]={0,1,2,3};int slots[4];
+        cache.acquire(0,ids,4,slots).wait_and_throw();
+        cache.RetirePrefillSlots(slots,4);
+        expect(cache.stats().ready_adoptions==4,"Resident chained adoption was not exercised");
+        check(cache);
+        cache.BeginHotsetForward(128,1);check(cache);
+        expect(cache.resident_exchange_bytes()>0,"Resident exchange was not exercised");
+        Qwen4ExpExpertCache moved=std::move(cache);check(moved);
+    }
+    expect(ctx.current_pinned_host_bytes()==host_bytes && ctx.pinned_host_allocation_count()==host_count,
+        "Large-page cleanup leaked host allocation accounting");
+    std::cout<<"[LARGE PAGES PASS] native_backing=1 rounded_accounting=1 cpu_gpu_payload=1 no_mmap_reads=1 metadata=1 exchange=1 adoption=1 borrow_restore=1 move_cleanup=1 guard=1\n";
+}
+
+void test_large_page_handoff(Context& ctx) {
+    _putenv_s("AILA_TEST_Q4E_HOST_SLOTS","0");_putenv_s("AILA_Q4E_HOT_RAM_MB","0");
+    SyntheticExpertWeights synth(512);ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    const size_t bytes=synth.gu_packed_per_exp+synth.gu_absmax_per_exp+synth.dn_packed_per_exp+synth.dn_absmax_per_exp;
+    expect(cache.init(ctx,weights,48,2824*bytes,512,256,64,64,&error,true),error);
+    for(int layer=0;layer<48;++layer)cache.set_layer_expert_ref(layer,synth.gu_ref,synth.dn_ref);
+    std::vector<int> keys;
+    for(int expert=0;keys.size()<2808;++expert)for(int layer=0;layer<48 && keys.size()<2808;++layer)
+        keys.push_back(layer*512+expert);
+    Qwen4ExpResidentTestAccess::Adaptive(cache,keys);
+    Qwen4ExpResidentTestAccess::LargePages(cache);
+    Qwen4ExpResidentTestAccess::LargePagePrompt(cache);
+    for(int phase=0;phase<2;++phase) {
+        cache.BeginHotsetForward(phase*4096,phase?1872:4096,phase?0:1872);
+        std::vector<int> route;
+        for(int expert=0;expert<512;++expert)for(int n=0;n<2+((expert+phase*32)%512)/16;++n)route.push_back(expert);
+        for(int layer=0;layer<48;++layer) {
+            cache.ObserveHotsetRoute(layer,route.data(),int(route.size()),1);
+            for(int first=0;first<512;first+=32) {
+                int ids[32],slots[32];for(int i=0;i<32;++i)ids[i]=first+i;
+                cache.acquire(layer,ids,32,slots).wait_and_throw();
+                cache.RetirePrefillSlots(slots,32);
+            }
+        }
+        cache.EndHotsetForward(phase?1872:4096,phase?0:1872);
+    }
+    std::cout<<"[LARGE PAGE HANDOFF] prefill complete adoptions="<<cache.stats().ready_adoptions<<std::endl;
+    cache.BeginHotsetForward(5968,1);
+    for(int layer=0;layer<48;++layer)for(int expert=0;expert<512;++expert) {
+        const auto source=cache.CpuExpertHostSource(layer,expert);
+        expect(source.gate_up_packed || cache.IsDirectReady(layer,expert),
+            "Handoff lost expert "+std::to_string(layer)+"/"+std::to_string(expert));
+        if(source.gate_up_packed)
+            expect(!std::memcmp(source.gate_up_packed,synth.gu_packed_host.data()+expert*synth.gu_packed_per_exp,synth.gu_packed_per_exp) &&
+                   !std::memcmp(source.gate_up_nested.codes,synth.gu_absmax_codes.data()+expert*synth.gu_absmax_per_exp,synth.gu_absmax_per_exp) &&
+                   !std::memcmp(source.down_packed,synth.dn_packed_host.data()+expert*synth.dn_packed_per_exp,synth.dn_packed_per_exp) &&
+                   !std::memcmp(source.down_nested.codes,synth.dn_absmax_codes.data()+expert*synth.dn_absmax_per_exp,synth.dn_absmax_per_exp),
+                   "Batched handoff changed resident expert payload");
+    }
+    std::cout<<"[LARGE PAGE HANDOFF PASS] full_key_space=1 real_slot_counts=1 staged_batches=1 prompt_swap=1\n";
+}
+
+void test_large_page_async_cpu(Context& ctx) {
+    _putenv_s("AILA_TEST_Q4E_HOST_SLOTS","0");_putenv_s("AILA_Q4E_HOT_RAM_MB","0");
+    _putenv_s("AILA_Q4E_CPU_MMAP_COLD","1");_putenv_s("AILA_Q4E_CPU_ASYNC_ROUTE","1");
+    _putenv_s("AILA_Q4E_COLD_MODE","2");_putenv_s("AILA_Q4E_COLD_POLICY","1");
+    _putenv_s("AILA_Q4E_CPU_THREADS","18");_putenv_s("AILA_Q4E_CPU_MAX_EXPERTS","10");
+    _putenv_s("AILA_Q4E_CPU_NF4_Q8","1");_putenv_s("AILA_Q4E_CPU_Q8_ACTIVATION64","1");
+    using bf16=sycl::ext::oneapi::bfloat16;
+    constexpr int H=2560,I=640,E=512;
+    const size_t gu_bytes=H*I,dn_bytes=H*I/2,gu_scales=2*H*I/64,dn_scales=H*I/64;
+    std::vector<uint8_t> gu_packed(E*gu_bytes,0x89),dn_packed(E*dn_bytes,0x89);
+    std::vector<uint8_t> gu_codes(E*gu_scales,100),dn_codes(E*dn_scales,100);
+    std::vector<float> gu_nested(E*gu_scales/256,1.25f),dn_nested(E*dn_scales/256,.75f);
+    SyntheticExpertWeights tiny;auto gu=tiny.gu_ref,dn=tiny.dn_ref;
+    gu.packed_weight.ptr=gu_packed.data();gu.packed_weight.bytes=gu_packed.size();gu.quant_state.shape={E,2*I,H};
+    dn.packed_weight.ptr=dn_packed.data();dn.packed_weight.bytes=dn_packed.size();dn.quant_state.shape={E,H,I};
+    gu.absmax.ptr=gu_codes.data();gu.absmax.bytes=gu_codes.size();dn.absmax.ptr=dn_codes.data();dn.absmax.bytes=dn_codes.size();
+    gu.nested_absmax.ptr=reinterpret_cast<const uint8_t*>(gu_nested.data());gu.nested_absmax.bytes=gu_nested.size()*sizeof(float);
+    dn.nested_absmax.ptr=reinterpret_cast<const uint8_t*>(dn_nested.data());dn.nested_absmax.bytes=dn_nested.size()*sizeof(float);
+    const size_t bytes=gu_bytes+dn_bytes+gu_scales+dn_scales;
+    ModelWeights weights;Qwen4ExpExpertCache cache;std::string error;
+    expect(cache.init(ctx,weights,1,64*bytes,E,H,I,64,&error,true),error);cache.set_layer_expert_ref(0,gu,dn);
+    std::vector<int> keys(32);for(int i=0;i<32;++i)keys[i]=i;
+    Qwen4ExpResidentTestAccess::Adaptive(cache,keys);
+    std::vector<bf16> input(H,bf16(.01f));
+    auto x=Tensor::allocate(ctx,{H},dnnl::memory::data_type::bf16);ctx.memcpy_h2d(x.data(),input.data(),H*sizeof(bf16));
+    auto output=Tensor::allocate(ctx,{10,H},dnnl::memory::data_type::f32);
+    auto run=[&]{
+        aila::Qwen4ExpExpertExecutor executor;executor.init(ctx,cache,4,10,H,I);
+        executor.PrepareAsyncResidentSources(1,E);
+        int ids[10],selected[10];for(int i=0;i<10;++i){ids[i]=100+i;selected[i]=-1;}
+        executor.StageResidentInput(x.data_as<bf16>());
+        auto route=cache.BindReady(0,ids,10);
+        executor.StartAsyncResidentRoute(0,ids,selected,ctx.queue().ext_oneapi_submit_barrier());
+        auto done=executor.JoinResidentCold(output.data_as<float>());
+        executor.RetireAsyncResidentRoute(route);expect(route.cold_count==0,"Async resident CPU lost a cold expert");
+        done.wait_and_throw();route.Finish(done);
+        std::vector<float> result(10*H);ctx.memcpy_d2h(result.data(),output.data(),result.size()*sizeof(float));
+        return result;
+    };
+    const auto expected=run();
+    Qwen4ExpResidentTestAccess::LargePages(cache);
+    const auto actual=run();
+    expect(!std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),"Large-page async CPU output differs from original NF4 source");
+    std::cout<<"[LARGE PAGE ASYNC CPU PASS] full_geometry=1 fresh_executor=1 activation64=1 bitwise_equal=1\n";
+}
+
 void test_prompt_policy() {
     Qwen4ExpHotsetPolicy full,chunked;full.Init(1,8);chunked.Init(1,8);
     full.BeginPrompt();chunked.BeginPrompt();
@@ -1963,7 +2149,7 @@ void test_prompt_policy() {
 
 } // namespace
 
-int main() {
+int main(int argc,char** argv) {
     try {
         std::cout << "========================================\n";
         std::cout << " Aila Qwen4Exp Expert Readiness (H1/H2b/H3) Tests\n";
@@ -1974,6 +2160,15 @@ int main() {
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=4");
 
         Context ctx;
+        if(argc==2 && std::string(argv[1])=="--large-page-async-cpu-only") {
+            test_large_page_async_cpu(ctx);return 0;
+        }
+        if(argc==2 && std::string(argv[1])=="--large-page-handoff-only") {
+            test_large_page_handoff(ctx);return 0;
+        }
+        if(argc==2 && std::string(argv[1])=="--large-pages-only") {
+            test_large_page_residency(ctx);return 0;
+        }
         test_query_residency_and_gpu_tickets(ctx);
         test_host_lease_lifecycle_and_eviction_protection(ctx);
         test_mixed_ready_copying_and_cancellation(ctx);

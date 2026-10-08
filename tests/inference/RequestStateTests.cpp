@@ -61,6 +61,9 @@ struct FakeState {
     std::vector<GenerationConfig> samplingConfigs;
     std::vector<bool> hostSampling;
     std::vector<bool> legacyPrefillLogits;
+    // Prompt-phase entry points only; decode stays on plain Forward.
+    std::vector<int> prefillRemaining;
+    int prefillForwards = 0;
     std::vector<int> samples;
     size_t samplesTaken = 0;
     size_t capturedLogits = 0;
@@ -178,6 +181,15 @@ public:
             }
         }
         return result;
+    }
+
+    ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
+                                   const SamplingInput* sampling,
+                                   bool captureLogits,
+                                   int prefillRemaining) override {
+        ++state->prefillForwards;
+        state->prefillRemaining.push_back(prefillRemaining);
+        return Forward(tokenIds, sampling, captureLogits);
     }
 
 private:
@@ -1367,10 +1379,47 @@ void TestDecodeWindowCommit() {
     Expect(f.state->windows == 0, "Window ignored output backpressure budget");
 }
 
+void TestPrefillChunkPhaseRemaining() {
+    // Each prompt chunk reports the queued prompt suffix; 0 marks the final
+    // slice so a phase-aware backend can close prefill. Decode and the final
+    // pending-token flush stay on the plain entry point.
+    auto chunked = MakeFixture();
+    auto options = Options(2, 2);
+    options.generation.do_sample = false;
+    chunked.state->samples = {10, 11, 12, 13};
+    Complete(RequestState::Create(chunked.session, {1, 2, 3, 4, 5}, options));
+    Expect(chunked.state->prefillRemaining == std::vector<int>({3, 1, 0}),
+           "Prefill chunks did not report the remaining prompt count");
+    Expect(chunked.state->prefillForwards == 3,
+           "Decode or finalize flush used the prompt-phase entry point");
+    Expect(chunked.state->inputs[0] == std::vector<int>({1, 2}) &&
+               chunked.state->inputs[1] == std::vector<int>({3, 4}) &&
+               chunked.state->inputs[2] == std::vector<int>({5}),
+           "Prefill chunk boundaries shifted");
+
+    auto single = MakeFixture();
+    auto whole = Options(2, 8);
+    whole.generation.do_sample = false;
+    single.state->samples = {10, 11, 12, 13};
+    Complete(RequestState::Create(single.session, {1, 2, 3, 4, 5}, whole));
+    Expect(single.state->prefillRemaining == std::vector<int>({0}) &&
+               single.state->prefillForwards == 1,
+           "Single-chunk prefill did not report remaining zero once");
+
+    auto replay = MakeFixture();
+    auto prefillOnly = Options(0, 2);
+    prefillOnly.prefillOnly = true;
+    Complete(RequestState::Create(replay.session, {1, 2, 3, 4, 5}, prefillOnly));
+    Expect(replay.state->prefillRemaining == std::vector<int>({3, 1, 0}) &&
+               replay.state->samplesTaken == 0,
+           "Prefill-only replay skipped or misordered its phase values");
+}
+
 } // namespace
 
 int main() {
     const std::vector<std::pair<const char*, void (*)()>> tests{
+        {"prefill chunk remaining phase metadata", TestPrefillChunkPhaseRemaining},
         {"decode window prefix, stop, tail and cancellation", TestDecodeWindowCommit},
         {"session mutations and actual truncate length", TestSessionMutations},
         {"prefill without sampling, capacity and cancelled replay", TestPrefillOnlyAndCancelledReplay},

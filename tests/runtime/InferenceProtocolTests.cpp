@@ -352,6 +352,7 @@ void TestModelCapabilities() {
     current.emplace_back("host_sampling_v1");
     current.emplace_back("legacy_prefill_logits_v1");
     current.emplace_back("extended_generation_v1");
+    current.emplace_back("extended_context_v1");
     current.emplace_back("worker_log_control_v1");
     current.emplace_back("runtime_memory_v1");
     current.emplace_back("continuous_batching_v1");
@@ -452,6 +453,118 @@ void TestExtendedGenerationLimits() {
     Success(wire::parse_command(frame, parsed, error, limits), error);
     Expect(parsed.consumedSequence == 1101 && !wire::parse_command(frame, parsed, error),
            "Extended terminal ACK lost its bound");
+}
+
+void TestExtendedContextLimits() {
+    wire::ValidationError error;
+    // The absolute combination ceiling keeps every field at its own design
+    // bound: generation from one extension, context from the other.
+    const auto absolute = wire::absolute_limits();
+    Expect(absolute.maxPromptTokens == wire::kExtendedMaxPromptTokens &&
+               absolute.maxAttachmentBytes == wire::kExtendedMaxAttachmentBytes &&
+               absolute.maxPrefillChunkSize == wire::kExtendedMaxPrefillChunkSize &&
+               absolute.maxOutstandingTokens == wire::kExtendedMaxOutstandingTokens &&
+               absolute.maxGeneratedTokens == wire::kExtendedMaxGeneratedTokens,
+           "Absolute combination ceiling lost an extended field");
+    // The aggregate budget must admit four maximal prompt+output requests, and
+    // the attachment ceiling must be able to carry the maximum prompt.
+    Expect(wire::kExtendedMaxOutstandingTokens ==
+               4ULL * (wire::kExtendedMaxPromptTokens + wire::kExtendedMaxGeneratedTokens),
+           "Outstanding token ceiling cannot hold four long requests");
+    Expect(wire::kExtendedMaxAttachmentBytes / sizeof(int32_t) >= wire::kExtendedMaxPromptTokens,
+           "Attachment bytes cannot carry the maximum prompt");
+
+    // Default validation still refuses each widened field; the capability is
+    // what unlocks them, exactly as with the generation extension.
+    for (int field = 0; field != 4; ++field) {
+        auto widened = wire::hard_limits();
+        if (field == 0) widened.maxPromptTokens = wire::kExtendedMaxPromptTokens;
+        if (field == 1) widened.maxAttachmentBytes = wire::kExtendedMaxAttachmentBytes;
+        if (field == 2) widened.maxPrefillChunkSize = wire::kExtendedMaxPrefillChunkSize;
+        if (field == 3) widened.maxOutstandingTokens = wire::kExtendedMaxOutstandingTokens;
+        Expect(!wire::validate_limits(widened, error), "Unqualified context ceiling was accepted");
+    }
+
+    // Configure carrying both capabilities negotiates the full combination
+    // without disturbing any unrelated limit.
+    auto configure = Command(wire::Method::WorkerConfigure);
+    configure.requiredCapabilities.emplace_back("extended_generation_v1");
+    configure.requiredCapabilities.emplace_back("extended_context_v1");
+    configure.limits.maxGeneratedTokens = wire::kExtendedMaxGeneratedTokens;
+    configure.limits.maxPromptTokens = wire::kExtendedMaxPromptTokens;
+    configure.limits.maxAttachmentBytes = wire::kExtendedMaxAttachmentBytes;
+    configure.limits.maxPrefillChunkSize = wire::kExtendedMaxPrefillChunkSize;
+    configure.limits.maxOutstandingTokens = wire::kExtendedMaxOutstandingTokens;
+    Frame frame = Make(configure);
+    wire::Command parsed;
+    Success(wire::parse_command(frame, parsed, error), error);
+    Expect(parsed.limits.maxGeneratedTokens == wire::kExtendedMaxGeneratedTokens &&
+               parsed.limits.maxPromptTokens == wire::kExtendedMaxPromptTokens &&
+               parsed.limits.maxAttachmentBytes == wire::kExtendedMaxAttachmentBytes &&
+               parsed.limits.maxPrefillChunkSize == wire::kExtendedMaxPrefillChunkSize &&
+               parsed.limits.maxOutstandingTokens == wire::kExtendedMaxOutstandingTokens &&
+               parsed.limits.maxSessions == 4 && parsed.limits.tokenWindow == 32,
+           "Combined extension perturbed unrelated limits");
+    Expect(!wire::validate_limits(configure.limits, error), "Combined ceiling leaked past default validation");
+
+    // One field past its own design bound is rejected even for a qualified peer.
+    auto overflow = configure;
+    overflow.limits.maxAttachmentBytes = wire::kExtendedMaxAttachmentBytes + 4;
+    Expect(!wire::make_command(overflow, frame, error), "Attachment ceiling overflow was accepted");
+    overflow = configure;
+    overflow.limits.maxPromptTokens = wire::kExtendedMaxPromptTokens + 1;
+    Expect(!wire::make_command(overflow, frame, error), "Prompt ceiling overflow was accepted");
+    overflow = configure;
+    overflow.limits.maxPrefillChunkSize = wire::kExtendedMaxPrefillChunkSize + 1;
+    Expect(!wire::make_command(overflow, frame, error), "Prefill ceiling overflow was accepted");
+    overflow = configure;
+    overflow.limits.maxOutstandingTokens = wire::kExtendedMaxOutstandingTokens + 1;
+    Expect(!wire::make_command(overflow, frame, error), "Outstanding ceiling overflow was accepted");
+
+    // A Worker deliberately offering a smaller ceiling keeps it, and the two
+    // extensions compose independently.
+    auto reduced = wire::hard_limits();
+    reduced.maxPromptTokens = 8192;
+    reduced.maxGeneratedTokens = 512;
+    auto both = configure.requiredCapabilities;
+    const auto ceiling = wire::configure_limits_ceiling(reduced, both);
+    Expect(ceiling.maxPromptTokens == 8192 && ceiling.maxGeneratedTokens == 512 &&
+               ceiling.maxAttachmentBytes == wire::kExtendedMaxAttachmentBytes &&
+               ceiling.maxPrefillChunkSize == wire::kExtendedMaxPrefillChunkSize &&
+               ceiling.maxOutstandingTokens == wire::kExtendedMaxOutstandingTokens,
+           "Extension widened a deliberately reduced ceiling");
+    const auto generationOnly = wire::configure_limits_ceiling(
+        wire::hard_limits(), {std::string(wire::kExtendedGenerationCapability)});
+    Expect(generationOnly.maxGeneratedTokens == wire::kExtendedMaxGeneratedTokens &&
+               generationOnly.maxPromptTokens == wire::hard_limits().maxPromptTokens &&
+               generationOnly.maxOutstandingTokens == wire::hard_limits().maxOutstandingTokens,
+           "Generation extension silently widened a context field");
+    const auto contextOnly = wire::configure_limits_ceiling(
+        wire::hard_limits(), {std::string(wire::kExtendedContextCapability)});
+    Expect(contextOnly.maxGeneratedTokens == wire::hard_limits().maxGeneratedTokens &&
+               contextOnly.maxPromptTokens == wire::kExtendedMaxPromptTokens,
+           "Context extension silently widened the generation field");
+
+    // Submit round trips an actually long attachment the default limit could
+    // never carry, and the negotiated limits bound both reservation terms.
+    const auto negotiated = configure.limits;
+    auto submit = Command(wire::Method::RequestSubmit);
+    submit.promptIds.assign(65536, 5);
+    submit.promptIds.back() = 3;
+    submit.generation.maxNewTokens = wire::kExtendedMaxGeneratedTokens;
+    submit.prefillChunkSize = wire::kExtendedMaxPrefillChunkSize;
+    Success(wire::make_command(submit, frame, error, negotiated), error);
+    Expect(frame.attachment.size() == submit.promptIds.size() * sizeof(int32_t),
+           "Long attachment was truncated");
+    wire::Command recovered;
+    Success(wire::parse_command(frame, recovered, error, negotiated), error);
+    Expect(recovered.promptIds == submit.promptIds && recovered.prefillChunkSize == wire::kExtendedMaxPrefillChunkSize,
+           "Long attachment changed in transit");
+    Expect(!wire::parse_command(frame, recovered, error), "Default connection accepted a long attachment");
+    // One token beyond the attachment ceiling still fails on the qualified pipe.
+    auto beyond = submit;
+    beyond.promptIds.assign(wire::kExtendedMaxPromptTokens + 1, 1);
+    Expect(!wire::make_command(beyond, frame, error, negotiated), "Attachment exceeded its negotiated ceiling");
 }
 
 void TestStrictCommandPayloads() {
@@ -1035,6 +1148,7 @@ int main() {
         {"versions and stable names", TestVersionsAndNames},
         {"limits and capability negotiation", TestLimitsAndNegotiation},
         {"explicit extended generation, reservation and terminal bounds", TestExtendedGenerationLimits},
+        {"optional extended context ceiling, combination and long attachment", TestExtendedContextLimits},
         {"decode batching opt-in, strict schema and exact bounds", TestDecodeBatchingConfiguration},
         {"prefix and strict envelope", TestPrefixAndEnvelope},
         {"little endian token attachment", TestLittleEndianTokens},

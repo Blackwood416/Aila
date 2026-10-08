@@ -30,6 +30,11 @@ struct ChatSettings {
     uint32_t maxContextTokens = 4096;
     uint32_t maxPromptTokens = 4096;
     uint32_t maxNewTokens = 1024;
+    // Prefill work per scheduler step. Bounded by the prompt limit at render time.
+    uint32_t prefillChunkSize = 512;
+    // Per-request body and rendered-prompt byte ceiling. 1 MiB is the legacy
+    // default; the server CLI may raise it up to 4 MiB.
+    size_t maxBodyBytes = 1024 * 1024;
     size_t maxOutputBytes = 262144;
     ModelFamily family = ModelFamily::Qwen3Dense;
 };
@@ -43,11 +48,12 @@ struct PreparedChat {
     chat::ChatRequest chatRequest;
     // A generation prompt can already contain an opening <think> marker.
     bool startsInReasoning = false;
+    uint64_t cachedPromptTokens = 0; // Server-owned exact prefix reuse, not a request field.
 };
 
 // Strict text and function-tool OpenAI-style input. Unknown fields and unsupported features
-// are rejected before template rendering or inference admission. Each request
-// uses a fresh Session; prompt + requested generation must fit its capacity.
+// are rejected before template rendering or inference admission. The full
+// prompt + requested generation must fit the Session, including reused tokens.
 PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer,
                          const ChatSettings& settings);
 

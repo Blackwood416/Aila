@@ -64,7 +64,9 @@ struct ValidationError {
 };
 
 // Default/hello bounds retain the original wire revision. The optional
-// extended_generation_v1 configuration raises only maxGeneratedTokens.
+// extended_generation_v1 configuration raises only maxGeneratedTokens, while
+// the independent extended_context_v1 configuration raises the prompt,
+// attachment, prefill-chunk and aggregate reserved-token ceilings.
 // maxSessionCacheBytes == 0 means no byte ceiling beyond the session count.
 // The offered hard limit may also be zero; then a finite requested ceiling is valid.
 struct Limits {
@@ -96,10 +98,26 @@ struct Limits {
 };
 
 Limits hard_limits() noexcept;
+inline constexpr std::string_view kExtendedGenerationCapability = "extended_generation_v1";
 inline constexpr uint32_t kExtendedMaxGeneratedTokens = 32768;
 Limits extended_generation_limits() noexcept;
-// Interpret the optional configure capability without changing old hello
-// fields. A Worker advertising a lower generation ceiling still keeps it.
+// Optional extended_context_v1. The aggregate budget admits four concurrent
+// maximal requests, each carrying a full prompt plus its longest output, so the
+// product below is the exact finite ceiling rather than an open-ended value.
+inline constexpr std::string_view kExtendedContextCapability = "extended_context_v1";
+inline constexpr uint32_t kExtendedMaxPromptTokens = 262144;
+inline constexpr uint32_t kExtendedMaxAttachmentBytes = 1024 * 1024;
+inline constexpr uint32_t kExtendedMaxPrefillChunkSize = 4096;
+inline constexpr uint64_t kExtendedMaxOutstandingTokens =
+    4ULL * (kExtendedMaxPromptTokens + kExtendedMaxGeneratedTokens);
+Limits extended_context_limits() noexcept;
+// Elementwise maximum of every optional-extension ceiling. This is the exact
+// absolute bound that admits extended_generation_v1 and extended_context_v1
+// alone or in combination; no single field is widened beyond its own design.
+Limits absolute_limits() noexcept;
+// Interpret the optional configure capabilities without changing old hello
+// fields. A Worker advertising a lower ceiling still keeps it, and the two
+// extensions are applied independently of one another.
 Limits configure_limits_ceiling(const Limits& offered,
                                 const std::vector<std::string>& requiredCapabilities);
 // Keep existing Qwen3 callers compatible with Workers that predate Hybrid.

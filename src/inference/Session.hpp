@@ -92,6 +92,16 @@ public:
     virtual ExecutionResult Forward(const std::vector<int>& tokenIds,
                                     const SamplingInput* sampling,
                                     bool captureLogits) = 0;
+    // Prompt prefill chunk carrying the number of prompt tokens still queued
+    // after this chunk (0 marks the final prefill slice); -1 for decode or an
+    // unspecified phase. Backends that ignore prompt phase keep this default.
+    virtual ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
+                                           const SamplingInput* sampling,
+                                           bool captureLogits,
+                                           int prefillRemaining) {
+        (void)prefillRemaining;
+        return Forward(tokenIds, sampling, captureLogits);
+    }
     // Identity of immutable weights, adapter combination and execution slot.
     // A null key explicitly disables grouping; matching model paths/families
     // alone are insufficient. The key remains stable for this backend's life.
@@ -148,7 +158,8 @@ private:
     void ResetCancelledWindow();
     ExecutionResult Execute(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
-                            bool captureLogits = false);
+                            bool captureLogits = false,
+                            int prefillRemaining = -1);
     static std::vector<ExecutionResult> ExecuteDecodeBatch(
         const std::vector<SessionDecodeInput>& rows);
 

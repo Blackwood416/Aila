@@ -661,8 +661,11 @@ void PromptAndServerLimits(const Fixture& fixture) {
         [](auto& s) { s.modelId = Bytes({0x80}); }, [](auto& s) { s.maxContextTokens = 0; },
         [](auto& s) { s.maxContextTokens = (std::numeric_limits<uint32_t>::max)(); },
         [](auto& s) { s.maxPromptTokens = 0; }, [](auto& s) { s.maxNewTokens = 0; },
-        [](auto& s) { s.maxPromptTokens = wire::hard_limits().maxPromptTokens + 1; },
-        [](auto& s) { s.maxNewTokens = wire::hard_limits().maxGeneratedTokens + 1; },
+        [](auto& s) { s.maxPromptTokens = wire::absolute_limits().maxPromptTokens + 1; },
+        [](auto& s) { s.maxNewTokens = wire::absolute_limits().maxGeneratedTokens + 1; },
+        [](auto& s) { s.prefillChunkSize = 0; },
+        [](auto& s) { s.prefillChunkSize = wire::absolute_limits().maxPrefillChunkSize + 1; },
+        [](auto& s) { s.maxBodyBytes = 65536 - 1; }, [](auto& s) { s.maxBodyBytes = 4 * 1024 * 1024 + 1; },
         [](auto& s) { s.maxOutputBytes = 4095; }
     };
     for (const auto& mutate : invalid) {
@@ -676,6 +679,57 @@ void PromptAndServerLimits(const Fixture& fixture) {
     const auto fallback = PrepareChat(Serialize(body), fixture.fallback, fixture.settings);
     const auto expected = fixture.fallback.encode("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n");
     Expect(fallback.promptIds == std::vector<int32_t>(expected.begin(), expected.end()), "Fixed fallback template was not applied");
+}
+
+void PiClientCompatibility(const Fixture& fixture) {
+    // The PI coding agent's openai-completions client always sends store:false.
+    auto body = Request(); body["store"] = false;
+    Expect(!fixture.Prepare(body).promptIds.empty(), "store:false must be accepted and ignored");
+    body["store"] = true;
+    ExpectError([&] { fixture.Prepare(body); }, 400, "unsupported_parameter", "store");
+    // reasoning_effort only selects the thinking channel, never a token budget.
+    body = Request(); body["reasoning_effort"] = "low";
+    Expect(fixture.Prepare(body).startsInReasoning, "reasoning_effort must open the thinking channel");
+    body["reasoning_effort"] = "off";
+    Expect(!fixture.Prepare(body).startsInReasoning, "reasoning_effort=off must suppress thinking");
+    body["reasoning_effort"] = "extreme";
+    ExpectError([&] { fixture.Prepare(body); }, 400, "invalid_parameter", "reasoning_effort");
+    // PI labels its leading instruction message "developer"; it must render as
+    // the template's system instruction instead of raising on the role.
+    body = Request();
+    body["messages"].insert(0, Json::Value(Json::objectValue));
+    body["messages"][0]["role"] = "developer";
+    body["messages"][0]["content"] = "You are terse.";
+    const auto developer_first = fixture.Prepare(body);
+    auto system_body = body; system_body["messages"][0]["role"] = "system";
+    const auto system_first = fixture.Prepare(system_body);
+    Expect(developer_first.chatRequest.messages.front().role == aila::chat::ChatRole::System,
+           "A leading developer message must be normalized to system");
+    Expect(developer_first.promptIds == system_first.promptIds,
+           "A leading developer message must render exactly like a system message");
+    // This fixture tokenizes one byte per token, so both byte and token
+    // capacities must permit a long message.
+    auto settings = fixture.settings; settings.maxBodyBytes = 65536;
+    settings.maxPromptTokens = settings.maxContextTokens = 65536;
+    settings.prefillChunkSize = 2048;
+    const auto long_content = std::string(80 * 1024, 'y');
+    ExpectError([&] { PrepareChat(RawContent(long_content), fixture.tokenizer, settings); }, 413, "request_too_large");
+    auto longPrepared = PrepareChat(RawContent(std::string(48 * 1024, 'x')), fixture.tokenizer, settings);
+    longPrepared.cachedPromptTokens = 32000;
+    Expect(longPrepared.promptIds.size() > 4096 && longPrepared.options.prefillChunkSize == 2048,
+           "A large message must retain its tokens and configured prefill chunk");
+    ChatOutput longOutput({"chatcmpl-long", settings.modelId, 1}, longPrepared);
+    wire::Summary summary;
+    summary.status = wire::RequestStatus::Completed;
+    summary.endReason = wire::EndReason::StopToken;
+    summary.promptTokensProcessed = longPrepared.promptIds.size();
+    summary.eventCount = 1;
+    const auto completion = longOutput.Finish(summary);
+    Expect(!completion.failed, "Long prompt failed terminal summary validation");
+    const auto usage = Parse(completion.json)["usage"];
+    Expect(usage["prompt_tokens"].asUInt64() == longPrepared.promptIds.size() &&
+           usage["prompt_tokens_details"]["cached_tokens"].asUInt64() == 32000,
+           "Cached prefix usage must retain the full prompt token count");
 }
 
 ChatSettings HybridSettings(const Fixture& fixture) {
@@ -1692,6 +1746,7 @@ int main() {
             {"message shape validation", [&] { InvalidMessages(fixture); }},
             {"sampling and option validation", [&] { InvalidParameters(fixture); }},
             {"prompt and service configuration limits", [&] { PromptAndServerLimits(fixture); }},
+            {"PI client field and body compatibility", [&] { PiClientCompatibility(fixture); }},
             {"Hybrid fallback, thinking, and checkpoint EOS IDs", [&] { HybridFallbackAndEos(fixture); }},
             {"Hybrid history and text parts", [&] { HybridHistoryAndTextParts(fixture); }},
             {"Hybrid trusted templates and rendered reasoning state", [&] { HybridTrustedTemplate(fixture); }},

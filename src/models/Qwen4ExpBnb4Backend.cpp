@@ -702,8 +702,10 @@ bool Qwen4ExpBnb4Backend::load(
         AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d dynamic_ready=1 fixed_hot_slots=0", resident_decode_mode_);
     }
     expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
-    expert_executor_.PrepareAsyncResidentSources(cfg_.num_hidden_layers, cfg_.num_experts);
     expert_cache_.ConfigureHotset();
+    static const bool large_page_resident = aila::env::read_flag("AILA_Q4E_LARGE_PAGE_RESIDENT", false);
+    if (large_page_resident) expert_cache_.InitializeLargePageResidency(&embed_host_);
+    expert_executor_.PrepareAsyncResidentSources(cfg_.num_hidden_layers, cfg_.num_experts);
     // Batched prefill acquire needs every unique expert of a layer resident at once.
     if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
         prefill_expert_slot_.assign(cfg_.num_experts, -1);
@@ -2649,6 +2651,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
     if (s_work_summary) {
+        const auto& supply = expert_cache_.stats();
+        AILA_LOG_INFO("[Q4E Supply] pos=%d count=%d acquire_ms=%.6f router_wait_ms=%.6f fill_ms=%.6f dma_wait_ms=%.6f demand_wait_ms=%.6f",
+            start_pos, count, prof_acquire_ms, prof_router_sync_ms,
+            (supply.fill_ns-prof_stats0.fill_ns)*1e-6, (supply.dma_wait_ns-prof_stats0.dma_wait_ns)*1e-6,
+            (supply.demand_exposed_wait_ns-prof_stats0.demand_exposed_wait_ns)*1e-6);
         if (decode_pending_mlp) {
             AILA_LOG_INFO("[Q4E PendingMlp] pos=%d count=%d deferred=%llu fused=%llu materialized=%llu",
                 start_pos, count, (unsigned long long)pending_mlp.deferred,

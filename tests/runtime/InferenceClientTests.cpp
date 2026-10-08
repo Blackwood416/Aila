@@ -1352,6 +1352,90 @@ void ExtendedGenerationNegotiation() {
     client->Shutdown(2s);
 }
 
+void ExtendedContextNegotiation() {
+    // Each of the four context fields, widened in isolation, must auto-require
+    // extended_context_v1 so an unqualified peer fails before configure.
+    const auto widen = [](InferenceClientOptions& options, int field) {
+        if (field == 0) options.limits.maxPromptTokens = wire::kExtendedMaxPromptTokens;
+        if (field == 1) options.limits.maxAttachmentBytes = wire::kExtendedMaxAttachmentBytes;
+        if (field == 2) options.limits.maxPrefillChunkSize = wire::kExtendedMaxPrefillChunkSize;
+        if (field == 3) options.limits.maxOutstandingTokens = wire::kExtendedMaxOutstandingTokens;
+        // The prompt and attachment fields are independent but must stay
+        // mutually consistent: the attachment must be able to carry the prompt.
+        options.limits.maxAttachmentBytes = std::max(
+            options.limits.maxAttachmentBytes,
+            options.limits.maxPromptTokens * static_cast<uint32_t>(sizeof(int32_t)));
+        options.limits.maxPrefillChunkSize = std::min(options.limits.maxPrefillChunkSize,
+                                                      options.limits.maxPromptTokens);
+    };
+    for (int field = 0; field != 4; ++field) {
+        auto transport = std::make_shared<ControlledTransport>();
+        InferenceClientOptions options;
+        widen(options, field);
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::UnsupportedCapability);
+        Expect(Count(transport->History(), wire::Method::WorkerConfigure) == 0 && transport->Stopped(),
+               "Context configuration reached a peer without extended_context_v1");
+    }
+
+    auto hello = Hello();
+    hello.capabilities = wire::supported_capabilities();
+    for (int field = 0; field != 4; ++field) {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        InferenceClientOptions options;
+        widen(options, field);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity(), options);
+        const auto command = transport->Take(wire::Method::WorkerConfigure);
+        Expect(std::find(command.requiredCapabilities.begin(), command.requiredCapabilities.end(),
+                         "extended_context_v1") != command.requiredCapabilities.end(),
+               "Widened context field lost its required capability");
+        // The two extensions are independent: a context widen must never imply
+        // the generation extension, and vice versa.
+        Expect(std::find(command.requiredCapabilities.begin(), command.requiredCapabilities.end(),
+                         "extended_generation_v1") == command.requiredCapabilities.end(),
+               "Context widen silently required extended_generation_v1");
+        Expect(command.limits.maxPromptTokens == options.limits.maxPromptTokens &&
+                   command.limits.maxAttachmentBytes == options.limits.maxAttachmentBytes &&
+                   command.limits.maxPrefillChunkSize == options.limits.maxPrefillChunkSize &&
+                   command.limits.maxOutstandingTokens == options.limits.maxOutstandingTokens &&
+                   command.limits.maxGeneratedTokens == options.limits.maxGeneratedTokens,
+               "Context widen changed an unrelated negotiated field");
+        client->Shutdown(2s);
+        Expect(!transport->Forced(), "Context negotiation prevented graceful shutdown");
+    }
+
+    // A minimal lower offered ceiling is honored rather than silently raised;
+    // a request above it fails negotiation exactly like the generation path.
+    {
+        auto reducedHello = hello;
+        reducedHello.hardLimits.maxPromptTokens = 2048;
+        auto transport = std::make_shared<ControlledTransport>(reducedHello);
+        InferenceClientOptions options;
+        options.limits.maxPromptTokens = wire::kExtendedMaxPromptTokens;
+        options.limits.maxAttachmentBytes = wire::kExtendedMaxAttachmentBytes;
+        options.limits.maxPrefillChunkSize = 512;
+        ExpectError([&] { InferenceClient::Connect(transport, ExpectedIdentity(), options); },
+                    ClientErrorCode::RemoteError, wire::ErrorCode::InvalidArgument);
+        Expect(Count(transport->History(), wire::Method::WorkerConfigure) == 0 && transport->Stopped(),
+               "Worker's reduced context ceiling was bypassed");
+    }
+
+    // Ordinary callers keep the original schema and never request the extension.
+    {
+        auto transport = std::make_shared<ControlledTransport>(hello);
+        auto client = InferenceClient::Connect(transport, ExpectedIdentity());
+        const auto ordinary = transport->Take(wire::Method::WorkerConfigure);
+        Expect(ordinary.limits.maxPromptTokens == 4096 &&
+                   ordinary.limits.maxAttachmentBytes == 16 * 1024 &&
+                   ordinary.limits.maxPrefillChunkSize == 512 &&
+                   ordinary.limits.maxOutstandingTokens == 32768 &&
+                   std::find(ordinary.requiredCapabilities.begin(), ordinary.requiredCapabilities.end(),
+                             "extended_context_v1") == ordinary.requiredCapabilities.end(),
+               "Ordinary callers changed their context contract");
+        client->Shutdown(2s);
+    }
+}
+
 void DecodeBatchingNegotiationAndEcho() {
     for (uint32_t size : {uint32_t{0}, uint32_t{5}, uint32_t{0xffffffff}}) {
         auto transport = std::make_shared<ControlledTransport>();
@@ -1786,6 +1870,7 @@ int main() {
         {"thinking budget negotiation and routing", ThinkingBudgetNegotiationAndRouting},
         {"request policy capability rejection before RPC", RequestPolicyNegotiation},
         {"extended generation old-peer rejection and exact configure echo", ExtendedGenerationNegotiation},
+        {"extended context field opt-in, independence and reduced ceiling", ExtendedContextNegotiation},
         {"decode batching capability, admission bound and exact configure echo", DecodeBatchingNegotiationAndEcho},
         {"prefill-only negotiation and zero-token terminal routing", PrefillNegotiationAndRouting},
         {"Session context capability and correlated response validation", SessionContextNegotiationAndResponseValidation},

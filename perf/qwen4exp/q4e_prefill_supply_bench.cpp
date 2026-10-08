@@ -144,11 +144,151 @@ void run(bool smoke, bool sliced) {
         }
     }
 }
+// Full gate/up -> down chain, one scheduling variable. Host payloads are
+// prefilled: this isolates DMA/compute competition, not ReadFile throughput.
+void run_pacing(int rows, bool smoke) {
+    constexpr int batch=32, guard=16;
+    constexpr size_t DownPacked=H*I/2, DownCodes=H*I/64, DownNested=DownCodes/256;
+    constexpr size_t DownOffset=Packed+Codes, DownCodesOffset=DownOffset+DownPacked;
+    static_assert(DownCodesOffset+DownCodes==Slot);
+    const int acts=E*rows, tokens=(acts+R-1)/R;
+    const size_t h_count=size_t(tokens)*R*I+guard, d_count=size_t(tokens)*R*H+guard;
+    aila::env::enable_l0_copy_engine();
+    Context ctx(nullptr,true);
+    auto& q=ctx.queue();
+    const size_t scale_count=E*(Nested+DownNested), lut_offset=scale_count, qmap_offset=lut_offset+256;
+    std::vector<float> meta(qmap_offset+16), actual_down(d_count), reference_down;
+    std::vector<bf16> x(size_t(tokens)*H), actual_h(h_count), reference_h;
+    std::vector<ops::MoeExpertSlotDev> slots(acts);
+    std::vector<int> token_ids(acts), ranks(acts);
+    auto bytes=[&](size_t n) {return Tensor::allocate(ctx,{int64_t(n)},dnnl::memory::data_type::u8);};
+    auto pool=bytes(E*Slot), metadata=bytes(meta.size()*4), sd=bytes(acts*sizeof(slots[0]));
+    auto td=bytes(acts*4), rd=bytes(acts*4), xd=bytes(x.size()*2), hd=bytes(h_count*2), dd=bytes(d_count*4);
+    sycl::queue copy(q.get_context(),q.get_device(),sycl::property_list{sycl::property::queue::in_order(),
+        sycl::ext::intel::property::queue::immediate_command_list(),sycl::property::queue::enable_profiling()});
+    auto* host=static_cast<uint8_t*>(ctx.alloc_host(E*Slot));
+    struct Drain {Context& ctx;sycl::queue& copy;void* host;~Drain(){
+        try {copy.wait_and_throw();}catch(...){} try{ctx.synchronize();}catch(...){}ctx.free_host(host);
+    }} drain{ctx,copy,host};
+    for(size_t w=0;w<E*Slot/4;++w)reinterpret_cast<uint32_t*>(host)[w]=mix(uint32_t(w)+37);
+    for(size_t j=0;j<scale_count;++j)meta[j]=.035f+.00001f*float(j%1000);
+    for(int j=0;j<256;++j)meta[lut_offset+j]=float(j+1)/256.f;
+    std::copy(Qmap.begin(),Qmap.end(),meta.begin()+qmap_offset);
+    for(size_t j=0;j<x.size();++j)x[j]=bf16((int(mix(uint32_t(j)+19)%1001)-500)/1024.f);
+    for(int a=0;a<acts;++a){
+        const int e=a/rows, m=a%rows, logical=m*E+e;
+        // Unique expert per token/rank, with four arbitrary token rows sharing
+        // one expert, as in the production expert-major route.
+        token_ids[a]=logical/R;ranks[a]=logical%R;
+        auto& s=slots[a];auto* base=pool.data_as<uint8_t>()+size_t(e)*Slot;
+        s.gate_up_packed=base;s.down_packed=base+DownOffset;
+        s.gate_up_nested={base+Packed,metadata.data_as<float>()+e*Nested,
+            metadata.data_as<float>()+lut_offset,.001f,256};
+        s.down_nested={base+DownCodesOffset,metadata.data_as<float>()+E*Nested+e*DownNested,
+            metadata.data_as<float>()+lut_offset,.001f,256};
+    }
+    q.memcpy(metadata.data(),meta.data(),meta.size()*4);
+    q.memcpy(sd.data(),slots.data(),acts*sizeof(slots[0]));q.memcpy(td.data(),token_ids.data(),acts*4);
+    q.memcpy(rd.data(),ranks.data(),acts*4);q.memcpy(xd.data(),x.data(),x.size()*2);q.wait_and_throw();
+    std::vector<sycl::event> kernels,copies;
+    kernels.reserve(2*E/batch);copies.reserve(E);
+    auto poison=[&]{q.fill(hd.data_as<bf16>(),bf16(-9),h_count);q.fill(dd.data_as<float>(),-17.f,d_count);q.wait_and_throw();};
+    auto execute=[&](bool paced){
+        kernels.clear();copies.clear();sycl::event last{};
+        const auto t0=Clock::now();
+        for(int e=0;e<E;e+=batch){
+            // No host wait. CPU source preparation could run while the previous
+            // group's GPU work is active; only its DMA receives this dependency.
+            if(paced && e)copy.ext_oneapi_submit_barrier({last});
+            sycl::event ready;
+            for(int j=e;j<e+batch;++j){
+                ready=copy.memcpy(pool.data_as<uint8_t>()+size_t(j)*Slot,host+size_t(j)*Slot,Slot);
+                copies.push_back(ready);
+            }
+            auto gu=ops::moe_expert_major_prefill_gate_up_4token(ctx,
+                sd.data_as<ops::MoeExpertSlotDev>()+e*rows,td.data_as<int>()+e*rows,rd.data_as<int>()+e*rows,
+                metadata.data_as<float>()+qmap_offset,xd.data_as<bf16>(),hd.data_as<bf16>(),
+                batch*rows/4,R,H,I,64,&ready,true);
+            last=ops::moe_expert_major_prefill_down_4token(ctx,
+                sd.data_as<ops::MoeExpertSlotDev>()+e*rows,td.data_as<int>()+e*rows,rd.data_as<int>()+e*rows,
+                metadata.data_as<float>()+qmap_offset,hd.data_as<bf16>(),dd.data_as<float>(),
+                batch*rows/4,R,I,H,64,&gu,true);
+            kernels.push_back(gu);kernels.push_back(last);
+        }
+        q.wait_and_throw();copy.wait_and_throw();
+        Sample s;s.wall=std::chrono::duration<double,std::milli>(Clock::now()-t0).count();
+        // Deferred extraction, after the natural end of the complete chain.
+        for(const auto& ev:kernels)s.kernel+=(end(ev)-start(ev))*1e-6;
+        for(const auto& ev:copies)s.copy+=(end(ev)-start(ev))*1e-6;
+        return s;
+    };
+    poison();execute(false);
+    q.memcpy(actual_h.data(),hd.data(),h_count*2);q.memcpy(actual_down.data(),dd.data(),d_count*4);q.wait_and_throw();
+    reference_h=actual_h;reference_down=actual_down;
+    for(size_t j=0;j<size_t(acts)*I;++j)check(std::isfinite(float(actual_h[j])),"Nonfinite gate/up");
+    for(size_t j=0;j<size_t(acts)*H;++j)check(std::isfinite(actual_down[j]),"Nonfinite down");
+    for(size_t j=size_t(acts)*I;j<h_count;++j)check(float(actual_h[j])==-9,"Gate/up guard overwritten");
+    for(size_t j=size_t(acts)*H;j<d_count;++j)check(actual_down[j]==-17,"Down guard overwritten");
+    double max_h_error=0,max_d_error=0;int cpu_samples=0;
+    auto weight=[&](int e,bool down,int n,int k){
+        const size_t index=size_t(n)*(down?I:H)+k;
+        const auto* base=host+size_t(e)*Slot;
+        const auto packed=base[(down?DownOffset:0)+index/2];
+        const auto code=base[(down?DownCodesOffset:Packed)+index/64];
+        const size_t scale=(down?E*Nested+e*DownNested:e*Nested)+index/64/256;
+        return Qmap[(packed>>(index%2?0:4))&15]*(meta[scale]*meta[lut_offset+code]+.001f);
+    };
+    for(int e:{0,37,255})for(int m:{0,rows-1}){
+        const int a=e*rows+m,t=token_ids[a],r=ranks[a];
+        std::vector<bf16> cpu_h(I);
+        for(int n=0;n<I;++n){
+            double g=0,u=0;for(int k=0;k<H;++k){g+=float(x[size_t(t)*H+k])*weight(e,false,n,k);u+=float(x[size_t(t)*H+k])*weight(e,false,n+I,k);}
+            cpu_h[n]=bf16(float(g/(1+std::exp(-g))*u));
+            const float got=float(actual_h[(size_t(t)*R+r)*I+n]),ref=float(cpu_h[n]);
+            max_h_error=std::max(max_h_error,double(std::abs(got-ref)));
+            check(std::abs(got-ref)<=.001f+.006f*std::abs(ref),"CPU gate/up reference mismatch");
+        }
+        for(int n:{0,1279,2559}){
+            double value=0;for(int k=0;k<I;++k)value+=float(cpu_h[k])*weight(e,true,n,k);
+            const float got=actual_down[(size_t(t)*R+r)*H+n];
+            max_d_error=std::max(max_d_error,std::abs(got-value));
+            check(std::abs(got-value)<=.001+.006*std::abs(value),"CPU full-chain reference mismatch");++cpu_samples;
+        }
+    }
+    poison();execute(true);
+    q.memcpy(actual_h.data(),hd.data(),h_count*2);q.memcpy(actual_down.data(),dd.data(),d_count*4);q.wait_and_throw();
+    check(!std::memcmp(actual_h.data(),reference_h.data(),h_count*2),"Pacing changed gate/up or guards");
+    check(!std::memcmp(actual_down.data(),reference_down.data(),d_count*4),"Pacing changed down or guards");
+    std::cout<<std::unitbuf<<std::fixed<<std::setprecision(6)<<"[PACING CONFIG] rows="<<rows<<" batch="<<batch
+        <<" experts="<<E<<" copy_bytes="<<E*Slot<<" device="<<q.get_device().get_info<sycl::info::device::name>()
+        <<" driver="<<q.get_device().get_info<sycl::info::device::driver_version>()<<'\n';
+    std::cout<<"[PACING CHECK] rows="<<rows<<" cpu_down_samples="<<cpu_samples<<" max_h_abs="<<max_h_error
+        <<" max_down_abs="<<max_d_error<<" bitwise=1 guards=1\n";
+    const int repeats=smoke?1:3,samples=smoke?1:20;
+    for(int rep=0;rep<repeats;++rep){
+        std::array<std::vector<Sample>,2> data;
+        for(int warm=0;warm<3;++warm){execute(false);execute(true);}
+        for(int n=0;n<samples;++n)for(int order=0;order<2;++order){
+            int mode=(n+order+rep)%2;data[mode].push_back(execute(mode!=0));
+        }
+        for(int mode=0;mode<2;++mode){
+            std::vector<double>w,k,c;for(auto s:data[mode]){w.push_back(s.wall);k.push_back(s.kernel);c.push_back(s.copy);}
+            auto sorted=w;std::sort(sorted.begin(),sorted.end());
+            std::cout<<"[PACING TIME] rows="<<rows<<" repeat="<<rep<<" paced="<<mode<<" samples="<<samples
+                <<" wall_ms="<<median(w)<<" kernel_ms="<<median(k)<<" copy_ms="<<median(c)
+                <<" p10_ms="<<sorted[sorted.size()/10]<<" p90_ms="<<sorted[sorted.size()*9/10]<<" raw_ms=";
+            for(size_t n=0;n<w.size();++n)std::cout<<(n?",":"")<<w[n];std::cout<<'\n';
+        }
+    }
+}
 }
 int main(int argc,char** argv) {
     try {
         check(argc==2,"Expected --smoke, --bench or --sliced");
         const std::string option=argv[1];
+        if(option=="--pacing" || option=="--pacing-smoke"){
+            run_pacing(8,option=="--pacing-smoke");run_pacing(80,option=="--pacing-smoke");return 0;
+        }
         check(option=="--smoke"||option=="--bench"||option=="--sliced","Unknown supply probe option");
         run(option=="--smoke",option=="--sliced");return 0;
     }
