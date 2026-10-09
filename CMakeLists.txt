@@ -203,6 +203,8 @@ set(LIB_SOURCES
     src/models/Qwen4ExpPrefill.cpp
     src/models/Qwen4ExpExpertExecutor.cpp
     src/models/Qwen4ExpExpertReader.cpp
+    src/models/Qwen4ExpHostArena.cpp
+    src/models/Qwen4ExpAdaptiveCache.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -627,7 +629,8 @@ add_test(
 
 add_executable(AilaBnb4BitLinearKernelTests
     tests/ops/Bnb4BitLinearKernelTests.cpp
-    src/core/ExecutionTrace.cpp)
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -640,7 +643,8 @@ add_test(NAME AilaBnb4BitLinearKernelTests COMMAND AilaBnb4BitLinearKernelTests)
 
 add_executable(AilaConvOpsKernelTests
     tests/ops/ConvOpsKernelTests.cpp
-    src/core/ExecutionTrace.cpp)
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp)
 target_compile_definitions(AilaConvOpsKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaConvOpsKernelTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -661,7 +665,8 @@ target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
 
 add_executable(AilaDiffusionGemmaNf4InferRefAdapter
     tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp
-    src/core/ExecutionTrace.cpp)
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp)
 target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
@@ -674,7 +679,8 @@ target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
 
 add_executable(AilaQwen4ExpInferRefAdapter
     tests/inferref/Qwen4ExpInferRefAdapter.cpp
-    src/core/ExecutionTrace.cpp)
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp)
 target_compile_definitions(AilaQwen4ExpInferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQwen4ExpInferRefAdapter PRIVATE
@@ -858,6 +864,32 @@ target_include_directories(AilaQwen4ExpDmaTimingTests PRIVATE
 target_link_libraries(AilaQwen4ExpDmaTimingTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpDmaTimingTests COMMAND AilaQwen4ExpDmaTimingTests)
 set_tests_properties(AilaQwen4ExpDmaTimingTests PROPERTIES LABELS "gpu;models;qwen4_exp;h5" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpHostArenaTests
+    tests/models/Qwen4ExpHostArenaTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpHostArenaTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpHostArenaTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpHostArenaTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpHostArenaTests COMMAND AilaQwen4ExpHostArenaTests)
+set_tests_properties(AilaQwen4ExpHostArenaTests PROPERTIES LABELS "gpu;models;qwen4_exp;arena" TIMEOUT 120)
+
+add_executable(AilaQwen4ExpAdaptiveCacheTests
+    tests/models/Qwen4ExpAdaptiveCacheTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpAdaptiveCacheTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpAdaptiveCacheTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpAdaptiveCacheTests PRIVATE AilaLib)
+add_test(NAME AilaQwen4ExpAdaptiveCacheTests COMMAND AilaQwen4ExpAdaptiveCacheTests)
+set_tests_properties(AilaQwen4ExpAdaptiveCacheTests PROPERTIES LABELS "gpu;models;qwen4_exp;cache" TIMEOUT 300)
 
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp

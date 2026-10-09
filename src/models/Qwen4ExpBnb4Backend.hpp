@@ -10,6 +10,8 @@
 #include "../core/Tensor.hpp"
 #include "Qwen4ExpExpertCache.hpp"
 #include "Qwen4ExpExpertExecutor.hpp"
+#include "Qwen4ExpHostArena.hpp"
+#include "Qwen4ExpAdaptiveCache.hpp"
 #include "Qwen4ExpPle.hpp"
 #include "engine/Types.hpp"
 
@@ -336,6 +338,12 @@ public:
             attentionNf4Q8ProjectionCounts_[2] + attentionNf4Q8ProjectionCounts_[3];
     }
 
+    const aila::Qwen4ExpHostArena& host_arena() const noexcept { return host_arena_; }
+    aila::Qwen4ExpHostArena& host_arena() noexcept { return host_arena_; }
+    const aila::Qwen4ExpAdaptiveCache& adaptive_cache() const noexcept { return adaptive_cache_; }
+    aila::Qwen4ExpAdaptiveCache& adaptive_cache() noexcept { return adaptive_cache_; }
+    bool use_adaptive_pipeline() const noexcept { return use_adaptive_pipeline_; }
+
 private:
     bool decodeHcReferenceForTest_ = false;
     bool gpuNf4Q8ReferenceForTest_ = false;
@@ -446,6 +454,14 @@ private:
     PleTicket ple_ticket_;
     Qwen4ExpExpertCache expert_cache_;
     aila::Qwen4ExpExpertExecutor expert_executor_;
+    aila::Qwen4ExpHostArena host_arena_;
+    aila::Qwen4ExpAdaptiveCache adaptive_cache_;
+    std::unique_ptr<sycl::queue> copy_q_;
+    const bool use_adaptive_pipeline_ = true;
+    int ping_pong_index_ = 0;
+    void* resident_embedding_ = nullptr;
+    std::vector<ops::MoeExpertSlotDev> adaptive_prefill_slots_;
+    sycl::event RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count);
     int resident_decode_mode_ = 0; // 0 legacy, 1 host Ready binding, 2 GPU resident selection
     int cold_mode_ = 0; // 0 dynamic, 1 frozen + GPU cold, 2 frozen + bounded CPU cold
     bool resident_prefill_ = false;
@@ -455,7 +471,9 @@ private:
     sycl::event resident_hot_reader_{};
     void* resident_probe_data_ = nullptr;
     void (*resident_probe_)(void*,Qwen4ExpBnb4Backend&,int) = nullptr;
-    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, GpuReadyLease* device_lease = nullptr,
+    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count);
+    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared,
+                                  GpuReadyLease* device_lease = nullptr,
                                   ResidentColdWork* early_cold = nullptr);
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0

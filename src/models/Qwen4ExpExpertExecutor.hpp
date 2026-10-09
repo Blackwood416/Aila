@@ -12,6 +12,7 @@
 #include <memory>
 
 namespace aila {
+class Qwen4ExpHostArena;
 
 struct RouteRankEntry {
     int token_idx = 0;
@@ -182,6 +183,10 @@ public:
     // entries (or opt-in immutable mapped sources) from the cold subset; caller
     // submits remaining GPU work before Join. ModelWeights must outlive executor.
     int StartResidentCold(GpuReadyLease& route, const bf16* x_dev);
+    // The coordinator keeps arena ownership fixed until JoinResidentCold.
+    // Reuses the existing bounded CPU worker and result banks.
+    int StartArenaCold(const Qwen4ExpHostArena& arena, int layer, const int* ids,
+                       const int* ranks, int count, const bf16* x_dev);
     // Init-only immutable mapped views; no cache operation runs on the worker.
     void PrepareAsyncResidentSources(int layers, int experts);
     bool CanStartAsyncResidentRoute(int layer) const;

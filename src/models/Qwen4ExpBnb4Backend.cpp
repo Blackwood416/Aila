@@ -20,6 +20,9 @@
 
 namespace fs = std::filesystem;
 using bf16 = sycl::ext::oneapi::bfloat16;
+using aila::StagingBatch;
+using aila::Qwen4ExpAdaptiveCache;
+using aila::Qwen4ExpHostArena;
 
 namespace {
 
@@ -253,8 +256,16 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
+    expert_executor_.AbortResidentCold();
     free_pinned_host_buffers();
-    if (resident_selected_host_) context_->free_host(resident_selected_host_);
+    if (resident_selected_host_ && context_) context_->free_host(resident_selected_host_);
+    if (copy_q_) {
+        try { copy_q_->wait(); } catch (...) {}
+        copy_q_.reset();
+    }
+    adaptive_cache_.Release();
+    host_arena_.Release();
+    if (resident_embedding_ && context_) context_->free_host(resident_embedding_);
 }
 
 void Qwen4ExpBnb4Backend::PrepareDecodeVerification(Context& ctx) {
@@ -269,7 +280,10 @@ void Qwen4ExpBnb4Backend::PrepareDecodeVerification(Context& ctx) {
 
 void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (!context_) return;
-    context_->synchronize();
+    // Buffer growth already checks Context errors before entering here. Teardown
+    // must also release raw buffers after a forward fault without rethrowing the
+    // latched async error from a destructor. Always drain the actual queue first.
+    try { context_->queue().wait_and_throw(); } catch (...) {}
     if (router_host_ids_) context_->free_host(router_host_ids_);
     if (router_host_weights_) context_->free_host(router_host_weights_);
     router_host_ids_ = nullptr;
@@ -325,7 +339,7 @@ bool Qwen4ExpBnb4Backend::load(
     Context& ctx, ModelWeights& weights, const ModelSpec& spec,
     int max_seq_len, std::string* error_message) {
     context_ = &ctx;
-    moe_compact_tile_ = aila::env::read_int("AILA_Q4E_MOE_COMPACT_ACTS", 0);
+    moe_compact_tile_ = 0; // adaptive prefill uses the existing ordered rank buffer
     if (moe_compact_tile_ && (moe_compact_tile_ != 256 && moe_compact_tile_ != 512 && moe_compact_tile_ != 1024))
         throw std::invalid_argument("AILA_Q4E_MOE_COMPACT_ACTS must be 0, 256, 512 or 1024");
     if (moe_compact_tile_ && (!aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true) ||
@@ -667,15 +681,44 @@ bool Qwen4ExpBnb4Backend::load(
             max_reserve / (1024.0 * 1024.0),
             expert_cache_bytes / (1024.0 * 1024.0));
     }
-    AILA_LOG_INFO("[Qwen4Exp] Initializing Expert Cache (%.0f MB)...", expert_cache_bytes / (1024.0 * 1024.0));
-    if (!expert_cache_.init(ctx, weights, cfg_.num_hidden_layers, expert_cache_bytes,
-                            cfg_.num_experts, hidden_size_, cfg_.moe_intermediate_size, 64, error_message)) {
+    // GPU experts and native RAM experts are complementary owners. Allocate
+    // the contiguous embedding before the smaller large-page expert chunks.
+    if (embed_host_.valid()) {
+        resident_embedding_=ctx.alloc_large_host(embed_host_.bytes);
+        std::memcpy(resident_embedding_,embed_host_.ptr,embed_host_.bytes);
+        embed_host_.ptr=static_cast<const uint8_t*>(resident_embedding_);
+    }
+    aila::AdaptiveCacheConfig cache_cfg;
+    cache_cfg.num_layers=cfg_.num_hidden_layers;
+    cache_cfg.num_experts_per_layer=cfg_.num_experts;
+    cache_cfg.hidden_size=hidden_size_;
+    cache_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
+    cache_cfg.staging_slots_per_buffer=16;
+    const size_t slot_bytes=size_t(3)*hidden_size_*cfg_.moe_intermediate_size*33/64;
+    // The 32K session and prefill projections reserve more VRAM than the CLI's
+    // 4K smoke. Fit the cache after those reservations, including both banks.
+    cache_cfg.num_gpu_slots=std::min(2800,int(expert_cache_bytes/slot_bytes)-32);
+    if (cache_cfg.num_gpu_slots<=0) {
+        if (error_message) *error_message="Qwen4Exp resident cache exceeds the admitted VRAM budget";
         return false;
     }
-    static const bool s_static_pinning = aila::env::read_flag("AILA_Q4E_STATIC_PINNING", false);
-    if (s_static_pinning) {
-        expert_cache_.init_pinned_experts();
-    }
+    if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
+    auto gpu_owners=adaptive_cache_.InitializeResidency();
+    aila::HostArenaConfig arena_cfg;
+    arena_cfg.num_layers=cfg_.num_hidden_layers; arena_cfg.num_experts_per_layer=cfg_.num_experts;
+    arena_cfg.hidden_size=hidden_size_; arena_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
+    if (!host_arena_.Allocate(ctx,arena_cfg,error_message,gpu_owners)) return false;
+    AILA_LOG_INFO("[Qwen4Exp] Loading native RAM complement: %zu experts, %.2f GiB; GPU-only experts=%d",
+        host_arena_.ResidentExperts(),host_arena_.TotalAllocatedBytes()/double(1ULL<<30),adaptive_cache_.NumGpuSlots());
+    if (!host_arena_.LoadFromModelWeights(weights,error_message)) return false;
+    adaptive_cache_.FinishInitialLoad(ctx.queue());
+    copy_q_=std::make_unique<sycl::queue>(ctx.queue().get_context(),ctx.queue().get_device(),
+        sycl::property_list{sycl::property::queue::in_order()});
+    prefill_expert_uses_.assign(cfg_.num_experts,0);
+    prefill_unique_.reserve(cfg_.num_experts);
+    adaptive_prefill_slots_.resize(cfg_.num_experts);
+    AILA_LOG_INFO("[Qwen4Exp] Adaptive residency ready: expert_mmap_fallback=0 small_host_staging_mib=%.1f",
+        adaptive_cache_.TotalStagingBytes()/double(1ULL<<20));
 
     ensure_runtime_buffers(ctx, 1);
     static const int s_resident_decode = aila::env::read_int("AILA_Q4E_RESIDENT_DECODE", 0);
@@ -690,35 +733,40 @@ bool Qwen4ExpBnb4Backend::load(
         if (error_message) *error_message = "Resident decode currently supports GPU-only mode 0/1/2";
         return false;
     }
-    if (resident_decode_mode_) {
+    if (resident_decode_mode_ || use_adaptive_pipeline_) {
         resident_down_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, hidden_size_}, dnnl::memory::data_type::f32);
         resident_weights_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::f32);
-        if (resident_decode_mode_ == 2) {
+        if (resident_decode_mode_ == 2 && !use_adaptive_pipeline_) {
             expert_cache_.EnableResidentDeviceTables();
             resident_route_ids_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::s32);
             resident_selected_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::s32);
             resident_selected_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts_per_tok * sizeof(int)));
         }
-        AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d dynamic_ready=1 fixed_hot_slots=0", resident_decode_mode_);
+        AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d adaptive_pipeline=%d", resident_decode_mode_, int(use_adaptive_pipeline_));
     }
-    expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
-    expert_cache_.ConfigureHotset();
-    static const bool large_page_resident = aila::env::read_flag("AILA_Q4E_LARGE_PAGE_RESIDENT", false);
-    if (large_page_resident) expert_cache_.InitializeLargePageResidency(&embed_host_);
-    expert_executor_.PrepareAsyncResidentSources(cfg_.num_hidden_layers, cfg_.num_experts);
-    // Batched prefill acquire needs every unique expert of a layer resident at once.
-    if (expert_cache_.num_slots() >= cfg_.num_experts + cfg_.num_experts_per_tok) {
+    if (!use_adaptive_pipeline_) {
+        expert_executor_.init(ctx, expert_cache_, max_seq_len_, cfg_.num_experts_per_tok, hidden_size_, cfg_.moe_intermediate_size);
+        expert_cache_.ConfigureHotset();
+        static const bool large_page_resident = aila::env::read_flag("AILA_Q4E_LARGE_PAGE_RESIDENT", false);
+        if (large_page_resident) expert_cache_.InitializeLargePageResidency(&embed_host_);
+        expert_executor_.PrepareAsyncResidentSources(cfg_.num_hidden_layers, cfg_.num_experts);
+        // Batched prefill acquire needs every unique expert of a layer resident at once.
         prefill_expert_slot_.assign(cfg_.num_experts, -1);
         prefill_expert_uses_.assign(cfg_.num_experts, 0);
         prefill_unique_.reserve(cfg_.num_experts);
         prefill_unique_slots_.reserve(cfg_.num_experts);
+        if (expert_cache_.num_slots() < cfg_.num_experts + cfg_.num_experts_per_tok) {
+            AILA_LOG_WARN("[Qwen4Exp] Expert cache has %d slots (< %d): prefill acquires experts per token",
+                          expert_cache_.num_slots(), cfg_.num_experts + cfg_.num_experts_per_tok);
+        }
+        prefill_pred_uses_.assign(cfg_.num_experts, 0);
+        prefill_pred_unique_.reserve(cfg_.num_experts);
+        sort_scratch_.resize(cfg_.num_experts);
     } else {
-        AILA_LOG_WARN("[Qwen4Exp] Expert cache has %d slots (< %d): prefill acquires experts per token",
-                      expert_cache_.num_slots(), cfg_.num_experts + cfg_.num_experts_per_tok);
+        // Reuse the existing CPU worker and tiny decode banks. The retired
+        // cache supplies no weights/slots; StartArenaCold reads native owners.
+        expert_executor_.init(ctx,expert_cache_,1,cfg_.num_experts_per_tok,hidden_size_,cfg_.moe_intermediate_size);
     }
-    prefill_pred_uses_.assign(cfg_.num_experts, 0);
-    prefill_pred_unique_.reserve(cfg_.num_experts);
-    sort_scratch_.resize(cfg_.num_experts);
 
     // With K-only indexer projection (A2) the engine's 2-token warmup completes no QSA block, so
     // it launches no QsaIndexerOps kernel. The first request would then pay that module's JIT
@@ -737,7 +785,7 @@ bool Qwen4ExpBnb4Backend::load(
         ctx.synchronize();
         break;
     }
-    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
+    const bool s_expert_major = true;
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
     const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
     const bool s_dense_xmx = aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
@@ -750,12 +798,12 @@ bool Qwen4ExpBnb4Backend::load(
                   s_dense_xmx ? "XMX Joint Matrix" : "oneDNN on-demand",
                   s_direct_io ? "enabled" : "disabled");
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
-    AILA_LOG_INFO("[Q4E ExecutionConfig] preset=%s chunk=%d host_ram_mb=%d slots=%d dense_xmx=%d direct_io=%d phase_scratch=%d demand_microbatch=%d checkpoint=%s attn_tile=%d compact_acts=%d",
+    AILA_LOG_INFO("[Q4E ExecutionConfig] preset=%s chunk=%d native_ram_mib=%.1f slots=%d dense_xmx=%d direct_io=%d phase_scratch=%d staging_experts=%d checkpoint=%s attn_tile=%d compact_acts=%d",
         aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "none").c_str(),
         aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 512),
-        std::max(0, aila::env::read_int_raw("AILA_Q4E_HOT_RAM_MB", 16384)), expert_cache_.num_slots(),
+        (host_arena_.TotalAllocatedBytes() + (resident_embedding_ ? aila::memory::LargePageAllocationSize(embed_host_.bytes) : 0)) / double(1ULL<<20), adaptive_cache_.NumGpuSlots(),
         int(s_dense_xmx), int(s_direct_io), int(aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", false)),
-        aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0),
+        adaptive_cache_.StagingSlotsPerBuffer(),
         aila::env::read_string("AILA_Q4E_INLINE_CHECKPOINT", "auto-30/26").c_str(), prefill_attention_tile_, moe_compact_tile_);
     return true;
 }
@@ -773,7 +821,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     // old tensor/view backing store is replaced (including oneDNN consumers).
     ctx.synchronize();
     static const bool s_phase_scratch = aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", false);
-    const bool s_expert_major = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
+    const bool s_expert_major = true;
     constexpr int kDensePrefillLimit = 2052;
     const int attn_cap = prefill_attention_tile_ ? std::min(cap, prefill_attention_tile_) : cap;
     const int dense_cap = std::min(attn_cap, kDensePrefillLimit);
@@ -985,11 +1033,136 @@ Qwen4ExpBnb4Backend::ResidentColdWork::~ResidentColdWork() noexcept {
     if (active) executor.AbortResidentCold();
 }
 
+sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count) {
+    if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated()) {
+        constexpr int kMaxTopK = 16;
+        const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
+        const bool nested = true;
+        const auto& nested_meta = host_arena_.GetLayerNestedMetadata(layer);
+
+        auto* h_base = buf_.moe_h.data_as<bf16>();
+        auto* down = resident_down_.data_as<float>();
+        auto* x_base = buf_.x.data_as<bf16>();
+        auto* y_base = buf_.y.data_as<bf16>();
+        auto* sh_out_base = fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr;
+        auto* sh_gate_base = fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr;
+
+        sycl::event last{};
+        ResidentColdWork cpu_work{expert_executor_};
+
+
+        for (int t = 0; t < count; ++t) {
+            const int* t_ids = router_host_ids_ + t * top_k;
+            const float* t_weights = router_host_weights_ + t * top_k;
+            const bf16* x_t = x_base + static_cast<size_t>(t) * hidden_size_;
+            bf16* y_t = y_base + static_cast<size_t>(t) * hidden_size_;
+            const bf16* sh_out_t = sh_out_base ? sh_out_base + static_cast<size_t>(t) * hidden_size_ : nullptr;
+            const bf16* sh_gate_t = sh_gate_base ? sh_gate_base + t : nullptr;
+
+            // 1. Separate hits and misses via adaptive cache
+            int hit_count = 0;
+            int miss_count = 0;
+            std::array<int, kMaxTopK> hit_slots{};
+            std::array<int, kMaxTopK> hit_ranks{};
+            std::array<int, kMaxTopK> miss_experts{};
+            std::array<int, kMaxTopK> miss_ranks{};
+
+            for (int k = 0; k < top_k; ++k) {
+                const int exp_id = t_ids[k];
+                const int slot = adaptive_cache_.GetSlot(layer, exp_id);
+                if (slot >= 0) {
+                    hit_slots[hit_count] = slot;
+                    hit_ranks[hit_count] = k;
+                    hit_count++;
+                } else {
+                    miss_experts[miss_count] = exp_id;
+                    miss_ranks[miss_count] = k;
+                    miss_count++;
+                }
+            }
+
+            // 2. Observe routing for frequency tracking & stats
+            adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+
+            // Native CPU sources remain owned until Join below. CPU work can
+            // overlap the already submitted shared expert and resident kernels.
+            const int cpu_count=count==1 && expert_executor_.cpu_overlap_enabled()
+                ? expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_t) : 0;
+            cpu_work.active=cpu_count>0;
+            const int gpu_cold_count=miss_count-cpu_count;
+            StagingBatch staging{};
+            if (gpu_cold_count>0) {
+                sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
+                staging = adaptive_cache_.StageColdExpertsAsync(
+                    host_arena_, dma_q, layer, miss_experts.data()+cpu_count, gpu_cold_count, ping_pong_index_);
+                ping_pong_index_ ^= 1;
+            }
+
+            // 4. Build GPU descriptors and launch XMX fused kernels
+            // 4a. Execute hot hits (immediate GPU execution)
+            if (hit_count > 0) {
+                std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
+                for (int i = 0; i < hit_count; ++i) {
+                    hot[i] = adaptive_cache_.GetResidentSlotDev(hit_slots[i], &nested_meta);
+                }
+                last = ops::moe_decode_gate_up_swiglu_grouped(
+                    ctx, hot.data(), nullptr,
+                    x_t, h_base, hit_count,
+                    hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(), nullptr, nested);
+
+                last = ops::moe_decode_down_to_rank_f32(
+                    ctx, hot.data(), hit_ranks.data(), h_base,
+                    down, hit_count, top_k, intermediate, hidden_size_, 64,
+                    nullptr, nullptr, &last, nested);
+                adaptive_cache_.RecordResidentConsumer(last);
+            }
+
+            // 4b. Execute cold staging (waiting on PCIe DMA completion)
+            if (staging.count > 0) {
+                std::array<ops::MoeExpertSlotDev, kMaxTopK> cold{};
+                for (int i = 0; i < staging.count; ++i) {
+                    cold[i] = adaptive_cache_.GetStagingSlotDev(staging.ping_pong_index, staging.staging_slots[i], &nested_meta);
+                }
+                auto* cold_h = h_base + size_t(hit_count) * intermediate;
+
+                last = ops::moe_decode_gate_up_swiglu_grouped(
+                    ctx, cold.data(), nullptr,
+                    x_t, cold_h, staging.count,
+                    hidden_size_, intermediate, 64, &staging.ready_event, nullptr, nested);
+
+                last = ops::moe_decode_down_to_rank_f32(
+                    ctx, cold.data(), miss_ranks.data()+cpu_count, cold_h,
+                    down, staging.count, top_k, intermediate, hidden_size_, 64,
+                    nullptr, nullptr, &last, nested);
+
+                adaptive_cache_.RecordStagingConsumer(staging.ping_pong_index,last);
+            }
+
+            const auto cpu_ready=expert_executor_.JoinResidentCold(down);
+            if (cpu_count) last=cpu_ready;
+            cpu_work.active=false;
+            // 5. Accumulate ranked down rows into y
+            ctx.queue().memcpy(resident_weights_.data(), t_weights, top_k * sizeof(float));
+
+            const auto* cpu_rows=expert_executor_.ResidentCpuHostRows();
+            last = cpu_rows ? ops::moe_ordered_accumulate_cpu_host_rows(ctx,down,resident_weights_.data_as<float>(),
+                y_t,1,top_k,hidden_size_,*cpu_rows,sh_out_t,sh_gate_t,&last)
+                : ops::moe_ordered_accumulate_down_rows(ctx,down,resident_weights_.data_as<float>(),
+                    y_t,1,top_k,hidden_size_,sh_out_t,sh_gate_t,&last,expert_executor_.ResidentCpuResultPacket());
+            expert_executor_.FinishResidentCpuRead(last);
+        }
+
+        if (resident_probe_) resident_probe_(resident_probe_data_, *this, layer);
+        return last;
+    }
+    return sycl::event{};
+}
+
 sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared,
     GpuReadyLease* device_lease, ResidentColdWork* early_cold) {
     constexpr int kMaxTopK = 16;
     const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
-    const bool nested = expert_cache_.uses_nested_codes();
+    const bool nested = use_adaptive_pipeline_ || expert_cache_.uses_nested_codes();
     auto lease = device_lease ? std::move(*device_lease) : expert_cache_.BindReady(layer, router_host_ids_, top_k);
     ResidentColdWork cold_guard{expert_executor_};
     const bool cpu_collected = early_cold && early_cold->completed;
@@ -1059,6 +1232,58 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
     return merge;
 }
 
+sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count) {
+    const int top_k=cfg_.num_experts_per_tok;
+    adaptive_cache_.ObserveRouting(layer,router_host_ids_,count*top_k);
+    std::fill(prefill_expert_uses_.begin(),prefill_expert_uses_.end(),0);
+    prefill_unique_.clear();
+    for (int i=0;i<count*top_k;++i) {
+        const int e=router_host_ids_[i];
+        if (e<0 || e>=cfg_.num_experts) throw std::runtime_error("Invalid Qwen4Exp route");
+        ++prefill_expert_uses_[e];
+    }
+    const auto& metadata=host_arena_.GetLayerNestedMetadata(layer);
+    for (int e=0;e<cfg_.num_experts;++e) {
+        const int slot=adaptive_cache_.GetSlot(layer,e);
+        if (prefill_expert_uses_[e] && slot>=0) {
+            prefill_unique_.push_back(e);
+            adaptive_prefill_slots_[e]=adaptive_cache_.GetResidentSlotDev(slot,&metadata);
+        }
+    }
+    const int hits=int(prefill_unique_.size());
+    for (int e=0;e<cfg_.num_experts;++e)
+        if (prefill_expert_uses_[e] && adaptive_cache_.GetSlot(layer,e)<0) prefill_unique_.push_back(e);
+    static const int xmx_rows=aila::env::read_int("AILA_Q4E_GROUPED_XMX_MIN_ROWS",0);
+    const int threshold=grouped_xmx_min_rows_override_>=0 ? grouped_xmx_min_rows_override_ : xmx_rows;
+    const int min_rows=grouped_xmx_supported_ && threshold>0 ? threshold : std::numeric_limits<int>::max();
+    int act_start=0,tile_start=0;
+    sycl::event last{};
+    if (hits) {
+        const auto* ready=adaptive_cache_.ResidentReady();
+        last=RunGroupedExperts(ctx,layer,count,0,hits,act_start,tile_start,min_rows,ready ? *ready : sycl::event{});
+        adaptive_cache_.RecordResidentConsumer(last);
+    }
+    // A cold expert is uploaded once per layer/window, regardless of its row
+    // count. Keep the original W4/G3/XMX math and rank-ordered accumulation.
+    for (int start=hits;start<int(prefill_unique_.size());) {
+        const int n=std::min(adaptive_cache_.StagingSlotsPerBuffer(),int(prefill_unique_.size())-start);
+        auto batch=adaptive_cache_.StageColdExpertsAsync(host_arena_,*copy_q_,layer,
+            prefill_unique_.data()+start,n,ping_pong_index_);
+        ping_pong_index_^=1;
+        for (int j=0;j<n;++j)
+            adaptive_prefill_slots_[prefill_unique_[start+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
+        last=RunGroupedExperts(ctx,layer,count,start,n,act_start,tile_start,min_rows,batch.ready_event);
+        adaptive_cache_.RecordStagingConsumer(batch.ping_pong_index,last);
+        start+=n;
+    }
+    if (act_start!=count*top_k) throw std::logic_error("Incomplete Qwen4Exp prefill routing map");
+    ctx.queue().memcpy(batch_weights_dev_,router_host_weights_,size_t(count)*top_k*sizeof(float));
+    return ops::moe_ordered_accumulate_down_rows(ctx,buf_.moe_down_acc.data_as<float>(),batch_weights_dev_,
+        buf_.y.data_as<bf16>(),count,top_k,hidden_size_,
+        fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
+        fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr,&last,nullptr);
+}
+
 sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     Context& ctx, int layer, int count, int firstUnique, int numUnique,
     int& actStart, int& tileStart, int minRows, const sycl::event& ready) {
@@ -1111,7 +1336,8 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         }
         expert_map_token_host_[pos] = i / top_k;
         expert_map_rank_host_[pos] = i % top_k;
-        expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
+        expert_map_slot_host_[pos] = use_adaptive_pipeline_ ? adaptive_prefill_slots_[e]
+            : expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
     }
     const int acts = alu + nx, tiles = tileStart - tileBegin;
     // Microbatches use disjoint slices: host descriptors remain immutable until
@@ -1122,7 +1348,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     auto* tilesDev = reinterpret_cast<ops::MoeExpertTile*>(expert_tiles_dev_.data());
     if (tiles) ctx.queue().memcpy(tilesDev + tileBegin, expert_tiles_host_ + tileBegin, size_t(tiles) * sizeof(ops::MoeExpertTile));
     sycl::event last = ready;
-    const bool nested = expert_cache_.uses_nested_codes();
+    const bool nested = use_adaptive_pipeline_ || expert_cache_.uses_nested_codes();
     if (alu) {
         last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
@@ -1148,7 +1374,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         last = expert_quality_probe_(expert_quality_probe_data_, *this, layer,
                                      count, actStart, acts, last);
     // This event covers ALU, XMX and any test-only readers on the compute queue.
-    expert_cache_.record_consumer_reader_fences(prefill_unique_slots_.data() + firstUnique, numUnique, last);
+    if (!use_adaptive_pipeline_) expert_cache_.record_consumer_reader_fences(prefill_unique_slots_.data() + firstUnique, numUnique, last);
     actStart += acts;
     return last;
 }
@@ -1324,11 +1550,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (options.decode_verification && options.prefill_remaining >= 0)
         throw std::invalid_argument("Decode verification cannot be a prefill slice");
 
-    expert_cache_.SetDemandForwardRows(count);
     int start_pos = session.currentLength_;
-    if(expert_cache_.CpuPackedPromptRefreshPending(start_pos,count,options.prefill_remaining,options.decode_verification))
-        expert_executor_.AbortResidentCold(); // drains CPU readers before rewriting their source arena
-    if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining,options.decode_verification);
+    if (!use_adaptive_pipeline_) {
+        expert_cache_.SetDemandForwardRows(count);
+        if(expert_cache_.CpuPackedPromptRefreshPending(start_pos,count,options.prefill_remaining,options.decode_verification))
+            expert_executor_.AbortResidentCold(); // drains CPU readers before rewriting their source arena
+        if(cold_epoch_enabled_ || expert_cache_.adaptive_hotset())expert_cache_.BeginHotsetForward(start_pos,count,options.prefill_remaining,options.decode_verification);
+    }
     int cached_len = start_pos + count;
     if (cached_len > max_seq_len_) {
         throw std::runtime_error("Qwen4ExpBnb4Backend: context length " +
@@ -1457,17 +1685,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         return std::chrono::duration<double, std::milli>(b - a).count();
     };
     const auto prof_t0 = prof_clock::now();
-    expert_cache_.trace_forward(start_pos, count, true, options.need_logits);
     static const bool s_trace_markers = aila::env::read_flag("AILA_Q4E_TRACE_MARKERS", false);
-    if (expert_cache_.tracing() && s_trace_markers)
-        ctx.queue().single_task<class Q4ETraceForwardBegin>([] {});
     double prof_router_sync_ms = 0.0;
     double prof_acquire_ms = 0.0;
-    const ExpertCacheStats prof_stats0 = expert_cache_.stats();
-    const auto cold_stats0 = expert_executor_.stats();
-    if(cold_mode_ && cold_epoch_enabled_ && count==1 && start_pos>0 && !expert_cache_.frozen() && !expert_cache_.adaptive_hotset())
-        expert_cache_.FreezeReady(std::min(cfg_.num_experts,expert_cache_.num_slots()-1));
-    if (resident_decode_mode_ == 2 && count == 1) expert_cache_.BeginResidentDeviceEpoch();
+    ExpertCacheStats prof_stats0{};
+    aila::HeteroExecutionStats cold_stats0{};
+    if (!use_adaptive_pipeline_) {
+        expert_cache_.trace_forward(start_pos, count, true, options.need_logits);
+        if (expert_cache_.tracing() && s_trace_markers)
+            ctx.queue().single_task<class Q4ETraceForwardBegin>([] {});
+        prof_stats0 = expert_cache_.stats();
+        cold_stats0 = expert_executor_.stats();
+        if(cold_mode_ && cold_epoch_enabled_ && count==1 && start_pos>0 && !expert_cache_.frozen() && !expert_cache_.adaptive_hotset())
+            expert_cache_.FreezeReady(std::min(cfg_.num_experts,expert_cache_.num_slots()-1));
+        if (resident_decode_mode_ == 2 && count == 1) expert_cache_.BeginResidentDeviceEpoch();
+    }
 
     // AILA_PROFILE_Q4E_STAGES serializes after every stage; use for relative cost only.
     static const bool s_stages = aila::env::read_flag("AILA_PROFILE_Q4E_STAGES", false);
@@ -1510,8 +1742,6 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage_ms[s] += prof_ms(stage_t, now);
         stage_t = now;
     };
-
-    sycl::event fallback_last_down_event{};
 
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
@@ -1569,12 +1799,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         std::optional<GpuResidentLayerLease> resident_epoch;
         std::optional<GpuReadyLease> resident_binding;
         ResidentColdWork early_cold{expert_executor_}; // drain CPU before either route lease is released
-        if (resident_decode_mode_ == 2 && count == 1)
+        if (!use_adaptive_pipeline_ && resident_decode_mode_ == 2 && count == 1)
             resident_epoch.emplace(expert_cache_.BeginResidentLayer(L));
-        const bool cpu_async_route = s_cpu_async_route && !decodeHcReferenceForTest_ && resident_epoch &&
+        const bool cpu_async_route = !use_adaptive_pipeline_ && s_cpu_async_route && !decodeHcReferenceForTest_ && resident_epoch &&
             cold_mode_ == 2 && !is_prefill && !s_prefetch &&
             (!expert_cache_.adaptive_hotset() || s_hotset_swaps == 0) && expert_executor_.CanStartAsyncResidentRoute(L);
-        const bool cpu_early_start = !cpu_async_route && s_cpu_early_start && resident_epoch &&
+        const bool cpu_early_start = !use_adaptive_pipeline_ && !cpu_async_route && s_cpu_early_start && resident_epoch &&
             cold_mode_ == 2 && expert_cache_.frozen() && !is_prefill;
         static const bool s_verify_async_route = aila::env::read_flag("AILA_Q4E_VERIFY_ASYNC_ROUTE", false);
         // The four-row screen regressed; keep this measured overlap path at T2.
@@ -1582,7 +1812,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             (!expert_cache_.adaptive_hotset() || s_hotset_swaps == 0) && expert_executor_.CanStartAsyncResidentRoute(L);
         // Place the activation copy ahead of the router so waiting for the
         // route also makes CPU input ready, before resident/shared GPU work.
-        if (cpu_early_start || cpu_async_route || cpu_verify_async) expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+        if (cpu_early_start || cpu_async_route || cpu_verify_async ||
+            (use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
+            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
         const bool gpu_nf4_q8 = resident_epoch && gpuNf4Q8Supported_ && !gpuNf4Q8ReferenceForTest_ &&
             !decodeHcReferenceForTest_ && count == 1 && !is_prefill && resident_decode_mode_ == 2;
         const bool moe_front_fused = s_moe_front_fused && s_front_native_gemv && moeFrontFusedGpu_ &&
@@ -1630,10 +1862,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
         }
         auto bind_actual_route = [&] {
-            if (cold_epoch_enabled_) expert_cache_.ObserveHotsetRoute(L, router_host_ids_, count, top_k);
+            if (!use_adaptive_pipeline_ && cold_epoch_enabled_) expert_cache_.ObserveHotsetRoute(L, router_host_ids_, count, top_k);
             if (resident_epoch)
                 resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
-            if (expert_cache_.tracing()) expert_cache_.trace_router(L, router_host_ids_, count, top_k);
+            if (!use_adaptive_pipeline_ && expert_cache_.tracing()) expert_cache_.trace_router(L, router_host_ids_, count, top_k);
         };
         auto wait_actual_route = [&] {
             const auto begin = prof_clock::now();
@@ -1641,7 +1873,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             bind_actual_route();
             const auto end = prof_clock::now();
             prof_router_sync_ms += prof_ms(begin, end);
-            if (expert_cache_.tracing()) {
+            if (!use_adaptive_pipeline_ && expert_cache_.tracing()) {
                 expert_cache_.trace_host_interval("router_wait", L,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count(),
                     std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
@@ -1689,15 +1921,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
             if (expert_cache_.tracing()) expert_cache_.trace_host_interval("resident_gpu_submit", L, submit_begin, Qwen4ExpCacheTrace::NowNs());
         }
-        const auto cur_cache_stats = expert_cache_.stats();
+        const auto cur_cache_stats = !use_adaptive_pipeline_ ? expert_cache_.stats() : ExpertCacheStats{};
         const bool high_hit_rate = (cur_cache_stats.hit_count + cur_cache_stats.miss_count > 100) &&
                                    (cur_cache_stats.hit_rate() >= 0.90);
         const bool gate_prediction = s_predict_gating && (count == 1) &&
             (session.consecutive_no_miss_layers_ >= 2 || (high_hit_rate && session.consecutive_no_miss_layers_ > 0));
 
-        const bool predict_next = (count == 1)
+        const bool predict_next = !use_adaptive_pipeline_ && ((count == 1)
             ? (!gate_prediction && (s_prefetch || s_predict_stats) && (L + 1 < cfg_.num_hidden_layers))
-            : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers));
+            : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < cfg_.num_hidden_layers)));
         sycl::event prediction_event{};
         if (predict_next) {
             // Route this layer's MoE input through the next layer's router to guess its experts.
@@ -1755,7 +1987,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             expert_executor_.RetireAsyncResidentRoute(*resident_binding);
             early_cold.active=false;early_cold.completed=true;
         } else if (!cpu_early_start) wait_actual_route();
-        if (have_pred && s_predict_stats && count == 1) {
+        if (!use_adaptive_pipeline_ && have_pred && s_predict_stats && count == 1) {
             for (int k = 0; k < top_k; ++k) {
                 const int e = router_host_ids_[k];
                 const bool in_pred = std::find(pred_ids.begin(), pred_ids.begin() + top_k, e) != pred_ids.begin() + top_k;
@@ -1769,755 +2001,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         have_pred = predict_next && (count == 1);
         stage(kStageRouter);
-        // Prefill: acquire the layer's unique experts in one batch (one streamed fill/DMA
-        // instead of a blocking round trip per token), then map slots back per token.
-        const auto prof_acq_batch_t0 = prof_clock::now();
-        static const bool s_cpu_expert_dispatch = aila::env::read_flag("AILA_Q4E_CPU_EXPERT_DISPATCH", false);
-        static const bool s_cpu_small_m = aila::env::read_flag("AILA_Q4E_CPU_SMALL_M", false);
-        const bool cpu_small_m = s_cpu_expert_dispatch && s_cpu_small_m && count > 1 && count <= 4;
-        const bool can_batch = count > 1 && !cpu_small_m && !verify_cpu_rows && prefill_expert_slot_.size() == static_cast<size_t>(cfg_.num_experts);
-        bool batch_acquire = false;
-        sycl::event batch_dma_event{};
-        static const bool s_expert_major_prefill = aila::env::read_flag("AILA_Q4E_EXPERT_MAJOR_PREFILL", true);
-        static const bool s_prefill_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
-        static const int configured_microbatch = aila::env::read_int("AILA_Q4E_DEMAND_MICROBATCH", 0);
-        int s_demand_microbatch = resident_prefill_ ? std::min(cfg_.num_experts,configured_microbatch>0?configured_microbatch:cfg_.num_experts) : configured_microbatch;
-        if (options.decode_verification && resident_prefill_ && expert_cache_.frozen())
-            s_demand_microbatch = std::min(s_demand_microbatch,
-                std::max(1,expert_cache_.num_slots()-expert_cache_.frozen_slots()));
-        const bool use_microbatch_pipeline = can_batch && s_expert_major_prefill && count > 1 && (s_demand_microbatch > 0);
-        auto acquire_group = [&](int offset,int n,std::optional<GpuReadyLease>& binding) {
-            auto* assigned=prefill_unique_slots_.data()+offset;
-            if(!resident_prefill_)return expert_cache_.acquire(L,prefill_unique_.data()+offset,n,assigned);
-            binding.emplace(expert_cache_.BindReady(L,prefill_unique_.data()+offset,n));
-            std::array<int,GpuReadyLease::kMaxEntries> cold_slots{};
-            auto ready=expert_cache_.AcquireCold(*binding,cold_slots.data());
-            for(int i=0;i<binding->ready_count;++i)assigned[binding->ready_ranks[i]]=binding->ready_slots[i];
-            for(int i=0;i<binding->cold_count;++i)assigned[binding->cold_ranks[i]]=cold_slots[i];
-            return ready;
-        };
-
-        if (can_batch) {
-            std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
-            prefill_unique_.clear();
-            for (int i = 0; i < count * top_k; ++i) {
-                const int e = router_host_ids_[i];
-                if (prefill_expert_uses_[e]++ == 0) {
-                    prefill_unique_.push_back(e);
-                }
-            }
-            if (expert_histogram_enabled_) {
-                for (int e : prefill_unique_) {
-                    const int n = prefill_expert_uses_[e];
-                    const int bucket = n <= 2 ? n - 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : 5;
-                    auto& bin = expert_histogram_[bucket];
-                    ++bin[0]; bin[1] += n;
-                    ++bin[expert_cache_.contains(L, e) ? 2 : 3];
-                }
-            }
-            if (prefill_unique_.size() <= static_cast<size_t>(expert_cache_.num_slots())) {
-                batch_acquire = true;
-                prefill_unique_slots_.resize(prefill_unique_.size());
-                if (!use_microbatch_pipeline) {
-                    batch_dma_event = expert_cache_.acquire(L, prefill_unique_.data(), static_cast<int>(prefill_unique_.size()),
-                                                            prefill_unique_slots_.data());
-                    for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                        prefill_expert_slot_[prefill_unique_[u]] = prefill_unique_slots_[u];
-                    }
-                    // A long prompt touches several times the cache capacity, so plain LRU would leave
-                    // only the last layers resident for decode. Keep each layer's share of its most-used
-                    // experts hot and queue the rest for eviction, least used first.
-                    static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
-                    const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
-                    if (s_prefill_demote && prefill_unique_.size() > keep) {
-                        stable_sort_with_scratch(
-                            prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
-                            [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
-                        expert_cache_.demote(L, prefill_unique_.data() + keep,
-                                             static_cast<int>(prefill_unique_.size() - keep));
-                    }
-                }
-            }
-        }
-        if (s_prefetch && predict_next && count > 1 && batch_acquire && !use_microbatch_pipeline) {
-            ensure_prediction_ready();
-            prefill_pred_unique_.clear();
-            std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
-            const int total_preds = count * top_k;
-            for (int i = 0; i < total_preds; ++i) {
-                const int e = pred_host_ids_[i];
-                if (e >= 0 && e < cfg_.num_experts && prefill_pred_uses_[e]++ == 0) {
-                    prefill_pred_unique_.push_back(e);
-                }
-            }
-            stable_sort_with_scratch(
-                prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
-                [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
-            const int prefetch_count = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
-            expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(),
-                                         static_cast<int>(prefill_pred_unique_.size()), prefetch_count);
-        }
-        prof_acquire_ms += prof_ms(prof_acq_batch_t0, prof_clock::now());
-
-        static const int s_grouped_min = aila::env::read_int("AILA_Q4E_GROUPED_XMX_MIN_ROWS", 0);
-        const int grouped_min = grouped_xmx_min_rows_override_ >= 0 ? grouped_xmx_min_rows_override_ : s_grouped_min;
-        const bool grouped = grouped_min > 0 && grouped_xmx_supported_ &&
-            hidden_size_ % 64 == 0 && cfg_.moe_intermediate_size % 64 == 0;
-        const bool compact_moe = moe_compact_tile_ && count > 4;
-        if (compact_moe && (!batch_acquire || !use_microbatch_pipeline || grouped))
-            throw std::runtime_error("Compact MoE needs a complete ALU microbatch route");
-        if (verify_cpu_rows) {
-            if (expert_histogram_enabled_) {
-                std::fill(prefill_expert_uses_.begin(), prefill_expert_uses_.end(), 0);
-                for (int i = 0; i < count * top_k; ++i) ++prefill_expert_uses_[router_host_ids_[i]];
-                for (int e = 0; e < cfg_.num_experts; ++e) if (const int n = prefill_expert_uses_[e]) {
-                    const int bucket = n <= 2 ? n - 1 : n <= 4 ? 2 : n <= 8 ? 3 : n <= 16 ? 4 : 5;
-                    auto& bin = expert_histogram_[bucket];
-                    ++bin[0]; bin[1] += n;
-                    ++bin[expert_cache_.IsDirectReady(L, e) ? 2 : 3];
-                }
-            }
-            expert_executor_.ExecuteVerifyRows(ctx, L, router_host_ids_, router_host_weights_,
-                buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), buf_.y.data_as<bf16>(), count, top_k,
-                s_fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
-                s_fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr);
-            if (cpu_verify_async) { early_cold.active=false; early_cold.completed=true; }
-        } else if (batch_acquire && s_expert_major_prefill && count > 1 && grouped) {
-            int ready_boundary=0;
-            if (use_microbatch_pipeline) {
-                ready_boundary=int(std::stable_partition(prefill_unique_.begin(), prefill_unique_.end(),
-                    [&](int e) { return resident_prefill_ ? expert_cache_.IsDirectReady(L,e) : expert_cache_.contains(L, e); })-prefill_unique_.begin());
-            }
-            ctx.queue().memcpy(batch_weights_dev_, router_host_weights_, size_t(count) * top_k * sizeof(float));
-            int actStart = 0, tileStart = 0;
-            sycl::event last = batch_dma_event;
-            const int total = static_cast<int>(prefill_unique_.size());
-            const int step = use_microbatch_pipeline ? s_demand_microbatch : total;
-            for (int u = 0; u < total;) {
-                const int n = std::min(step, (resident_prefill_ && u<ready_boundary?ready_boundary:total) - u);
-                std::optional<GpuReadyLease> binding;
-                sycl::event ready = batch_dma_event;
-                if (use_microbatch_pipeline) {
-                    const auto begin = prof_clock::now();
-                    ready = acquire_group(u,n,binding);
-                    prof_acquire_ms += prof_ms(begin, prof_clock::now());
-                    for (int j = u; j < u + n; ++j)
-                        prefill_expert_slot_[prefill_unique_[j]] = prefill_unique_slots_[j];
-                }
-                last = RunGroupedExperts(ctx, L, count, u, n, actStart, tileStart, grouped_min, ready);
-                if(binding)binding->Finish(last);
-                expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data()+u,n);
-                u+=n;
-            }
-            ops::moe_ordered_accumulate_down_rows(ctx, buf_.moe_down_acc.data_as<float>(), batch_weights_dev_,
-                buf_.y.data_as<bf16>(), count, top_k, hidden_size_,
-                s_fuse_shared ? buf_.shared_out_buf.data_as<bf16>() : nullptr,
-                s_fuse_shared ? buf_.shared_gate_buf.data_as<bf16>() : nullptr, &last);
-            if (use_microbatch_pipeline) {
-                static const bool demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
-                const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
-                if (demote && prefill_unique_.size() > keep) {
-                    stable_sort_with_scratch(prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
-                        [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
-                    expert_cache_.demote(L, prefill_unique_.data() + keep, static_cast<int>(prefill_unique_.size() - keep));
-                }
-            }
-            if (use_microbatch_pipeline && s_prefetch && predict_next) {
-                ensure_prediction_ready();
-                prefill_pred_unique_.clear();
-                std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
-                for (int i = 0; i < count * top_k; ++i) {
-                    const int e = pred_host_ids_[i];
-                    if (e >= 0 && e < cfg_.num_experts && prefill_pred_uses_[e]++ == 0)
-                        prefill_pred_unique_.push_back(e);
-                }
-                stable_sort_with_scratch(prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
-                    [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
-                const int n = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
-                expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(), static_cast<int>(prefill_pred_unique_.size()), n);
-            }
-        } else if (batch_acquire && s_expert_major_prefill && count > 1) {
-            if (use_microbatch_pipeline) {
-                // Phase B6: Demand microbatch double-buffered pipeline
-                // Partition unique experts: ready (GPU resident hits) first, then misses
-                const auto resident_end = std::stable_partition(prefill_unique_.begin(), prefill_unique_.end(),
-                                      [&](int e) { return resident_prefill_ ? expert_cache_.IsDirectReady(L,e) : expert_cache_.contains(L, e); });
-                const size_t resident_count = size_t(resident_end - prefill_unique_.begin());
-                static const bool s_resident_split = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_RESIDENT_SPLIT", false);
-                const bool split_resident = resident_prefill_ || (count >= 2 && count <= 4 &&
-                    (small_rows_resident_split_override_ >= 0 ? small_rows_resident_split_override_ != 0 : s_resident_split));
-                // A mixed batch makes already-resident work depend on missing
-                // payloads. Cut at that boundary, keeping each expert intact.
-                // Residency is not DMA readiness: acquire's event still guards
-                // every kernel, and existing consumer fences protect reuse.
-                auto microbatch_count = [&](size_t offset) {
-                    size_t n = std::min<size_t>(size_t(s_demand_microbatch), prefill_unique_.size() - offset);
-                    if (split_resident && offset < resident_count) n = std::min(n, resident_count - offset);
-                    return n;
-                };
-
-                const int total_acts = count * top_k;
-                std::fill_n(expert_counts_host_, cfg_.num_experts, 0);
-                for (int i = 0; i < total_acts; ++i) {
-                    const int e = router_host_ids_[i];
-                    if (e >= 0 && e < cfg_.num_experts) {
-                        expert_counts_host_[e]++;
-                    }
-                }
-                static const bool s_q4e_weight_reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
-                static const bool s_q4e_4token = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
-                if (s_q4e_weight_reuse) {
-                    int cur_chunk_start = 0;
-                    size_t scan_u = 0;
-                    while (scan_u < prefill_unique_.size()) {
-                        const size_t c_u = microbatch_count(scan_u);
-                        int c_quads = 0;
-                        int c_pairs = 0;
-                        int c_acts = 0;
-                        for (size_t g = 0; g < c_u; ++g) {
-                            const int e = prefill_unique_[scan_u + g];
-                            const int cnt = expert_counts_host_[e];
-                            if (s_q4e_4token) {
-                                c_quads += cnt / 4;
-                                c_pairs += (cnt % 4) / 2;
-                            } else {
-                                c_pairs += cnt / 2;
-                            }
-                            c_acts += cnt;
-                        }
-                        expert_offsets_host_[prefill_unique_[scan_u]] = cur_chunk_start;
-                        int quad_off = cur_chunk_start;
-                        int pair_off = cur_chunk_start + 4 * c_quads;
-                        int single_off = cur_chunk_start + 4 * c_quads + 2 * c_pairs;
-                        for (size_t g = 0; g < c_u; ++g) {
-                            const int e = prefill_unique_[scan_u + g];
-                            const int cnt = expert_counts_host_[e];
-                            if (s_q4e_4token) {
-                                expert_quad_pos_host_[e] = quad_off;
-                                expert_pair_pos_host_[e] = pair_off;
-                                expert_single_pos_host_[e] = single_off;
-                                quad_off += (cnt / 4) * 4;
-                                pair_off += ((cnt % 4) / 2) * 2;
-                                single_off += (cnt % 2);
-                            } else {
-                                expert_pair_pos_host_[e] = pair_off;
-                                expert_single_pos_host_[e] = single_off;
-                                pair_off += (cnt / 2) * 2;
-                                single_off += (cnt % 2);
-                            }
-                        }
-                        cur_chunk_start += c_acts;
-                        scan_u += c_u;
-                    }
-                    std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
-                    for (int t = 0; t < count; ++t) {
-                        for (int k = 0; k < top_k; ++k) {
-                            const int i = t * top_k + k;
-                            const int e = router_host_ids_[i];
-                            if (e >= 0 && e < cfg_.num_experts) {
-                                const int seen = expert_curr_pos_host_[e]++;
-                                const int cnt = expert_counts_host_[e];
-                                int pos;
-                                if (s_q4e_4token) {
-                                    const int quads_limit = (cnt / 4) * 4;
-                                    const int pairs_limit = quads_limit + ((cnt % 4) / 2) * 2;
-                                    if (seen < quads_limit) {
-                                        pos = expert_quad_pos_host_[e] + seen;
-                                    } else if (seen < pairs_limit) {
-                                        pos = expert_pair_pos_host_[e] + (seen - quads_limit);
-                                    } else {
-                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
-                                    }
-                                } else {
-                                    const int pairs_limit = (cnt / 2) * 2;
-                                    if (seen < pairs_limit) {
-                                        pos = expert_pair_pos_host_[e] + seen;
-                                    } else {
-                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
-                                    }
-                                }
-                                expert_map_token_host_[pos] = t;
-                                expert_map_rank_host_[pos] = k;
-                            }
-                        }
-                    }
-                } else {
-                    int cur_act_offset = 0;
-                    for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                        const int e = prefill_unique_[u];
-                        expert_offsets_host_[e] = cur_act_offset;
-                        expert_curr_pos_host_[e] = cur_act_offset;
-                        cur_act_offset += expert_counts_host_[e];
-                    }
-                    for (int t = 0; t < count; ++t) {
-                        for (int k = 0; k < top_k; ++k) {
-                            const int i = t * top_k + k;
-                            const int e = router_host_ids_[i];
-                            if (e >= 0 && e < cfg_.num_experts) {
-                                const int pos = expert_curr_pos_host_[e]++;
-                                expert_map_token_host_[pos] = t;
-                                expert_map_rank_host_[pos] = k;
-                            }
-                        }
-                    }
-                }
-
-                ctx.queue().memcpy(expert_map_token_dev_, expert_map_token_host_,
-                                    static_cast<size_t>(total_acts) * sizeof(int));
-                ctx.queue().memcpy(expert_map_rank_dev_, expert_map_rank_host_,
-                                    static_cast<size_t>(total_acts) * sizeof(int));
-                ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
-                                    static_cast<size_t>(total_acts) * sizeof(float));
-
-                const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
-                bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
-                bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
-
-                if (compact_moe) {
-                    ops::moe_build_inverse_map(ctx,expert_map_token_dev_,expert_map_rank_dev_,
-                        buf_.moe_inverse_map.data_as<int>(),total_acts,top_k);
-                    ctx.queue().memset(buf_.moe_window_sum.data(),0,size_t(count)*hidden_size_*sizeof(int64_t));
-                }
-                sycl::event last_dn_event{};
-                size_t u = 0;
-                while (u < prefill_unique_.size()) {
-                    const size_t chunk_u = microbatch_count(u);
-                    const int act_start = expert_offsets_host_[prefill_unique_[u]];
-                    int act_count = 0;
-                    int chunk_quads = 0;
-                    int chunk_pairs = 0;
-                    for (size_t g = 0; g < chunk_u; ++g) {
-                        const int e = prefill_unique_[u + g];
-                        const int cnt = expert_counts_host_[e];
-                        act_count += cnt;
-                        if (s_q4e_weight_reuse) {
-                            if (s_q4e_4token) {
-                                chunk_quads += cnt / 4;
-                                chunk_pairs += (cnt % 4) / 2;
-                            } else {
-                                chunk_pairs += cnt / 2;
-                            }
-                        }
-                    }
-
-                    const auto prof_group_acq_t0 = prof_clock::now();
-                    std::optional<GpuReadyLease> binding;
-                    sycl::event group_dma_event = acquire_group(int(u),int(chunk_u),binding);
-                    prof_acquire_ms += prof_ms(prof_group_acq_t0, prof_clock::now());
-
-                    for (size_t g = 0; g < chunk_u; ++g) {
-                        const int e = prefill_unique_[u + g];
-                        const int slot = prefill_unique_slots_[u + g];
-                        prefill_expert_slot_[e] = slot;
-                        const ops::MoeExpertSlotDev dev_s = expert_cache_.get_slot_dev(slot);
-                        if (s_q4e_weight_reuse) {
-                            if (s_q4e_4token) {
-                                const int q_start = expert_quad_pos_host_[e];
-                                const int q_cnt = (expert_counts_host_[e] / 4) * 4;
-                                for (int p = q_start; p < q_start + q_cnt; ++p) {
-                                    expert_map_slot_host_[p] = dev_s;
-                                }
-                                const int p_start = expert_pair_pos_host_[e];
-                                const int p_cnt = ((expert_counts_host_[e] % 4) / 2) * 2;
-                                for (int p = p_start; p < p_start + p_cnt; ++p) {
-                                    expert_map_slot_host_[p] = dev_s;
-                                }
-                                if (expert_counts_host_[e] % 2 != 0) {
-                                    expert_map_slot_host_[expert_single_pos_host_[e]] = dev_s;
-                                }
-                            } else {
-                                const int p_start = expert_pair_pos_host_[e];
-                                const int p_cnt = (expert_counts_host_[e] / 2) * 2;
-                                for (int p = p_start; p < p_start + p_cnt; ++p) {
-                                    expert_map_slot_host_[p] = dev_s;
-                                }
-                                if (expert_counts_host_[e] % 2 != 0) {
-                                    expert_map_slot_host_[expert_single_pos_host_[e]] = dev_s;
-                                }
-                            }
-                        } else {
-                            const int e_start = expert_offsets_host_[e];
-                            const int e_cnt = expert_counts_host_[e];
-                            for (int p = e_start; p < e_start + e_cnt; ++p) {
-                                expert_map_slot_host_[p] = dev_s;
-                            }
-                        }
-                    }
-
-                    if (act_count > 0) {
-                        ctx.queue().memcpy(expert_map_slot_dev_ + act_start,
-                                           expert_map_slot_host_ + act_start,
-                                           static_cast<size_t>(act_count) * sizeof(ops::MoeExpertSlotDev));
-
-                        sycl::event gu_event = ops::moe_expert_major_prefill_gate_up(
-                            ctx, expert_map_slot_dev_ + act_start,
-                            expert_map_token_dev_ + act_start,
-                            expert_map_rank_dev_ + act_start,
-                            nullptr, x_ptr, h_ptr, act_count, top_k,
-                            hidden_size_, cfg_.moe_intermediate_size, 64,
-                            &group_dma_event, expert_cache_.uses_nested_codes(),
-                            s_q4e_weight_reuse ? chunk_pairs : 0,
-                            (s_q4e_weight_reuse && s_q4e_4token) ? chunk_quads : 0);
-
-                        sycl::event dn_event = compact_moe
-                            ? RunCompactExpertDown(ctx,act_start,act_count,chunk_pairs,chunk_quads,gu_event)
-                            : ops::moe_expert_major_prefill_down(
-                            ctx, expert_map_slot_dev_ + act_start,
-                            expert_map_token_dev_ + act_start,
-                            expert_map_rank_dev_ + act_start,
-                            nullptr, h_ptr, static_cast<float*>(buf_.moe_down_acc.data()),
-                            act_count, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                            &gu_event, expert_cache_.uses_nested_codes(),
-                            s_q4e_weight_reuse ? chunk_pairs : 0,
-                            (s_q4e_weight_reuse && s_q4e_4token) ? chunk_quads : 0);
-
-                        expert_cache_.record_consumer_reader_fences(
-                            prefill_unique_slots_.data() + u, static_cast<int>(chunk_u), dn_event);
-                        last_dn_event = dn_event;
-                        if(binding)binding->Finish(dn_event);
-                        expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data()+u,int(chunk_u));
-                    }
-                    u += chunk_u;
-                }
-
-                if (compact_moe) ops::moe_finish_compact_down(ctx,buf_.moe_window_sum.data_as<int64_t>(),
-                    y_ptr,count,hidden_size_,s_fuse_shared?buf_.shared_out_buf.data_as<bf16>():nullptr,
-                    s_fuse_shared?buf_.shared_gate_buf.data_as<bf16>():nullptr);
-                else ops::moe_ordered_accumulate_down_rows(
-                    ctx, static_cast<const float*>(buf_.moe_down_acc.data()), batch_weights_dev_,
-                    y_ptr, count, top_k, hidden_size_,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
-                    &last_dn_event);
-
-                static const bool s_prefill_demote = aila::env::read_flag("AILA_Q4E_PREFILL_DEMOTE", true);
-                const size_t keep = static_cast<size_t>(expert_cache_.num_slots() / cfg_.num_hidden_layers);
-                if (s_prefill_demote && prefill_unique_.size() > keep) {
-                    stable_sort_with_scratch(
-                        prefill_unique_.data(), prefill_unique_.size(), sort_scratch_.data(),
-                        [&](int a, int b) { return prefill_expert_uses_[a] > prefill_expert_uses_[b]; });
-                    expert_cache_.demote(L, prefill_unique_.data() + keep,
-                                         static_cast<int>(prefill_unique_.size() - keep));
-                }
-                if (s_prefetch && predict_next && count > 1) {
-                    ensure_prediction_ready();
-                    prefill_pred_unique_.clear();
-                    std::fill(prefill_pred_uses_.begin(), prefill_pred_uses_.end(), 0);
-                    const int total_preds = count * top_k;
-                    for (int i = 0; i < total_preds; ++i) {
-                        const int e = pred_host_ids_[i];
-                        if (e >= 0 && e < cfg_.num_experts && prefill_pred_uses_[e]++ == 0) {
-                            prefill_pred_unique_.push_back(e);
-                        }
-                    }
-                    stable_sort_with_scratch(
-                        prefill_pred_unique_.data(), prefill_pred_unique_.size(), sort_scratch_.data(),
-                        [&](int a, int b) { return prefill_pred_uses_[a] > prefill_pred_uses_[b]; });
-                    const int prefetch_count = std::min(static_cast<int>(prefill_pred_unique_.size()), s_prefill_prefetch_max);
-                    expert_cache_.prefetch_async(L + 1, prefill_pred_unique_.data(),
-                                                 static_cast<int>(prefill_pred_unique_.size()), prefetch_count);
-                }
-            } else {
-                const int total_acts = count * top_k;
-                std::fill_n(expert_counts_host_, cfg_.num_experts, 0);
-                for (int i = 0; i < total_acts; ++i) {
-                    const int e = router_host_ids_[i];
-                    if (e >= 0 && e < cfg_.num_experts) {
-                        expert_counts_host_[e]++;
-                    }
-                }
-                static const bool s_q4e_weight_reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
-                static const bool s_q4e_4token = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
-                int total_quads = 0;
-                int total_pairs = 0;
-                if (s_q4e_weight_reuse) {
-                    if (s_q4e_4token) {
-                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                            const int e = prefill_unique_[u];
-                            const int cnt = expert_counts_host_[e];
-                            total_quads += cnt / 4;
-                            total_pairs += (cnt % 4) / 2;
-                        }
-                        int quad_off = 0;
-                        int pair_off = 4 * total_quads;
-                        int single_off = 4 * total_quads + 2 * total_pairs;
-                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                            const int e = prefill_unique_[u];
-                            const int cnt = expert_counts_host_[e];
-                            expert_quad_pos_host_[e] = quad_off;
-                            expert_pair_pos_host_[e] = pair_off;
-                            expert_single_pos_host_[e] = single_off;
-                            quad_off += (cnt / 4) * 4;
-                            pair_off += ((cnt % 4) / 2) * 2;
-                            single_off += (cnt % 2);
-                        }
-                        std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
-                        for (int t = 0; t < count; ++t) {
-                            for (int k = 0; k < top_k; ++k) {
-                                const int i = t * top_k + k;
-                                const int e = router_host_ids_[i];
-                                if (e >= 0 && e < cfg_.num_experts) {
-                                    const int seen = expert_curr_pos_host_[e]++;
-                                    const int cnt = expert_counts_host_[e];
-                                    const int quads_limit = (cnt / 4) * 4;
-                                    const int pairs_limit = quads_limit + ((cnt % 4) / 2) * 2;
-                                    int pos;
-                                    if (seen < quads_limit) {
-                                        pos = expert_quad_pos_host_[e] + seen;
-                                    } else if (seen < pairs_limit) {
-                                        pos = expert_pair_pos_host_[e] + (seen - quads_limit);
-                                    } else {
-                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
-                                    }
-                                    expert_map_token_host_[pos] = t;
-                                    expert_map_rank_host_[pos] = k;
-                                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
-                                }
-                            }
-                        }
-                    } else {
-                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                            const int e = prefill_unique_[u];
-                            total_pairs += expert_counts_host_[e] / 2;
-                        }
-                        int pair_off = 0;
-                        int single_off = 2 * total_pairs;
-                        for (size_t u = 0; u < prefill_unique_.size(); ++u) {
-                            const int e = prefill_unique_[u];
-                            expert_pair_pos_host_[e] = pair_off;
-                            expert_single_pos_host_[e] = single_off;
-                            pair_off += (expert_counts_host_[e] / 2) * 2;
-                            single_off += (expert_counts_host_[e] % 2);
-                        }
-                        std::fill_n(expert_curr_pos_host_, cfg_.num_experts, 0);
-                        for (int t = 0; t < count; ++t) {
-                            for (int k = 0; k < top_k; ++k) {
-                                const int i = t * top_k + k;
-                                const int e = router_host_ids_[i];
-                                if (e >= 0 && e < cfg_.num_experts) {
-                                    const int seen = expert_curr_pos_host_[e]++;
-                                    const int pairs_limit = (expert_counts_host_[e] / 2) * 2;
-                                    int pos;
-                                    if (seen < pairs_limit) {
-                                        pos = expert_pair_pos_host_[e] + seen;
-                                    } else {
-                                        pos = expert_single_pos_host_[e] + (seen - pairs_limit);
-                                    }
-                                    expert_map_token_host_[pos] = t;
-                                    expert_map_rank_host_[pos] = k;
-                                    expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    expert_offsets_host_[0] = 0;
-                    for (int e = 0; e < cfg_.num_experts; ++e) {
-                        expert_offsets_host_[e + 1] = expert_offsets_host_[e] + expert_counts_host_[e];
-                        expert_curr_pos_host_[e] = expert_offsets_host_[e];
-                    }
-                    for (int t = 0; t < count; ++t) {
-                        for (int k = 0; k < top_k; ++k) {
-                            const int i = t * top_k + k;
-                            const int e = router_host_ids_[i];
-                            if (e >= 0 && e < cfg_.num_experts) {
-                                const int pos = expert_curr_pos_host_[e]++;
-                                expert_map_token_host_[pos] = t;
-                                expert_map_rank_host_[pos] = k;
-                                expert_map_slot_host_[pos] = expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
-                            }
-                        }
-                    }
-                }
-
-                ctx.queue().memcpy(expert_map_slot_dev_, expert_map_slot_host_,
-                                    static_cast<size_t>(total_acts) * sizeof(ops::MoeExpertSlotDev));
-                ctx.queue().memcpy(expert_map_token_dev_, expert_map_token_host_,
-                                    static_cast<size_t>(total_acts) * sizeof(int));
-                ctx.queue().memcpy(expert_map_rank_dev_, expert_map_rank_host_,
-                                    static_cast<size_t>(total_acts) * sizeof(int));
-                ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
-                                    static_cast<size_t>(total_acts) * sizeof(float));
-
-                const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
-                bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
-                bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
-
-                sycl::event gu_event = ops::moe_expert_major_prefill_gate_up(
-                    ctx, expert_map_slot_dev_, expert_map_token_dev_, expert_map_rank_dev_,
-                    nullptr, x_ptr, h_ptr, total_acts, top_k,
-                    hidden_size_, cfg_.moe_intermediate_size, 64,
-                    &batch_dma_event, expert_cache_.uses_nested_codes(),
-                    s_q4e_weight_reuse ? total_pairs : 0,
-                    (s_q4e_weight_reuse && s_q4e_4token) ? total_quads : 0);
-
-                sycl::event dn_event = ops::moe_expert_major_prefill_down(
-                    ctx, expert_map_slot_dev_, expert_map_token_dev_, expert_map_rank_dev_,
-                    nullptr, h_ptr, static_cast<float*>(buf_.moe_down_acc.data()),
-                    total_acts, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                    &gu_event, expert_cache_.uses_nested_codes(),
-                    s_q4e_weight_reuse ? total_pairs : 0,
-                    (s_q4e_weight_reuse && s_q4e_4token) ? total_quads : 0);
-
-                ops::moe_ordered_accumulate_down_rows(
-                    ctx, static_cast<const float*>(buf_.moe_down_acc.data()), batch_weights_dev_,
-                    y_ptr, count, top_k, hidden_size_,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
-                    s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
-                    &dn_event);
-
-                expert_cache_.record_consumer_reader_fences(
-                    prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
-                expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
-            }
-        } else if (batch_acquire && s_prefill_moe_rows && count > 1) {
-            for (int t = 0; t < count; ++t) {
-                const int* t_ids = router_host_ids_ + t * top_k;
-                ops::MoeExpertSlotDev* t_batch_slots = batch_slots_host_ + t * top_k;
-                for (int k = 0; k < top_k; ++k) {
-                    t_batch_slots[k] = expert_cache_.get_slot_dev(prefill_expert_slot_[t_ids[k]]);
-                }
-            }
-            ctx.queue().memcpy(batch_slots_dev_, batch_slots_host_,
-                                static_cast<size_t>(count) * top_k * sizeof(ops::MoeExpertSlotDev));
-            ctx.queue().memcpy(batch_weights_dev_, router_host_weights_,
-                                static_cast<size_t>(count) * top_k * sizeof(float));
-
-            const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
-            bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
-            bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
-
-            ops::moe_prefill_gate_up_rows(
-                ctx, batch_slots_dev_, nullptr, x_ptr, h_ptr,
-                count, top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
-                &batch_dma_event, expert_cache_.uses_nested_codes());
-
-            sycl::event dn_event = ops::moe_prefill_down_rows(
-                ctx, batch_slots_dev_, batch_weights_dev_, nullptr, h_ptr, y_ptr,
-                count, top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr,
-                s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr,
-                nullptr, expert_cache_.uses_nested_codes());
-
-            expert_cache_.record_consumer_reader_fences(
-                prefill_unique_slots_.data(), static_cast<int>(prefill_unique_slots_.size()), dn_event);
-            expert_cache_.RetirePrefillSlots(prefill_unique_slots_.data(),int(prefill_unique_slots_.size()));
+        // Unified Prefill and Decode via Qwen4ExpAdaptiveCache + Qwen4ExpHostArena
+        if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated()) {
+            if (count>4) RunAdaptivePrefill(ctx,L,s_fuse_shared,count);
+            else RunResidentDecode(ctx,L,s_fuse_shared,count);
         } else {
-            static const bool s_ready_first = aila::env::read_flag("AILA_Q4E_READY_FIRST", false);
-            bool hetero_executed = false;
-            if (resident_decode_mode_ && count == 1 && !batch_acquire) {
-                const auto acq_before = expert_cache_.stats().direct_cold_acquire_ns;
-                RunResidentDecode(ctx, L, s_fuse_shared, resident_binding ? &*resident_binding : nullptr,
-                    cpu_early_start || cpu_async_route ? &early_cold : nullptr);
-                prof_acquire_ms += (expert_cache_.stats().direct_cold_acquire_ns - acq_before) * 1e-6;
-                if (s_prefetch && predict_next) {
-                    ensure_prediction_ready();
-                    expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
-                }
-                hetero_executed = true;
-            }
-            if (!hetero_executed && (s_cpu_expert_dispatch || s_ready_first) && count <= 4 && !batch_acquire) {
-                auto& plan = expert_executor_.plan_layer(L, router_host_ids_, router_host_weights_, count, top_k, s_cpu_expert_dispatch);
-                const bool mixed_gpu = plan.ready_gpu_tasks > 0 && plan.pending_gpu_tasks > 0;
-                if (plan.cpu_tasks > 0 || (s_ready_first && mixed_gpu)) {
-                    const auto acquire_ns_before = expert_executor_.stats().gpu_acquire_ns;
-                    const bool defer_acquire = s_ready_first || expert_executor_.cpu_overlap_enabled();
-                    if (!defer_acquire) expert_executor_.ensure_gpu_pending(plan);
-                    aila::ExpertPrefetchRequest next_prefetch;
-                    if (s_prefetch && predict_next && count == 1) {
-                        ensure_prediction_ready();
-                        if (defer_acquire) next_prefetch = {L + 1, pred_ids.data(), top_k, s_prefetch_topn};
-                        else expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
-                    }
-                    const bf16* x_ptr = static_cast<const bf16*>(buf_.x.data());
-                    bf16* h_ptr = static_cast<bf16*>(buf_.moe_h.data());
-                    bf16* y_ptr = static_cast<bf16*>(buf_.y.data());
-                    const bf16* sh_out = s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) : nullptr;
-                    const bf16* sh_gate = s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) : nullptr;
-
-                    sycl::event hetero_ev = expert_executor_.execute_hetero_decode(
-                        ctx, plan, x_ptr, h_ptr, router_host_weights_,
-                        y_ptr, count, top_k, sh_out, sh_gate, expert_cache_.uses_nested_codes(), defer_acquire,
-                        next_prefetch.expert_ids ? &next_prefetch : nullptr);
-                    prof_acquire_ms += (expert_executor_.stats().gpu_acquire_ns - acquire_ns_before) * 1e-6;
-
-                    // The in-order queue carries merge -> residual -> next route.
-                    // Slot readers already have fences; ready-first needs no host drain here.
-                    if (!defer_acquire) fallback_last_down_event = hetero_ev;
-                    hetero_executed = true;
-                }
-            }
-
-            if (!hetero_executed) {
-                for (int t = 0; t < count; ++t) {
-                    const int* t_ids = router_host_ids_ + t * top_k;
-                    const float* t_weights = router_host_weights_ + t * top_k;
-                    int slots[kMaxTopK];
-                    sycl::event dma_event{};
-                    if (batch_acquire) {
-                        for (int k = 0; k < top_k; ++k) slots[k] = prefill_expert_slot_[t_ids[k]];
-                        if (t == 0) dma_event = batch_dma_event;
-                    } else {
-                        const auto prof_acq_t0 = prof_clock::now();
-                        dma_event = expert_cache_.acquire(L, t_ids, top_k, slots);
-                        prof_acquire_ms += prof_ms(prof_acq_t0, prof_clock::now());
-                        if (s_prefetch && predict_next && count == 1) {
-                            ensure_prediction_ready();
-                            expert_cache_.prefetch_async(L + 1, pred_ids.data(), top_k, s_prefetch_topn);
-                        }
-                    }
-
-                ops::MoeExpertSlotDev dev_slots[kMaxTopK];
-                expert_cache_.get_slots_dev(slots, top_k, dev_slots);
-
-                const bf16* x_t = static_cast<const bf16*>(buf_.x.data()) + t * hidden_size_;
-                bf16* y_t = static_cast<bf16*>(buf_.y.data()) + t * hidden_size_;
-
-                expert_cache_.record_first_consumer_start();
-                ops::moe_decode_gate_up_swiglu_grouped(
-                    ctx, dev_slots, nullptr, x_t,
-                    static_cast<bf16*>(buf_.moe_h.data()),
-                    top_k, hidden_size_, cfg_.moe_intermediate_size, 64,
-                    dma_event);
-
-                sycl::event down_ev{};
-                if (!batch_acquire && count > 1) {
-                    fallback_last_down_event = ops::moe_decode_down_weighted_accumulate(
-                        ctx, dev_slots, nullptr, t_weights,
-                        static_cast<const bf16*>(buf_.moe_h.data()),
-                        nullptr, y_t,
-                        top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
-                                            static_cast<size_t>(t) * hidden_size_ : nullptr,
-                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
-                    down_ev = fallback_last_down_event;
-                } else {
-                    down_ev = ops::moe_decode_down_weighted_accumulate(
-                        ctx, dev_slots, nullptr, t_weights,
-                        static_cast<const bf16*>(buf_.moe_h.data()),
-                        nullptr, y_t,
-                        top_k, cfg_.moe_intermediate_size, hidden_size_, 64,
-                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_out_buf.data()) +
-                                            static_cast<size_t>(t) * hidden_size_ : nullptr,
-                        s_fuse_shared ? static_cast<const bf16*>(buf_.shared_gate_buf.data()) + t : nullptr);
-                }
-                expert_cache_.record_consumer_reader_fences(slots, top_k, down_ev);
-            }
-        }
-        }
-        if (fallback_last_down_event != sycl::event{}) {
-            fallback_last_down_event.wait_and_throw();
-            fallback_last_down_event = sycl::event{};
+            throw std::runtime_error("Qwen4Exp: legacy expert_cache pipeline has been removed; please enable adaptive pipeline.");
         }
         ensure_prediction_ready();
         stage(kStageExperts);
-        if (expert_cache_.tracing()) {
-            expert_cache_.trace_host_interval("expert_acquire_submit", L,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(prof_acq_batch_t0.time_since_epoch()).count(),
-                Qwen4ExpCacheTrace::NowNs());
-        }
 
-        const uint64_t misses_after_moe = expert_cache_.stats().miss_count;
+        const uint64_t misses_after_moe = use_adaptive_pipeline_
+            ? static_cast<uint64_t>(adaptive_cache_.Stats().cache_misses)
+            : expert_cache_.stats().miss_count;
         if (misses_after_moe > cur_cache_stats.miss_count) {
             session.consecutive_no_miss_layers_ = 0;
         } else {
@@ -2549,9 +2045,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
     }
 
-    if (fallback_last_down_event != sycl::event{}) {
-        fallback_last_down_event.wait_and_throw();
-        fallback_last_down_event = sycl::event{};
+    if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated() && count == 1) {
+        static const int s_adaptive_swap_freq = aila::env::read_int("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 1);
+        static const int s_max_swaps = aila::env::read_int("AILA_Q4E_MAX_SWAPS", 2);
+        if (s_adaptive_swap_freq > 0 && (cached_len % s_adaptive_swap_freq == 0)) {
+            auto swap_plans = adaptive_cache_.PlanSwaps(1, s_max_swaps);
+            if (!swap_plans.empty()) {
+                sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
+                adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans);
+            }
+        }
     }
 
     if (options.need_logits) {
@@ -2602,7 +2105,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // No-logits forwards must also leave a materialized stack before snapshot,
     // state publication or return. This is a no-op after the final mixer.
     pending_mlp.Materialize();
-    expert_cache_.wait_prefetch();
+    if (!use_adaptive_pipeline_) {
+        expert_cache_.wait_prefetch();
+    }
     if (moe_compact_tile_ && count > 4) {
         int invalid=0;ctx.memcpy_d2h(&invalid,buf_.moe_compact_invalid.data(),sizeof(invalid));
         if(invalid)throw std::runtime_error("Compact MoE Q36 contribution is nonfinite or exceeds 2^20; window not committed");
@@ -2624,15 +2129,18 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
     }
     session.currentLength_ = cached_len;
-    if (expert_cache_.tracing() && s_trace_markers)
-        ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
-    expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
-    if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count,options.prefill_remaining);
+    if (!use_adaptive_pipeline_) {
+        if (expert_cache_.tracing() && s_trace_markers)
+            ctx.queue().single_task<class Q4ETraceForwardEnd>([] {});
+        expert_cache_.trace_forward(start_pos, count, false, options.need_logits);
+        if(cold_epoch_enabled_)expert_cache_.EndHotsetForward(count,options.prefill_remaining);
+    }
     // An explicit remaining=0 is the final prefill slice. Trim after all
     // checkpoint/logit work is submitted and before the first decode call;
     // steady-state decode never allocates or frees this workspace.
     if (options.prefill_remaining == 0) TrimDecodeRuntimeBuffers(ctx);
-    if(expert_cache_.adaptive_hotset()) {const auto& hs=expert_cache_.stats();
+    if (!use_adaptive_pipeline_ && expert_cache_.adaptive_hotset()) {
+        const auto& hs=expert_cache_.stats();
         AILA_LOG_INFO("[Q4E HotsetEpoch] pos=%d count=%d slots=%d swaps=%llu refill_bytes=%llu refill_ns=%llu publishes=%llu ready_adoptions=%llu ready_adoption_ns=%llu",
             start_pos,count,expert_cache_.frozen_slots(),(unsigned long long)hs.epoch_swaps,
             (unsigned long long)hs.epoch_refill_bytes,(unsigned long long)hs.epoch_refill_ns,(unsigned long long)hs.epoch_publishes,
@@ -2650,7 +2158,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             static_cast<unsigned long long>(grouped_xmx_tiles_), static_cast<unsigned long long>(grouped_xmx_acts_));
     }
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
-    if (s_work_summary) {
+    if (!use_adaptive_pipeline_ && s_work_summary) {
         const auto& supply = expert_cache_.stats();
         AILA_LOG_INFO("[Q4E Supply] pos=%d count=%d acquire_ms=%.6f router_wait_ms=%.6f fill_ms=%.6f dma_wait_ms=%.6f demand_wait_ms=%.6f",
             start_pos, count, prof_acquire_ms, prof_router_sync_ms,
@@ -2754,22 +2262,34 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
     if (s_profile) {
         ctx.synchronize();
-        const ExpertCacheStats& s1 = expert_cache_.stats();
-        const uint64_t hits = s1.hit_count - prof_stats0.hit_count;
-        const uint64_t misses = s1.miss_count - prof_stats0.miss_count;
-        AILA_LOG_INFO("[Q4E Profile] pos=%d count=%d total=%.2fms router_sync=%.2fms acquire=%.2fms "
-                      "(fill=%.2fms dma_wait=%.2fms pf_wait=%.2fms pf=%llu/%llu) hit=%llu/%llu xfer=%.1fMB logits=%d",
-                      start_pos, count, prof_ms(prof_t0, prof_clock::now()),
-                      prof_router_sync_ms, prof_acquire_ms,
-                      (s1.fill_ns - prof_stats0.fill_ns) * 1e-6,
-                      (s1.dma_wait_ns - prof_stats0.dma_wait_ns) * 1e-6,
-                      (s1.prefetch_wait_ns - prof_stats0.prefetch_wait_ns) * 1e-6,
-                      static_cast<unsigned long long>(s1.prefetch_used - prof_stats0.prefetch_used),
-                      static_cast<unsigned long long>(s1.prefetch_issued - prof_stats0.prefetch_issued),
-                      static_cast<unsigned long long>(hits),
-                      static_cast<unsigned long long>(hits + misses),
-                      (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0),
-                      options.need_logits ? 1 : 0);
+        if (use_adaptive_pipeline_) {
+            const auto& as = adaptive_cache_.Stats();
+            AILA_LOG_INFO("[Q4E Adaptive Profile] pos=%d count=%d total=%.2fms router_sync=%.2fms hits=%llu misses=%llu staged=%llu DMA=%.1fMB logits=%d",
+                          start_pos, count, prof_ms(prof_t0, prof_clock::now()),
+                          prof_router_sync_ms,
+                          (unsigned long long)as.cache_hits,
+                          (unsigned long long)as.cache_misses,
+                          (unsigned long long)as.cold_experts_staged,
+                          (as.warm_bytes_transferred + as.cold_bytes_transferred + as.swap_bytes_transferred) / (1024.0 * 1024.0),
+                          options.need_logits ? 1 : 0);
+        } else {
+            const ExpertCacheStats& s1 = expert_cache_.stats();
+            const uint64_t hits = s1.hit_count - prof_stats0.hit_count;
+            const uint64_t misses = s1.miss_count - prof_stats0.miss_count;
+            AILA_LOG_INFO("[Q4E Profile] pos=%d count=%d total=%.2fms router_sync=%.2fms acquire=%.2fms "
+                          "(fill=%.2fms dma_wait=%.2fms pf_wait=%.2fms pf=%llu/%llu) hit=%llu/%llu xfer=%.1fMB logits=%d",
+                          start_pos, count, prof_ms(prof_t0, prof_clock::now()),
+                          prof_router_sync_ms, prof_acquire_ms,
+                          (s1.fill_ns - prof_stats0.fill_ns) * 1e-6,
+                          (s1.dma_wait_ns - prof_stats0.dma_wait_ns) * 1e-6,
+                          (s1.prefetch_wait_ns - prof_stats0.prefetch_wait_ns) * 1e-6,
+                          static_cast<unsigned long long>(s1.prefetch_used - prof_stats0.prefetch_used),
+                          static_cast<unsigned long long>(s1.prefetch_issued - prof_stats0.prefetch_issued),
+                          static_cast<unsigned long long>(hits),
+                          static_cast<unsigned long long>(hits + misses),
+                          (s1.total_transferred_bytes - prof_stats0.total_transferred_bytes) / (1024.0 * 1024.0),
+                          options.need_logits ? 1 : 0);
+        }
         if (count > 1) {
             auto dstats = Bnb4BitLinear::get_prefill_dispatch_stats();
             AILA_LOG_INFO("[Q4E Prefill Dispatch] linear calls: fused_gemm=%llu cached=%llu on_demand=%llu sync_waits=%llu direct_io=%llu",
@@ -2779,7 +2299,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                           static_cast<unsigned long long>(dstats.sync_wait),
                           static_cast<unsigned long long>(dstats.direct_io));
         }
-        if (s_predict_stats && pred_total_ > 0) {
+        if (!use_adaptive_pipeline_ && s_predict_stats && pred_total_ > 0) {
             AILA_LOG_INFO("[Q4E Predict] next-layer overlap=%.1f%% misses_predicted=%llu/%llu (%.1f%%)",
                           100.0 * pred_overlap_ / pred_total_,
                           static_cast<unsigned long long>(pred_miss_hit_),
@@ -2792,7 +2312,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                           stage_ms[kStagePle], stage_ms[kStageHc], stage_ms[kStageLinearAttn],
                           stage_ms[kStageFullAttn], stage_ms[kStageRouter], stage_ms[kStageExperts],
                           prof_acquire_ms, stage_ms[kStageShared], stage_ms[kStageHead]);
-            if (expert_executor_.stats().layers_hetero_executed > 0) {
+            if (!use_adaptive_pipeline_ && expert_executor_.stats().layers_hetero_executed > 0) {
                 const auto& hs = expert_executor_.stats();
                 AILA_LOG_INFO("[Q4E Hetero] layers=%llu cpu_tasks=%llu (overlapped=%llu, stragglers=%llu) gpu_tasks=%llu cpu_compute=%.2f ms straggler_interval=%.2f ms",
                               static_cast<unsigned long long>(hs.layers_hetero_executed),
@@ -2804,14 +2324,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                               static_cast<double>(hs.cpu_straggler_interval_ns) / 1e6);
             }
         }
-        if (expert_executor_.stats().ready_first_layers > 0 || expert_executor_.stats().cpu_tasks_dispatched > 0) {
+        if (!use_adaptive_pipeline_ && (expert_executor_.stats().ready_first_layers > 0 || expert_executor_.stats().cpu_tasks_dispatched > 0)) {
             AILA_LOG_INFO("[Q4E ReadyFirst] layers=%llu cpu_tasks=%llu cpu_compute=%.2fms cpu_activation_wait=%.2fms",
                           static_cast<unsigned long long>(expert_executor_.stats().ready_first_layers),
                           static_cast<unsigned long long>(expert_executor_.stats().cpu_tasks_dispatched),
                           expert_executor_.stats().cpu_compute_ns * 1e-6,
                           expert_executor_.stats().cpu_activation_wait_ns * 1e-6);
         }
-        if (expert_executor_.stats().cpu_async_layers > 0) {
+        if (!use_adaptive_pipeline_ && expert_executor_.stats().cpu_async_layers > 0) {
             const auto& hs = expert_executor_.stats();
             AILA_LOG_INFO("[Q4E CPU Overlap] layers=%llu join_wait=%.2fms acquire_overlap=%.2fms max_tasks=%llu host_prepare=%.2fms",
                           static_cast<unsigned long long>(hs.cpu_async_layers),

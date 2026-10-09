@@ -605,23 +605,34 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
             int* warmup_token_ids = static_cast<int*>(ctx_->alloc_device(2 * sizeof(int)));
             ctx_->memcpy_h2d_async(warmup_token_ids, warmup_arr, 2 * sizeof(int));
 
-            Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, 2);
-            int* warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
-            ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
-            ctx_->synchronize();
+            int* warmup_argmax = nullptr;
+            try {
+                Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, 2);
+                warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
+                ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
+                ctx_->synchronize();
 
-            // H0: exercise count=1 decode step while session has cached tokens,
-            // compiling decode GEMV, decode attention / JM, decode MoE, and LM head.
-            Tensor& warmup_decode_logits = backend_->forward(*ctx_, warmup_token_ids, 1);
-            ops::argmax(*ctx_, warmup_decode_logits, config_.vocab_size, warmup_argmax);
-            ctx_->synchronize();
-            t_warmup_end = std::chrono::high_resolution_clock::now();
+                // H0: exercise count=1 decode step while session has cached tokens,
+                // compiling decode GEMV, decode attention / JM, decode MoE, and LM head.
+                Tensor& warmup_decode_logits = backend_->forward(*ctx_, warmup_token_ids, 1);
+                ops::argmax(*ctx_, warmup_decode_logits, config_.vocab_size, warmup_argmax);
+                ctx_->synchronize();
+                t_warmup_end = std::chrono::high_resolution_clock::now();
 
-            ctx_->free_device(warmup_argmax);
-            ctx_->free_device(warmup_token_ids);
-            backend_->reset();
+                ctx_->free_device(warmup_argmax);
+                warmup_argmax = nullptr;
+                ctx_->free_device(warmup_token_ids);
+                warmup_token_ids = nullptr;
+                backend_->reset();
 
-            AILA_LOG_INFO("[Warmup Manifest] reached: 2-token prefill (gemm, score buf), 1-token decode (gemv, decode attn, moe), state reset");
+                AILA_LOG_INFO("[Warmup Manifest] reached: 2-token prefill (gemm, score buf), 1-token decode (gemv, decode attn, moe), state reset");
+            } catch (const std::exception& e) {
+                AILA_LOG_ERROR("[Warmup] Lightweight warmup failed: %s", e.what());
+                try { ctx_->queue().wait_and_throw(); } catch (...) {}
+                if (warmup_argmax) ctx_->free_device(warmup_argmax);
+                ctx_->free_device(warmup_token_ids);
+                throw;
+            }
             }
 
             double warmup_ms = std::chrono::duration<double, std::milli>(t_warmup_end - t_warmup_start).count();

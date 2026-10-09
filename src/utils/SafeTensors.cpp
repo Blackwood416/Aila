@@ -912,6 +912,9 @@ ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx) {
         auto layer_names = ParseHeader(json_str, metadata);
 
         for (const auto& name : layer_names) {
+            if (name.rfind("model.visual.", 0) == 0 || name.rfind("visual.", 0) == 0) {
+                continue;
+            }
             const auto& meta = metadata[name];
             HostTensorEntry entry;
             entry.shard_index = shard_idx;
@@ -953,7 +956,7 @@ ModelWeights LoadModelWeightsLazy(const std::string& model_dir, Context* ctx) {
         if (!fs::exists(shard_path)) {
             throw std::runtime_error("Missing safetensors shard: " + shard_path.string());
         }
-        load_shard(shard_path, i);
+        load_shard(shard_path, weights.shard_paths_.size());
     }
 
     AILA_LOG_INFO("[SafeTensors] Lazy index complete: %zu host tensors indexed across %zu shards",

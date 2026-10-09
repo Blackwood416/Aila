@@ -1,4 +1,5 @@
 #include "models/Qwen4ExpExpertExecutor.hpp"
+#include "models/Qwen4ExpHostArena.hpp"
 #include "utils/EnvUtils.hpp"
 #include "ops/CpuTilePool.hpp"
 #include "profile/Profiling.hpp"
@@ -829,6 +830,38 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         if(cache_->tracing())cache_->trace_host_interval("cold_cpu_submit",cold_layer_,cold_submit_ns_,steady_ns());
         return cold_count_;
     } catch(...) {AbortResidentCold();throw;}
+}
+
+int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int layer,
+    const int* ids, const int* ranks, int count, const bf16* x_dev) {
+    if (!cpu_worker_ || count<=0) return 0;
+    if (!ids || !ranks || count>16 || cold_count_ || async_route_pending_ ||
+        async_route_collected_ || cpu_host_result_active_)
+        throw std::logic_error("Invalid native arena CPU batch");
+    try {
+        if (prev_cpu_h2d_ev_!=sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
+        prev_cpu_h2d_ev_={}; cold_layer_=layer;
+        cold_count_=std::min(count,max_cpu_credits_);
+        cold_cached_count_=cold_count_; cold_mapped_count_=0;
+        if (!cold_count_) return 0;
+        CpuWorker::Job job;
+        job.count=cold_count_; job.hidden=hidden_size_; job.intermediate=intermediate_size_; job.tokens=1;
+        job.x=x_host_; job.h=scratch_h_; job.out=cpu_out_host_; job.resident_prepared=true;
+        job.output_reader=cpu_output_reader_event_;
+        job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
+            ctx_->queue().memcpy(x_host_,x_dev,size_t(hidden_size_)*sizeof(bf16));
+        for (int c=0;c<cold_count_;++c) {
+            const auto source=arena.GetExpertSlotHost(layer,ids[c]);
+            if (!source.gate_up_packed || !source.down_packed || ranks[c]<0 || ranks[c]>=top_k_)
+                throw std::logic_error("CPU expert has no native RAM owner or rank");
+            cold_source_slots_[c]=source; cold_ids_[c]=ids[c]; cold_ranks_[c]=ranks[c];
+            job.tasks[c]={source,0};
+        }
+        cold_submit_ns_=steady_ns(); cpu_worker_->submit(job);
+        stats_.cpu_tasks_dispatched+=cold_count_;
+        stats_.cpu_cached_tasks_dispatched+=cold_count_;
+        return cold_count_;
+    } catch (...) { AbortResidentCold(); throw; }
 }
 
 sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
