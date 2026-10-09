@@ -401,17 +401,23 @@ sycl::event router_topk_ids_device(
 
 namespace {
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 inline float load_expert_absmax(const float* absmax_f32,
                                 const MoeNestedScaleDev& nested,
                                 size_t index) {
     if constexpr (UseNested) {
+        // Q4E validates nested blocksize 256 at load, so the fixed-geometry
+        // instantiation replaces the runtime 64-bit division with an exact
+        // shift; unsigned x/256 == x>>8 for every index.
+        size_t nested_block;
+        if constexpr (FixedNested256) nested_block = index >> 8;
+        else nested_block = index / static_cast<size_t>(nested.blocksize);
         // Match the host fill's two f32 rounding steps. A single contracted
         // FMA changes some reconstructed absmax values by 1 ULP, which can
         // change greedy routing after the 48-layer recurrence.
         const float product = sycl::fma(
             nested.nested_quant_map[nested.codes[index]],
-            nested.nested_absmax[index / static_cast<size_t>(nested.blocksize)], 0.0f);
+            nested.nested_absmax[nested_block], 0.0f);
         return sycl::fma(product, 1.0f, nested.offset);
     } else {
         return absmax_f32[index];
@@ -518,7 +524,7 @@ sycl::event launch_moe_quantize_q8_64(Context& ctx, const bf16* input,
     });
 }
 
-template <bool UseNested, int WorkGroup>
+template <bool UseNested, int WorkGroup, bool FixedNested256 = false>
 sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
     const MoeExpertSlotDev* descriptors, const int* selected,
     const int8_t* xq, const float* xs, bf16* h, int8_t* hq, float* hs,
@@ -560,9 +566,9 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
                     const uint32_t u4 = *reinterpret_cast<const uint32_t*>(slot.gate_up_packed + up_bytes + byte_offset);
                     const int input_block = byte_offset / 32;
                     const float ga_leader = (lane == 0 || lane == 8)
-                        ? load_expert_absmax<UseNested>(slot.gate_up_absmax, slot.gate_up_nested, gate_blocks + input_block) : 0.0f;
+                        ? load_expert_absmax<UseNested, FixedNested256>(slot.gate_up_absmax, slot.gate_up_nested, gate_blocks + input_block) : 0.0f;
                     const float ua_leader = (lane == 0 || lane == 8)
-                        ? load_expert_absmax<UseNested>(slot.gate_up_absmax, slot.gate_up_nested, up_blocks + input_block) : 0.0f;
+                        ? load_expert_absmax<UseNested, FixedNested256>(slot.gate_up_absmax, slot.gate_up_nested, up_blocks + input_block) : 0.0f;
                     const float ga0 = sycl::group_broadcast(sg, ga_leader, 0);
                     const float ga8 = sycl::group_broadcast(sg, ga_leader, 8);
                     const float ua0 = sycl::group_broadcast(sg, ua_leader, 0);
@@ -614,7 +620,7 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_resident_down_q8_64(Context& ctx,
     const MoeExpertSlotDev* descriptors, const int* selected,
     const int8_t* hq, const float* hs, float* down,
@@ -647,7 +653,7 @@ sycl::event launch_moe_resident_down_q8_64(Context& ctx,
                     const uint32_t d4 = *reinterpret_cast<const uint32_t*>(slot.down_packed + bytes_base + byte_offset);
                     const int input_block = byte_offset / 32;
                     const float da_leader = (lane == 0 || lane == 8)
-                        ? load_expert_absmax<UseNested>(slot.down_absmax, slot.down_nested, blocks_base + input_block) : 0.0f;
+                        ? load_expert_absmax<UseNested, FixedNested256>(slot.down_absmax, slot.down_nested, blocks_base + input_block) : 0.0f;
                     const float da0 = sycl::group_broadcast(sg, da_leader, 0);
                     const float da8 = sycl::group_broadcast(sg, da_leader, 8);
                     const float da = lane < 8 ? da0 : da8;
@@ -663,7 +669,7 @@ sycl::event launch_moe_resident_down_q8_64(Context& ctx,
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
     const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
@@ -733,11 +739,11 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
                             // collectives require a uniform source lane.
                             const int leader = sg_lane < 8 ? 0 : 8;
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -751,9 +757,9 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const int token = token_ptrs[static_cast<size_t>(expert_idx)];
@@ -800,7 +806,7 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
     });
 }
 
-template <bool UseNested, bool Resident = false>
+template <bool UseNested, bool Resident = false, bool FixedNested256 = false>
 sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -870,11 +876,11 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
                         float ua;
                         if (blocksize == 64) {
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -888,9 +894,9 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const int token = token_ids ? token_ids[expert_idx] : 0;
@@ -937,7 +943,7 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped_dev(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_decode_down_weighted_accumulate(
     Context& ctx,
     const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
@@ -998,7 +1004,7 @@ sycl::event launch_moe_decode_down_weighted_accumulate(
                             float da;
                             if (blocksize == 64) {
                                 const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                    ? load_expert_absmax<UseNested>(
+                                    ? load_expert_absmax<UseNested, FixedNested256>(
                                           slot.down_absmax, slot.down_nested, scale_index)
                                     : 0.0f;
                                 const float da0 = sycl::group_broadcast(
@@ -1007,7 +1013,7 @@ sycl::event launch_moe_decode_down_weighted_accumulate(
                                     item.get_sub_group(), da_leader, 8);
                                 da = sg_lane < 8 ? da0 : da8;
                             } else {
-                                da = load_expert_absmax<UseNested>(
+                                da = load_expert_absmax<UseNested, FixedNested256>(
                                     slot.down_absmax, slot.down_nested, scale_index);
                             }
                             const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
@@ -1051,7 +1057,7 @@ sycl::event launch_moe_decode_down_weighted_accumulate(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_decode_down_to_rank_f32(
     Context& ctx,
     const std::array<MoeExpertSlotDev, 16>& slot_ptrs,
@@ -1115,7 +1121,7 @@ sycl::event launch_moe_decode_down_to_rank_f32(
                         float da;
                         if (blocksize == 64) {
                             const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.down_absmax, slot.down_nested, scale_index)
                                 : 0.0f;
                             const float da0 = sycl::group_broadcast(
@@ -1124,7 +1130,7 @@ sycl::event launch_moe_decode_down_to_rank_f32(
                                 item.get_sub_group(), da_leader, 8);
                             da = sg_lane < 8 ? da0 : da8;
                         } else {
-                            da = load_expert_absmax<UseNested>(
+                            da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
@@ -1158,7 +1164,7 @@ sycl::event launch_moe_decode_down_to_rank_f32(
     });
 }
 
-template <bool UseNested, bool Resident = false>
+template <bool UseNested, bool Resident = false, bool FixedNested256 = false>
 sycl::event launch_moe_decode_down_to_rank_f32_dev(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1226,7 +1232,7 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
                         float da;
                         if (blocksize == 64) {
                             const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.down_absmax, slot.down_nested, scale_index)
                                 : 0.0f;
                             const float da0 = sycl::group_broadcast(
@@ -1235,7 +1241,7 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
                                 item.get_sub_group(), da_leader, 8);
                             da = sg_lane < 8 ? da0 : da8;
                         } else {
-                            da = load_expert_absmax<UseNested>(
+                            da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
@@ -1269,7 +1275,7 @@ sycl::event launch_moe_decode_down_to_rank_f32_dev(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_prefill_gate_up_rows(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1341,11 +1347,11 @@ sycl::event launch_moe_prefill_gate_up_rows(
                         if (blocksize == 64) {
                             const int leader = sg_lane < 8 ? 0 : 8;
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -1359,9 +1365,9 @@ sycl::event launch_moe_prefill_gate_up_rows(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(x_token + byte_offset * 2);
@@ -1406,7 +1412,7 @@ sycl::event launch_moe_prefill_gate_up_rows(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_prefill_down_rows(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1482,7 +1488,7 @@ sycl::event launch_moe_prefill_down_rows(
                             float da;
                             if (blocksize == 64) {
                                 const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                    ? load_expert_absmax<UseNested>(
+                                    ? load_expert_absmax<UseNested, FixedNested256>(
                                           slot.down_absmax, slot.down_nested, scale_index)
                                     : 0.0f;
                                 const float da0 = sycl::group_broadcast(
@@ -1491,7 +1497,7 @@ sycl::event launch_moe_prefill_down_rows(
                                     item.get_sub_group(), da_leader, 8);
                                 da = sg_lane < 8 ? da0 : da8;
                             } else {
-                                da = load_expert_absmax<UseNested>(
+                                da = load_expert_absmax<UseNested, FixedNested256>(
                                     slot.down_absmax, slot.down_nested, scale_index);
                             }
                             const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
@@ -1531,7 +1537,7 @@ sycl::event launch_moe_prefill_down_rows(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_gate_up(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1602,11 +1608,11 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
                         float ua;
                         if (blocksize == 64) {
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -1620,9 +1626,9 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(x_token + byte_offset * 2);
@@ -1672,7 +1678,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
     });
 }
 
-template <bool UseNested, bool Compact = false>
+template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_down(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1737,7 +1743,7 @@ sycl::event launch_moe_expert_major_prefill_down(
                         float da;
                         if (blocksize == 64) {
                             const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.down_absmax, slot.down_nested, scale_index)
                                 : 0.0f;
                             const float da0 = sycl::group_broadcast(
@@ -1746,7 +1752,7 @@ sycl::event launch_moe_expert_major_prefill_down(
                                 item.get_sub_group(), da_leader, 8);
                             da = sg_lane < 8 ? da0 : da8;
                         } else {
-                            da = load_expert_absmax<UseNested>(
+                            da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
                         const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
@@ -1780,7 +1786,7 @@ sycl::event launch_moe_expert_major_prefill_down(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_gate_up_2token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1856,11 +1862,11 @@ sycl::event launch_moe_expert_major_prefill_gate_up_2token(
                         float ua;
                         if (blocksize == 64) {
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -1874,9 +1880,9 @@ sycl::event launch_moe_expert_major_prefill_gate_up_2token(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
@@ -1970,7 +1976,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up_2token(
     });
 }
 
-template <bool UseNested, bool Compact = false>
+template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_down_2token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2041,7 +2047,7 @@ sycl::event launch_moe_expert_major_prefill_down_2token(
                         float da;
                         if (blocksize == 64) {
                             const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.down_absmax, slot.down_nested, scale_index)
                                 : 0.0f;
                             const float da0 = sycl::group_broadcast(
@@ -2050,7 +2056,7 @@ sycl::event launch_moe_expert_major_prefill_down_2token(
                                 item.get_sub_group(), da_leader, 8);
                             da = sg_lane < 8 ? da0 : da8;
                         } else {
-                            da = load_expert_absmax<UseNested>(
+                            da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
                         const vec8 in_v0 = *reinterpret_cast<const vec8*>(in_expert0 + byte_offset * 2);
@@ -2110,7 +2116,7 @@ sycl::event launch_moe_expert_major_prefill_down_2token(
     });
 }
 
-template <bool UseNested>
+template <bool UseNested, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_gate_up_4token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2194,11 +2200,11 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
                         float ua;
                         if (blocksize == 64) {
                             const float ga_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
                                 : 0.0f;
                             const float ua_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
                                 : 0.0f;
                             const float ga0 = sycl::group_broadcast(
@@ -2212,9 +2218,9 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
                             ga = sg_lane < 8 ? ga0 : ga8;
                             ua = sg_lane < 8 ? ua0 : ua8;
                         } else {
-                            ga = load_expert_absmax<UseNested>(
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
-                            ua = load_expert_absmax<UseNested>(
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
                         const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
@@ -2358,7 +2364,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
     });
 }
 
-template <bool UseNested, bool Compact = false>
+template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_down_4token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2437,7 +2443,7 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
                         float da;
                         if (blocksize == 64) {
                             const float da_leader = (sg_lane == 0 || sg_lane == 8)
-                                ? load_expert_absmax<UseNested>(
+                                ? load_expert_absmax<UseNested, FixedNested256>(
                                       slot.down_absmax, slot.down_nested, scale_index)
                                 : 0.0f;
                             const float da0 = sycl::group_broadcast(
@@ -2446,7 +2452,7 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
                                 item.get_sub_group(), da_leader, 8);
                             da = sg_lane < 8 ? da0 : da8;
                         } else {
-                            da = load_expert_absmax<UseNested>(
+                            da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
                         const vec8 in_v0 = *reinterpret_cast<const vec8*>(in_expert0 + byte_offset * 2);
@@ -2554,18 +2560,22 @@ sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* wei
 }
 
 sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,
-    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested) {
+    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256) {
     if (top_k < 1 || top_k > 16 || hidden % 64 || intermediate % 16)
         throw std::invalid_argument("Resident gate/up shape");
-    if (nested) return launch_moe_decode_gate_up_swiglu_grouped_dev<true,true>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected);
+    if (nested) return nested_fixed256 ? launch_moe_decode_gate_up_swiglu_grouped_dev<true,true,true>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected)
+        : launch_moe_decode_gate_up_swiglu_grouped_dev<true,true,false>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected);
     return launch_moe_decode_gate_up_swiglu_grouped_dev<false,true>(ctx,descriptors,nullptr,nullptr,x,h,top_k,hidden,intermediate,64,nullptr,selected);
 }
 
 sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
-    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested) {
+    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256) {
     if (top_k < 1 || top_k > 16 || hidden % 16 || intermediate % 64)
         throw std::invalid_argument("Resident down shape");
-    if (nested) return launch_moe_decode_down_to_rank_f32_dev<true,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
+    if (nested) return nested_fixed256 ? launch_moe_decode_down_to_rank_f32_dev<true,true,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected)
+        : launch_moe_decode_down_to_rank_f32_dev<true,true,false>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
     return launch_moe_decode_down_to_rank_f32_dev<false,true>(ctx,descriptors,nullptr,nullptr,h,down,top_k,top_k,intermediate,hidden,64,nullptr,nullptr,selected);
 }
 
@@ -2578,7 +2588,8 @@ sycl::event quantize_moe_input_q8_64(Context& ctx, const bf16* x,
 
 sycl::event moe_resident_gate_up_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const int8_t* xq, const float* xs, bf16* h,
-    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested) {
+    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256) {
     if (top_k < 1 || top_k > 16 || hidden <= 0 || hidden % 64 ||
         intermediate <= 0 || intermediate % 64 || !descriptors || !selected ||
         !xq || !xs || !h || !hq || !hs)
@@ -2587,23 +2598,26 @@ sycl::event moe_resident_gate_up_q8_64(Context& ctx, const MoeExpertSlotDev* des
     // physical work-group limit is smaller; it quantizes rounded h separately.
     const size_t max_group = moe_q8_max_work_group_size(ctx);
     if (max_group >= 1024) {
-        if (nested) return launch_moe_resident_gate_up_q8_64<true,1024>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+        if (nested) return nested_fixed256 ? launch_moe_resident_gate_up_q8_64<true,1024,true>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate)
+            : launch_moe_resident_gate_up_q8_64<true,1024,false>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
         return launch_moe_resident_gate_up_q8_64<false,1024>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
     }
     if (max_group < 256) throw std::invalid_argument("Resident Q8 gate/up needs work-group size >=256");
-    if (nested) launch_moe_resident_gate_up_q8_64<true,256>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+    if (nested) { if (nested_fixed256) launch_moe_resident_gate_up_q8_64<true,256,true>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
+        else launch_moe_resident_gate_up_q8_64<true,256,false>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate); }
     else launch_moe_resident_gate_up_q8_64<false,256>(ctx, descriptors, selected, xq, xs, h, hq, hs, top_k, hidden, intermediate);
     return launch_moe_quantize_q8_64(ctx, h, hq, hs, top_k, intermediate, selected);
 }
 
 sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const int8_t* hq, const float* hs, float* down,
-    int top_k, int hidden, int intermediate, bool nested) {
+    int top_k, int hidden, int intermediate, bool nested, bool nested_fixed256) {
     if (top_k < 1 || top_k > 16 || hidden <= 0 || hidden % 64 ||
         intermediate <= 0 || intermediate % 64 || !descriptors || !selected ||
         !hq || !hs || !down)
         throw std::invalid_argument("Resident Q8 down shape or arena");
-    if (nested) return launch_moe_resident_down_q8_64<true>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
+    if (nested) return nested_fixed256 ? launch_moe_resident_down_q8_64<true,true>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate)
+        : launch_moe_resident_down_q8_64<true,false>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
     return launch_moe_resident_down_q8_64<false>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
 }
 
@@ -2619,7 +2633,8 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int blocksize,
     const sycl::event* dep_event,
     const int* token_ids,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (num_active_experts <= 0) return {};
 
     bool is_nested = use_nested;
@@ -2638,7 +2653,10 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
         }
 
         if (is_nested) {
-            return launch_moe_decode_gate_up_swiglu_grouped<true>(
+            if (nested_fixed256) return launch_moe_decode_gate_up_swiglu_grouped<true, true>(
+                ctx, slot_ptrs, token_ptrs, quant_map, x, h, num_active_experts,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_decode_gate_up_swiglu_grouped<true, false>(
                 ctx, slot_ptrs, token_ptrs, quant_map, x, h, num_active_experts,
                 in_features, intermediate_size, blocksize, dep_event);
         }
@@ -2648,7 +2666,10 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     }
 
     if (is_nested) {
-        return launch_moe_decode_gate_up_swiglu_grouped_dev<true>(
+        if (nested_fixed256) return launch_moe_decode_gate_up_swiglu_grouped_dev<true, false, true>(
+            ctx, slots, token_ids, quant_map, x, h, num_active_experts,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_decode_gate_up_swiglu_grouped_dev<true, false, false>(
             ctx, slots, token_ids, quant_map, x, h, num_active_experts,
             in_features, intermediate_size, blocksize, dep_event);
     }
@@ -2670,7 +2691,8 @@ sycl::event moe_decode_down_weighted_accumulate(
     int out_features,
     int blocksize,
     const bf16* shared_out,
-    const bf16* shared_gate) {
+    const bf16* shared_gate,
+    bool nested_fixed256) {
     if (num_active_experts <= 0) return {};
 
     std::array<MoeExpertSlotDev, 16> slot_ptrs{};
@@ -2682,7 +2704,11 @@ sycl::event moe_decode_down_weighted_accumulate(
     }
 
     if (slots[0].down_nested.codes != nullptr) {
-        return launch_moe_decode_down_weighted_accumulate<true>(
+        if (nested_fixed256) return launch_moe_decode_down_weighted_accumulate<true, true>(
+            ctx, slot_ptrs, weight_ptrs, quant_map, h, acc_f32, out_bf16,
+            num_active_experts, in_features, out_features, blocksize,
+            shared_out, shared_gate);
+        return launch_moe_decode_down_weighted_accumulate<true, false>(
             ctx, slot_ptrs, weight_ptrs, quant_map, h, acc_f32, out_bf16,
             num_active_experts, in_features, out_features, blocksize,
             shared_out, shared_gate);
@@ -2707,7 +2733,8 @@ sycl::event moe_decode_down_to_rank_f32(
     const int* token_ids,
     const float* quant_map,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (num_active_experts <= 0 || out_features <= 0 || in_features <= 0) return {};
 
     bool is_nested = use_nested;
@@ -2729,7 +2756,11 @@ sycl::event moe_decode_down_to_rank_f32(
         }
 
         if (is_nested) {
-            return launch_moe_decode_down_to_rank_f32<true>(
+            if (nested_fixed256) return launch_moe_decode_down_to_rank_f32<true, true>(
+                ctx, slot_ptrs, rank_ptrs, token_ptrs, h, down_acc,
+                num_active_experts, top_k, in_features, out_features, blocksize,
+                quant_map, dep_event);
+            return launch_moe_decode_down_to_rank_f32<true, false>(
                 ctx, slot_ptrs, rank_ptrs, token_ptrs, h, down_acc,
                 num_active_experts, top_k, in_features, out_features, blocksize,
                 quant_map, dep_event);
@@ -2741,7 +2772,11 @@ sycl::event moe_decode_down_to_rank_f32(
     }
 
     if (is_nested) {
-        return launch_moe_decode_down_to_rank_f32_dev<true>(
+        if (nested_fixed256) return launch_moe_decode_down_to_rank_f32_dev<true, false, true>(
+            ctx, slots, ranks, token_ids, h, down_acc,
+            num_active_experts, top_k, in_features, out_features, blocksize,
+            quant_map, dep_event);
+        return launch_moe_decode_down_to_rank_f32_dev<true, false, false>(
             ctx, slots, ranks, token_ids, h, down_acc,
             num_active_experts, top_k, in_features, out_features, blocksize,
             quant_map, dep_event);
@@ -2764,7 +2799,8 @@ sycl::event moe_prefill_gate_up_rows(
     int intermediate_size,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (tokens <= 0 || num_active_experts <= 0) return {};
 
     bool nested = use_nested;
@@ -2778,7 +2814,10 @@ sycl::event moe_prefill_gate_up_rows(
     }
 
     if (nested) {
-        return launch_moe_prefill_gate_up_rows<true>(
+        if (nested_fixed256) return launch_moe_prefill_gate_up_rows<true, true>(
+            ctx, slots, quant_map, x, h, tokens, num_active_experts,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_prefill_gate_up_rows<true, false>(
             ctx, slots, quant_map, x, h, tokens, num_active_experts,
             in_features, intermediate_size, blocksize, dep_event);
     }
@@ -2802,7 +2841,8 @@ sycl::event moe_prefill_down_rows(
     const bf16* shared_out,
     const bf16* shared_gate,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (tokens <= 0 || num_active_experts <= 0) return {};
 
     bool nested = use_nested;
@@ -2816,7 +2856,10 @@ sycl::event moe_prefill_down_rows(
     }
 
     if (nested) {
-        return launch_moe_prefill_down_rows<true>(
+        if (nested_fixed256) return launch_moe_prefill_down_rows<true, true>(
+            ctx, slots, weights, quant_map, h, y, tokens, num_active_experts,
+            in_features, out_features, blocksize, shared_out, shared_gate, dep_event);
+        return launch_moe_prefill_down_rows<true, false>(
             ctx, slots, weights, quant_map, h, y, tokens, num_active_experts,
             in_features, out_features, blocksize, shared_out, shared_gate, dep_event);
     }
@@ -2869,10 +2912,14 @@ sycl::event moe_expert_major_prefill_gate_up_2token(
     int intermediate_size,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (total_pairs <= 0) return {};
     if (use_nested) {
-        return launch_moe_expert_major_prefill_gate_up_2token<true>(
+        if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_2token<true, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_pairs, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_gate_up_2token<true, false>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_pairs, top_k,
             in_features, intermediate_size, blocksize, dep_event);
     }
@@ -2895,10 +2942,14 @@ sycl::event moe_expert_major_prefill_down_2token(
     int out_features,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (total_pairs <= 0) return {};
     if (use_nested) {
-        return launch_moe_expert_major_prefill_down_2token<true>(
+        if (nested_fixed256) return launch_moe_expert_major_prefill_down_2token<true, false, true>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_pairs, top_k,
+            in_features, out_features, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_down_2token<true, false, false>(
             ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_pairs, top_k,
             in_features, out_features, blocksize, dep_event);
     }
@@ -2921,10 +2972,14 @@ sycl::event moe_expert_major_prefill_gate_up_4token(
     int intermediate_size,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (total_quads <= 0) return {};
     if (use_nested) {
-        return launch_moe_expert_major_prefill_gate_up_4token<true>(
+        if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token<true, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_gate_up_4token<true, false>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
             in_features, intermediate_size, blocksize, dep_event);
     }
@@ -2947,10 +3002,14 @@ sycl::event moe_expert_major_prefill_down_4token(
     int out_features,
     int blocksize,
     const sycl::event* dep_event,
-    bool use_nested) {
+    bool use_nested,
+    bool nested_fixed256) {
     if (total_quads <= 0) return {};
     if (use_nested) {
-        return launch_moe_expert_major_prefill_down_4token<true>(
+        if (nested_fixed256) return launch_moe_expert_major_prefill_down_4token<true, false, true>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
+            in_features, out_features, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_down_4token<true, false, false>(
             ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
             in_features, out_features, blocksize, dep_event);
     }
@@ -2975,13 +3034,17 @@ sycl::event moe_expert_major_prefill_gate_up(
     const sycl::event* dep_event,
     bool use_nested,
     int num_pairs,
-    int num_quads) {
+    int num_quads,
+    bool nested_fixed256) {
     if (total_acts <= 0) return {};
     if (num_quads <= 0 && num_pairs <= 0) {
-        auto ev = use_nested ? launch_moe_expert_major_prefill_gate_up<true>(
+        auto ev = use_nested ? (nested_fixed256 ? launch_moe_expert_major_prefill_gate_up<true, true>(
                 ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
                 in_features, intermediate_size, blocksize, dep_event)
-            : launch_moe_expert_major_prefill_gate_up<false>(
+            : launch_moe_expert_major_prefill_gate_up<true, false>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
+                in_features, intermediate_size, blocksize, dep_event))
+            : launch_moe_expert_major_prefill_gate_up<false, false>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
             in_features, intermediate_size, blocksize, dep_event);
         return ev;
@@ -2997,7 +3060,11 @@ sycl::event moe_expert_major_prefill_gate_up(
         const int clamped_quads = std::min(num_quads, remaining_acts / 4);
         if (clamped_quads > 0) {
             if (use_nested) {
-                quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true>(
+                if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, x, h, clamped_quads, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+                else quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true, false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_quads, top_k,
                     in_features, intermediate_size, blocksize, dep_event);
@@ -3017,7 +3084,11 @@ sycl::event moe_expert_major_prefill_gate_up(
         const int clamped_pairs = std::min(num_pairs, remaining_acts / 2);
         if (clamped_pairs > 0) {
             if (use_nested) {
-                pair_ev = launch_moe_expert_major_prefill_gate_up_2token<true>(
+                if (nested_fixed256) pair_ev = launch_moe_expert_major_prefill_gate_up_2token<true, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, x, h, clamped_pairs, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+                else pair_ev = launch_moe_expert_major_prefill_gate_up_2token<true, false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, x, h, clamped_pairs, top_k,
                     in_features, intermediate_size, blocksize, dep_event);
@@ -3035,7 +3106,11 @@ sycl::event moe_expert_major_prefill_gate_up(
 
     if (remaining_acts > 0) {
         if (use_nested) {
-            single_ev = launch_moe_expert_major_prefill_gate_up<true>(
+            if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_gate_up<true, true>(
+                ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                quant_map, x, h, remaining_acts, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            else single_ev = launch_moe_expert_major_prefill_gate_up<true, false>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, x, h, remaining_acts, top_k,
                 in_features, intermediate_size, blocksize, dep_event);
@@ -3069,11 +3144,15 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
     const sycl::event* dep_event,
     bool use_nested,
     int num_pairs,
-    int num_quads) {
+    int num_quads,
+    bool nested_fixed256) {
     if (total_acts <= 0) return {};
     if (num_quads <= 0 && num_pairs <= 0) {
         if (use_nested) {
-            return launch_moe_expert_major_prefill_down<true, Compact>(
+            if (nested_fixed256) return launch_moe_expert_major_prefill_down<true, Compact, true>(
+                ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
+                in_features, out_features, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_down<true, Compact, false>(
                 ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
         }
@@ -3092,7 +3171,11 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
         const int clamped_quads = std::min(num_quads, remaining_acts / 4);
         if (clamped_quads > 0) {
             if (use_nested) {
-                quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact>(
+                if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
+                    in_features, out_features, blocksize, dep_event);
+                else quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact, false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
                     in_features, out_features, blocksize, dep_event);
@@ -3112,7 +3195,11 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
         const int clamped_pairs = std::min(num_pairs, remaining_acts / 2);
         if (clamped_pairs > 0) {
             if (use_nested) {
-                pair_ev = launch_moe_expert_major_prefill_down_2token<true, Compact>(
+                if (nested_fixed256) pair_ev = launch_moe_expert_major_prefill_down_2token<true, Compact, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_pairs, top_k,
+                    in_features, out_features, blocksize, dep_event);
+                else pair_ev = launch_moe_expert_major_prefill_down_2token<true, Compact, false>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_pairs, top_k,
                     in_features, out_features, blocksize, dep_event);
@@ -3130,7 +3217,11 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
 
     if (remaining_acts > 0) {
         if (use_nested) {
-            single_ev = launch_moe_expert_major_prefill_down<true, Compact>(
+            if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_down<true, Compact, true>(
+                ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
+                in_features, out_features, blocksize, dep_event);
+            else single_ev = launch_moe_expert_major_prefill_down<true, Compact, false>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
@@ -3151,11 +3242,11 @@ sycl::event moe_expert_major_prefill_down(
     Context& ctx, const MoeExpertSlotDev* slots, const int* tokens, const int* ranks,
     const float* qmap, const bf16* h, float* down, int acts, int top_k,
     int in_features, int out_features, int blocksize, const sycl::event* dep,
-    bool nested, int pairs, int quads, bool compact) {
+    bool nested, int pairs, int quads, bool compact, bool nested_fixed256) {
     if (compact) return dispatch_moe_expert_major_prefill_down<true>(ctx,slots,tokens,ranks,
-        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads);
+        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads,nested_fixed256);
     return dispatch_moe_expert_major_prefill_down<false>(ctx,slots,tokens,ranks,
-        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads);
+        qmap,h,down,acts,top_k,in_features,out_features,blocksize,dep,nested,pairs,quads,nested_fixed256);
 }
 
 void moe_build_inverse_map(Context& ctx, const int* tokens, const int* ranks,

@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
         int samples_per_repeat = 20;
         int repeats = 3;
         bool nested = false;
+        int mode = 0;  // 0 = generic division path only, 2 = interleaved generic/fixed A/B
         for (int i = 1; i < argc; i += 2) {
             if (i + 1 >= argc) throw std::invalid_argument("expected value after option");
             const std::string key(argv[i]);
@@ -147,11 +148,14 @@ int main(int argc, char** argv) {
             const int value = positive_arg(argv[i + 1]);
             if (key == "--layers") layers = value;
             else if (key == "--experts") experts = value;
+            else if (key == "--mode") mode = value;
             else if (key == "--samples") samples_per_repeat = value;
             else if (key == "--repeats") repeats = value;
             else throw std::invalid_argument("unknown option: " + key);
         }
         if (experts > 16) throw std::invalid_argument("the MoE kernel supports at most 16 experts");
+        if (mode != 0 && mode != 2) throw std::invalid_argument("--mode must be 0 or 2");
+        if (mode == 2 && !nested) throw std::invalid_argument("--mode 2 requires --nested 1");
 
         Context ctx(nullptr, true);
         auto& q = ctx.queue();
@@ -230,17 +234,25 @@ int main(int argc, char** argv) {
         const std::vector<float> weights(experts, 1.0f / experts);
         ctx.memcpy_h2d(x, x_host.data(), x_host.size() * sizeof(bf16));
 
-        auto gate = [&](int layer) {
+        auto* h_fixed = mode == 2 ? static_cast<bf16*>(
+            ctx.alloc_device(static_cast<size_t>(experts) * kIntermediate * sizeof(bf16))) : nullptr;
+        auto* out_fixed = mode == 2 ? static_cast<bf16*>(ctx.alloc_device(kIn * sizeof(bf16))) : nullptr;
+        auto gate_mode = [&](int layer, bool fixed, bf16* dst) {
             return ops::moe_decode_gate_up_swiglu_grouped(
                 ctx, slots.data() + static_cast<size_t>(layer) * experts,
-                nullptr, x, h, experts, kIn, kIntermediate, kBlock);
+                nullptr, x, dst, experts, kIn, kIntermediate, kBlock,
+                static_cast<const sycl::event*>(nullptr), static_cast<const int*>(nullptr),
+                nested, fixed);
         };
-        auto down = [&](int layer) {
+        auto down_mode = [&](int layer, bool fixed, bf16* src, bf16* dst) {
             return ops::moe_decode_down_weighted_accumulate(
                 ctx, slots.data() + static_cast<size_t>(layer) * experts,
-                nullptr, weights.data(), h, nullptr, out, experts,
-                kIntermediate, kIn, kBlock);
+                nullptr, weights.data(), src, nullptr, dst, experts,
+                kIntermediate, kIn, kBlock,
+                static_cast<const bf16*>(nullptr), static_cast<const bf16*>(nullptr), fixed);
         };
+        auto gate = [&](int layer) { return gate_mode(layer, false, h); };
+        auto down = [&](int layer) { return down_mode(layer, false, h, out); };
 
         // CPU reference for the uniform input and real slot geometry. The
         // randomized indexing test remains AilaQwen4ExpKernelTests.
@@ -333,20 +345,31 @@ int main(int argc, char** argv) {
                 gate(layer);
                 down(layer);
             }
+            if (mode == 2) {
+                for (int layer = 0; layer < layers; ++layer) {
+                    gate_mode(layer, true, h_fixed);
+                    down_mode(layer, true, h_fixed, out_fixed);
+                }
+            }
             ctx.synchronize();
         }
 
         std::vector<Sample> measurements;
+        std::vector<Sample> fixed_measurements;
         measurements.reserve(static_cast<size_t>(samples_per_repeat) * repeats);
+        if (mode == 2) fixed_measurements.reserve(measurements.capacity());
         std::vector<sycl::event> events;
         events.reserve(static_cast<size_t>(layers) * 2);
+        int measurement_index = 0;
         for (int repeat = 0; repeat < repeats; ++repeat) {
-            for (int sample = 0; sample < samples_per_repeat; ++sample) {
+            for (int sample = 0; sample < samples_per_repeat; ++sample, ++measurement_index) {
+                const bool use_fixed = mode == 2 && (measurement_index % 2) == 1;
                 events.clear();
                 const auto wall_start = Clock::now();
                 for (int layer = 0; layer < layers; ++layer) {
-                    events.push_back(gate(layer));
-                    events.push_back(down(layer));
+                    events.push_back(gate_mode(layer, use_fixed, use_fixed ? h_fixed : h));
+                    events.push_back(down_mode(layer, use_fixed,
+                        use_fixed ? h_fixed : h, use_fixed ? out_fixed : out));
                 }
                 const auto submitted = Clock::now();
                 ctx.synchronize();
@@ -362,15 +385,37 @@ int main(int argc, char** argv) {
                     m.down_device_ms += static_cast<double>(end_ns(events[i + 1]) -
                                                             start_ns(events[i + 1])) / 1e6;
                 }
-                measurements.push_back(m);
+                if (use_fixed) fixed_measurements.push_back(m);
+                else measurements.push_back(m);
             }
         }
         std::cout << "moe_batch_ms (all times per " << layers << " layers):\n";
-        report("wall", measurements, &Sample::wall_ms);
-        report("enqueue_loop", measurements, &Sample::submit_ms);
-        report("device_span", measurements, &Sample::device_span_ms);
-        report("gate_device_sum", measurements, &Sample::gate_device_ms);
-        report("down_device_sum", measurements, &Sample::down_device_ms);
+        report(mode == 2 ? "wall_generic" : "wall", measurements, &Sample::wall_ms);
+        report(mode == 2 ? "enqueue_generic" : "enqueue_loop", measurements, &Sample::submit_ms);
+        report(mode == 2 ? "device_span_generic" : "device_span", measurements, &Sample::device_span_ms);
+        report(mode == 2 ? "gate_device_generic" : "gate_device_sum", measurements, &Sample::gate_device_ms);
+        report(mode == 2 ? "down_device_generic" : "down_device_sum", measurements, &Sample::down_device_ms);
+        if (mode == 2) {
+            report("wall_fixed", fixed_measurements, &Sample::wall_ms);
+            report("enqueue_fixed", fixed_measurements, &Sample::submit_ms);
+            report("device_span_fixed", fixed_measurements, &Sample::device_span_ms);
+            report("gate_device_fixed", fixed_measurements, &Sample::gate_device_ms);
+            report("down_device_fixed", fixed_measurements, &Sample::down_device_ms);
+            const auto h_bytes = static_cast<size_t>(experts) * kIntermediate * sizeof(bf16);
+            std::vector<uint16_t> hb(static_cast<size_t>(experts) * kIntermediate),
+                hb2(hb.size()), ob(kIn), ob2(kIn);
+            ctx.memcpy_d2h(hb.data(), h, h_bytes);
+            ctx.memcpy_d2h(hb2.data(), h_fixed, h_bytes);
+            ctx.memcpy_d2h(ob.data(), out, kIn * sizeof(bf16));
+            ctx.memcpy_d2h(ob2.data(), out_fixed, kIn * sizeof(bf16));
+            ctx.synchronize();
+            const bool h_bitwise = std::memcmp(hb.data(), hb2.data(), h_bytes) == 0;
+            const bool out_bitwise = std::memcmp(ob.data(), ob2.data(), kIn * sizeof(bf16)) == 0;
+            std::cout << "bitwise_generic_vs_fixed h=" << (h_bitwise ? 1 : 0)
+                      << " out=" << (out_bitwise ? 1 : 0) << "\n";
+            if (!h_bitwise || !out_bitwise) throw std::runtime_error(
+                "fixed-256 nested specialization changed output bits");
+        }
 
         // Smallest no-op kernel batch with the same number of in-order
         // submissions. Enqueue time includes runtime work and backpressure.
@@ -441,6 +486,8 @@ int main(int argc, char** argv) {
         std::cout << "streaming_read_GBps=" << pool_bytes / (stream_device_ms * 1e6) << "\n";
 
         ctx.free_device(sums);
+        if (out_fixed) ctx.free_device(out_fixed);
+        if (h_fixed) ctx.free_device(h_fixed);
         ctx.free_device(out);
         ctx.free_device(h);
         ctx.free_device(x);

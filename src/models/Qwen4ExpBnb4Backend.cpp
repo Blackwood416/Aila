@@ -1038,6 +1038,9 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         constexpr int kMaxTopK = 16;
         const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
         const bool nested = true;
+        // Adaptive descriptors are produced only by MakeResidentSlot, which
+        // stamps nested blocksize 256; the kernels drop the runtime division.
+        const bool nested_fixed256 = true;
         const auto& nested_meta = host_arena_.GetLayerNestedMetadata(layer);
 
         auto* h_base = buf_.moe_h.data_as<bf16>();
@@ -1108,12 +1111,13 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 last = ops::moe_decode_gate_up_swiglu_grouped(
                     ctx, hot.data(), nullptr,
                     x_t, h_base, hit_count,
-                    hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(), nullptr, nested);
+                    hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(), nullptr, nested,
+                    nested_fixed256);
 
                 last = ops::moe_decode_down_to_rank_f32(
                     ctx, hot.data(), hit_ranks.data(), h_base,
                     down, hit_count, top_k, intermediate, hidden_size_, 64,
-                    nullptr, nullptr, &last, nested);
+                    nullptr, nullptr, &last, nested, nested_fixed256);
                 adaptive_cache_.RecordResidentConsumer(last);
             }
 
@@ -1128,12 +1132,13 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 last = ops::moe_decode_gate_up_swiglu_grouped(
                     ctx, cold.data(), nullptr,
                     x_t, cold_h, staging.count,
-                    hidden_size_, intermediate, 64, &staging.ready_event, nullptr, nested);
+                    hidden_size_, intermediate, 64, &staging.ready_event, nullptr, nested,
+                    nested_fixed256);
 
                 last = ops::moe_decode_down_to_rank_f32(
                     ctx, cold.data(), miss_ranks.data()+cpu_count, cold_h,
                     down, staging.count, top_k, intermediate, hidden_size_, 64,
-                    nullptr, nullptr, &last, nested);
+                    nullptr, nullptr, &last, nested, nested_fixed256);
 
                 adaptive_cache_.RecordStagingConsumer(staging.ping_pong_index,last);
             }
@@ -1349,15 +1354,16 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     if (tiles) ctx.queue().memcpy(tilesDev + tileBegin, expert_tiles_host_ + tileBegin, size_t(tiles) * sizeof(ops::MoeExpertTile));
     sycl::event last = ready;
     const bool nested = use_adaptive_pipeline_ || expert_cache_.uses_nested_codes();
+    const bool nested_fixed256 = use_adaptive_pipeline_;
     if (alu) {
         last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
             buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), alu, top_k,
-            hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq);
+            hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq, nested_fixed256);
         last = ops::moe_expert_major_prefill_down(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
             buf_.moe_h.data_as<bf16>(), buf_.moe_down_acc.data_as<float>(), alu, top_k,
-            cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq);
+            cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq, false, nested_fixed256);
     }
     if (tiles) {
         last = ops::moe_grouped_xmx_gate_up(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,

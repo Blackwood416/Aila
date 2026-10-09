@@ -135,10 +135,14 @@ void router_topk_ids_host(
 sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* weights,
     const int* table, int* selected, int* host_ids, float* host_weights, int* host_selected,
     int top_k, int experts);
+// The nested_fixed256 flags below are a caller contract: when nested scales
+// are enabled, every referenced descriptor must use nested blocksize 256.
 sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,
-    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested);
+    const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256 = false);
 sycl::event moe_resident_down(Context& ctx, const MoeExpertSlotDev* descriptors,
-    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested);
+    const int* selected, const bf16* h, float* down, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256 = false);
 
 // Experimental resident NF4/Q8 decode. Packed NF4 descriptors retain their
 // original row-major format and block-64 nested scales. Only activations and
@@ -153,10 +157,12 @@ sycl::event quantize_moe_input_q8_64(Context& ctx, const bf16* x,
     int8_t* xq, float* xs, int hidden);
 sycl::event moe_resident_gate_up_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const int8_t* xq, const float* xs, bf16* h,
-    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested);
+    int8_t* hq, float* hs, int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256 = false);
 sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const int8_t* hq, const float* hs, float* down,
-    int top_k, int hidden, int intermediate, bool nested);
+    int top_k, int hidden, int intermediate, bool nested,
+    bool nested_fixed256 = false);
 
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
@@ -172,7 +178,8 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
     const int* token_ids = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 inline sycl::event moe_decode_gate_up_swiglu_grouped(
     Context& ctx,
@@ -221,7 +228,8 @@ sycl::event moe_decode_down_weighted_accumulate(
     int out_features = 2560,
     int blocksize = 64,
     const bf16* shared_out = nullptr,
-    const bf16* shared_gate = nullptr);
+    const bf16* shared_gate = nullptr,
+    bool nested_fixed256 = false);
 
 // Slotted expert decode down-projection writing directly to rank slots of down_acc (unweighted FP32):
 // down_acc[(token * top_k + rank) * out_features + row] = down_k(h[k])_row
@@ -239,7 +247,8 @@ sycl::event moe_decode_down_to_rank_f32(
     const int* token_ids = nullptr,
     const float* quant_map = nullptr,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 // Batched prefill expert gate_up GEMV with SwiGLU: h[t, k, intermediate_size] = silu(gate) * up
 sycl::event moe_prefill_gate_up_rows(
@@ -254,7 +263,8 @@ sycl::event moe_prefill_gate_up_rows(
     int intermediate_size = 640,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 inline sycl::event moe_prefill_gate_up_rows(
     Context& ctx,
@@ -291,7 +301,8 @@ sycl::event moe_prefill_down_rows(
     const bf16* shared_out = nullptr,
     const bf16* shared_gate = nullptr,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 inline sycl::event moe_prefill_down_rows(
     Context& ctx,
@@ -339,7 +350,8 @@ sycl::event moe_expert_major_prefill_gate_up(
     const sycl::event* dep_event = nullptr,
     bool use_nested = false,
     int num_pairs = 0,
-    int num_quads = 0);
+    int num_quads = 0,
+    bool nested_fixed256 = false);
 
 sycl::event moe_expert_major_prefill_down(
     Context& ctx,
@@ -358,7 +370,8 @@ sycl::event moe_expert_major_prefill_down(
     bool use_nested = false,
     int num_pairs = 0,
     int num_quads = 0,
-    bool compact_output = false);
+    bool compact_output = false,
+    bool nested_fixed256 = false);
 
 // Compact output is [acts,H]; input h still uses [token,rank,I]. H must be divisible by 4.
 void moe_build_inverse_map(Context& ctx, const int* tokens, const int* ranks,
@@ -386,7 +399,8 @@ sycl::event moe_expert_major_prefill_gate_up_2token(
     int intermediate_size = 640,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 sycl::event moe_expert_major_prefill_down_2token(
     Context& ctx,
@@ -402,7 +416,8 @@ sycl::event moe_expert_major_prefill_down_2token(
     int out_features = 2560,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 // Phase G3: Explicit 4-token weight reuse prefill kernels
 sycl::event moe_expert_major_prefill_gate_up_4token(
@@ -419,7 +434,8 @@ sycl::event moe_expert_major_prefill_gate_up_4token(
     int intermediate_size = 640,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 sycl::event moe_expert_major_prefill_down_4token(
     Context& ctx,
@@ -435,7 +451,8 @@ sycl::event moe_expert_major_prefill_down_4token(
     int out_features = 2560,
     int blocksize = 64,
     const sycl::event* dep_event = nullptr,
-    bool use_nested = false);
+    bool use_nested = false,
+    bool nested_fixed256 = false);
 
 // Single-token CPU output in this queue's USM host context. The caller keeps
 // values immutable until the returned merge event completes. The rank map is

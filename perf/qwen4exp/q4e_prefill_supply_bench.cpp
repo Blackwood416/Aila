@@ -146,7 +146,7 @@ void run(bool smoke, bool sliced) {
 }
 // Full gate/up -> down chain, one scheduling variable. Host payloads are
 // prefilled: this isolates DMA/compute competition, not ReadFile throughput.
-void run_pacing(int rows, bool smoke) {
+void run_pacing(int rows, bool smoke, bool ab = false) {
     constexpr int batch=32, guard=16;
     constexpr size_t DownPacked=H*I/2, DownCodes=H*I/64, DownNested=DownCodes/256;
     constexpr size_t DownOffset=Packed+Codes, DownCodesOffset=DownOffset+DownPacked;
@@ -193,7 +193,7 @@ void run_pacing(int rows, bool smoke) {
     std::vector<sycl::event> kernels,copies;
     kernels.reserve(2*E/batch);copies.reserve(E);
     auto poison=[&]{q.fill(hd.data_as<bf16>(),bf16(-9),h_count);q.fill(dd.data_as<float>(),-17.f,d_count);q.wait_and_throw();};
-    auto execute=[&](bool paced){
+    auto execute=[&](bool paced, bool fixed){
         kernels.clear();copies.clear();sycl::event last{};
         const auto t0=Clock::now();
         for(int e=0;e<E;e+=batch){
@@ -208,11 +208,11 @@ void run_pacing(int rows, bool smoke) {
             auto gu=ops::moe_expert_major_prefill_gate_up_4token(ctx,
                 sd.data_as<ops::MoeExpertSlotDev>()+e*rows,td.data_as<int>()+e*rows,rd.data_as<int>()+e*rows,
                 metadata.data_as<float>()+qmap_offset,xd.data_as<bf16>(),hd.data_as<bf16>(),
-                batch*rows/4,R,H,I,64,&ready,true);
+                batch*rows/4,R,H,I,64,&ready,true,fixed);
             last=ops::moe_expert_major_prefill_down_4token(ctx,
                 sd.data_as<ops::MoeExpertSlotDev>()+e*rows,td.data_as<int>()+e*rows,rd.data_as<int>()+e*rows,
                 metadata.data_as<float>()+qmap_offset,hd.data_as<bf16>(),dd.data_as<float>(),
-                batch*rows/4,R,I,H,64,&gu,true);
+                batch*rows/4,R,I,H,64,&gu,true,fixed);
             kernels.push_back(gu);kernels.push_back(last);
         }
         q.wait_and_throw();copy.wait_and_throw();
@@ -222,7 +222,7 @@ void run_pacing(int rows, bool smoke) {
         for(const auto& ev:copies)s.copy+=(end(ev)-start(ev))*1e-6;
         return s;
     };
-    poison();execute(false);
+    poison();execute(false,false);
     q.memcpy(actual_h.data(),hd.data(),h_count*2);q.memcpy(actual_down.data(),dd.data(),d_count*4);q.wait_and_throw();
     reference_h=actual_h;reference_down=actual_down;
     for(size_t j=0;j<size_t(acts)*I;++j)check(std::isfinite(float(actual_h[j])),"Nonfinite gate/up");
@@ -255,10 +255,14 @@ void run_pacing(int rows, bool smoke) {
             check(std::abs(got-value)<=.001+.006*std::abs(value),"CPU full-chain reference mismatch");++cpu_samples;
         }
     }
-    poison();execute(true);
+    poison();execute(true,false);
     q.memcpy(actual_h.data(),hd.data(),h_count*2);q.memcpy(actual_down.data(),dd.data(),d_count*4);q.wait_and_throw();
     check(!std::memcmp(actual_h.data(),reference_h.data(),h_count*2),"Pacing changed gate/up or guards");
     check(!std::memcmp(actual_down.data(),reference_down.data(),d_count*4),"Pacing changed down or guards");
+    poison();execute(false,true);
+    q.memcpy(actual_h.data(),hd.data(),h_count*2);q.memcpy(actual_down.data(),dd.data(),d_count*4);q.wait_and_throw();
+    check(!std::memcmp(actual_h.data(),reference_h.data(),h_count*2),"Fixed-256 specialization changed gate/up bits");
+    check(!std::memcmp(actual_down.data(),reference_down.data(),d_count*4),"Fixed-256 specialization changed down bits");
     std::cout<<std::unitbuf<<std::fixed<<std::setprecision(6)<<"[PACING CONFIG] rows="<<rows<<" batch="<<batch
         <<" experts="<<E<<" copy_bytes="<<E*Slot<<" device="<<q.get_device().get_info<sycl::info::device::name>()
         <<" driver="<<q.get_device().get_info<sycl::info::device::driver_version>()<<'\n';
@@ -267,9 +271,26 @@ void run_pacing(int rows, bool smoke) {
     const int repeats=smoke?1:3,samples=smoke?1:20;
     for(int rep=0;rep<repeats;++rep){
         std::array<std::vector<Sample>,2> data;
-        for(int warm=0;warm<3;++warm){execute(false);execute(true);}
+        if(ab){
+            for(int warm=0;warm<3;++warm){execute(false,false);execute(false,true);}
+            for(int n=0;n<samples;++n)for(int order=0;order<2;++order){
+                int which=(n+order+rep)%2;data[which].push_back(execute(false,which==1));
+            }
+            const char* names[2]={"generic","fixed256"};
+            for(int arm=0;arm<2;++arm){
+                std::vector<double>w,k,c;for(auto s:data[arm]){w.push_back(s.wall);k.push_back(s.kernel);c.push_back(s.copy);}
+                auto sorted=w;std::sort(sorted.begin(),sorted.end());
+                std::cout<<"[PACING AB] rows="<<rows<<" repeat="<<rep<<" arm="<<names[arm]
+                    <<" samples="<<samples<<" wall_ms="<<median(w)<<" kernel_ms="<<median(k)
+                    <<" copy_ms="<<median(c)<<" p10_ms="<<sorted[sorted.size()/10]
+                    <<" p90_ms="<<sorted[sorted.size()*9/10]<<" raw_ms=";
+                for(size_t n=0;n<w.size();++n)std::cout<<(n?",":"")<<w[n];std::cout<<'\n';
+            }
+            continue;
+        }
+        for(int warm=0;warm<3;++warm){execute(false,false);execute(true,false);}
         for(int n=0;n<samples;++n)for(int order=0;order<2;++order){
-            int mode=(n+order+rep)%2;data[mode].push_back(execute(mode!=0));
+            int mode=(n+order+rep)%2;data[mode].push_back(execute(mode!=0,false));
         }
         for(int mode=0;mode<2;++mode){
             std::vector<double>w,k,c;for(auto s:data[mode]){w.push_back(s.wall);k.push_back(s.kernel);c.push_back(s.copy);}
@@ -289,6 +310,7 @@ int main(int argc,char** argv) {
         if(option=="--pacing" || option=="--pacing-smoke"){
             run_pacing(8,option=="--pacing-smoke");run_pacing(80,option=="--pacing-smoke");return 0;
         }
+        if(option=="--pacingab"){run_pacing(8,false,true);run_pacing(80,false,true);return 0;}
         check(option=="--smoke"||option=="--bench"||option=="--sliced","Unknown supply probe option");
         run(option=="--smoke",option=="--sliced");return 0;
     }
