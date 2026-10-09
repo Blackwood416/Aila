@@ -60,20 +60,40 @@ int main() {
         cfg.num_gpu_slots=2; cfg.staging_slots_per_buffer=2;
         aila::Qwen4ExpAdaptiveCache cache;
         std::string error; require(cache.Allocate(ctx,cfg,&error),error.c_str());
-        const std::vector<std::pair<int,int>> initial={{0,0},{0,1}};
+        const std::vector<std::pair<int,int>> initial={{0,3},{0,1}};
+        const std::vector<std::pair<int,int>> duplicate={{0,3},{0,3}};
+        bool duplicate_rejected=false;
+        try { (void)cache.InitializeResidency(&duplicate); }
+        catch (const std::invalid_argument&) { duplicate_rejected=true; }
+        require(duplicate_rejected,"duplicate initial resident expert must be rejected");
         auto owners=cache.InitializeResidency(&initial);
+        require(cache.GetResidentEntry(0).layer==0 && cache.GetResidentEntry(0).expert_id==3 &&
+                cache.GetResidentEntry(1).layer==0 && cache.GetResidentEntry(1).expert_id==1,
+                "ranked initial prefix must preserve slot order");
         aila::HostArenaConfig hc; hc.num_layers=1; hc.num_experts_per_layer=E;
         aila::Qwen4ExpHostArena arena;
         require(arena.Allocate(ctx,hc,&error,owners),error.c_str());
         arena.LoadLayerDirect(0,gu.Ref(),dn.Ref()); cache.FinishInitialLoad(ctx.queue());
-        require(arena.ResidentExperts()==2 && !arena.GetExpertPointer(0,0) && arena.GetExpertPointer(0,2),"GPU/RAM complement");
+        require(arena.ResidentExperts()==2 && !arena.GetExpertPointer(0,3) && !arena.GetExpertPointer(0,1) &&
+                arena.GetExpertPointer(0,0) && arena.GetExpertPointer(0,2),"GPU/RAM complement follows ranked prefix");
         const auto& g=arena.Geometry();
         std::vector<uint8_t> payload(g.slot_bytes);
         for (int e=0;e<E;++e) {
+            require((owners[e]!=nullptr)!=(arena.GetExpertPointer(0,e)!=nullptr),"each expert has exactly one initial owner");
             if (owners[e]) ctx.memcpy_d2h(payload.data(),owners[e],payload.size());
             else std::memcpy(payload.data(),arena.GetExpertPointer(0,e),payload.size());
             check_payload(payload.data(),e,g,gu,dn);
         }
+
+        // Keep the nontrivial ranked-prefix check independent from the legacy
+        // numerical and swap cases below, which use experts 0/1 as residents.
+        arena.Release();
+        const std::vector<std::pair<int,int>> baseline={{0,0},{0,1}};
+        owners=cache.InitializeResidency(&baseline);
+        require(cache.GetResidentEntry(0).expert_id==0 && cache.GetResidentEntry(1).expert_id==1,
+                "baseline resident set for subsequent numerical checks");
+        require(arena.Allocate(ctx,hc,&error,owners),error.c_str());
+        arena.LoadLayerDirect(0,gu.Ref(),dn.Ref());cache.FinishInitialLoad(ctx.queue());
 
         // Independent device copies of original tensors form the reference;
         // distinct per-expert scales catch an omitted expert index immediately.

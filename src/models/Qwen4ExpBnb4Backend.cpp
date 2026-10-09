@@ -2,6 +2,7 @@
 #include "../memory/SessionMemory.hpp"
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
+#include "models/Qwen4ExpHotsetPolicy.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
@@ -702,8 +703,50 @@ bool Qwen4ExpBnb4Backend::load(
         if (error_message) *error_message="Qwen4Exp resident cache exceeds the admitted VRAM budget";
         return false;
     }
+    const auto hotset_profile_path=aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","");
+    const bool profile_hotset=!hotset_profile_path.empty();
+    std::vector<std::pair<int,int>> initial_ranked_profile;
+    if (profile_hotset) {
+        // Build the same source-byte identity used by the legacy cache. The
+        // adaptive arena's expert payload is always compact nested NF4.
+        std::vector<aila::ExpertLayerSource> profile_sources(cfg_.num_hidden_layers);
+        for (int layer=0;layer<cfg_.num_hidden_layers;++layer) {
+            const std::string prefix="model.language_model.layers."+std::to_string(layer)+".mlp.experts.";
+            auto& source=profile_sources[layer];
+            std::string detail;
+            const auto gate_up_base=prefix+"gate_up_proj",down_base=prefix+"down_proj";
+            const auto gate_up_name=weights.has_host(gate_up_base)?gate_up_base:gate_up_base+".weight";
+            const auto down_name=weights.has_host(down_base)?down_base:down_base+".weight";
+            if (!LoadBnb4BitHostRef(weights,gate_up_name,source.gate_up,&detail,hidden_size_) ||
+                !LoadBnb4BitHostRef(weights,down_name,source.down,&detail,cfg_.moe_intermediate_size)) {
+                if (error_message) *error_message="Cannot validate AILA_Q4E_HOTSET_PROFILE identity: "+detail;
+                return false;
+            }
+            source.valid=true;
+        }
+        const std::string identity=Qwen4ExpHotsetPolicy::MakeIdentity(profile_sources,
+            cfg_.num_hidden_layers,cfg_.num_experts,hidden_size_,cfg_.moe_intermediate_size,64,true);
+        Qwen4ExpHotsetPolicy policy;
+        policy.Init(cfg_.num_hidden_layers,cfg_.num_experts);
+        try {
+            policy.Load(hotset_profile_path,identity);
+        } catch (const std::exception& e) {
+            if (error_message) *error_message=e.what();
+            return false;
+        }
+        const size_t resident_rank_count=std::min<size_t>(
+            static_cast<size_t>(cache_cfg.num_gpu_slots),policy.ranking.size());
+        initial_ranked_profile.reserve(resident_rank_count);
+        for (size_t i=0;i<resident_rank_count;++i) {
+            const int key=policy.ranking[i];
+            initial_ranked_profile.emplace_back(key/cfg_.num_experts,key%cfg_.num_experts);
+        }
+        AILA_LOG_INFO("[Q4E Adaptive Residency] profile=%s identity=%s ranked_keys=%zu resident_slots=%d",
+            hotset_profile_path.c_str(),identity.c_str(),initial_ranked_profile.size(),cache_cfg.num_gpu_slots);
+    }
     if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
-    auto gpu_owners=adaptive_cache_.InitializeResidency();
+    auto gpu_owners=adaptive_cache_.InitializeResidency(
+        profile_hotset ? &initial_ranked_profile : nullptr);
     aila::HostArenaConfig arena_cfg;
     arena_cfg.num_layers=cfg_.num_hidden_layers; arena_cfg.num_experts_per_layer=cfg_.num_experts;
     arena_cfg.hidden_size=hidden_size_; arena_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
@@ -723,7 +766,6 @@ bool Qwen4ExpBnb4Backend::load(
     ensure_runtime_buffers(ctx, 1);
     static const int s_resident_decode = aila::env::read_int("AILA_Q4E_RESIDENT_DECODE", 0);
     cold_mode_ = aila::env::read_int("AILA_Q4E_COLD_MODE",0);
-    const bool profile_hotset=!aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","").empty();
     if(profile_hotset && !cold_mode_)cold_mode_=1;
     resident_prefill_ = aila::env::read_flag("AILA_Q4E_RESIDENT_PREFILL",false);
     if(cold_mode_<0 || cold_mode_>2)throw std::invalid_argument("Cold mode must be 0/1/2");

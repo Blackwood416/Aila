@@ -3,7 +3,12 @@
 #include "models/Qwen4ExpExpertExecutor.hpp"
 #include "utils/SafeTensors.hpp"
 
+#include <algorithm>
 #include <cstdlib>
+#include <array>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -13,6 +18,7 @@
 #include <cstring>
 #include <thread>
 #include <limits>
+#include <system_error>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 
@@ -2152,6 +2158,71 @@ void test_prompt_policy() {
     std::cout<<"[H5 POLICY PASS] chunk_invariance=1 repeat_learning=1 domain_switch=1 bounded_admission=1\n";
 }
 
+void test_hotset_profile_contract() {
+    std::array<uint8_t,128> source_bytes{};
+    for(size_t i=0;i<source_bytes.size();++i)source_bytes[i]=uint8_t(i*17+3);
+    std::vector<aila::ExpertLayerSource> sources(1);
+    size_t source_offset=0;
+    auto bind_ref=[&](Bnb4BitHostWeightRef& weight,float offset) {
+        auto bind_view=[&](HostTensorView& view,size_t bytes) {
+            view.ptr=source_bytes.data()+source_offset;view.bytes=bytes;source_offset+=bytes;
+        };
+        bind_view(weight.packed_weight,7);bind_view(weight.absmax,5);bind_view(weight.quant_map,4);
+        bind_view(weight.nested_absmax,6);bind_view(weight.nested_quant_map,8);
+        weight.quant_state.nested_offset=offset;weight.quant_state.nested_blocksize=256;
+    };
+    bind_ref(sources[0].gate_up,0.25f);bind_ref(sources[0].down,-0.5f);
+
+    // The pre-extraction identity loop is kept here as a small equivalence
+    // oracle so profile IDs cannot silently drift during this refactor.
+    uint64_t legacy_hash=1469598103934665603ULL;
+    auto legacy_bytes=[&](const uint8_t* p,size_t n){for(size_t i=0;i<n;++i){legacy_hash^=p[i];legacy_hash*=1099511628211ULL;}};
+    for(const auto& layer:sources) for(const auto* weight:{&layer.gate_up,&layer.down}) {
+        for(const auto* view:{&weight->packed_weight,&weight->absmax,&weight->quant_map,
+                              &weight->nested_absmax,&weight->nested_quant_map}) {
+            const uint64_t n=view->bytes;legacy_bytes(reinterpret_cast<const uint8_t*>(&n),sizeof(n));
+            if(view->valid()) {const size_t sample=std::min<size_t>(4096,n);
+                legacy_bytes(view->ptr,sample);if(n>sample)legacy_bytes(view->ptr+n-sample,sample);}
+        }
+        legacy_bytes(reinterpret_cast<const uint8_t*>(&weight->quant_state.nested_offset),sizeof(weight->quant_state.nested_offset));
+        legacy_bytes(reinterpret_cast<const uint8_t*>(&weight->quant_state.nested_blocksize),sizeof(weight->quant_state.nested_blocksize));
+    }
+    const std::string legacy_identity="nf4-original-expert-order-1x2-2560x640-b64-nested1-sample-fnv64-"+
+        std::to_string(legacy_hash);
+    const auto identity=Qwen4ExpHotsetPolicy::MakeIdentity(sources,1,2,2560,640,64,true);
+    expect(identity==legacy_identity,"shared profile identity differs from the original identity algorithm");
+
+    const auto profile_path=std::filesystem::temp_directory_path()/(
+        "aila-q4e-hotset-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".profile");
+    struct RemoveProfile {
+        std::filesystem::path path;
+        ~RemoveProfile(){std::error_code error;std::filesystem::remove(path,error);}
+    } remove_profile{profile_path};
+    auto write_profile=[&](const std::vector<int>& order,int declared_count=-1) {
+        std::ofstream out(profile_path,std::ios::trunc);
+        if(!out)throw std::runtime_error("Cannot create hotset profile test file");
+        out<<"AILA_Q4E_HOTSET 1\nprofile-test-identity\n2 3 "
+           <<(declared_count<0?int(order.size()):declared_count)<<'\n';
+        for(int key:order)out<<key<<" 1 2 3\n";
+        if(!out)throw std::runtime_error("Cannot write hotset profile test file");
+    };
+    const std::vector<int> complete={4,1,3,0,5,2};
+    write_profile(complete);
+    Qwen4ExpHotsetPolicy loaded;loaded.Init(2,3);
+    loaded.Load(profile_path.string(),"profile-test-identity");
+    expect(loaded.ranking==complete,"profile load did not preserve the complete ranking");
+    bool identity_rejected=false;
+    try {loaded.Load(profile_path.string(),"wrong-identity");}
+    catch(const std::runtime_error& e) {identity_rejected=std::string(e.what()).find("identity mismatch")!=std::string::npos;}
+    expect(identity_rejected,"profile with a wrong model identity was not clearly rejected");
+    write_profile({4,1,3,0,5,4});
+    bool duplicate_rejected=false;
+    try {loaded.Load(profile_path.string(),"profile-test-identity");}
+    catch(const std::runtime_error& e) {duplicate_rejected=std::string(e.what()).find("duplicate")!=std::string::npos;}
+    expect(duplicate_rejected,"duplicate in a complete ranking was not clearly rejected");
+    std::cout<<"[H4 HOTSET PROFILE PASS] identity_equivalence=1 complete_order=1 identity_guard=1 duplicate_guard=1\n";
+}
+
 } // namespace
 
 int main(int argc,char** argv) {
@@ -2164,6 +2235,9 @@ int main(int argc,char** argv) {
         _putenv("AILA_TEST_Q4E_HOST_POOL=1");
         _putenv("AILA_TEST_Q4E_HOST_SLOTS=4");
 
+        if(argc==2 && std::string(argv[1])=="--hotset-profile-only") {
+            test_hotset_profile_contract();return 0;
+        }
         Context ctx;
         if(argc==2 && std::string(argv[1])=="--large-page-async-cpu-only") {
             test_large_page_async_cpu(ctx);return 0;

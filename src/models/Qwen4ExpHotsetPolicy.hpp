@@ -21,6 +21,31 @@ struct Qwen4ExpHotsetPolicy {
     std::vector<float> prompt_usage, previous_prompt, prompt_mass;
     bool collecting_prompt = false;
     int prompt_rows = 0;
+
+    // Keep the profile identity shared by the legacy cache and the adaptive
+    // resident path. It binds a ranking to the original NF4 expert ordering,
+    // geometry, nested-code layout, and sampled source bytes.
+    template <typename LayerWeightRange>
+    static std::string MakeIdentity(const LayerWeightRange& layer_weights,
+                                    int layers, int experts, int hidden_size,
+                                    int intermediate_size, int blocksize,
+                                    bool compact_nested) {
+        uint64_t hash=1469598103934665603ULL;
+        auto bytes=[&](const uint8_t* p,size_t n){for(size_t i=0;i<n;++i){hash^=p[i];hash*=1099511628211ULL;}};
+        for(const auto& lw:layer_weights) for(const auto* w:{&lw.gate_up,&lw.down}) {
+            for(const auto* view:{&w->packed_weight,&w->absmax,&w->quant_map,&w->nested_absmax,&w->nested_quant_map}) {
+                const uint64_t n=view->bytes;bytes(reinterpret_cast<const uint8_t*>(&n),sizeof(n));
+                if(view->valid()) {const size_t sample=std::min<size_t>(4096,n);
+                    bytes(view->ptr,sample); if(n>sample)bytes(view->ptr+n-sample,sample);}
+            }
+            bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_offset),sizeof(w->quant_state.nested_offset));
+            bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_blocksize),sizeof(w->quant_state.nested_blocksize));
+        }
+        return "nf4-original-expert-order-"+std::to_string(layers)+"x"+std::to_string(experts)+
+            "-"+std::to_string(hidden_size)+"x"+std::to_string(intermediate_size)+"-b"+std::to_string(blocksize)+
+            "-nested"+std::to_string(int(compact_nested))+"-sample-fnv64-"+std::to_string(hash);
+    }
+
     void Init(int l, int e) {
         layers=l; experts=e; const int n=l*e;
         usage.assign(n,0); decode.assign(n,0); prefill.assign(n,0); unique.assign(n,0);
@@ -119,9 +144,15 @@ struct Qwen4ExpHotsetPolicy {
     }
     void Load(const std::string& path,const std::string& identity) {
         std::ifstream in(path);std::string magic,id;int version=0,l=0,e=0,n=0;
-        if(!(in>>magic>>version>>id>>l>>e>>n) || magic!="AILA_Q4E_HOTSET" || version!=1 ||
-            id!=identity || l!=layers || e!=experts || n!=layers*experts)
-            throw std::runtime_error("Hotset profile identity or dimensions mismatch");
+        if(!in)throw std::runtime_error("Cannot open hotset profile: "+path);
+        if(!(in>>magic>>version>>id>>l>>e>>n))
+            throw std::runtime_error("Invalid hotset profile header: "+path);
+        if(magic!="AILA_Q4E_HOTSET" || version!=1)
+            throw std::runtime_error("Unsupported hotset profile format: "+path);
+        if(id!=identity)
+            throw std::runtime_error("Hotset profile model identity mismatch: "+path);
+        if(l!=layers || e!=experts || n!=layers*experts)
+            throw std::runtime_error("Hotset profile dimensions mismatch: "+path);
         std::vector<int> order;std::vector<bool> seen(n,false);
         for(int i=0;i<n;++i) {int key;uint64_t d,p,u;
             if(!(in>>key>>d>>p>>u) || key<0 || key>=n || seen[key])

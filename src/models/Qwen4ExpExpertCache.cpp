@@ -1485,20 +1485,8 @@ void Qwen4ExpExpertCache::ConfigureHotset() {
     hotset_policy_.Init(num_layers_,num_experts_per_layer_);
     // Layout/quantization plus sampled source bytes, computed once at load. This
     // is an expert-identity guard, not a cryptographic hash of the entire model.
-    uint64_t hash=1469598103934665603ULL;
-    auto bytes=[&](const uint8_t* p,size_t n){for(size_t i=0;i<n;++i){hash^=p[i];hash*=1099511628211ULL;}};
-    for(const auto& lw:layer_weights_) for(const auto* w:{&lw.gate_up,&lw.down}) {
-        for(const auto* view:{&w->packed_weight,&w->absmax,&w->quant_map,&w->nested_absmax,&w->nested_quant_map}) {
-            const uint64_t n=view->bytes;bytes(reinterpret_cast<const uint8_t*>(&n),sizeof(n));
-            if(view->valid()) {const size_t sample=std::min<size_t>(4096,n);
-                bytes(view->ptr,sample); if(n>sample)bytes(view->ptr+n-sample,sample);}
-        }
-        bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_offset),sizeof(w->quant_state.nested_offset));
-        bytes(reinterpret_cast<const uint8_t*>(&w->quant_state.nested_blocksize),sizeof(w->quant_state.nested_blocksize));
-    }
-    hotset_identity_="nf4-original-expert-order-"+std::to_string(num_layers_)+"x"+std::to_string(num_experts_per_layer_)+
-        "-"+std::to_string(hidden_size_)+"x"+std::to_string(intermediate_size_)+"-b"+std::to_string(blocksize_)+
-        "-nested"+std::to_string(int(compact_nested_))+"-sample-fnv64-"+std::to_string(hash);
+    hotset_identity_=Qwen4ExpHotsetPolicy::MakeIdentity(layer_weights_,num_layers_,num_experts_per_layer_,
+        hidden_size_,intermediate_size_,blocksize_,compact_nested_);
     if(profile.empty())return;
     hotset_policy_.Load(profile,hotset_identity_); // Fail explicit experiments on a wrong profile.
     hotset_interval_=std::clamp(aila::env::read_int_raw("AILA_Q4E_HOTSET_INTERVAL",4),0,1024);
