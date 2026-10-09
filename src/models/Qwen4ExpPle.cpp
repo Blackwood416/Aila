@@ -678,6 +678,14 @@ PleTicket Qwen4ExpPle::prepare(
     return ticket;
 }
 
+bool Qwen4ExpPle::MatchesInput(const PleTicket& ticket, const int* tokens, int count) const {
+    const int slot = ticket.staging_slot;
+    return ticket.valid && tokens && count > 0 && ticket.num_tokens == count &&
+        slot >= 0 && slot < kNumStagingSlots && slot_task_ids_[slot] == ticket.task_id &&
+        slot_input_ids_[slot].size() >= size_t(count) &&
+        std::equal(tokens, tokens + count, slot_input_ids_[slot].begin());
+}
+
 void Qwen4ExpPle::consume(
     Context& ctx,
     PleTicket& ticket,

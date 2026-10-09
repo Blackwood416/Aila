@@ -268,9 +268,11 @@ StepResult RequestState::StepLocked(size_t outputSlots) {
             // Prompt tokens still queued after this chunk; 0 marks the last
             // prefill slice so phase-aware backends can close the prefill.
             const int prefillRemaining = static_cast<int>(remaining - chunkSize);
+            const int nextCount = std::min(prefillRemaining, options.prefillChunkSize);
+            const int* nextTokens = nextCount ? promptIds.data() + snapshot.promptTokensProcessed + chunkSize : nullptr;
             result = session->Execute(std::vector<int>(first, first + chunkSize),
                                       finalChunk ? nextSample : nullptr,
-                                      false, prefillRemaining);
+                                      false, prefillRemaining, nextTokens, nextCount);
             snapshot.promptTokensProcessed += chunkSize;
             if (cancelRequested.load(std::memory_order_acquire)) {
                 return Finish(RequestStatus::Cancelled);

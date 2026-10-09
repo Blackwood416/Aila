@@ -452,6 +452,7 @@ private:
     Qwen4ExpHyperConnectionLayer mixer_;
     Qwen4ExpPle ple_;
     PleTicket ple_ticket_;
+    PleTicket ple_next_ticket_;
     Qwen4ExpExpertCache expert_cache_;
     aila::Qwen4ExpExpertExecutor expert_executor_;
     aila::Qwen4ExpHostArena host_arena_;

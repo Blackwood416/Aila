@@ -19,7 +19,8 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--context", type=int, default=16384)
-    parser.add_argument("--prompt-tokens", type=int, nargs="+", default=[6000, 14000])
+    parser.add_argument("--prompt-tokens", type=int, nargs="*", default=[6000, 14000],
+                        help="context targets; pass without values for cancellation-only validation")
     parser.add_argument("--chunk", type=int, default=512)
     parser.add_argument("--generate", type=int, default=64)
     parser.add_argument("--reuse", type=int, choices=[0, 1], default=1)
@@ -27,6 +28,7 @@ def main():
     parser.add_argument("--pi-context-file", type=Path)
     parser.add_argument("--pi-only", action="store_true")
     parser.add_argument("--cancel-recover", action="store_true", help="cancel one stream, then verify a fresh single-stream request")
+    parser.add_argument("--cancel-prefill", action="store_true", help="after timing, cancel a long prefill before output and verify recovery")
     parser.add_argument("--fixture", type=Path, help="frozen natural inputs and fixed PI workspace")
     parser.add_argument("--production-timing", action="store_true", help="clear diagnostics before starting Worker")
     cli = parser.parse_args()
@@ -151,6 +153,38 @@ def main():
             messages += [{"role": "assistant", "content": answer["content"]},
                          {"role": "user", "content": "Continue the summary with error handling and validation details."}]
             request(f"context-{target}-continue", messages, cli.generate)
+        if cli.cancel_prefill:
+            st.check(fixture is not None, "Prefill cancellation requires a frozen fixture")
+            entry = next(item for item in fixture["inputs"] if item["target"] == 14000)
+            payload = runner.chat("", 32, stream=True)
+            payload["messages"] = [
+                {"role": "system", "content": "Summarize the repository carefully. This is the fixed prefill cancellation case."},
+                {"role": "user", "content": (cli.fixture / entry["file"]).read_text(encoding="utf-8")}
+            ]
+            st.write_json(out / "cancel-prefill-request.json", payload)
+            victim = runner.stream("cancel-prefill", payload)
+            try:
+                runner.wait_health(lambda health: health["active_requests"] == 1)
+                # The request is admitted; allow the first chunk to begin, then
+                # disconnect before any generated content is consumed.
+                time.sleep(0.5)
+                victim_id = victim.header_id
+            finally:
+                cancelled_at = time.perf_counter()
+                victim.close()
+            runner.idle(timeout=90)
+            record = runner.wait_record(victim_id)
+            result["prefill_cancel_recover"] = {"passed": False, "victim": record,
+                "drain_seconds": time.perf_counter() - cancelled_at}
+            # A disconnect before token delivery has no final Worker usage
+            # snapshot, so generated_tokens is legitimately null. The retained
+            # stream peak confirms that no content was queued before closing.
+            st.check(record["status"] == "disconnect" and record["generated_tokens"] in (None, 0)
+                     and record["peak_pending_bytes"] == 0,
+                     "Expected cancellation during prefill before output")
+            answer = request("after-prefill-cancel", [{"role": "user", "content": "Reply with exactly READY."}], 16)
+            st.check("READY" in answer["content"], "Fresh request failed after prefill cancellation")
+            result["prefill_cancel_recover"]["passed"] = True
         result["health_final"] = runner.health()
         result["passed"] = True
     finally:

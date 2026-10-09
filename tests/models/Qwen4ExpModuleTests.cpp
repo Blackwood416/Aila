@@ -3013,6 +3013,62 @@ void test_real_model_ple_and_cache_if_present(Context& ctx, bool pleOnly = false
         }
         std::cout << "[PASS] Real model PLE Ticket pipeline bit-exact parity rows=" << rows << "\n";
     }
+    // Three chained chunks exercise both banks, history crossing EOS, and a
+    // prepared suffix discarded after cancellation. Real PLE projections and
+    // recurrent state must match the ordinary preparation order bit for bit.
+    {
+        const std::array<int,3> counts{65,7,1};
+        std::vector<int> tokens(73);
+        for (int i=0;i<73;++i) tokens[i]=101+i*17;
+        tokens[63]=Qwen4ExpPle::EOS_TOKEN_ID;
+        Qwen4ExpPleState serial, ahead;
+        ple.init_state(ctx,serial); ple.init_state(ctx,ahead);
+        auto hidden=Tensor::allocate(ctx,{65,Qwen4ExpPle::HC_HIDDEN_SIZE},dnnl::memory::data_type::bf16);
+        auto output=Tensor::allocate(ctx,{65,Qwen4ExpPle::HC_HIDDEN_SIZE},dnnl::memory::data_type::bf16);
+        ctx.queue().fill(hidden.data_as<bf16>(),bf16(.02f),hidden.numel()).wait_and_throw();
+        std::array<std::vector<bf16>,3> reference;
+        int pos=0;
+        for (int i=0;i<3;++i) {
+            ple.forward(ctx,serial,tokens.data()+pos,counts[i],hidden.data_as<bf16>(),output.data_as<bf16>());
+            reference[i].resize(size_t(counts[i])*Qwen4ExpPle::HC_HIDDEN_SIZE);
+            ctx.memcpy_d2h(reference[i].data(),output.data(),reference[i].size()*sizeof(bf16));
+            pos+=counts[i];
+        }
+        const auto allocations=ctx.device_allocation_count();
+        auto current=ple.prepare(ctx,ahead,tokens.data(),counts[0],&ahead,1,0);
+        pos=0;
+        for (int i=0;i<3;++i) {
+            PleTicket next;
+            if (i+1<3) {
+                Qwen4ExpPleState future; future.prev_tokens=current.prev_tokens_next;
+                const auto before=ahead.prev_tokens;
+                next=ple.prepare(ctx,future,tokens.data()+pos+counts[i],counts[i+1],&ahead,1,pos+counts[i]);
+                expect(ahead.prev_tokens==before,"PLE lookahead advanced session history");
+                expect(next.staging_slot!=current.staging_slot,"PLE lookahead reused the current bank");
+                expect(ple.MatchesInput(next,tokens.data()+pos+counts[i],counts[i+1]),"PLE ticket did not match its owned input");
+            }
+            ple.consume(ctx,current,ahead,hidden.data_as<bf16>(),output.data_as<bf16>());
+            ple.commit(current,ahead);
+            std::vector<bf16> actual(reference[i].size());
+            ctx.memcpy_d2h(actual.data(),output.data(),actual.size()*sizeof(bf16));
+            expect(std::memcmp(actual.data(),reference[i].data(),actual.size()*sizeof(bf16))==0,"PLE lookahead output differs");
+            current=next; pos+=counts[i];
+        }
+        Qwen4ExpPleSnapshot a,b; ple.capture_snapshot(ctx,serial,a); ple.capture_snapshot(ctx,ahead,b);
+        expect(a.prev_tokens==b.prev_tokens && a.conv_head==b.conv_head && a.conv_state==b.conv_state,
+               "PLE lookahead recurrent state differs");
+        expect(ctx.device_allocation_count()==allocations,"PLE lookahead allocated new device buffers");
+        auto abandoned=ple.prepare(ctx,ahead,tokens.data(),7,&ahead,1,pos);
+        auto changed=tokens; changed[0]++;
+        expect(!ple.MatchesInput(abandoned,changed.data(),7),"Cancelled ticket matched replacement input");
+        expect(!ple.MatchesInput(abandoned,tokens.data(),6),"Cancelled ticket matched a different chunk length");
+        auto retry=ple.prepare(ctx,ahead,changed.data(),7,&ahead,2,pos);
+        ple.consume(ctx,retry,ahead,hidden.data_as<bf16>(),output.data_as<bf16>());
+        ple.commit(retry,ahead);
+        ctx.synchronize();
+        expect(ahead.prev_tokens==std::array<int,2>{changed[5],changed[6]},"PLE retry committed stale input");
+        std::cout<<"[PASS] Real PLE lookahead: chained banks, exact outputs/state, discarded input, no new USM\n";
+    }
     if (pleOnly) return;
 
     // 2. Verify ExpertCache initialization on real model with small memory

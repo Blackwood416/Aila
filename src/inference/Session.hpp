@@ -76,7 +76,8 @@ struct BackendDecodeInput {
 };
 
 // Device-independent seam for a real model session and CPU test executors.
-// Forward consumes its input and finishes all device work before returning.
+// Forward consumes its input and finishes its session/device consumers before
+// returning. Model-owned preparation may retain a copy of a known next chunk.
 // Implementations retain the model/runtime and serialize shared workspaces.
 // SessionState serializes mutable per-session state and ContextLength reads;
 // its constructor reads metadata before publishing the session to callers.
@@ -95,11 +96,16 @@ public:
     // Prompt prefill chunk carrying the number of prompt tokens still queued
     // after this chunk (0 marks the final prefill slice); -1 for decode or an
     // unspecified phase. Backends that ignore prompt phase keep this default.
+    // nextTokens/nextCount borrow at most one following prompt chunk through
+    // this call; asynchronous preparation must own a copy of that input.
     virtual ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
                                            const SamplingInput* sampling,
                                            bool captureLogits,
-                                           int prefillRemaining) {
+                                           int prefillRemaining,
+                                           const int* nextTokens, int nextCount) {
         (void)prefillRemaining;
+        (void)nextTokens;
+        (void)nextCount;
         return Forward(tokenIds, sampling, captureLogits);
     }
     // Identity of immutable weights, adapter combination and execution slot.
@@ -159,7 +165,8 @@ private:
     ExecutionResult Execute(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
                             bool captureLogits = false,
-                            int prefillRemaining = -1);
+                            int prefillRemaining = -1,
+                            const int* nextTokens = nullptr, int nextCount = 0);
     static std::vector<ExecutionResult> ExecuteDecodeBatch(
         const std::vector<SessionDecodeInput>& rows);
 

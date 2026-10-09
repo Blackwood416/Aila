@@ -63,6 +63,7 @@ struct FakeState {
     std::vector<bool> legacyPrefillLogits;
     // Prompt-phase entry points only; decode stays on plain Forward.
     std::vector<int> prefillRemaining;
+    std::vector<std::vector<int>> prefillLookahead;
     int prefillForwards = 0;
     std::vector<int> samples;
     size_t samplesTaken = 0;
@@ -186,9 +187,11 @@ public:
     ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
                                    const SamplingInput* sampling,
                                    bool captureLogits,
-                                   int prefillRemaining) override {
+                                   int prefillRemaining,
+                                   const int* nextTokens, int nextCount) override {
         ++state->prefillForwards;
         state->prefillRemaining.push_back(prefillRemaining);
+        state->prefillLookahead.push_back(nextCount ? std::vector<int>(nextTokens, nextTokens + nextCount) : std::vector<int>{});
         return Forward(tokenIds, sampling, captureLogits);
     }
 
@@ -1390,6 +1393,8 @@ void TestPrefillChunkPhaseRemaining() {
     Complete(RequestState::Create(chunked.session, {1, 2, 3, 4, 5}, options));
     Expect(chunked.state->prefillRemaining == std::vector<int>({3, 1, 0}),
            "Prefill chunks did not report the remaining prompt count");
+    Expect(chunked.state->prefillLookahead == std::vector<std::vector<int>>({{3, 4}, {5}, {}}),
+           "Lookahead must contain exactly the next chunk without consuming it");
     Expect(chunked.state->prefillForwards == 3,
            "Decode or finalize flush used the prompt-phase entry point");
     Expect(chunked.state->inputs[0] == std::vector<int>({1, 2}) &&
@@ -1405,6 +1410,8 @@ void TestPrefillChunkPhaseRemaining() {
     Expect(single.state->prefillRemaining == std::vector<int>({0}) &&
                single.state->prefillForwards == 1,
            "Single-chunk prefill did not report remaining zero once");
+    Expect(single.state->prefillLookahead == std::vector<std::vector<int>>({{}}),
+           "A final prefill chunk must not carry lookahead");
 
     auto replay = MakeFixture();
     auto prefillOnly = Options(0, 2);

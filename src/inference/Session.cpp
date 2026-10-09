@@ -129,7 +129,8 @@ std::vector<float> SessionState::ForwardLogits(const std::vector<int>& tokenIds)
 ExecutionResult SessionState::Execute(const std::vector<int>& tokenIds,
                                       const SamplingInput* sampling,
                                       bool captureLogits,
-                                      int prefillRemaining) {
+                                      int prefillRemaining,
+                                      const int* nextTokens, int nextCount) {
     std::lock_guard<std::mutex> lock(operationMutex);
     ValidateTokens(tokenIds, vocabSize);
     const int currentLength = CheckedContextLength(*backend, capacity);
@@ -141,7 +142,7 @@ ExecutionResult SessionState::Execute(const std::vector<int>& tokenIds,
     // Only a real prompt chunk carries phase information; decode and the
     // final pending-token flush keep the unspecified default.
     auto result = prefillRemaining >= 0
-        ? backend->ForwardPrefill(tokenIds, sampling, captureLogits, prefillRemaining)
+        ? backend->ForwardPrefill(tokenIds, sampling, captureLogits, prefillRemaining, nextTokens, nextCount)
         : backend->Forward(tokenIds, sampling, captureLogits);
     const int expectedLength = currentLength + static_cast<int>(tokenIds.size());
     if (CheckedContextLength(*backend, capacity) != expectedLength) {

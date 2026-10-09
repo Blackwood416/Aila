@@ -16,6 +16,10 @@ struct ForwardOptions {
     int checkpoint_after = 0; // Tokens within this forward; zero disables the interior checkpoint.
     int prefill_remaining = -1; // Known prompt tokens after this slice; -1 for decode/unspecified.
     bool decode_verification = false; // Explicit multi-token decode, not a new prompt slice.
+    // Borrowed through Forward only. Pure input preparation may copy one known
+    // future prompt chunk without advancing any session state.
+    const int* next_prefill_tokens = nullptr;
+    int next_prefill_count = 0;
 };
 
 class IModelBackend {

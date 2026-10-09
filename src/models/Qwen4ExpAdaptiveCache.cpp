@@ -1,11 +1,20 @@
 #include "models/Qwen4ExpAdaptiveCache.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 #include <stdexcept>
 
 namespace aila {
+namespace {
+uint64_t work_time_ns() {
+    static const bool enabled = env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
+    return enabled ? uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count()) : 0;
+}
+}
 
 Qwen4ExpAdaptiveCache::~Qwen4ExpAdaptiveCache() {
     Release();
@@ -539,6 +548,7 @@ std::vector<AdaptiveSwapPlan> Qwen4ExpAdaptiveCache::PlanSwaps(
 sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
     Qwen4ExpHostArena& arena, sycl::queue& q, const std::vector<AdaptiveSwapPlan>& plans) {
     if (plans.empty()) return {};
+    const auto begin = work_time_ns();
     if (!q.has_property<sycl::property::queue::in_order>())
         throw std::invalid_argument("Qwen4Exp copy queue must be in order");
     // CPU exchanges reuse the same bounded staging banks; drain their H2D
@@ -576,6 +586,7 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
     }
     resident_ready_=SyncSlotTableToDevice(q);
     resident_pending_=true;
+    stats_.swap_host_ns += work_time_ns() - begin;
     return resident_ready_;
 }
 
@@ -586,7 +597,10 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         !q.has_property<sycl::property::queue::in_order>())
         throw std::invalid_argument("Invalid Qwen4Exp cold staging batch");
     const int pp=index&1;
+    const auto wait_begin = work_time_ns();
     if (staging_pending_[pp]) staging_copy_[pp].wait_and_throw();
+    const auto fill_begin = work_time_ns();
+    stats_.staging_wait_ns += fill_begin - wait_begin;
     StagingBatch batch{};
     batch.ping_pong_index=pp; batch.layer=layer; batch.count=count;
     for (int i=0;i<count;++i) {
@@ -596,6 +610,7 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         staging_experts_[pp][i]=batch.expert_ids[i]=experts[i];
         batch.staging_slots[i]=i;
     }
+    stats_.staging_fill_ns += work_time_ns() - fill_begin;
     // The CPU can prepare the next host bank while the GPU still consumes the
     // device bank. Only the device write depends on its prior consumer.
     batch.ready_event=q.submit([&](sycl::handler& cgh) {

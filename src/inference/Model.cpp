@@ -254,16 +254,18 @@ public:
     ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
                                    const SamplingInput* sampling,
                                    bool captureLogits,
-                                   int prefillRemaining) override {
+                                   int prefillRemaining,
+                                   const int* nextTokens, int nextCount) override {
         const int remaining = model->mtp ? -1 : prefillRemaining;
-        return ForwardImpl(tokenIds, sampling, captureLogits, remaining);
+        return ForwardImpl(tokenIds, sampling, captureLogits, remaining, nextTokens, nextCount);
     }
 
 private:
     ExecutionResult ForwardImpl(const std::vector<int>& tokenIds,
                                 const SamplingInput* sampling,
                                 bool captureLogits,
-                                int prefillRemaining) {
+                                int prefillRemaining,
+                                const int* nextTokens = nullptr, int nextCount = 0) {
         aila::ScopedLogDeferral deferLogs;
         auto& device = *model->device;
         std::lock_guard<std::mutex> lock(device.mutex);
@@ -306,6 +308,10 @@ private:
                         // token only update state; their LM head is never read.
                         options.need_logits = sampling != nullptr || captureLogits;
                         options.prefill_remaining = prefillRemaining;
+                        if (prefillRemaining >= 0) {
+                            options.next_prefill_tokens = nextTokens;
+                            options.next_prefill_count = nextCount;
+                        }
                         forwardedLogits = &ModelBackend().Forward(context, *cache,
                             slot.tokenIds.data_as<int>(), static_cast<int>(tokenIds.size()), options);
                     } else {

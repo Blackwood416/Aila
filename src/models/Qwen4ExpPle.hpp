@@ -137,6 +137,10 @@ public:
         uint64_t generation = 0,
         int start_pos = 0);
 
+    // The two staging slots own their token copies. A cancelled/replaced
+    // request must not reuse a ticket merely because its position matches.
+    bool MatchesInput(const PleTicket& ticket, const int* tokens, int count) const;
+
     // Consume: waits for ticket ready and executes projection & fusion kernels.
     void consume(
         Context& ctx,

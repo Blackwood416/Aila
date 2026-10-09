@@ -1591,8 +1591,27 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (!embed_host_.valid()) {
         ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
     }
-    ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
-                               &session, session.generation(), start_pos);
+    static const bool ple_lookahead = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
+    const bool reuse_ple = ple_lookahead && options.prefill_remaining >= 0 &&
+        ple_next_ticket_.session_ptr == &session && ple_next_ticket_.generation == session.generation() &&
+        ple_next_ticket_.start_pos == start_pos && ple_next_ticket_.prev_tokens_in == session.ple_state_.prev_tokens &&
+        ple_.MatchesInput(ple_next_ticket_, ple_ids_ptr, count);
+    if (reuse_ple) ple_ticket_ = ple_next_ticket_;
+    else ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
+                                    &session, session.generation(), start_pos);
+    ple_next_ticket_.valid = false;
+    if (ple_lookahead && options.prefill_remaining > 0 && options.next_prefill_count > 0) {
+        if (!options.next_prefill_tokens || options.next_prefill_count > options.prefill_remaining ||
+            options.next_prefill_count > max_seq_len_ - cached_len)
+            throw std::invalid_argument("Invalid Qwen4Exp PLE lookahead chunk");
+        // N-gram lookup depends only on the known tokens and two-token history.
+        // The existing worker and other staging slot prepare it while this
+        // chunk runs; recurrent state is committed only by the actual forward.
+        Qwen4ExpPleState future;
+        future.prev_tokens = ple_ticket_.prev_tokens_next;
+        ple_next_ticket_ = ple_.prepare(ctx, future, options.next_prefill_tokens,
+            options.next_prefill_count, &session, session.generation(), cached_len);
+    }
 
     if (!session.embeddingOverridePositions_.empty() &&
         session.embeddingOverrideHiddenSize_ == hidden_size_) {
@@ -1680,6 +1699,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     };
     static const std::string s_dump_dir = aila::env::read_string("AILA_DEBUG_Q4E_DUMP_DIR", "");
     static const bool s_profile = aila::env::read_flag("AILA_PROFILE_Q4E_DECODE", false);
+    static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
     using prof_clock = std::chrono::steady_clock;
     auto prof_ms = [](prof_clock::time_point a, prof_clock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1689,7 +1709,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     double prof_router_sync_ms = 0.0;
     double prof_acquire_ms = 0.0;
     ExpertCacheStats prof_stats0{};
-    aila::HeteroExecutionStats cold_stats0{};
+    const auto adaptive_stats0 = adaptive_cache_.Stats();
+    aila::HeteroExecutionStats cold_stats0 = expert_executor_.stats();
     if (!use_adaptive_pipeline_) {
         expert_cache_.trace_forward(start_pos, count, true, options.need_logits);
         if (expert_cache_.tracing() && s_trace_markers)
@@ -1736,8 +1757,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     std::array<int, kMaxTopK> pred_ids{};
     bool have_pred = false;
     auto stage = [&](int s) {
-        if (!s_stages) return;
-        ctx.synchronize();
+        if (!s_stages && !s_work_summary) return;
+        if (s_stages) ctx.synchronize();
         const auto now = prof_clock::now();
         stage_ms[s] += prof_ms(stage_t, now);
         stage_t = now;
@@ -2157,7 +2178,29 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         AILA_LOG_INFO("[Q4E GroupedXMX] cumulative tiles=%llu acts=%llu",
             static_cast<unsigned long long>(grouped_xmx_tiles_), static_cast<unsigned long long>(grouped_xmx_acts_));
     }
-    static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
+    if (use_adaptive_pipeline_ && s_work_summary) {
+        const auto& a = adaptive_cache_.Stats();
+        const auto& c = expert_executor_.stats();
+        // These are coordinator/CPU intervals, never an additive GPU profile.
+        // No new queue wait or barrier is introduced by this summary.
+        AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d submitted_ms=%.3f router_wait_ms=%.3f "
+            "ple_host_ms=%.3f hc_host_ms=%.3f linear_host_ms=%.3f full_host_ms=%.3f "
+            "experts_host_ms=%.3f head_host_ms=%.3f fill_ms=%.3f bank_wait_ms=%.3f swap_ms=%.3f "
+            "cpu_compute_ms=%.3f cpu_join_ms=%.3f cpu_tasks=%llu hits=%llu misses=%llu staged=%llu h2d_mb=%.3f",
+            start_pos,count,int(reuse_ple),prof_ms(prof_t0,prof_clock::now()),prof_router_sync_ms,
+            stage_ms[kStagePle],stage_ms[kStageHc],stage_ms[kStageLinearAttn],stage_ms[kStageFullAttn],
+            stage_ms[kStageExperts],stage_ms[kStageHead],
+            (a.staging_fill_ns-adaptive_stats0.staging_fill_ns)*1e-6,
+            (a.staging_wait_ns-adaptive_stats0.staging_wait_ns)*1e-6,
+            (a.swap_host_ns-adaptive_stats0.swap_host_ns)*1e-6,
+            (c.cpu_compute_ns-cold_stats0.cpu_compute_ns)*1e-6,
+            (c.cpu_join_wait_ns-cold_stats0.cpu_join_wait_ns)*1e-6,
+            (unsigned long long)(c.cpu_tasks_completed-cold_stats0.cpu_tasks_completed),
+            (unsigned long long)(a.cache_hits-adaptive_stats0.cache_hits),
+            (unsigned long long)(a.cache_misses-adaptive_stats0.cache_misses),
+            (unsigned long long)(a.cold_experts_staged-adaptive_stats0.cold_experts_staged),
+            (a.cold_bytes_transferred-adaptive_stats0.cold_bytes_transferred)/1048576.0);
+    }
     if (!use_adaptive_pipeline_ && s_work_summary) {
         const auto& supply = expert_cache_.stats();
         AILA_LOG_INFO("[Q4E Supply] pos=%d count=%d acquire_ms=%.6f router_wait_ms=%.6f fill_ms=%.6f dma_wait_ms=%.6f demand_wait_ms=%.6f",
@@ -2476,6 +2519,7 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
     ple_.restore_snapshot(*session.context_, session.ple_state_, snapshot.ple_snapshot);
     session.bump_generation();
     ple_ticket_.valid = false;
+    ple_next_ticket_.valid = false;
 
     for (auto& entry : session.snapshots_) {
         if (entry.length > target) entry.length = -1;
@@ -2512,6 +2556,7 @@ void Qwen4ExpBnb4Backend::Reset(Session& session) {
     ple_.init_state(*session.context_, session.ple_state_);
     session.bump_generation();
     ple_ticket_.valid = false;
+    ple_next_ticket_.valid = false;
     session.currentLength_ = 0;
     session.context_->synchronize();
 }

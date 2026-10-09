@@ -77,6 +77,10 @@ struct AdaptiveCacheStats {
     uint64_t swap_bytes_transferred = 0;
     uint64_t cold_experts_staged = 0;
     uint64_t swaps_executed = 0;
+    // Host intervals only; fill and bank waits may overlap GPU computation.
+    uint64_t staging_fill_ns = 0;
+    uint64_t staging_wait_ns = 0;
+    uint64_t swap_host_ns = 0;
 
     double hit_rate() const noexcept {
         uint64_t total = cache_hits + cache_misses;
