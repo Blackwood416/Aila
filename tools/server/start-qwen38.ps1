@@ -21,6 +21,11 @@ $env:AILA_Q4E_SERVER_MTP = '0'
 # long prefill instead of assigning every released byte to expert residency.
 $env:AILA_Q4E_VRAM_RESERVE_MB = '3584'
 $env:AILA_Q4E_HOTSET_PROFILE = Join-Path $repoRoot 'perf/qwen4exp/profiles/qwen38-nf4-h4-v1.profile'
+# A770/Haswell paired screening: faster short continuations with the same
+# two staging banks. Preserve an explicit caller override (including '0').
+if (-not (Test-Path Env:AILA_Q4E_STAGE_COPY_PARALLEL)) {
+    $env:AILA_Q4E_STAGE_COPY_PARALLEL = '1'
+}
 $serverPath = Join-Path $repoRoot 'build-refactor-server/AilaServer.exe'
 $workerPath = Join-Path $repoRoot 'build-refactor/AilaWorker.exe'
 & $serverPath --worker $workerPath --model $Model --backend qwen4exp_nf4 --model-id qwen4exp `

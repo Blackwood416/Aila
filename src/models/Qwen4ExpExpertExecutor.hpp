@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -177,6 +178,10 @@ public:
     bool is_initialized() const { return initialized_; }
     bool cpu_overlap_enabled() const { return cpu_worker_ != nullptr; }
     bool cpu_work_complete_for_testing() const;
+    // Copies prevalidated Q4E staging slots using the existing bounded CPU
+    // worker arena. Returns true only when the arena ran a parallel batch.
+    bool CopyColdStagingHostSlots(const uint8_t* const* sources, uint8_t* destination,
+                                  size_t slot_bytes, int count, bool allow_parallel) const;
     const HeteroExecutionStats& stats() const { return stats_; }
     void reset_stats() { stats_.reset(); }
     // C1 single-row cold service. Start removes only successfully leased CPU

@@ -16,6 +16,8 @@
 #include <vector>
 #include <cstring>
 #include <tbb/task_arena.h>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <memoryapi.h>
@@ -540,6 +542,34 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
 Qwen4ExpExpertExecutor::Qwen4ExpExpertExecutor() = default;
 bool Qwen4ExpExpertExecutor::cpu_work_complete_for_testing() const {
     return cpu_worker_ && cpu_worker_->complete();
+}
+
+bool Qwen4ExpExpertExecutor::CopyColdStagingHostSlots(
+    const uint8_t* const* sources, uint8_t* destination, size_t slot_bytes,
+    int count, bool allow_parallel) const {
+    if (!sources || !destination || !slot_bytes || count < 1 || count > 16)
+        throw std::invalid_argument("Invalid Qwen4Exp staging host-copy batch");
+    for (int i = 0; i < count; ++i)
+        if (!sources[i]) throw std::invalid_argument("Qwen4Exp staging source is null");
+
+    const auto copy_one = [&](int i) {
+        std::memcpy(destination + size_t(i) * slot_bytes, sources[i], slot_bytes);
+    };
+    if (!allow_parallel || count == 1 || !cpu_worker_ || cpu_worker_->tilePool ||
+        cpu_worker_->arena.max_concurrency() <= 1) {
+        for (int i = 0; i < count; ++i) copy_one(i);
+        return false;
+    }
+
+    // This is the same bounded arena already used by CpuWorker::run. Do not
+    // create a second scheduler; each task owns a disjoint destination slot.
+    cpu_worker_->arena.execute([&] {
+        tbb::parallel_for(tbb::blocked_range<int>(0, count, 1),
+            [&](const tbb::blocked_range<int>& range) {
+                for (int i = range.begin(); i != range.end(); ++i) copy_one(i);
+            });
+    });
+    return true;
 }
 
 Qwen4ExpExpertExecutor::~Qwen4ExpExpertExecutor() {

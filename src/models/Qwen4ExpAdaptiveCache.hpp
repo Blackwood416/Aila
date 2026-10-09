@@ -15,6 +15,8 @@
 
 namespace aila {
 
+class Qwen4ExpExpertExecutor;
+
 /// Marker value for a non-resident expert
 inline constexpr int32_t kAdaptiveNotResident = -1;
 
@@ -292,7 +294,8 @@ public:
         int layer,
         const int* cold_expert_ids,
         int count,
-        int ping_pong_index);
+        int ping_pong_index,
+        Qwen4ExpExpertExecutor* copy_executor = nullptr);
 
     // =========================================================================
     // Telemetry & Statistics

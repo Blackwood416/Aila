@@ -2,7 +2,9 @@
 #include "models/Qwen4ExpExpertExecutor.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <vector>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
@@ -44,8 +46,92 @@ static void check_payload(const uint8_t* p,int e,const aila::ExpertSlotGeometry&
     require(std::memcmp(p+g.dn_absmax_offset,dn.codes.data()+size_t(e)*g.dn_absmax_count,g.dn_absmax_bytes)==0,"down codes");
 }
 
-int main() {
+static double sample_percentile(const std::vector<double>& values, double fraction) {
+    auto sorted=values;
+    std::sort(sorted.begin(),sorted.end());
+    const size_t index=static_cast<size_t>(fraction*double(sorted.size()-1));
+    return sorted[index];
+}
+
+static double sample_median(const std::vector<double>& values) {
+    auto sorted=values;
+    std::sort(sorted.begin(),sorted.end());
+    return (sorted[sorted.size()/2-1]+sorted[sorted.size()/2])*0.5;
+}
+
+static int run_staging_copy_microbench() {
+    _putenv_s("AILA_Q4E_COLD_MODE","1");
+    _putenv_s("AILA_Q4E_CPU_THREADS","18");
+    _putenv_s("AILA_Q4E_CPU_TILE_POOL","0");
+    constexpr int H=2560,I=640,count=16;
+    Context ctx;
+    aila::HostArenaConfig hc; hc.num_layers=1; hc.num_experts_per_layer=count;
+    hc.hidden_size=H; hc.moe_intermediate_size=I;
+    aila::Qwen4ExpHostArena arena;
+    std::string error;
+    require(arena.Allocate(ctx,hc,&error),error.c_str());
+    const size_t slot_bytes=arena.SlotBytes();
+    require(slot_bytes==2534400,"Q4E staging microbench requires the production compact slot geometry");
+    std::array<const uint8_t*,count> sources{};
+    for (int e=0;e<count;++e) {
+        auto* slot=arena.GetExpertPointer(0,e);
+        require(slot!=nullptr,"large-page arena source slot");
+        for (size_t j=0;j<slot_bytes;++j)
+            slot[j]=uint8_t((j*131u+size_t(e)*47u+(j>>8)*17u)&0xffu);
+        sources[e]=slot;
+    }
+    const size_t bytes=size_t(count)*slot_bytes;
+    auto* destination=static_cast<uint8_t*>(ctx.alloc_host(bytes));
+    struct HostRelease {
+        Context& ctx; void* ptr;
+        ~HostRelease() { if (ptr) ctx.free_host(ptr); }
+    } release{ctx,destination};
+
+    Qwen4ExpExpertCache cpu_cache;
+    aila::Qwen4ExpExpertExecutor executor;
+    executor.init(ctx,cpu_cache,1,1,H,I);
+    require(executor.cpu_overlap_enabled(),"bounded CPU worker arena must be enabled");
+
+    auto run=[&](bool parallel) {
+        const auto begin=std::chrono::steady_clock::now();
+        const bool used_parallel=executor.CopyColdStagingHostSlots(
+            sources.data(),destination,slot_bytes,count,parallel);
+        const auto end=std::chrono::steady_clock::now();
+        require(used_parallel==parallel,"requested staging copy path was not exercised");
+        for (int e=0;e<count;++e)
+            require(std::memcmp(destination+size_t(e)*slot_bytes,sources[e],slot_bytes)==0,
+                    "staging microbench byte comparison");
+        return std::chrono::duration<double,std::milli>(end-begin).count();
+    };
+    (void)run(false); (void)run(true); // warm both paths before interleaved samples
+    std::vector<double> serial_ms,parallel_ms;
+    serial_ms.reserve(20); parallel_ms.reserve(20);
+    for (int batch=0;batch<20;++batch) {
+        if ((batch&1)==0) {
+            serial_ms.push_back(run(false)); parallel_ms.push_back(run(true));
+        } else {
+            parallel_ms.push_back(run(true)); serial_ms.push_back(run(false));
+        }
+    }
+    std::cout << "[Q4E staging memcpy microbench] geometry=2560x640 slot_bytes=" << slot_bytes
+              << " experts=" << count << " bytes_per_batch=" << bytes
+              << " source=native-large-page destination=HostUSM interleaved_batches=20"
+              << " serial_median_ms=" << sample_median(serial_ms)
+              << " serial_p10_ms=" << sample_percentile(serial_ms,0.10)
+              << " serial_p90_ms=" << sample_percentile(serial_ms,0.90)
+              << " parallel_median_ms=" << sample_median(parallel_ms)
+              << " parallel_p10_ms=" << sample_percentile(parallel_ms,0.10)
+              << " parallel_p90_ms=" << sample_percentile(parallel_ms,0.90) << '\n';
+    return 0;
+}
+
+int main(int argc,char** argv) {
     try {
+        if (argc==2 && std::strcmp(argv[1],"--staging-copy-microbench-only")==0)
+            return run_staging_copy_microbench();
+        if (argc!=1) throw std::invalid_argument("Unknown AdaptiveCacheTests option");
+        _putenv_s("AILA_Q4E_STAGE_COPY_PARALLEL","1");
+        _putenv_s("AILA_Q4E_CPU_TILE_POOL","0");
         _putenv_s("AILA_Q4E_COLD_MODE","2");
         _putenv_s("AILA_Q4E_CPU_MAX_EXPERTS","16");
         _putenv_s("AILA_Q4E_CPU_THREADS","18");
@@ -130,9 +216,12 @@ int main() {
         std::vector<float> expected(E*H),actual(2*E*H);
         ctx.memcpy_d2h(expected.data(),down,expected.size()*4);
         const auto& meta=arena.GetLayerNestedMetadata(0);
+        aila::Qwen4ExpExpertExecutor cpu;
+        Qwen4ExpExpertCache retired_cache;
+        cpu.init(ctx,retired_cache,1,E,H,I);
         for (int round=0;round<2;++round) {
             const int cold[2]={round ? 3:2,round ? 2:3};
-            auto staged=cache.StageColdExpertsAsync(arena,copy,0,cold,2,0);
+            auto staged=cache.StageColdExpertsAsync(arena,copy,0,cold,2,0,&cpu);
             std::array<ops::MoeExpertSlotDev,E> slots{};
             slots[0]=cache.GetResidentSlotDev(cache.GetSlot(0,0),&meta);
             slots[1]=cache.GetResidentSlotDev(cache.GetSlot(0,1),&meta);
@@ -152,9 +241,6 @@ int main() {
         }
         // Replace the sole GPU owner, then chain a second replacement. No mmap
         // reader exists and the original host payload must survive in the new owner.
-        aila::Qwen4ExpExpertExecutor cpu;
-        Qwen4ExpExpertCache retired_cache;
-        cpu.init(ctx,retired_cache,1,E,H,I);
         const auto check_cpu=[&](int first) {
             const int ids[2]={first,3}, rank[2]={3,1};
             std::array<ops::cpu::CpuExpertTask,2> original{};

@@ -1,4 +1,5 @@
 #include "models/Qwen4ExpAdaptiveCache.hpp"
+#include "models/Qwen4ExpExpertExecutor.hpp"
 #include "utils/EnvUtils.hpp"
 
 #include <algorithm>
@@ -591,7 +592,8 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
 }
 
 StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
-    const Qwen4ExpHostArena& arena, sycl::queue& q, int layer, const int* experts, int count, int index) {
+    const Qwen4ExpHostArena& arena, sycl::queue& q, int layer, const int* experts, int count, int index,
+    Qwen4ExpExpertExecutor* copy_executor) {
     if (!IsAllocated() || !experts || count<1 || count>config_.staging_slots_per_buffer ||
         layer<0 || layer>=config_.num_layers || arena.SlotBytes()!=geom_.slot_bytes ||
         !q.has_property<sycl::property::queue::in_order>())
@@ -603,10 +605,24 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     stats_.staging_wait_ns += fill_begin - wait_begin;
     StagingBatch batch{};
     batch.ping_pong_index=pp; batch.layer=layer; batch.count=count;
+    std::array<const uint8_t*,16> sources{};
+    // Validate the complete batch before any copy task can start, so a missing
+    // RAM owner cannot leave a partially refreshed staging bank.
     for (int i=0;i<count;++i) {
-        const auto* src=arena.GetExpertPointer(layer,experts[i]);
-        if (!src) throw std::logic_error("Cold expert is missing its RAM owner");
-        std::memcpy(staging_host_[pp]+size_t(i)*geom_.slot_bytes,src,geom_.slot_bytes);
+        sources[i]=arena.GetExpertPointer(layer,experts[i]);
+        if (!sources[i]) throw std::logic_error("Cold expert is missing its RAM owner");
+    }
+    static const bool parallel_host_copy =
+        aila::env::read_flag("AILA_Q4E_STAGE_COPY_PARALLEL", false);
+    if (parallel_host_copy && count>1 && copy_executor) {
+        copy_executor->CopyColdStagingHostSlots(
+            sources.data(), staging_host_[pp], geom_.slot_bytes, count, true);
+    } else {
+        for (int i=0;i<count;++i)
+            std::memcpy(staging_host_[pp]+size_t(i)*geom_.slot_bytes,
+                        sources[i],geom_.slot_bytes);
+    }
+    for (int i=0;i<count;++i) {
         staging_experts_[pp][i]=batch.expert_ids[i]=experts[i];
         batch.staging_slots[i]=i;
     }

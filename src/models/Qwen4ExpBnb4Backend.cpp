@@ -1139,7 +1139,8 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             if (gpu_cold_count>0) {
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
                 staging = adaptive_cache_.StageColdExpertsAsync(
-                    host_arena_, dma_q, layer, miss_experts.data()+cpu_count, gpu_cold_count, ping_pong_index_);
+                    host_arena_, dma_q, layer, miss_experts.data()+cpu_count, gpu_cold_count, ping_pong_index_,
+                    &expert_executor_);
                 ping_pong_index_ ^= 1;
             }
 
@@ -1315,7 +1316,7 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     for (int start=hits;start<int(prefill_unique_.size());) {
         const int n=std::min(adaptive_cache_.StagingSlotsPerBuffer(),int(prefill_unique_.size())-start);
         auto batch=adaptive_cache_.StageColdExpertsAsync(host_arena_,*copy_q_,layer,
-            prefill_unique_.data()+start,n,ping_pong_index_);
+            prefill_unique_.data()+start,n,ping_pong_index_,&expert_executor_);
         ping_pong_index_^=1;
         for (int j=0;j<n;++j)
             adaptive_prefill_slots_[prefill_unique_[start+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
