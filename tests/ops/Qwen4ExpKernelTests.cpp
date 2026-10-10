@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -1549,6 +1551,71 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
                 }
             }
         }
+
+        // Phase Q4E WG-share: the same quad section computed with the subgroup
+        // regrouped mapping (ShareQuads in {2,4,8}) must stay bit-exact against
+        // the plain 4-token kernels (and therefore against the serial reference).
+        // The output buffers are pre-filled with NaN so any (quad,row) pair the
+        // new mapping drops fails the comparison.
+        bf16 nan_bf16;
+        {
+            const uint16_t nan_bits = 0x7FC0u;
+            std::memcpy(&nan_bf16, &nan_bits, sizeof(nan_bf16));
+        }
+        for (int share : {2, 4, 8}) {
+            Tensor ws_quad_h = Tensor::allocate(ctx, {tokens * num_active_experts * intermediate_size}, dnnl::memory::data_type::bf16);
+            Tensor ws_quad_dn = Tensor::allocate(ctx, {tokens * num_active_experts * out_features}, dnnl::memory::data_type::f32);
+            std::vector<bf16> sentinel_h(tokens * num_active_experts * intermediate_size, nan_bf16);
+            std::vector<float> sentinel_dn(tokens * num_active_experts * out_features,
+                                           std::numeric_limits<float>::quiet_NaN());
+            ctx.memcpy_h2d(ws_quad_h.data(), sentinel_h.data(), sentinel_h.size() * sizeof(bf16));
+            ctx.memcpy_h2d(ws_quad_dn.data(), sentinel_dn.data(), sentinel_dn.size() * sizeof(float));
+
+            sycl::event ws_gu = ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+                ctx, g3_slots_dev,
+                static_cast<const int*>(g3_tokens_dev.data()),
+                static_cast<const int*>(g3_ranks_dev.data()),
+                nullptr,
+                static_cast<const bf16*>(x_dev.data()),
+                static_cast<bf16*>(ws_quad_h.data()),
+                total_quads, num_active_experts, in_features, intermediate_size, blocksize,
+                nullptr, use_nested, share, false);
+
+            sycl::event ws_dn = ops::moe_expert_major_prefill_down_4token_wgshare(
+                ctx, g3_slots_dev,
+                static_cast<const int*>(g3_tokens_dev.data()),
+                static_cast<const int*>(g3_ranks_dev.data()),
+                nullptr,
+                static_cast<const bf16*>(ws_quad_h.data()),
+                static_cast<float*>(ws_quad_dn.data()),
+                total_quads, num_active_experts, intermediate_size, out_features, blocksize,
+                &ws_gu, use_nested, share, false);
+            ws_dn.wait();
+
+            std::vector<bf16> ws_h_host(tokens * num_active_experts * intermediate_size);
+            std::vector<float> ws_dn_host(tokens * num_active_experts * out_features);
+            ctx.memcpy_d2h(ws_h_host.data(), ws_quad_h.data(), ws_h_host.size() * sizeof(bf16));
+            ctx.memcpy_d2h(ws_dn_host.data(), ws_quad_dn.data(), ws_dn_host.size() * sizeof(float));
+
+            for (int q = 0; q < total_quads * 4; ++q) {
+                int t = g3_tokens[q];
+                int r = g3_ranks[q];
+                size_t base_h = (static_cast<size_t>(t) * num_active_experts + r) * intermediate_size;
+                for (int d = 0; d < intermediate_size; ++d) {
+                    if (ws_h_host[base_h + d] != quad_h_host[base_h + d]) {
+                        throw std::runtime_error("moe_expert_major_prefill_gate_up_4token_wgshare mismatch vs 4token at share=" +
+                                                 std::to_string(share) + " index=" + std::to_string(base_h + d));
+                    }
+                }
+                size_t base_dn = (static_cast<size_t>(t) * num_active_experts + r) * out_features;
+                for (int d = 0; d < out_features; ++d) {
+                    if (ws_dn_host[base_dn + d] != quad_dn_host[base_dn + d]) {
+                        throw std::runtime_error("moe_expert_major_prefill_down_4token_wgshare mismatch vs 4token at share=" +
+                                                 std::to_string(share) + " index=" + std::to_string(base_dn + d));
+                    }
+                }
+            }
+        }
     }
     ctx.free_device(g3_slots_dev);
 
@@ -1761,6 +1828,164 @@ void test_moe_prefill_gate_up_and_down(Context& ctx) {
     run_moe_prefill_case(ctx, 16, 4, true);
     run_moe_prefill_case(ctx, 32, 4, false);
     run_moe_prefill_case(ctx, 32, 4, true);
+}
+
+// Phase Q4E WG-share mapping edge cases. Both wgshare kernels are compared
+// directly (bit for bit) against their plain 4-token counterparts on shapes
+// that the production 640/2560 layouts cannot reach: Q not divisible by
+// ShareQuads (5 % 2, 5 % 4 and 5 % 8 are all non-zero) and short row-block
+// tails (13 % {8,4,2} and 7 % {8,4,2} are all non-zero). Output buffers start
+// at a sentinel value, so a dropped (quad,row) pair shows up as a mismatch.
+void test_moe_prefill_wgshare_mapping_edges(Context& ctx) {
+    constexpr int in_features = 256;       // 128 packed bytes per row
+    constexpr int gu_intermediate = 13;    // rows_per_wg in {8,4,2}: all leave a tail
+    constexpr int down_in_features = 128;  // 64 packed bytes per row
+    constexpr int down_out_features = 7;   // row-block tail for every ShareQuads
+    constexpr int blocksize = 64;
+    constexpr int top_k = 3;
+    constexpr int tokens = 8;
+    constexpr int acts = tokens * top_k;
+    constexpr int quads = 5;
+    constexpr int num_experts = 2;
+    constexpr float sentinel = -12345.0f;
+
+    std::mt19937 rng(20261010);
+    std::uniform_int_distribution<int> u8_dist(0, 255);
+    std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
+    std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
+
+    const size_t gu_packed_bytes = static_cast<size_t>(2 * gu_intermediate) * (in_features / 2);
+    const size_t gu_absmax_count = static_cast<size_t>(2 * gu_intermediate) * (in_features / blocksize);
+    const size_t dn_packed_bytes = static_cast<size_t>(down_out_features) * (down_in_features / 2);
+    const size_t dn_absmax_count = static_cast<size_t>(down_out_features) * (down_in_features / blocksize);
+
+    std::vector<Tensor> gu_packed_dev, gu_absmax_dev, dn_packed_dev, dn_absmax_dev;
+    std::vector<ops::MoeExpertSlotDev> pool(num_experts);
+    for (int e = 0; e < num_experts; ++e) {
+        gu_packed_dev.push_back(Tensor::allocate(ctx, {gu_packed_bytes}, dnnl::memory::data_type::u8));
+        gu_absmax_dev.push_back(Tensor::allocate(ctx, {gu_absmax_count}, dnnl::memory::data_type::f32));
+        dn_packed_dev.push_back(Tensor::allocate(ctx, {dn_packed_bytes}, dnnl::memory::data_type::u8));
+        dn_absmax_dev.push_back(Tensor::allocate(ctx, {dn_absmax_count}, dnnl::memory::data_type::f32));
+
+        std::vector<uint8_t> gu_p(gu_packed_bytes), dn_p(dn_packed_bytes);
+        std::vector<float> gu_a(gu_absmax_count), dn_a(dn_absmax_count);
+        for (auto& v : gu_p) v = static_cast<uint8_t>(u8_dist(rng));
+        for (auto& v : dn_p) v = static_cast<uint8_t>(u8_dist(rng));
+        for (auto& v : gu_a) v = f_dist(rng);
+        for (auto& v : dn_a) v = f_dist(rng);
+        ctx.memcpy_h2d(gu_packed_dev[e].data(), gu_p.data(), gu_packed_bytes);
+        ctx.memcpy_h2d(gu_absmax_dev[e].data(), gu_a.data(), gu_absmax_count * sizeof(float));
+        ctx.memcpy_h2d(dn_packed_dev[e].data(), dn_p.data(), dn_packed_bytes);
+        ctx.memcpy_h2d(dn_absmax_dev[e].data(), dn_a.data(), dn_absmax_count * sizeof(float));
+        pool[e].gate_up_packed = static_cast<const uint8_t*>(gu_packed_dev[e].data());
+        pool[e].gate_up_absmax = static_cast<const float*>(gu_absmax_dev[e].data());
+        pool[e].down_packed = static_cast<const uint8_t*>(dn_packed_dev[e].data());
+        pool[e].down_absmax = static_cast<const float*>(dn_absmax_dev[e].data());
+    }
+
+    // G3-style quad layout: slot 4q..4q+3 belong to one expert quad, and the
+    // (token,rank) pair of position p maps to output row p (act p).
+    std::vector<int> tok(acts), rnk(acts);
+    std::vector<ops::MoeExpertSlotDev> slots(acts);
+    for (int p = 0; p < acts; ++p) {
+        tok[p] = p / top_k;
+        rnk[p] = p % top_k;
+        slots[p] = pool[(p / 4) % num_experts];
+    }
+
+    std::vector<bf16> x_host(tokens * in_features);
+    for (auto& v : x_host) v = bf16(in_dist(rng));
+
+    Tensor x_dev = Tensor::allocate(ctx, {tokens, in_features}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+    Tensor tok_dev = Tensor::allocate(ctx, {acts}, dnnl::memory::data_type::s32);
+    Tensor rnk_dev = Tensor::allocate(ctx, {acts}, dnnl::memory::data_type::s32);
+    auto* slots_dev = static_cast<ops::MoeExpertSlotDev*>(ctx.alloc_device(acts * sizeof(ops::MoeExpertSlotDev)));
+    ctx.memcpy_h2d(tok_dev.data(), tok.data(), acts * sizeof(int));
+    ctx.memcpy_h2d(rnk_dev.data(), rnk.data(), acts * sizeof(int));
+    ctx.memcpy_h2d(slots_dev, slots.data(), acts * sizeof(ops::MoeExpertSlotDev));
+
+    const int gu_values = acts * gu_intermediate;
+    const int dn_values = acts * down_out_features;
+
+    auto run_gu = [&](bool wgshare, int share, Tensor& h_out, const sycl::event* dep) {
+        if (!wgshare) {
+            return ops::moe_expert_major_prefill_gate_up_4token(
+                ctx, slots_dev, static_cast<const int*>(tok_dev.data()), static_cast<const int*>(rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_out.data()),
+                quads, top_k, in_features, gu_intermediate, blocksize, dep, false, false);
+        }
+        return ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+            ctx, slots_dev, static_cast<const int*>(tok_dev.data()), static_cast<const int*>(rnk_dev.data()),
+            nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(h_out.data()),
+            quads, top_k, in_features, gu_intermediate, blocksize, dep, false, share, false);
+    };
+    auto run_dn = [&](bool wgshare, int share, const Tensor& h_in, Tensor& dn_out, const sycl::event* dep) {
+        if (!wgshare) {
+            return ops::moe_expert_major_prefill_down_4token(
+                ctx, slots_dev, static_cast<const int*>(tok_dev.data()), static_cast<const int*>(rnk_dev.data()),
+                nullptr, static_cast<const bf16*>(h_in.data()), static_cast<float*>(dn_out.data()),
+                quads, top_k, down_in_features, down_out_features, blocksize, dep, false, false);
+        }
+        return ops::moe_expert_major_prefill_down_4token_wgshare(
+            ctx, slots_dev, static_cast<const int*>(tok_dev.data()), static_cast<const int*>(rnk_dev.data()),
+            nullptr, static_cast<const bf16*>(h_in.data()), static_cast<float*>(dn_out.data()),
+            quads, top_k, down_in_features, down_out_features, blocksize, dep, false, share, false);
+    };
+
+    Tensor ref_gu_dev = Tensor::allocate(ctx, {gu_values}, dnnl::memory::data_type::bf16);
+    Tensor ref_dn_dev = Tensor::allocate(ctx, {dn_values}, dnnl::memory::data_type::f32);
+    std::vector<bf16> ref_gu(gu_values, bf16(sentinel));
+    std::vector<float> ref_dn(dn_values, sentinel);
+    ctx.memcpy_h2d(ref_gu_dev.data(), ref_gu.data(), ref_gu.size() * sizeof(bf16));
+    ctx.memcpy_h2d(ref_dn_dev.data(), ref_dn.data(), ref_dn.size() * sizeof(float));
+    sycl::event ref_gu_ev = run_gu(false, 0, ref_gu_dev, nullptr);
+    sycl::event ref_dn_ev = run_dn(false, 0, ref_gu_dev, ref_dn_dev, &ref_gu_ev);
+    ref_dn_ev.wait();
+    ctx.memcpy_d2h(ref_gu.data(), ref_gu_dev.data(), ref_gu.size() * sizeof(bf16));
+    ctx.memcpy_d2h(ref_dn.data(), ref_dn_dev.data(), ref_dn.size() * sizeof(float));
+
+    int mismatches = 0;
+    for (int share : {2, 4, 8}) {
+        Tensor ws_gu_dev = Tensor::allocate(ctx, {gu_values}, dnnl::memory::data_type::bf16);
+        Tensor ws_dn_dev = Tensor::allocate(ctx, {dn_values}, dnnl::memory::data_type::f32);
+        std::vector<bf16> ws_gu(gu_values, bf16(sentinel));
+        std::vector<float> ws_dn(dn_values, sentinel);
+        ctx.memcpy_h2d(ws_gu_dev.data(), ws_gu.data(), ws_gu.size() * sizeof(bf16));
+        ctx.memcpy_h2d(ws_dn_dev.data(), ws_dn.data(), ws_dn.size() * sizeof(float));
+        sycl::event ws_gu_ev = run_gu(true, share, ws_gu_dev, nullptr);
+        sycl::event ws_dn_ev = run_dn(true, share, ws_gu_dev, ws_dn_dev, &ws_gu_ev);
+        ws_dn_ev.wait();
+        ctx.memcpy_d2h(ws_gu.data(), ws_gu_dev.data(), ws_gu.size() * sizeof(bf16));
+        ctx.memcpy_d2h(ws_dn.data(), ws_dn_dev.data(), ws_dn.size() * sizeof(float));
+
+        for (int i = 0; i < gu_values; ++i) {
+            if (ws_gu[i] != ref_gu[i]) {
+                ++mismatches;
+                if (mismatches == 1) {
+                    std::cout << "  [wgshare] gate_up mismatch at share=" << share << " index=" << i << "\n";
+                }
+            }
+        }
+        for (int i = 0; i < dn_values; ++i) {
+            if (ws_dn[i] != ref_dn[i]) {
+                ++mismatches;
+                if (mismatches == 1) {
+                    std::cout << "  [wgshare] down mismatch at share=" << share << " index=" << i << "\n";
+                }
+            }
+        }
+    }
+    if (mismatches != 0) {
+        throw std::runtime_error("moe_expert_major_prefill wgshare mapping edge mismatch: " +
+                                 std::to_string(mismatches) + " values differ from the 4-token path");
+    }
+
+    ctx.free_device(slots_dev);
+    std::cout << "[PASS] moe_prefill wgshare mapping edges (quads=" << quads
+              << ", I=" << gu_intermediate << ", H=" << down_out_features
+              << ", shares 2/4/8 bit-exact vs 4-token, 0 mismatches)\n";
 }
 
 void test_gated_delta_net_sigmoid(Context& ctx) {
@@ -3752,6 +3977,84 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
         std::cout << "    W4 C1 2-Token Reuse (num_pairs=" << total_pairs << "): " << ms_w4 << " ms\n";
         std::cout << "    Speedup: " << speedup << "x (" << ((speedup - 1.0) * 100.0) << "% faster, 0 bit mismatches)\n";
 
+        // WG-share reference timing (opt-in AILA_Q4E_4TOKEN_WGSHARE mapping).
+        // Purely informational; the bit-exact claims are asserted in the G3
+        // section above and in test_moe_prefill_wgshare_mapping_edges.
+        {
+            int total_quads = 0;
+            for (int e = 0; e < num_unique_experts; ++e) total_quads += expert_counts[e] / 4;
+            if (total_quads > 0) {
+                std::vector<int> q_tok(4 * total_quads), q_rnk(4 * total_quads);
+                std::vector<ops::MoeExpertSlotDev> q_slots(4 * total_quads);
+                std::vector<int> q_seen(num_unique_experts, 0), q_pos(num_unique_experts, 0);
+                int q_off = 0;
+                for (int e = 0; e < num_unique_experts; ++e) {
+                    q_pos[e] = q_off;
+                    q_off += (expert_counts[e] / 4) * 4;
+                }
+                for (int t = 0; t < tokens; ++t) {
+                    for (int k = 0; k < num_active_experts; ++k) {
+                        int e = (t * 7 + k) % num_unique_experts;
+                        int seen = q_seen[e]++;
+                        if (seen >= (expert_counts[e] / 4) * 4) continue;
+                        int p = q_pos[e] + seen;
+                        q_tok[p] = t;
+                        q_rnk[p] = k;
+                        q_slots[p] = expert_pool[e];
+                    }
+                }
+                Tensor q_tok_dev = Tensor::allocate(ctx, {4 * total_quads}, dnnl::memory::data_type::s32);
+                Tensor q_rnk_dev = Tensor::allocate(ctx, {4 * total_quads}, dnnl::memory::data_type::s32);
+                auto* q_slt_dev = static_cast<ops::MoeExpertSlotDev*>(
+                    ctx.alloc_device(4 * total_quads * sizeof(ops::MoeExpertSlotDev)));
+                ctx.memcpy_h2d(q_tok_dev.data(), q_tok.data(), q_tok.size() * sizeof(int));
+                ctx.memcpy_h2d(q_rnk_dev.data(), q_rnk.data(), q_rnk.size() * sizeof(int));
+                ctx.memcpy_h2d(q_slt_dev, q_slots.data(), q_slots.size() * sizeof(ops::MoeExpertSlotDev));
+                Tensor q_h_dev = Tensor::allocate(ctx, {4 * total_quads * intermediate_size}, dnnl::memory::data_type::bf16);
+                Tensor q_dn_dev = Tensor::allocate(ctx, {4 * total_quads * out_features}, dnnl::memory::data_type::f32);
+
+                auto launch_quads = [&](int share) {
+                    sycl::event gu = share
+                        ? ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+                              ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
+                              nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(q_h_dev.data()),
+                              total_quads, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, share, false)
+                        : ops::moe_expert_major_prefill_gate_up_4token(
+                              ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
+                              nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(q_h_dev.data()),
+                              total_quads, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, false);
+                    sycl::event dn = share
+                        ? ops::moe_expert_major_prefill_down_4token_wgshare(
+                              ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
+                              nullptr, static_cast<const bf16*>(q_h_dev.data()), static_cast<float*>(q_dn_dev.data()),
+                              total_quads, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, share, false)
+                        : ops::moe_expert_major_prefill_down_4token(
+                              ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
+                              nullptr, static_cast<const bf16*>(q_h_dev.data()), static_cast<float*>(q_dn_dev.data()),
+                              total_quads, num_active_experts, intermediate_size, out_features, blocksize, &gu, false, false);
+                    return dn;
+                };
+                constexpr int q_iters = 20;
+                auto bench_quads = [&](int share) {
+                    for (int i = 0; i < 3; ++i) launch_quads(share).wait();
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    for (int i = 0; i < q_iters; ++i) launch_quads(share);
+                    ctx.synchronize();
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    return std::chrono::duration<double, std::milli>(t1 - t0).count() / q_iters;
+                };
+                double ms_4t = bench_quads(0);
+                std::cout << "    WG-share quads=" << total_quads << " (tokens=" << tokens << ")\n";
+                std::cout << "      4token share=0: " << ms_4t << " ms\n";
+                for (int share : {2, 4, 8}) {
+                    double ms = bench_quads(share);
+                    std::cout << "      4token share=" << share << ": " << ms << " ms ("
+                              << (ms_4t / ms) << "x vs 4token, informational)\n";
+                }
+                ctx.free_device(q_slt_dev);
+            }
+        }
+
         ctx.free_device(s4_slt_dev);
         ctx.free_device(wr_slt_dev);
         ctx.free_device(weights_dev);
@@ -4068,6 +4371,7 @@ int main(int argc, char** argv) {
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
         test_moe_prefill_gate_up_and_down(ctx);
+        test_moe_prefill_wgshare_mapping_edges(ctx);
         test_moe_prefill_weight_reuse_benchmark(ctx);
         test_non_moe_prefill_dense_xmx_evaluation(ctx);
         test_direct_prefill_io(ctx);

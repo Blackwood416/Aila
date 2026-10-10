@@ -456,6 +456,45 @@ sycl::event moe_expert_major_prefill_down_4token(
     bool use_nested = false,
     bool nested_fixed256 = false);
 
+// Phase Q4E WG-share: opt-in regrouping of the 4-token quad section that keeps
+// the arithmetic and reduction order bit-exact against the 4-token kernels.
+// share_quads in {2, 4, 8}; anything else falls back to the plain 4-token path.
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false,
+    int share_quads = 0,
+    bool nested_fixed256 = false);
+
+sycl::event moe_expert_major_prefill_down_4token_wgshare(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* h,
+    float* down_acc,
+    int total_quads,
+    int top_k,
+    int in_features = 640,
+    int out_features = 2560,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false,
+    int share_quads = 0,
+    bool nested_fixed256 = false);
+
 // Phase G4: Explicit 8-token weight reuse prefill kernels
 sycl::event moe_expert_major_prefill_gate_up_8token(
     Context& ctx,

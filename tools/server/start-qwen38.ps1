@@ -26,6 +26,12 @@ $env:AILA_Q4E_HOTSET_PROFILE = Join-Path $repoRoot 'perf/qwen4exp/profiles/qwen3
 if (-not (Test-Path Env:AILA_Q4E_STAGE_COPY_PARALLEL)) {
     $env:AILA_Q4E_STAGE_COPY_PARALLEL = '1'
 }
+# A770 paired screening: 4-token quads in a workgroup share weight rows for
+# different quads, cutting 14K first-token latency ~2.9% with bit-identical
+# outputs. Preserve an explicit caller override (including '0').
+if (-not (Test-Path Env:AILA_Q4E_4TOKEN_WGSHARE)) {
+    $env:AILA_Q4E_4TOKEN_WGSHARE = '4'
+}
 $serverPath = Join-Path $repoRoot 'build-refactor-server/AilaServer.exe'
 $workerPath = Join-Path $repoRoot 'build-refactor/AilaWorker.exe'
 & $serverPath --worker $workerPath --model $Model --backend qwen4exp_nf4 --model-id qwen4exp `
