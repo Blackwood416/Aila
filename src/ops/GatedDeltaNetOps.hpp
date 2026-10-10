@@ -108,6 +108,9 @@ void run_linear_delta_prefill_gpu_batched(
     bf16* out_ptr,
     int seq_len,
     // Small verifier reference windows may reuse the actual decode kernels.
-    bool decode_order = false);
+    bool decode_order = false,
+    // Test-only override for the AILA_Q4E_GDN_MLP_PREFETCH kernel variant so a
+    // single process can compare both variants bit-for-bit.
+    bool force_prefetch = false);
 
 } // namespace ops

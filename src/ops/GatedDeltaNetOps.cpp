@@ -430,7 +430,13 @@ void run_linear_delta_decode_gpu(
     }
 }
 
-template <GateActivation Act>
+// Elements staged per software-pipeline block inside the per-token state walk.
+// 16 was the first choice (two 16-float blocks = 32 GRF in flight) but it
+// measured the worst on A770, so the guarded fallback is 8; see
+// tmp/q4e-gdn-k1-20261010 for the block-width measurements.
+constexpr int linear_delta_prefill_mlp_block = 8;
+
+template <GateActivation Act, bool Prefetch = false>
 void run_linear_delta_prefill_gpu_batched_impl(
     Context& ctx,
     const DeltaNetGeometry& geom,
@@ -597,6 +603,46 @@ void run_linear_delta_prefill_gpu_batched_impl(
                         if (lid < head_dim) {
                             const int dv = lid;
                             float acc = 0.0f;
+                            if constexpr (Prefetch) {
+                                // Software-pipelined first pass: stage the next
+                                // S block in registers while the current block is
+                                // consumed, so at least two block loads stay in
+                                // flight. The per-element expressions and their
+                                // order match the scalar loop verbatim so the
+                                // result is bit-identical.
+                                constexpr int kBlk = linear_delta_prefill_mlp_block;
+                                float* S_col = S + dv;
+                                float blk[kBlk];
+                                #pragma unroll
+                                for (int i = 0; i < kBlk; ++i) {
+                                    blk[i] = S_col[static_cast<size_t>(i) * head_dim];
+                                }
+                                #pragma unroll
+                                for (int j = 0; j < head_dim; j += kBlk) {
+                                    float nxt[kBlk];
+                                    if (j + kBlk < head_dim) {
+                                        #pragma unroll
+                                        for (int i = 0; i < kBlk; ++i) {
+                                            nxt[i] = S_col[static_cast<size_t>(j + kBlk + i) * head_dim];
+                                        }
+                                    }
+                                    #pragma unroll
+                                    for (int q = 0; q < kBlk; q += 4) {
+                                        float sv0 = blk[q + 0] * decay;
+                                        float sv1 = blk[q + 1] * decay;
+                                        float sv2 = blk[q + 2] * decay;
+                                        float sv3 = blk[q + 3] * decay;
+                                        acc += sv0 * k_local[j + q + 0] +
+                                               sv1 * k_local[j + q + 1] +
+                                               sv2 * k_local[j + q + 2] +
+                                               sv3 * k_local[j + q + 3];
+                                    }
+                                    #pragma unroll
+                                    for (int i = 0; i < kBlk; ++i) {
+                                        blk[i] = nxt[i];
+                                    }
+                                }
+                            } else {
                             for (int j = 0; j < head_dim; j += 4) {
                                 const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
                                 const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
@@ -611,9 +657,57 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                        sv2 * k_local[j + 2] +
                                        sv3 * k_local[j + 3];
                             }
+                            }
 
                             float dval = (v_reg - acc) * beta;
                             float out = 0.0f;
+                            if constexpr (Prefetch) {
+                                // Same pipeline for the update pass: the next
+                                // block is read (pre-update values, untouched by
+                                // this block's stores) before the current block
+                                // is updated, and the update/output expressions
+                                // keep the original order.
+                                constexpr int kBlk = linear_delta_prefill_mlp_block;
+                                float* S_col = S + dv;
+                                float blk[kBlk];
+                                #pragma unroll
+                                for (int i = 0; i < kBlk; ++i) {
+                                    blk[i] = S_col[static_cast<size_t>(i) * head_dim];
+                                }
+                                #pragma unroll
+                                for (int j = 0; j < head_dim; j += kBlk) {
+                                    float nxt[kBlk];
+                                    if (j + kBlk < head_dim) {
+                                        #pragma unroll
+                                        for (int i = 0; i < kBlk; ++i) {
+                                            nxt[i] = S_col[static_cast<size_t>(j + kBlk + i) * head_dim];
+                                        }
+                                    }
+                                    #pragma unroll
+                                    for (int q = 0; q < kBlk; q += 4) {
+                                        const size_t off0 = static_cast<size_t>(j + q + 0) * head_dim + dv;
+                                        const size_t off1 = static_cast<size_t>(j + q + 1) * head_dim + dv;
+                                        const size_t off2 = static_cast<size_t>(j + q + 2) * head_dim + dv;
+                                        const size_t off3 = static_cast<size_t>(j + q + 3) * head_dim + dv;
+                                        float sv0 = blk[q + 0] * decay + k_local[j + q + 0] * dval;
+                                        float sv1 = blk[q + 1] * decay + k_local[j + q + 1] * dval;
+                                        float sv2 = blk[q + 2] * decay + k_local[j + q + 2] * dval;
+                                        float sv3 = blk[q + 3] * decay + k_local[j + q + 3] * dval;
+                                        S[off0] = sv0;
+                                        S[off1] = sv1;
+                                        S[off2] = sv2;
+                                        S[off3] = sv3;
+                                        out += sv0 * q_local[j + q + 0] +
+                                               sv1 * q_local[j + q + 1] +
+                                               sv2 * q_local[j + q + 2] +
+                                               sv3 * q_local[j + q + 3];
+                                    }
+                                    #pragma unroll
+                                    for (int i = 0; i < kBlk; ++i) {
+                                        blk[i] = nxt[i];
+                                    }
+                                }
+                            } else {
                             for (int j = 0; j < head_dim; j += 4) {
                                 const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
                                 const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
@@ -631,6 +725,7 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                        sv1 * q_local[j + 1] +
                                        sv2 * q_local[j + 2] +
                                        sv3 * q_local[j + 3];
+                            }
                             }
                             out_local[dv] = out * scale;
                         }
@@ -681,7 +776,7 @@ void run_linear_delta_prefill_gpu_batched(
     DeltaNetState& state,
     const bf16* fused_ptr,
     bf16* out_ptr,
-    int seq_len, bool decode_order) {
+    int seq_len, bool decode_order, bool force_prefetch) {
     if (decode_order && seq_len >= 1 && seq_len <= 4) {
         // Reuse the actual decode kernel: matching the source-level sum grouping
         // alone did not produce bitwise recurrent trajectories on DG2.
@@ -693,12 +788,28 @@ void run_linear_delta_prefill_gpu_batched(
         }
         return;
     }
+    // Opt-in software-pipelined state walk. Default off keeps the historical
+    // kernel unchanged; the explicit parameter lets one process compare both
+    // variants bit-for-bit.
+    static const bool s_mlp_prefetch_cached =
+        aila::env::read_flag("AILA_Q4E_GDN_MLP_PREFETCH", false);
+    const bool use_prefetch = force_prefetch || s_mlp_prefetch_cached;
     if (geom.gate_act == GateActivation::Sigmoid) {
-        run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid>(
-            ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        if (use_prefetch) {
+            run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid, true>(
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        } else {
+            run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid, false>(
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        }
     } else {
-        run_linear_delta_prefill_gpu_batched_impl<GateActivation::Silu>(
-            ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        if (use_prefetch) {
+            run_linear_delta_prefill_gpu_batched_impl<GateActivation::Silu, true>(
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        } else {
+            run_linear_delta_prefill_gpu_batched_impl<GateActivation::Silu, false>(
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+        }
     }
 }
 

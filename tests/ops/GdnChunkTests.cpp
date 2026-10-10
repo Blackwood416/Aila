@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -177,6 +178,75 @@ void baseline_bench(Context& ctx) {
         }
     }
 }
+// Independent-workgroup sweep for the batched DeltaNet prefill kernel. Each
+// (vh, n) cell is one geometry; samples are collected round-robin so that
+// frequency/thermal drift does not alias with a single cell. Reported
+// per_head_us / per_head_token_ns use the wall median with the same
+// reset+barrier timing convention as baseline_bench.
+void mlp_sweep(Context& ctx) {
+    const std::vector<int> vh_list{32,48,64,96};
+    const std::vector<int> n_list{256,512,1024,2048,4096};
+    struct Cell { int vh=0,n=0; std::unique_ptr<Fixture> f; std::vector<double> wall,span; };
+    std::vector<Cell> cells; cells.reserve(vh_list.size()*n_list.size());
+    for(int vh:vh_list) for(int n:n_list) {
+        Cell c; c.vh=vh; c.n=n; c.f=std::make_unique<Fixture>(ctx,n,16,vh);
+        cells.push_back(std::move(c));
+    }
+    const auto time_cell=[&](Cell& c) {
+        auto st=c.f->reset(); auto w=c.f->weights(); const auto start=Clock::now();
+        auto a=ctx.queue().ext_oneapi_submit_barrier();
+        ops::run_linear_delta_prefill_gpu_batched(ctx,c.f->g,w,st,c.f->in.data_as<bf16>(),c.f->out.data_as<bf16>(),c.n);
+        auto b=ctx.queue().ext_oneapi_submit_barrier(); b.wait_and_throw();
+        c.wall.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+        c.span.push_back((b.get_profiling_info<sycl::info::event_profiling::command_start>()-a.get_profiling_info<sycl::info::event_profiling::command_end>())*1e-6);
+    };
+    for(auto& c:cells) time_cell(c); // one warm-up per geometry
+    for(int sample=0;sample<5;++sample) for(auto& c:cells) time_cell(c);
+    for(const auto& c:cells) {
+        const double med=quantile(c.wall,.5);
+        std::cout<<"[X4 MLP SWEEP] vh="<<c.vh<<" n="<<c.n<<" median_ms="<<med
+            <<" p10="<<quantile(c.wall,.1)<<" p90="<<quantile(c.wall,.9)
+            <<" device_span_ms="<<quantile(c.span,.5)
+            <<" per_head_us="<<med*1000.0/c.vh
+            <<" per_head_token_ns="<<med*1e6/(double(c.vh)*c.n)<<'\n';
+    }
+}
+// Bit-exact A/B of the batched prefill state walk against its software-
+// pipelined (MLP/prefetch) variant. Both runs share the fixture, weights and
+// inputs; only the launcher variant flag differs. Any difference in the final
+// fp32 state, the bf16 output or the conv history fails the case.
+void mlp_parity(Context& ctx) {
+    struct Geom { int qh, vh; };
+    const std::vector<Geom> geoms{{16,48},{16,96}};
+    const std::vector<int> n_list{256,1024,4096};
+    for(const auto& gm:geoms) for(int n:n_list) {
+        Fixture f(ctx,n,gm.qh,gm.vh); auto w=f.weights();
+        const auto run_once=[&](bool prefetch,std::vector<float>& st,
+                                std::vector<float>& hist,std::vector<bf16>& out) {
+            auto s=f.reset();
+            ops::run_linear_delta_prefill_gpu_batched(ctx,f.g,w,s,f.in.data_as<bf16>(),
+                f.out.data_as<bf16>(),n,false,prefetch);
+            ctx.synchronize();
+            st.resize(f.initial.size()); hist.resize(f.history.size()); out.resize(f.out.numel());
+            ctx.memcpy_d2h(st.data(),f.state.data(),f.state.size_bytes());
+            ctx.memcpy_d2h(hist.data(),f.conv_state.data(),f.conv_state.size_bytes());
+            ctx.memcpy_d2h(out.data(),f.out.data(),f.out.size_bytes());
+        };
+        const auto first_diff=[](const auto& a,const auto& b)->long long {
+            for(size_t i=0;i<a.size();++i) if(std::memcmp(&a[i],&b[i],sizeof(a[0]))!=0) return (long long)i;
+            return -1;
+        };
+        std::vector<float> st0,st1,hist0,hist1; std::vector<bf16> out0,out1;
+        run_once(false,st0,hist0,out0);
+        run_once(true,st1,hist1,out1);
+        const long long ds=first_diff(st0,st1),dh=first_diff(hist0,hist1),do_=first_diff(out0,out1);
+        const bool ok=(ds<0 && dh<0 && do_<0);
+        std::cout<<"[X4 MLP PARITY] qh="<<gm.qh<<" vh="<<gm.vh<<" n="<<n
+            <<" state_first_diff="<<ds<<" conv_first_diff="<<dh<<" out_first_diff="<<do_
+            <<" bitwise="<<(ok?"pass":"FAIL")<<'\n';
+        require(ok,"MLP prefetch variant is not bit-identical");
+    }
+}
 void chunk_bench(Context& ctx) {
     for(int n:{30,256}) {
         Fixture f(ctx,n,16,48); auto w=f.weights();
@@ -282,6 +352,8 @@ int main(int argc,char** argv) {
     try {
         Context ctx(nullptr,true); std::cout<<"[X4 DEVICE] "<<ctx.queue().get_device().get_info<sycl::info::device::name>()<<'\n';
         if(argc==2 && std::string(argv[1])=="--baseline-bench") baseline_bench(ctx);
+        else if(argc==2 && std::string(argv[1])=="--mlp-sweep") mlp_sweep(ctx);
+        else if(argc==2 && std::string(argv[1])=="--mlp-parity") mlp_parity(ctx);
         else if(argc==2 && std::string(argv[1])=="--bench") chunk_bench(ctx);
         else if(argc==2 && std::string(argv[1])=="--profile-chunk") profile_chunk(ctx);
         else correctness(ctx);
