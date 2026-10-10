@@ -308,6 +308,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (expert_counts_host_) context_->free_host(expert_counts_host_);
     if (expert_tiles_host_) context_->free_host(expert_tiles_host_);
     if (expert_curr_pos_host_) context_->free_host(expert_curr_pos_host_);
+    if (expert_eight_pos_host_) context_->free_host(expert_eight_pos_host_);
     if (expert_quad_pos_host_) context_->free_host(expert_quad_pos_host_);
     if (expert_pair_pos_host_) context_->free_host(expert_pair_pos_host_);
     if (expert_single_pos_host_) context_->free_host(expert_single_pos_host_);
@@ -321,6 +322,7 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     expert_counts_host_ = nullptr;
     expert_tiles_host_ = nullptr;
     expert_curr_pos_host_ = nullptr;
+    expert_eight_pos_host_ = nullptr;
     expert_quad_pos_host_ = nullptr;
     expert_pair_pos_host_ = nullptr;
     expert_single_pos_host_ = nullptr;
@@ -1017,6 +1019,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertTile)));
         expert_tiles_dev_ = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, 2}, dnnl::memory::data_type::s32);
         expert_curr_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
+        expert_eight_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_quad_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_pair_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
         expert_single_pos_host_ = static_cast<int*>(ctx.alloc_host(cfg_.num_experts * sizeof(int)));
@@ -1338,19 +1341,25 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     const int top_k = cfg_.num_experts_per_tok;
     static const bool reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
     static const bool quads = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
-    int nq = 0, np = 0, ns = 0, nx = 0;
+    static const bool eights = aila::env::read_flag("AILA_Q4E_8TOKEN_REUSE", false);
+    int ne = 0, nq = 0, np = 0, ns = 0, nx = 0;
     for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
         const int n = prefill_expert_uses_[prefill_unique_[u]];
         if (n >= minRows) nx += n;
         else {
-            nq += reuse && quads ? n / 4 : 0;
-            const int rem = reuse && quads ? n % 4 : n;
-            np += reuse ? rem / 2 : 0;
-            ns += reuse ? rem % 2 : rem;
+            ne += reuse && eights ? n / 8 : 0;
+            const int rem8 = reuse && eights ? n % 8 : n;
+            nq += reuse && quads ? rem8 / 4 : 0;
+            const int rem4 = reuse && quads ? rem8 % 4 : rem8;
+            np += reuse ? rem4 / 2 : 0;
+            ns += reuse ? rem4 % 2 : rem4;
         }
     }
-    const int alu = nq * 4 + np * 2 + ns;
-    int qo = actStart, po = qo + nq * 4, so = po + np * 2, xo = actStart + alu;
+    const int alu = ne * 8 + nq * 4 + np * 2 + ns;
+    // Eights lead the ALU layout so the descending-width dispatch chain keeps
+    // every section behind its own gate/up section. With the default zero
+    // eights this reduces to the HEAD quad/pair/single layout verbatim.
+    int eo = actStart, qo = eo + ne * 8, po = qo + nq * 4, so = po + np * 2, xo = actStart + alu;
     const int tileBegin = tileStart;
     std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
     for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
@@ -1362,11 +1371,14 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
                 expert_tiles_host_[tileStart++] = {xo + row, std::min(8, n - row)};
             xo += n;
         } else {
-            const int q = reuse && quads ? n / 4 : 0;
-            const int rem = n - q * 4, p = reuse ? rem / 2 : 0;
+            const int g = reuse && eights ? n / 8 : 0;
+            const int rem = n - g * 8;
+            const int q = reuse && quads ? rem / 4 : 0;
+            const int rem4 = rem - q * 4, p = reuse ? rem4 / 2 : 0;
+            expert_eight_pos_host_[e] = eo; eo += g * 8;
             expert_quad_pos_host_[e] = qo; qo += q * 4;
             expert_pair_pos_host_[e] = po; po += p * 2;
-            expert_single_pos_host_[e] = so; so += rem - p * 2;
+            expert_single_pos_host_[e] = so; so += rem4 - p * 2;
         }
     }
     for (int i = 0; i < count * top_k; ++i) {
@@ -1376,11 +1388,13 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         int pos;
         if (base >= 0) pos = base + seen;
         else {
-            const int q = reuse && quads ? (n / 4) * 4 : 0;
-            const int p = reuse ? ((n - q) / 2) * 2 : 0;
-            pos = seen < q ? expert_quad_pos_host_[e] + seen :
-                seen < q + p ? expert_pair_pos_host_[e] + seen - q :
-                expert_single_pos_host_[e] + seen - q - p;
+            const int g = reuse && eights ? (n / 8) * 8 : 0;
+            const int q = reuse && quads ? ((n - g) / 4) * 4 : 0;
+            const int p = reuse ? ((n - g - q) / 2) * 2 : 0;
+            pos = seen < g ? expert_eight_pos_host_[e] + seen :
+                seen < g + q ? expert_quad_pos_host_[e] + seen - g :
+                seen < g + q + p ? expert_pair_pos_host_[e] + seen - g - q :
+                expert_single_pos_host_[e] + seen - g - q - p;
         }
         expert_map_token_host_[pos] = i / top_k;
         expert_map_rank_host_[pos] = i % top_k;
@@ -1402,11 +1416,11 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
             buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), alu, top_k,
-            hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq, nested_fixed256);
+            hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq, ne, nested_fixed256);
         last = ops::moe_expert_major_prefill_down(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
             buf_.moe_h.data_as<bf16>(), buf_.moe_down_acc.data_as<float>(), alu, top_k,
-            cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq, false, nested_fixed256);
+            cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq, ne, false, nested_fixed256);
     }
     if (tiles) {
         last = ops::moe_grouped_xmx_gate_up(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,

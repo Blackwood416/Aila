@@ -513,6 +513,7 @@ private:
     int* expert_offsets_host_ = nullptr;
     int* expert_counts_host_ = nullptr;
     int* expert_curr_pos_host_ = nullptr;
+    int* expert_eight_pos_host_ = nullptr;
     int* expert_quad_pos_host_ = nullptr;
     int* expert_pair_pos_host_ = nullptr;
     int* expert_single_pos_host_ = nullptr;

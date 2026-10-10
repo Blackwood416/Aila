@@ -1552,10 +1552,198 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
     }
     ctx.free_device(g3_slots_dev);
 
+    // 7. Expert-major prefill with 8-token weight reuse (G4). Mirrors the G3
+    // layout exactly, but the leading bucket packs eight tokens instead of
+    // four. Only exercised when eights is enabled so the default runs keep the
+    // exact G3 topology.
+    static const bool eights = aila::env::read_flag("AILA_Q4E_8TOKEN_REUSE", false);
+    if (eights) {
+        int total_eights = 0;
+        int total_quads_g4 = 0;
+        int total_pairs_g4 = 0;
+        for (int e = 0; e < num_unique_experts; ++e) {
+            int cnt = expert_counts[e];
+            total_eights += cnt / 8;
+            total_quads_g4 += (cnt % 8) / 4;
+            total_pairs_g4 += ((cnt % 8) % 4) / 2;
+        }
+        std::vector<int> g4_eight_pos(num_unique_experts, 0);
+        std::vector<int> g4_quad_pos(num_unique_experts, 0);
+        std::vector<int> g4_pair_pos(num_unique_experts, 0);
+        std::vector<int> g4_single_pos(num_unique_experts, 0);
+        int e_off = 0;
+        int q_off_g4 = 8 * total_eights;
+        int p_off_g4 = q_off_g4 + 4 * total_quads_g4;
+        int s_off_g4 = p_off_g4 + 2 * total_pairs_g4;
+        for (int e = 0; e < num_unique_experts; ++e) {
+            int cnt = expert_counts[e];
+            int cnt8 = cnt % 8;
+            g4_eight_pos[e] = e_off;
+            g4_quad_pos[e] = q_off_g4;
+            g4_pair_pos[e] = p_off_g4;
+            g4_single_pos[e] = s_off_g4;
+            e_off += (cnt / 8) * 8;
+            q_off_g4 += (cnt8 / 4) * 4;
+            p_off_g4 += ((cnt8 % 4) / 2) * 2;
+            s_off_g4 += cnt8 % 2;
+        }
+        std::vector<int> g4_tokens(total_acts);
+        std::vector<int> g4_ranks(total_acts);
+        std::vector<ops::MoeExpertSlotDev> g4_slots(total_acts);
+        std::vector<int> g4_expert_seen(num_unique_experts, 0);
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < num_active_experts; ++k) {
+                int e = (t * 7 + k) % num_unique_experts;
+                int seen = g4_expert_seen[e]++;
+                int cnt = expert_counts[e];
+                int e_limit = (cnt / 8) * 8;
+                int q_limit = e_limit + ((cnt % 8) / 4) * 4;
+                int p_limit = q_limit + (((cnt % 8) % 4) / 2) * 2;
+                int pos;
+                if (seen < e_limit) {
+                    pos = g4_eight_pos[e] + seen;
+                } else if (seen < q_limit) {
+                    pos = g4_quad_pos[e] + (seen - e_limit);
+                } else if (seen < p_limit) {
+                    pos = g4_pair_pos[e] + (seen - q_limit);
+                } else {
+                    pos = g4_single_pos[e] + (seen - p_limit);
+                }
+                g4_tokens[pos] = t;
+                g4_ranks[pos] = k;
+                g4_slots[pos] = expert_pool[e];
+            }
+        }
+
+        Tensor g4_tokens_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        Tensor g4_ranks_dev = Tensor::allocate(ctx, {total_acts}, dnnl::memory::data_type::s32);
+        ops::MoeExpertSlotDev* g4_slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+            ctx.alloc_device(total_acts * sizeof(ops::MoeExpertSlotDev)));
+        Tensor g4_h_dev = Tensor::allocate(ctx, {total_acts * intermediate_size}, dnnl::memory::data_type::bf16);
+        Tensor g4_down_acc_dev = Tensor::allocate(ctx, {total_acts * out_features}, dnnl::memory::data_type::f32);
+        Tensor g4_y_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+        Tensor g4_y_fused_dev = Tensor::allocate(ctx, {tokens, out_features}, dnnl::memory::data_type::bf16);
+
+        ctx.memcpy_h2d(g4_tokens_dev.data(), g4_tokens.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(g4_ranks_dev.data(), g4_ranks.data(), total_acts * sizeof(int));
+        ctx.memcpy_h2d(g4_slots_dev, g4_slots.data(), total_acts * sizeof(ops::MoeExpertSlotDev));
+
+        sycl::event g4_gu = ops::moe_expert_major_prefill_gate_up(
+            ctx, g4_slots_dev,
+            static_cast<const int*>(g4_tokens_dev.data()),
+            static_cast<const int*>(g4_ranks_dev.data()),
+            nullptr,
+            static_cast<const bf16*>(x_dev.data()),
+            static_cast<bf16*>(g4_h_dev.data()),
+            total_acts, num_active_experts, in_features, intermediate_size, blocksize,
+            nullptr, use_nested, total_pairs_g4, total_quads_g4, total_eights);
+
+        sycl::event g4_dn = ops::moe_expert_major_prefill_down(
+            ctx, g4_slots_dev,
+            static_cast<const int*>(g4_tokens_dev.data()),
+            static_cast<const int*>(g4_ranks_dev.data()),
+            nullptr,
+            static_cast<const bf16*>(g4_h_dev.data()),
+            static_cast<float*>(g4_down_acc_dev.data()),
+            total_acts, num_active_experts, intermediate_size, out_features, blocksize,
+            &g4_gu, use_nested, total_pairs_g4, total_quads_g4, total_eights);
+
+        ops::moe_ordered_accumulate_down_rows(
+            ctx, static_cast<const float*>(g4_down_acc_dev.data()),
+            weights_dev,
+            static_cast<bf16*>(g4_y_dev.data()),
+            tokens, num_active_experts, out_features,
+            nullptr, nullptr, &g4_dn);
+
+        ops::moe_ordered_accumulate_down_rows(
+            ctx, static_cast<const float*>(g4_down_acc_dev.data()),
+            weights_dev,
+            static_cast<bf16*>(g4_y_fused_dev.data()),
+            tokens, num_active_experts, out_features,
+            static_cast<const bf16*>(shared_dev.data()),
+            static_cast<const bf16*>(gate_dev.data()),
+            &g4_dn);
+
+        ctx.synchronize();
+
+        std::vector<bf16> g4_h(total_acts * intermediate_size);
+        std::vector<bf16> g4_y(tokens * out_features);
+        std::vector<bf16> g4_y_fused(tokens * out_features);
+        ctx.memcpy_d2h(g4_h.data(), g4_h_dev.data(), g4_h.size() * sizeof(bf16));
+        ctx.memcpy_d2h(g4_y.data(), g4_y_dev.data(), g4_y.size() * sizeof(bf16));
+        ctx.memcpy_d2h(g4_y_fused.data(), g4_y_fused_dev.data(), g4_y_fused.size() * sizeof(bf16));
+
+        for (size_t i = 0; i < ref_h.size(); ++i) {
+            if (g4_h[i] != ref_h[i]) {
+                throw std::runtime_error("moe_expert_major_prefill_gate_up (8-token reuse) bit-exact mismatch at index " + std::to_string(i));
+            }
+        }
+        for (size_t i = 0; i < ref_y.size(); ++i) {
+            if (g4_y[i] != ref_y[i]) {
+                throw std::runtime_error("moe_expert_major_prefill_down (8-token reuse) bit-exact mismatch at index " + std::to_string(i));
+            }
+        }
+        for (size_t i = 0; i < ref_y_fused.size(); ++i) {
+            if (g4_y_fused[i] != ref_y_fused[i]) {
+                throw std::runtime_error("moe_expert_major_prefill_down (8-token reuse fused) bit-exact mismatch at index " + std::to_string(i));
+            }
+        }
+
+        if (total_eights > 0) {
+            Tensor direct_eight_h = Tensor::allocate(ctx, {tokens * num_active_experts * intermediate_size}, dnnl::memory::data_type::bf16);
+            Tensor direct_eight_dn = Tensor::allocate(ctx, {tokens * num_active_experts * out_features}, dnnl::memory::data_type::f32);
+            std::vector<float> g4_down_acc_host(total_acts * out_features);
+            ctx.memcpy_d2h(g4_down_acc_host.data(), g4_down_acc_dev.data(), g4_down_acc_host.size() * sizeof(float));
+            sycl::event eight_gu = ops::moe_expert_major_prefill_gate_up_8token(
+                ctx, g4_slots_dev,
+                static_cast<const int*>(g4_tokens_dev.data()),
+                static_cast<const int*>(g4_ranks_dev.data()),
+                nullptr,
+                static_cast<const bf16*>(x_dev.data()),
+                static_cast<bf16*>(direct_eight_h.data()),
+                total_eights, num_active_experts, in_features, intermediate_size, blocksize,
+                nullptr, use_nested);
+
+            sycl::event eight_dn = ops::moe_expert_major_prefill_down_8token(
+                ctx, g4_slots_dev,
+                static_cast<const int*>(g4_tokens_dev.data()),
+                static_cast<const int*>(g4_ranks_dev.data()),
+                nullptr,
+                static_cast<const bf16*>(direct_eight_h.data()),
+                static_cast<float*>(direct_eight_dn.data()),
+                total_eights, num_active_experts, intermediate_size, out_features, blocksize,
+                &eight_gu, use_nested);
+            eight_dn.wait();
+
+            std::vector<bf16> eight_h_host(tokens * num_active_experts * intermediate_size);
+            std::vector<float> eight_dn_host(tokens * num_active_experts * out_features);
+            ctx.memcpy_d2h(eight_h_host.data(), direct_eight_h.data(), eight_h_host.size() * sizeof(bf16));
+            ctx.memcpy_d2h(eight_dn_host.data(), direct_eight_dn.data(), eight_dn_host.size() * sizeof(float));
+
+            for (int o = 0; o < total_eights * 8; ++o) {
+                int t = g4_tokens[o];
+                int r = g4_ranks[o];
+                size_t base_h = (static_cast<size_t>(t) * num_active_experts + r) * intermediate_size;
+                for (int d = 0; d < intermediate_size; ++d) {
+                    if (eight_h_host[base_h + d] != ref_h[base_h + d]) {
+                        throw std::runtime_error("moe_expert_major_prefill_gate_up_8token direct bit-exact mismatch");
+                    }
+                }
+                size_t base_dn = (static_cast<size_t>(t) * num_active_experts + r) * out_features;
+                for (int d = 0; d < out_features; ++d) {
+                    if (eight_dn_host[base_dn + d] != g4_down_acc_host[base_dn + d]) {
+                        throw std::runtime_error("moe_expert_major_prefill_down_8token direct bit-exact mismatch");
+                    }
+                }
+            }
+        }
+        ctx.free_device(g4_slots_dev);
+    }
+
     std::cout << "[PASS] moe_prefill tokens=" << tokens
               << " k=" << num_active_experts
               << " nested=" << (use_nested ? "true" : "false")
-              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, all S1, S4, W4 C1/C2, and G3 4-token)\n";
+              << " bit-exact match (0 mismatches across " << ref_y.size() << " values, all S1, S4, W4 C1/C2, G3 4-token, and G4 8-token)\n";
 
     ctx.free_device(slots_dev_buf);
     ctx.free_device(weights_dev);
@@ -1567,6 +1755,12 @@ void test_moe_prefill_gate_up_and_down(Context& ctx) {
     run_moe_prefill_case(ctx, 26, 10, false);
     run_moe_prefill_case(ctx, 26, 10, true);
     run_moe_prefill_case(ctx, 64, 10, true);
+    // Larger routings (expert counts >= 8) also exercise the AILA_Q4E_8TOKEN_REUSE
+    // 8-token bucket when the environment enables it; env-off runs stay at G3 size.
+    run_moe_prefill_case(ctx, 16, 4, false);
+    run_moe_prefill_case(ctx, 16, 4, true);
+    run_moe_prefill_case(ctx, 32, 4, false);
+    run_moe_prefill_case(ctx, 32, 4, true);
 }
 
 void test_gated_delta_net_sigmoid(Context& ctx) {
