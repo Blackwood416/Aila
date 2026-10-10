@@ -2130,8 +2130,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated() && count == 1) {
-        static const int s_adaptive_swap_freq = aila::env::read_int("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 1);
-        static const int s_max_swaps = aila::env::read_int("AILA_Q4E_MAX_SWAPS", 2);
+        // Raw reads so explicit 0 is meaningful: FREQ=0 disables the synchronous
+        // swap pass (measured: production decode +8.0% rate with bit-identical
+        // requests; see docs/plans/qwen38-swap-longwindow-2026-10-10.md) and
+        // MAX_SWAPS=0 keeps the documented "no total cap" meaning.
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 0);
+        static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 2);
         if (s_adaptive_swap_freq > 0 && (cached_len % s_adaptive_swap_freq == 0)) {
             auto swap_plans = adaptive_cache_.PlanSwaps(1, s_max_swaps);
             if (!swap_plans.empty()) {
