@@ -218,6 +218,13 @@ Qwen4ExpBnb4Backend::Session::Session(
     std::size_t maxSnapshots)
     : context_(&ctx), owner_(std::move(owner)),
       capacity_(capacity), snapshots_(maxSnapshots) {
+    // INT8 KV is opt-in and default-off; both switches must be present.
+    const bool int8_kv = aila::env::read_flag("AILA_KV_QUANT", false) &&
+                         aila::env::kv_quant_format_is_int8();
+    if (aila::env::read_flag("AILA_KV_QUANT", false)) {
+        AILA_LOG_INFO("[Q4E KV] AILA_KV_QUANT=1 format=%s",
+                      int8_kv ? "int8" : "fp8(ignored: Qwen4Exp keeps bf16 KV)");
+    }
     layerCaches_.resize(48);
     for (int i = 0; i < 48; ++i) {
         bool is_linear = ((i + 1) % 4 != 0);
@@ -233,8 +240,14 @@ Qwen4ExpBnb4Backend::Session::Session(
             cache.linear_conv_head = 0;
             cache.device_state_dirty = false;
         } else {
-            cache.k = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
-            cache.v = Tensor::allocate(ctx, {2, capacity, 256}, dnnl::memory::data_type::bf16);
+            const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8
+                                          : dnnl::memory::data_type::bf16;
+            cache.k = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
+            cache.v = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
+            if (int8_kv) {
+                cache.k_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+                cache.v_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+            }
             cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
             const int max_blocks = std::max(1, capacity / 4);
             cache.indexer_compressed_k = Tensor::allocate(ctx, {max_blocks, 128}, dnnl::memory::data_type::bf16);
@@ -2652,7 +2665,8 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
     for (const auto& cache : session->layerCaches_) {
         for (const Tensor* tensor : {&cache.k, &cache.v, &cache.indexer_k,
                                      &cache.indexer_compressed_k, &cache.linear_state,
-                                     &cache.linear_conv_state}) {
+                                     &cache.linear_conv_state, &cache.k_scale,
+                                     &cache.v_scale}) {
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
         }
     }

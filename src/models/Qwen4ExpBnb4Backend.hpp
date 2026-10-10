@@ -78,6 +78,10 @@ struct Qwen4ExpLayerCache {
     // Full Attention
     Tensor k;
     Tensor v;
+    // Opt-in INT8 KV: per-(kv_head, token) f32 dequantization scale for k/v.
+    // Only allocated when AILA_KV_QUANT=1 AILA_KV_QUANT_FORMAT=int8.
+    Tensor k_scale; // [2, capacity]
+    Tensor v_scale; // [2, capacity]
     Tensor indexer_k; // [capacity, 128] bf16
     Tensor indexer_compressed_k; // [capacity / 4, 128] bf16 (A1)
     int num_compressed_blocks = 0; // Number of complete blocks compressed (A1)

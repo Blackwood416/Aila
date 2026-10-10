@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <sycl/sycl.hpp>
 
@@ -15,24 +17,49 @@ namespace ops {
 
 namespace {
 
-template <bool Quantized>
+// Fmt is a KvCacheFormat code: 0 bf16, 1 fp8 e4m3, 2 int8 (per-token scale).
+// Keeping it a compile-time int preserves the exact codegen of the bf16 and fp8
+// default paths; only the opt-in int8 instantiation pays for a scale lookup.
+template <int Fmt>
 struct KVCacheAccessor {
   const void *ptr;
+  const float *scale; // [num_kv_heads, max_seq_len] f32, int8 only
   int max_seq_len;
   int head_dim;
 
-  KVCacheAccessor(const void *p, int msl, int hd)
-      : ptr(p), max_seq_len(msl), head_dim(hd) {}
+  KVCacheAccessor(const void *p, const float *s, int msl, int hd)
+      : ptr(p), scale(s), max_seq_len(msl), head_dim(hd) {}
 
   inline float load(int kv_head, int t, int d) const {
     int idx = kv_head * max_seq_len * head_dim + t * head_dim + d;
-    if constexpr (Quantized) {
+    if constexpr (Fmt == kKvFmtFp8) {
       return fp8_e4m3fn_to_float(static_cast<const uint8_t *>(ptr)[idx]);
+    } else if constexpr (Fmt == kKvFmtInt8) {
+      return int8_kv_to_float(static_cast<const int8_t *>(ptr)[idx],
+                              scale[kv_head * max_seq_len + t]);
     } else {
       return static_cast<float>(static_cast<const bf16 *>(ptr)[idx]);
     }
   }
 };
+
+// Storage format of a KV cache tensor; also used by callers to pick the
+// matching template instantiation.
+inline int kv_cache_format_of(const Tensor &cache) {
+  switch (cache.dtype()) {
+    case dnnl::memory::data_type::f8_e4m3: return kKvFmtFp8;
+    case dnnl::memory::data_type::s8: return kKvFmtInt8;
+    default: return kKvFmtBf16;
+  }
+}
+
+inline const float *kv_scale_ptr(const Tensor *scale) {
+  return (scale && scale->valid()) ? scale->data_as<float>() : nullptr;
+}
+
+inline float *kv_scale_write_ptr(Tensor *scale) {
+  return (scale && scale->valid()) ? scale->data_as<float>() : nullptr;
+}
 
 inline int round_up(int x, int align) {
   return ((x + align - 1) / align) * align;
@@ -95,7 +122,7 @@ constexpr int kVisionBidiExact64VUnrollEnabled = 1;
 constexpr int kVisionBidiExact64VUnrollDefault =
     kVisionBidiExact64VUnrollEnabled;
 
-template <bool Quantized>
+template <int Quantized>
 void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
                                     Tensor &v_cache, Tensor &output,
                                     Tensor &scores_buf, int num_heads,
@@ -105,7 +132,9 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
                                      const bf16 *gate_ptr = nullptr,
                                      const int *active_indices = nullptr,
                                      const int *active_blocks = nullptr,
-                                     int num_active_blocks = 0) {
+                                     int num_active_blocks = 0,
+                                     const float *k_scale = nullptr,
+                                     const float *v_scale = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -129,8 +158,8 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
           int lid = item.get_local_id(0);
           int kv_head = head / heads_per_kv;
 
-          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
-          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
 
           for (int d = lid; d < head_dim; d += wg_size) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
@@ -247,23 +276,29 @@ void attention_decode_baseline(Context &ctx, Tensor &q, Tensor &k_cache,
                                const Tensor *gate_buf = nullptr,
                                const int *active_indices = nullptr,
                                const int *active_blocks = nullptr,
-                               int num_active_blocks = 0) {
+                               int num_active_blocks = 0,
+                               const Tensor *k_scale = nullptr,
+                               const Tensor *v_scale = nullptr) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
-  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-    attention_decode_baseline_impl<true>(
-        ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices,
-        active_blocks, num_active_blocks);
-  } else {
-    attention_decode_baseline_impl<false>(
-        ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
-        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices,
-        active_blocks, num_active_blocks);
+  const int fmt = kv_cache_format_of(k_cache);
+  const float *k_scale_ptr = kv_scale_ptr(k_scale);
+  const float *v_scale_ptr = kv_scale_ptr(v_scale);
+  if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
+    throw std::invalid_argument("attention_decode: int8 KV cache requires k_scale/v_scale");
   }
+  auto run = [&](auto tag) {
+    attention_decode_baseline_impl<decltype(tag)::value>(
+        ctx, q, k_cache, v_cache, output, scores_buf, num_heads, num_kv_heads,
+        head_dim, cached_len, tail_start, sink_len, effective_len, wg_size, gate_ptr, active_indices,
+        active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+  };
+  if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
+  else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
+  else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
 
-template <bool Quantized>
+template <int Quantized>
 void attention_decode_exact_head256_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
@@ -271,7 +306,9 @@ void attention_decode_exact_head256_partial_merge_impl(
     const bf16 *gate_ptr = nullptr,
     const int *active_indices = nullptr,
     const int *active_blocks = nullptr,
-    int num_active_blocks = 0) {
+    int num_active_blocks = 0,
+    const float *k_scale = nullptr,
+    const float *v_scale = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -314,8 +351,8 @@ void attention_decode_exact_head256_partial_merge_impl(
               partials_ptr +
               (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
 
-          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
-          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
 
           for (int d = lid; d < head_dim; d += tile_wg) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
@@ -473,28 +510,36 @@ void attention_decode_exact_head256_partial_merge(
     const Tensor *gate_buf = nullptr,
     const int *active_indices = nullptr,
     const int *active_blocks = nullptr,
-    int num_active_blocks = 0) {
+    int num_active_blocks = 0,
+    const Tensor *k_scale = nullptr,
+    const Tensor *v_scale = nullptr) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
-  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-    attention_decode_exact_head256_partial_merge_impl<true>(
-        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr, active_indices,
-        active_blocks, num_active_blocks);
-  } else {
-    attention_decode_exact_head256_partial_merge_impl<false>(
-        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr, active_indices,
-        active_blocks, num_active_blocks);
+  const int fmt = kv_cache_format_of(k_cache);
+  const float *k_scale_ptr = kv_scale_ptr(k_scale);
+  const float *v_scale_ptr = kv_scale_ptr(v_scale);
+  if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
+    throw std::invalid_argument("attention_decode(exact256): int8 KV cache requires k_scale/v_scale");
   }
+  auto run = [&](auto tag) {
+    attention_decode_exact_head256_partial_merge_impl<decltype(tag)::value>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len, gate_ptr, active_indices,
+        active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+  };
+  if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
+  else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
+  else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
 
-template <bool Quantized>
+template <int Quantized>
 void attention_decode_exact_head128_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
-    const bf16 *gate_ptr = nullptr) {
+    const bf16 *gate_ptr = nullptr,
+    const float *k_scale = nullptr,
+    const float *v_scale = nullptr) {
   bf16 *q_ptr = static_cast<bf16 *>(q.data());
   const void *k_ptr = k_cache.data();
   const void *v_ptr = v_cache.data();
@@ -534,8 +579,8 @@ void attention_decode_exact_head128_partial_merge_impl(
               partials_ptr +
               (head * max_tiles + tile_idx) * kDecodeExact128PartialStride;
 
-          KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
-          KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
 
           q_cache[lid] = static_cast<float>(q_ptr[head * head_dim + lid]);
           item.barrier(sycl::access::fence_space::local_space);
@@ -648,17 +693,24 @@ void attention_decode_exact_head128_partial_merge(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
     int sink_len, int effective_len,
-    const Tensor *gate_buf = nullptr) {
+    const Tensor *gate_buf = nullptr,
+    const Tensor *k_scale = nullptr,
+    const Tensor *v_scale = nullptr) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
-  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-    attention_decode_exact_head128_partial_merge_impl<true>(
-        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr);
-  } else {
-    attention_decode_exact_head128_partial_merge_impl<false>(
-        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-        tail_start, sink_len, effective_len, gate_ptr);
+  const int fmt = kv_cache_format_of(k_cache);
+  const float *k_scale_ptr = kv_scale_ptr(k_scale);
+  const float *v_scale_ptr = kv_scale_ptr(v_scale);
+  if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
+    throw std::invalid_argument("attention_decode(exact128): int8 KV cache requires k_scale/v_scale");
   }
+  auto run = [&](auto tag) {
+    attention_decode_exact_head128_partial_merge_impl<decltype(tag)::value>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len, gate_ptr, k_scale_ptr, v_scale_ptr);
+  };
+  if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
+  else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
+  else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
 template <int TM, int TN, int TK, int SG>
@@ -846,7 +898,7 @@ void attention_decode_joint_matrix(Context &ctx, Tensor &q, Tensor &k_cache,
 // Each row keeps the single-row body verbatim, including the vec8 K dot, the
 // reduce_over_group order and the V accumulation loop, so a row output equals
 // the single-row kernel for the same cache and position.
-template <bool Quantized>
+template <int Quantized>
 void attention_decode_rows_baseline_impl(
     Context &ctx, Tensor &q, int q_row_stride, Tensor &output,
     Tensor &scores_buf, const DecodeRowGeometry *rows, int row_count,
@@ -893,8 +945,8 @@ void attention_decode_rows_baseline_impl(
           bf16 *o_row = o_ptr +
               static_cast<size_t>(sequence) * o_row_stride + head * head_dim;
 
-          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], max_seq_len, head_dim);
-          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], nullptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], nullptr, max_seq_len, head_dim);
 
           for (int d = lid; d < head_dim; d += wg_size) {
             q_cache[d] = static_cast<float>(q_row[d]);
@@ -1108,7 +1160,7 @@ void attention_decode_rows_joint_matrix_impl(
 // reduction order verbatim, and each sequence owns a private partials region so
 // rows cannot overwrite one another. A row's output therefore stays bitwise
 // identical to calling the single-row merge for that row alone.
-template <bool Quantized, int HeadDim>
+template <int Quantized, int HeadDim>
 void attention_decode_rows_exact_merge_impl(
     Context &ctx, Tensor &q, int q_row_stride, Tensor &output,
     Tensor &partials_buf, const DecodeRowGeometry *rows, int row_count,
@@ -1188,8 +1240,8 @@ void attention_decode_rows_exact_merge_impl(
                       partial_stride +
               static_cast<size_t>(tile_idx) * partial_stride;
 
-          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], max_seq_len, head_dim);
-          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> k_acc(k_ptrs[sequence], nullptr, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptrs[sequence], nullptr, max_seq_len, head_dim);
 
           const bf16 *q_row =
               q_ptr + static_cast<size_t>(sequence) * q_row_stride + head * head_dim;
@@ -1374,7 +1426,9 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                       const int *active_indices,
                       int num_active_tokens,
                       const int *active_blocks,
-                      int num_active_blocks) {
+                      int num_active_blocks,
+                      const Tensor *k_scale,
+                      const Tensor *v_scale) {
   static bool jm_log_once = false;
   const auto &jm_cfg = get_jm_decode_config(ctx.queue().get_device());
   bool allow_jm = jm_cfg.allow_jm;
@@ -1385,6 +1439,7 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
   int decode_window = jm_cfg.decode_window;
   int decode_window_start = jm_cfg.decode_window_start;
   int decode_sink = jm_cfg.decode_sink;
+  const int kv_fmt = kv_cache_format_of(k_cache);
 
   int effective_len = cached_len;
   int tail_start = 0;
@@ -1438,11 +1493,15 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
       exact_partials_buf && exact_partials_buf->valid() && !active_indices && !active_blocks) {
     attention_decode_exact_head128_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
-        num_kv_heads, tail_start, sink_len, effective_len, gate_buf);
+        num_kv_heads, tail_start, sink_len, effective_len, gate_buf, k_scale, v_scale);
     return;
   }
 
-  if (allow_jm && contiguous_mode && head_dim == 128 && cached_len > 0 && !active_indices && !active_blocks) {
+  // S0: the joint-matrix decode kernel reads a bf16 cache only. Quantized
+  // caches must take the baseline path, which dequantizes per element. The
+  // multi-row entry point already applies the same guard.
+  if (allow_jm && kv_fmt == kKvFmtBf16 && contiguous_mode && head_dim == 128 &&
+      cached_len > 0 && !active_indices && !active_blocks) {
     attention_decode_joint_matrix(ctx, q, k_cache, v_cache, output, scores_buf,
                                   num_heads, num_kv_heads, head_dim, cached_len,
                                   attn_start, jm_tile_id, decode_wg, gate_buf);
@@ -1454,7 +1513,7 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     attention_decode_exact_head256_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
         num_kv_heads, tail_start, sink_len, effective_len, gate_buf, active_indices,
-        active_blocks, num_active_blocks);
+        active_blocks, num_active_blocks, k_scale, v_scale);
     return;
   }
 
@@ -1462,7 +1521,7 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
                             num_heads, num_kv_heads, head_dim, cached_len,
                             tail_start, sink_len, effective_len,
                             decode_wg, gate_buf, active_indices,
-                            active_blocks, num_active_blocks);
+                            active_blocks, num_active_blocks, k_scale, v_scale);
 }
 
 
@@ -1480,6 +1539,18 @@ void attention_decode_rows(Context &ctx, Tensor &q, int q_row_stride,
     if (rows[r].k_cache == nullptr || rows[r].v_cache == nullptr ||
         rows[r].cached_len < 0) {
       throw std::invalid_argument("attention_decode_rows: invalid row geometry");
+    }
+  }
+  // INT8 KV is prototype-scoped to the single-row Qwen4Exp dense decode path.
+  // A batched call would need one scale tensor per row (scales are per
+  // session), which the shared signature cannot express, so reject instead of
+  // silently picking whichever row's scale happened to be passed.
+  for (int r = 0; r < row_count; ++r) {
+    if (rows[r].k_cache->dtype() == dnnl::memory::data_type::s8 ||
+        rows[r].v_cache->dtype() == dnnl::memory::data_type::s8) {
+      throw std::invalid_argument(
+          "attention_decode_rows: int8 KV cache is not supported on the "
+          "multi-row decode path");
     }
   }
   // One multi-row kernel covers a row when it matches the single-row choice
@@ -3439,14 +3510,16 @@ void attention_bidi(Context& ctx, Tensor& q, Tensor& k, Tensor& v,
 // SYCL Kernel: Incremental Prefill Attention
 // ============================================================
 
-template <bool Quantized>
+template <int Quantized>
 void attention_prefill_cached_impl(Context& ctx,
                                    Tensor& q, Tensor& k_cache, Tensor& v_cache,
                                    Tensor& output, Tensor& scores_buf,
                                    int seq_len, int start_pos,
                                    int num_heads, int num_kv_heads,
                                    int head_dim, int max_seq_len,
-                                   const bf16* gate_ptr = nullptr) {
+                                   const bf16* gate_ptr = nullptr,
+                                   const float* k_scale = nullptr,
+                                   const float* v_scale = nullptr) {
   const int total_len = start_pos + seq_len;
   if (head_dim == 128 && total_len >= kPrefillCachedExact128MinTotal) {
     bf16 *q_ptr = static_cast<bf16 *>(q.data());
@@ -3487,8 +3560,8 @@ void attention_prefill_cached_impl(Context& ctx,
               merge_state[3] = 0.0f;
             }
 
-            KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, exact_head_dim);
-            KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, exact_head_dim);
 
             item.barrier(sycl::access::fence_space::local_space);
 
@@ -3609,8 +3682,8 @@ void attention_prefill_cached_impl(Context& ctx,
               merge_state[3] = 0.0f;
             }
 
-            KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, exact_head_dim);
-            KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, exact_head_dim);
+            KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, exact_head_dim);
 
             item.barrier(sycl::access::fence_space::local_space);
 
@@ -3716,7 +3789,7 @@ void attention_prefill_cached_impl(Context& ctx,
           return;
         }
 
-        KVCacheAccessor<Quantized> k_acc(k_ptr, max_seq_len, head_dim);
+        KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
 
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
@@ -3757,7 +3830,7 @@ void attention_prefill_cached_impl(Context& ctx,
         int d = idx[2];
         int kv_h = h / heads_per_kv;
 
-        KVCacheAccessor<Quantized> v_acc(v_ptr, max_seq_len, head_dim);
+        KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
 
         float acc = 0.0f;
         float *row = scores_device + h * seq_len * total_len + qi * total_len;
@@ -3781,30 +3854,81 @@ void attention_prefill_cached(Context& ctx,
                               int seq_len, int start_pos,
                               int num_heads, int num_kv_heads,
                               int head_dim, int max_seq_len,
-                              const Tensor* gate_buf) {
+                              const Tensor* gate_buf,
+                              const Tensor* k_scale,
+                              const Tensor* v_scale) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
-  if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-    attention_prefill_cached_impl<true>(
-        ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
-        num_heads, num_kv_heads, head_dim, max_seq_len, gate_ptr);
-  } else {
-    attention_prefill_cached_impl<false>(
-        ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
-        num_heads, num_kv_heads, head_dim, max_seq_len, gate_ptr);
+  const int fmt = kv_cache_format_of(k_cache);
+  const float *k_scale_ptr = kv_scale_ptr(k_scale);
+  const float *v_scale_ptr = kv_scale_ptr(v_scale);
+  if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
+    throw std::invalid_argument("attention_prefill_cached: int8 KV cache requires k_scale/v_scale");
   }
+  auto run = [&](auto tag) {
+    attention_prefill_cached_impl<decltype(tag)::value>(
+        ctx, q, k_cache, v_cache, output, scores_buf, seq_len, start_pos,
+        num_heads, num_kv_heads, head_dim, max_seq_len, gate_ptr,
+        k_scale_ptr, v_scale_ptr);
+  };
+  if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
+  else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
+  else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
 // ============================================================
 // SYCL Kernel: Copy K/V to Cache
 // ============================================================
 
-template <bool Quantized>
+template <int Quantized>
 void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
                         int start_pos, int num_heads, int head_dim,
-                        int max_seq_len) {
+                        int max_seq_len, float *scale = nullptr) {
   bf16 *src = static_cast<bf16 *>(new_kv.data());
   void *dst_void = cache.data();
   int total_dim = num_heads * head_dim;
+
+  if constexpr (Quantized == kKvFmtInt8) {
+    // Per-(head, token) symmetric int8 write: one work-group per cache row
+    // computes the row amax, publishes scale = amax/127, and stores codes.
+    // A single pass, so no extra device traffic beyond the write itself.
+    int8_t *dst = static_cast<int8_t *>(dst_void);
+    constexpr int wg_size = 128;
+    ctx.queue().submit([&](sycl::handler &cgh) {
+      sycl::local_accessor<float, 1> row_max(sycl::range<1>(wg_size), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<1>((size_t)seq_len * num_heads * wg_size, wg_size),
+          [=](sycl::nd_item<1> item) {
+            const int group = item.get_group(0);
+            const int s = group / num_heads;
+            const int h = group % num_heads;
+            const int lid = item.get_local_id(0);
+            const int src_base = s * total_dim + h * head_dim;
+            float amax = 0.0f;
+            for (int d = lid; d < head_dim; d += wg_size) {
+              amax = sycl::fmax(amax, sycl::fabs(static_cast<float>(src[src_base + d])));
+            }
+            row_max[lid] = amax;
+            item.barrier(sycl::access::fence_space::local_space);
+            for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+              if (lid < stride) {
+                row_max[lid] = sycl::fmax(row_max[lid], row_max[lid + stride]);
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+            }
+            const float row_scale = row_max[0] / 127.0f;
+            if (lid == 0) {
+              scale[h * max_seq_len + (start_pos + s)] = row_scale;
+            }
+            const int dst_base =
+                h * max_seq_len * head_dim + (start_pos + s) * head_dim;
+            for (int d = lid; d < head_dim; d += wg_size) {
+              dst[dst_base + d] =
+                  float_to_int8_kv(static_cast<float>(src[src_base + d]), row_scale);
+            }
+          });
+    });
+    return;
+  }
 
   ctx.queue().parallel_for(sycl::range<2>(seq_len, total_dim),
                            [=](sycl::id<2> idx) {
@@ -3816,7 +3940,7 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
                              int src_idx = s * total_dim + flat;
                              int dst_idx = h * max_seq_len * head_dim +
                                            (start_pos + s) * head_dim + d;
-                             if constexpr (Quantized) {
+                             if constexpr (Quantized == kKvFmtFp8) {
                                uint8_t *dst = static_cast<uint8_t *>(dst_void);
                                dst[dst_idx] = float_to_fp8_e4m3fn(static_cast<float>(src[src_idx]));
                              } else {
@@ -3828,11 +3952,20 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
 
 void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
                    int start_pos, int num_heads, int head_dim,
-                   int max_seq_len) {
-  if (cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-    copy_to_cache_impl<true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
+                   int max_seq_len, Tensor* scale_arg) {
+  const int fmt = kv_cache_format_of(cache);
+  // copy_to_cache writes a single tensor, so the caller passes that tensor's
+  // own scale (k_scale for K, v_scale for V).
+  float *scale = kv_scale_write_ptr(scale_arg);
+  if (fmt == kKvFmtInt8 && !scale) {
+    throw std::invalid_argument("copy_to_cache: int8 KV cache requires a scale tensor");
+  }
+  if (fmt == kKvFmtInt8) {
+    copy_to_cache_impl<kKvFmtInt8>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, scale);
+  } else if (fmt == kKvFmtFp8) {
+    copy_to_cache_impl<kKvFmtFp8>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
   } else {
-    copy_to_cache_impl<false>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
+    copy_to_cache_impl<kKvFmtBf16>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len);
   }
 }
 

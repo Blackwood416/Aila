@@ -57,6 +57,31 @@ inline float fp8_e4m3fn_to_float(uint8_t val) {
 }
 
 // ============================================================
+// INT8 KV conversions (opt-in: AILA_KV_QUANT=1 AILA_KV_QUANT_FORMAT=int8)
+// ============================================================
+// Symmetric signed 8-bit codes in [-127, 127] with a per-(layer, kv_head,
+// token) float scale = amax / 127. The per-token scale is required for
+// incremental decode: a single per-head scale would silently invalidate codes
+// already written whenever a later token had a larger amplitude. Both helpers
+// are deterministic IEEE-754 operations (single correctly-rounded division and
+// round-to-nearest-even), so the host reference in the microtest reproduces the
+// device result bit for bit.
+inline int8_t float_to_int8_kv(float value, float scale) {
+    if (!(sycl::fabs(value) < 3.402823466e38f)) return int8_t(0); // NaN/Inf
+    if (!(scale > 0.0f)) return int8_t(0);
+    const float clamped = sycl::clamp(value / scale, -127.0f, 127.0f);
+    return static_cast<int8_t>(sycl::rint(clamped));
+}
+
+inline float int8_kv_to_float(int8_t code, float scale) {
+    return static_cast<float>(code) * scale;
+}
+
+// KV cache storage format tag used by the templated attention/write kernels.
+// 0 = bf16 (default), 1 = fp8 e4m3, 2 = int8 (per-token f32 scale).
+enum KvCacheFormat : int { kKvFmtBf16 = 0, kKvFmtFp8 = 1, kKvFmtInt8 = 2 };
+
+// ============================================================
 // Linear 层 (oneDNN MatMul 封装)
 // ============================================================
 class Linear {
@@ -256,9 +281,12 @@ namespace ops {
     // 将新 K/V 写到 cache 的指定位置
     // new_kv: [seq_len, num_kv_heads * head_dim]
     // cache: [num_kv_heads, max_seq_len, head_dim] (预分配)
+    // scale: [num_kv_heads, max_seq_len] f32, required only when the cache
+    // dtype is s8 (INT8 KV, opt-in).
     void copy_to_cache(Context& ctx, Tensor& new_kv, Tensor& cache,
                        int seq_len, int start_pos,
-                       int num_heads, int head_dim, int max_seq_len);
+                       int num_heads, int head_dim, int max_seq_len,
+                       Tensor* scale = nullptr);
 
     // Decode fused prep (seq_len=1):
     // Q/K per-head RMSNorm + RoPE, and write K/V to cache at start_pos.
@@ -308,7 +336,9 @@ namespace ops {
                                             int text_pos_delta = 0,
                                             int mrope_section_t = 0,
                                             int mrope_section_h = 0,
-                                            int mrope_section_w = 0);
+                                            int mrope_section_w = 0,
+                                            Tensor* k_scale = nullptr,
+                                            Tensor* v_scale = nullptr);
 
     // GQA Attention (decode 模式, seq_len=1)
     // q:       [1, num_heads * head_dim]
@@ -325,7 +355,9 @@ namespace ops {
                           const int* active_indices = nullptr,
                           int num_active_tokens = 0,
                           const int* active_blocks = nullptr,
-                          int num_active_blocks = 0);
+                          int num_active_blocks = 0,
+                          const Tensor* k_scale = nullptr,
+                          const Tensor* v_scale = nullptr);
 
 
     // Per-row decode geometry for the multi-row entry point below. Rows are
@@ -386,7 +418,9 @@ namespace ops {
                                   int seq_len, int start_pos,
                                   int num_heads, int num_kv_heads,
                                   int head_dim, int max_seq_len,
-                                  const Tensor* gate_buf = nullptr);
+                                  const Tensor* gate_buf = nullptr,
+                                  const Tensor* k_scale = nullptr,
+                                  const Tensor* v_scale = nullptr);
 
     // Masked prefill attention (DiffusionGemma encoder/decoder).
     // q: [q_len, num_heads * head_dim] bf16

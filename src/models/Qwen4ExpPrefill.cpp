@@ -160,7 +160,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 session.mropePromptLength_, session.mropeTextPositionDelta_,
                 cfg_.rope.mrope_section[0],
                 cfg_.rope.mrope_section[1],
-                cfg_.rope.mrope_section[2]);
+                cfg_.rope.mrope_section[2],
+                cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                cache.v_scale.valid() ? &cache.v_scale : nullptr);
 
             const int* active_indices = nullptr;
             int num_active_tokens = 0;
@@ -247,7 +249,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.decode_scores,
                 full_q_heads_, full_kv_heads_, full_head_dim_, cached_len,
                 &buf_.decode_attn_partials, &buf_.z, active_indices, num_active_tokens,
-                active_blocks, num_active_blocks);
+                active_blocks, num_active_blocks,
+                cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                cache.v_scale.valid() ? &cache.v_scale : nullptr);
 
             project_decode(layer.o_proj, buf_.attn_out, output, 3);
         } else {
@@ -299,7 +303,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                         (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                         session.mropePromptLength_, session.mropeTextPositionDelta_,
-                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                        cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                        cache.v_scale.valid() ? &cache.v_scale : nullptr);
                 }
             } else {
                 ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
@@ -318,8 +324,10 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                         cfg_.rope.mrope_section[2]);
 
                 if (count > 1) {
-                    ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
-                    ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity());
+                    ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity(),
+                                       cache.k_scale.valid() ? &cache.k_scale : nullptr);
+                    ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity(),
+                                       cache.v_scale.valid() ? &cache.v_scale : nullptr);
                 }
             }
 
@@ -445,7 +453,10 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, q_row, cache.k, cache.v, attn_out_row, buf_.decode_scores,
                             full_q_heads_, full_kv_heads_, full_head_dim_, visible_len,
                             &buf_.decode_attn_partials, &z_row,
-                            buf_.indexer_active_tokens.data_as<int>(), attention_active_tokens);
+                            buf_.indexer_active_tokens.data_as<int>(), attention_active_tokens,
+                            nullptr, 0,
+                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                            cache.v_scale.valid() ? &cache.v_scale : nullptr);
                     }
                 }
                 project_prefill(layer.o_proj, buf_.attn_out, output);
@@ -501,12 +512,17 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         auto out_row = Tensor::view(ctx, buf_.attn_out.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
                         ops::attention_decode(ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
                             full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + row + 1,
-                            &buf_.decode_attn_partials, &z_row);
+                            &buf_.decode_attn_partials, &z_row,
+                            nullptr, 0, nullptr, 0,
+                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                            cache.v_scale.valid() ? &cache.v_scale : nullptr);
                     }
                 } else if (start_pos == 0) {
                     ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
                 } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z);
+                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z,
+                                                  cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                                  cache.v_scale.valid() ? &cache.v_scale : nullptr);
                 }
                 project_prefill(layer.o_proj, buf_.attn_out, output);
             }

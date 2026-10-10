@@ -2,6 +2,8 @@
 #include <sycl/sycl.hpp>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <type_traits>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -232,6 +234,12 @@ void decode_prepare_qkv_impl(Context& ctx,
                         for (int k = 0; k < 4; ++k) {
                             k_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(k0_vec[k]));
                             v_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(v0_vec[k]));
+                            // S0: the fast path holds the full head in two
+                            // vec4 halves; the second half must be encoded too.
+                            k_cache_fp8[cache_base + half_dim_const + lid * 4 + k] =
+                                float_to_fp8_e4m3fn(static_cast<float>(k1_vec[k]));
+                            v_cache_fp8[cache_base + half_dim_const + lid * 4 + k] =
+                                float_to_fp8_e4m3fn(static_cast<float>(v1_vec[k]));
                         }
                     } else {
                         bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
@@ -354,7 +362,11 @@ void decode_prepare_qkv(Context& ctx,
                         int start_pos,
                         int num_heads_q, int num_kv_heads, int head_dim,
                         float eps, float theta) {
-    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    if (k_cache.dtype() == dnnl::memory::data_type::s8) {
+        throw std::invalid_argument(
+            "decode_prepare_qkv: int8 KV cache is not supported on this path "
+            "(only decode_prepare_qgkv_packed_partial implements INT8 KV)");
+    } else if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
         decode_prepare_qkv_impl<true>(ctx, q, k, v, rope_freq, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, theta);
     } else {
         decode_prepare_qkv_impl<false>(ctx, q, k, v, rope_freq, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, theta);
@@ -1070,12 +1082,19 @@ void decode_prepare_qkv_partial_impl(Context& ctx,
                     vec4 v1_vec = reinterpret_cast<const vec4*>(v_ptr + kv_base + half_dim_const)[lid];
 
                     int cache_base = head * max_seq_len * head_dim_const + start_pos * head_dim_const;
-                    if constexpr (Quantized) {
+                    if constexpr (Quantized == kKvFmtFp8) {
                         uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
                         uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
                         for (int k = 0; k < 4; ++k) {
                             k_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(k0_vec[k]));
                             v_cache_fp8[cache_base + lid * 4 + k] = float_to_fp8_e4m3fn(static_cast<float>(v0_vec[k]));
+                            // S0: encode the second vec4 half as well; the
+                            // fast path never wrote it, so heads 64..127 of
+                            // every cached token were left uninitialized.
+                            k_cache_fp8[cache_base + half_dim_const + lid * 4 + k] =
+                                float_to_fp8_e4m3fn(static_cast<float>(k1_vec[k]));
+                            v_cache_fp8[cache_base + half_dim_const + lid * 4 + k] =
+                                float_to_fp8_e4m3fn(static_cast<float>(v1_vec[k]));
                         }
                     } else {
                         bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
@@ -1204,7 +1223,7 @@ void decode_prepare_qkv_partial_impl(Context& ctx,
 
                 int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
                 for (int d = lid; d < head_dim; d += wg_size) {
-                    if constexpr (Quantized) {
+                    if constexpr (Quantized == kKvFmtFp8) {
                         uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
                         uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
                         k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
@@ -1236,14 +1255,18 @@ void decode_prepare_qkv_partial(Context& ctx,
                                 int mrope_section_t,
                                 int mrope_section_h,
                                 int mrope_section_w) {
-    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+    if (k_cache.dtype() == dnnl::memory::data_type::s8) {
+        throw std::invalid_argument(
+            "decode_prepare_qkv_partial: int8 KV cache is not supported on this path "
+            "(only decode_prepare_qgkv_packed_partial implements INT8 KV)");
+    } else if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
         decode_prepare_qkv_partial_impl<true>(ctx, q, k, v, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
     } else {
         decode_prepare_qkv_partial_impl<false>(ctx, q, k, v, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
     }
 }
 
-template <bool Quantized>
+template <int Quantized>
 void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              Tensor& q_gate_packed, Tensor& k, Tensor& v,
                                              Tensor& q_out, Tensor& gate_out,
@@ -1260,7 +1283,9 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              int text_pos_delta,
                                              int mrope_section_t,
                                              int mrope_section_h,
-                                             int mrope_section_w) {
+                                             int mrope_section_w,
+                                             float* k_scale_ptr = nullptr,
+                                             float* v_scale_ptr = nullptr) {
     bf16* packed_ptr = static_cast<bf16*>(q_gate_packed.data());
     bf16* q_ptr = static_cast<bf16*>(q_out.data());
     bf16* gate_ptr = static_cast<bf16*>(gate_out.data());
@@ -1270,6 +1295,12 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
     bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
     void* k_cache_ptr = k_cache.data();
     void* v_cache_ptr = v_cache.data();
+    if constexpr (Quantized == kKvFmtInt8) {
+        if (k_scale_ptr == nullptr || v_scale_ptr == nullptr) {
+            throw std::invalid_argument(
+                "decode_prepare_qgkv_packed_partial: int8 KV cache requires k_scale/v_scale");
+        }
+    }
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int packed_per_head = head_dim * 2;
     int k_dim = num_kv_heads * head_dim;
@@ -1394,17 +1425,58 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 item.barrier(sycl::access::fence_space::local_space);
 
                 int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
-                for (int d = lid; d < head_dim; d += wg_size) {
-                    if constexpr (Quantized) {
-                        uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
-                        uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
-                        k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
-                        v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
-                    } else {
-                        bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
-                        bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
-                        k_cache_bf16[cache_base + d] = k_ptr[k_base + d];
-                        v_cache_bf16[cache_base + d] = v_ptr[k_base + d];
+                if constexpr (Quantized == kKvFmtInt8) {
+                    // Opt-in INT8/INT8 KV: K is quantized after RoPE, V as-is.
+                    // One subgroup-wide amax per (head, token) yields the
+                    // per-token scale in the same pass (no extra global pass).
+                    float kamax = 0.0f;
+                    for (int d = lid; d < head_dim; d += wg_size) {
+                        kamax = sycl::fmax(kamax, sycl::fabs(static_cast<float>(k_ptr[k_base + d])));
+                    }
+                    local_sum[lid] = kamax;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_sum[lid] = sycl::fmax(local_sum[lid], local_sum[lid + stride]);
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    const float k_scale = local_sum[0] / 127.0f;
+                    if (lid == 0) k_scale_ptr[head * max_seq_len + start_pos] = k_scale;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    float vamax = 0.0f;
+                    for (int d = lid; d < head_dim; d += wg_size) {
+                        vamax = sycl::fmax(vamax, sycl::fabs(static_cast<float>(v_ptr[k_base + d])));
+                    }
+                    local_sum[lid] = vamax;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_sum[lid] = sycl::fmax(local_sum[lid], local_sum[lid + stride]);
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    const float v_scale = local_sum[0] / 127.0f;
+                    if (lid == 0) v_scale_ptr[head * max_seq_len + start_pos] = v_scale;
+
+                    int8_t* k_cache_i8 = static_cast<int8_t*>(k_cache_ptr);
+                    int8_t* v_cache_i8 = static_cast<int8_t*>(v_cache_ptr);
+                    for (int d = lid; d < head_dim; d += wg_size) {
+                        k_cache_i8[cache_base + d] =
+                            float_to_int8_kv(static_cast<float>(k_ptr[k_base + d]), k_scale);
+                        v_cache_i8[cache_base + d] =
+                            float_to_int8_kv(static_cast<float>(v_ptr[k_base + d]), v_scale);
+                    }
+                } else {
+                    for (int d = lid; d < head_dim; d += wg_size) {
+                        if constexpr (Quantized == kKvFmtFp8) {
+                            uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
+                            uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
+                            k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
+                            v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
+                        } else {
+                            bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
+                            bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
+                            k_cache_bf16[cache_base + d] = k_ptr[k_base + d];
+                            v_cache_bf16[cache_base + d] = v_ptr[k_base + d];
+                        }
                     }
                 }
             });
@@ -1427,11 +1499,20 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
                                         int text_pos_delta,
                                         int mrope_section_t,
                                         int mrope_section_h,
-                                        int mrope_section_w) {
-    if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
-        decode_prepare_qgkv_packed_partial_impl<true>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+                                        int mrope_section_w,
+                                        Tensor* k_scale,
+                                        Tensor* v_scale) {
+    float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
+    float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
+    auto dispatch = [&](auto tag) {
+        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
+    };
+    if (k_cache.dtype() == dnnl::memory::data_type::s8) {
+        dispatch(std::integral_constant<int, kKvFmtInt8>{});
+    } else if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+        dispatch(std::integral_constant<int, kKvFmtFp8>{});
     } else {
-        decode_prepare_qgkv_packed_partial_impl<false>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+        dispatch(std::integral_constant<int, kKvFmtBf16>{});
     }
 }
 

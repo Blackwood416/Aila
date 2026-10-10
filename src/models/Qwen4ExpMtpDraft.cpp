@@ -192,7 +192,9 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     ops::decode_prepare_qgkv_packed_partial(ctx_, q, k, v, b.q, b.z, *layer_.q_norm_weight,
                                             *layer_.k_norm_weight, cache.k, cache.v, position, 24, 2, 256,
                                             1e-6f, 64, 10000000.0f, true, nullptr, nullptr, nullptr, 0, 0, 11,
-                                            11, 10);
+                                            11, 10,
+                                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                            cache.v_scale.valid() ? &cache.v_scale : nullptr);
     ops::bf16_gemv_bf16(ctx_, layer_.index_k_weight, b.x.data_as<bf16>(),
                         cache.indexer_k.data_as<bf16>() + size_t(position) * 128, 128, 2560);
     if ((position + 1) % 4 == 0) {
@@ -204,7 +206,9 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     // these persistent rows; neither attention nor MoE feeds them.
     if (kvOnly) return;
     ops::attention_decode(ctx_, b.q, cache.k, cache.v, b.attn_out, b.decode_scores, 24, 2, 256, position + 1,
-                          &b.decode_attn_partials, &b.z);
+                          &b.decode_attn_partials, &b.z, nullptr, 0, nullptr, 0,
+                          cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                          cache.v_scale.valid() ? &cache.v_scale : nullptr);
     layer_.o_proj.ForwardDecodeRows(ctx_, scratch, b.attn_out, b.y, 1);
     target_.RunHyperConnectionCombined(ctx_, layer_.mlp_hc, 1, true, b.y.data_as<bf16>(),
                                        b.hc_inject_f32.data_as<float>());

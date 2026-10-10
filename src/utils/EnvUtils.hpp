@@ -105,6 +105,15 @@ inline std::string read_string(const char* name, const std::string& default_valu
 #endif
 }
 
+// AILA_KV_QUANT_FORMAT selects the 1-byte KV storage when AILA_KV_QUANT is on:
+// "int8" opts into the symmetric INT8 prototype, anything else (including
+// unset) keeps the legacy fp8 E4M3 cache. This deliberately does not widen
+// AILA_KV_QUANT itself into an enum: its `atoi != 0` reading must stay intact.
+inline bool kv_quant_format_is_int8() {
+    const std::string value = read_string("AILA_KV_QUANT_FORMAT");
+    return value == "int8" || value == "INT8" || value == "Int8";
+}
+
 inline float read_float(const char* name, float default_value = 0.0f) {
 #ifdef _WIN32
     char* value = nullptr;
