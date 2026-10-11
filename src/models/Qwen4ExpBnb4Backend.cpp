@@ -1629,7 +1629,7 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     static const bool s_hc_up_streams = aila::env::read_flag("AILA_Q4E_HC_DECODE_UP_STREAMS", false);
     const int hc_down_wg = decodeHcReferenceForTest_ ? 256 : s_hc_down_wg;
     const bool hc_up_streams = !decodeHcReferenceForTest_ && s_hc_up_streams;
-    if (s_small_rows_hc && s_fused_hc && count >= 2 && count <= 4 &&
+    if ((s_small_rows_hc || verify_rows_alignment_) && s_fused_hc && count >= 2 && count <= 4 &&
         hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
         ops::hc_decode_down_inject_rows(ctx, buf_.hc_N.data_as<bf16>(),
             hc.mix_down_w->data_as<bf16>(), with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
@@ -1833,7 +1833,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // Experimental tiny-prefill/verification route. Keep it opt-in until full
     // model numerics and state semantics are accepted for each supported shape.
     static const bool s_small_rows_decode = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_DECODE", false);
-    const bool small_rows_decode = s_small_rows_decode && count >= 2 && count <= 4;
+    static const bool s_verify_small_rows = aila::env::read_flag("AILA_Q4E_VERIFY_SMALL_ROWS", false);
+    const bool verify_rows_alignment = s_verify_small_rows && options.decode_verification &&
+        count >= 2 && count <= 4;
+    const bool small_rows_decode = (s_small_rows_decode || verify_rows_alignment) && count >= 2 && count <= 4;
+    // Scope the verify-path alignment to this forward; the in-order submission
+    // means the flag only affects kernels queued here.
+    struct VerifyRowsAlignScope {
+        Qwen4ExpBnb4Backend& self;
+        bool prev;
+        VerifyRowsAlignScope(Qwen4ExpBnb4Backend& s, bool v)
+            : self(s), prev(s.verify_rows_alignment_) {
+            self.verify_rows_alignment_ = v;
+            self.ple_.set_rows_decode(v);
+        }
+        ~VerifyRowsAlignScope() {
+            self.verify_rows_alignment_ = prev;
+            self.ple_.set_rows_decode(prev);
+        }
+    } verifyRowsAlignScope{*this, verify_rows_alignment};
     auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& input, Tensor& output) {
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, input, output, count);
         else projection.forward(ctx, linear_scratch_, input, output, count);
@@ -1928,14 +1946,38 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStagePle);
 
         // 2.1. Attn Hyper-Connection
+        if (verification_hidden_in_for_test_ && options.decode_verification &&
+            count <= verification_stage_rows_for_test_) {
+            ctx.queue().memcpy(
+                verification_hidden_in_for_test_ + size_t(L) * verification_stage_rows_for_test_ * 10240,
+                buf_.hidden4.data(), size_t(count) * 10240 * sizeof(bf16));
+        }
         if (pending_mlp.pending)
             RunHyperConnectionCombined(ctx, layer.attn_hc, 1, true, nullptr, nullptr, &pending_mlp);
         else
             RunHyperConnection(ctx, layer.attn_hc, count, true);
+        if (verification_attn_in_for_test_ && options.decode_verification &&
+            count <= verification_stage_rows_for_test_) {
+            ctx.queue().memcpy(
+                verification_attn_in_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
+                buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));
+        }
         stage(kStageHc);
 
         // Attention tiles advance this layer's state before routing the whole window.
         RunAttentionWindow(ctx, session, L, count, start_pos, interior, checkpoint_after, !is_prefill);
+        if (verification_attn_raw_for_test_ && options.decode_verification &&
+            count <= verification_stage_rows_for_test_) {
+            ctx.queue().memcpy(
+                verification_attn_raw_for_test_ + size_t(L) * verification_stage_rows_for_test_ * 6144,
+                buf_.attn_out.data(), size_t(count) * 6144 * sizeof(bf16));
+        }
+        if (verification_attn_out_for_test_ && options.decode_verification &&
+            count <= verification_stage_rows_for_test_) {
+            ctx.queue().memcpy(
+                verification_attn_out_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
+                buf_.y.data(), size_t(count) * hidden_size_ * sizeof(bf16));
+        }
 
         stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
 
@@ -2002,6 +2044,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (verification_router_inputs_for_test_ && options.decode_verification && count == 2)
             ctx.queue().memcpy(verification_router_inputs_for_test_ + size_t(L) * 2 * hidden_size_,
                 buf_.x.data(), size_t(2) * hidden_size_ * sizeof(bf16));
+        if (verification_router_x_for_test_ && options.decode_verification &&
+            count <= verification_stage_rows_for_test_) {
+            ctx.queue().memcpy(
+                verification_router_x_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
+                buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));
+        }
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
         sycl::event actual_route_event;
         if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512) {
@@ -2245,6 +2293,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 if (lmHeadQ8ForwardCount_ == 1)
                     AILA_LOG_INFO("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1 experimental=1",
                         rows, hidden_size_, cfg_.vocab_size);
+            } else if (verify_rows_alignment_ && rows > 1) {
+                // Verify-path alignment: one head GEMV per row so the window
+                // matches sequential B1 logits exactly.
+                for (int r = 0; r < rows; ++r) {
+                    auto x_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
+                    auto y_row = Tensor::view(ctx, buf_.logits.data_as<bf16>() + size_t(r) * cfg_.vocab_size, {1, cfg_.vocab_size});
+                    lm_head_.forward(ctx, x_row, y_row, 1);
+                }
             } else lm_head_.forward(ctx, input, buf_.logits, rows);
         };
         if (lastTokenOnly) {

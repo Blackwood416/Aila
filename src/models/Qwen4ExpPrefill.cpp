@@ -19,7 +19,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
     const int cached_len = start_pos + count;
     constexpr int full_rotary_dim = 64;
     static const bool s_small_rows_decode = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_DECODE", false);
-    const bool small_rows_decode = s_small_rows_decode && count >= 2 && count <= 4;
+    const bool small_rows_decode = (s_small_rows_decode || verify_rows_alignment_) && count >= 2 && count <= 4;
     auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& x, Tensor& y) {
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, x, y, count);
         else projection.forward(ctx, linear_scratch_, x, y, count);
@@ -284,7 +284,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
 
             project_prefill(layer.qkv_proj, input, buf_.full_qkv);
             static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", false);
-            if (verify_decode_prepare && allowQ8 && !interior && count == 2 && start_pos > 0 && !sparse_prefill) {
+            if (verify_decode_prepare && allowQ8 && !interior && count >= 2 && count <= 4 && start_pos > 0 && !sparse_prefill) {
                 // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode.
                 // Reuse the packed projection and existing output banks; no USM scratch.
                 for (int r = 0; r < count; ++r) {

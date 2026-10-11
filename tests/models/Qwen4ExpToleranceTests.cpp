@@ -78,6 +78,23 @@ struct Qwen4ExpGenerationTestAccess {
             b.buf_.logits = Tensor::allocate(Ctx(e), {rows, b.cfg_.vocab_size}, dnnl::memory::data_type::bf16);
     }
     static const ops::DeltaNetGeometry& FrontGeometry(Qwen4ExpBnb4Backend& b) { return b.layers_.at(0).geom; }
+    static void PrepareVerification(Qwen4ExpBnb4Backend& b, Context& c) { b.PrepareDecodeVerification(c); }
+    static int HiddenSize(const Qwen4ExpBnb4Backend& b) { return b.hidden_size_; }
+    static int LayerCount(const Qwen4ExpBnb4Backend& b) { return int(b.layers_.size()); }
+    static int VocabSize(const Qwen4ExpBnb4Backend& b) { return b.cfg_.vocab_size; }
+    // B4-2 alignment probe: copies the per-layer attention output and the
+    // per-layer router input for every verify row into caller-owned
+    // [layers, rows, hidden] bf16 buffers. Inert (no copies) unless rows>0, so
+    // ordinary forwards stay byte-identical.
+    static void StageProbe(Qwen4ExpBnb4Backend& b, bf16* attnOut, bf16* routerX, bf16* hiddenIn,
+                           bf16* attnIn, bf16* attnRaw, int rows) {
+        b.verification_attn_out_for_test_ = attnOut;
+        b.verification_router_x_for_test_ = routerX;
+        b.verification_hidden_in_for_test_ = hiddenIn;
+        b.verification_attn_in_for_test_ = attnIn;
+        b.verification_attn_raw_for_test_ = attnRaw;
+        b.verification_stage_rows_for_test_ = rows;
+    }
     static Tensor& FrontHidden(Qwen4ExpBnb4Backend& b) { return b.buf_.hidden4; }
     static Tensor& FrontX(Qwen4ExpBnb4Backend& b) { return b.buf_.x; }
     static Tensor& FrontScores(Qwen4ExpBnb4Backend& b) { return b.buf_.router_scores; }
@@ -595,6 +612,7 @@ void test_real_model_tolerance(const std::string& model_dir) {
 #include "Qwen4ExpDecodeProbe.hpp"
 #include "Qwen4ExpHeadProbe.hpp"
 #include "Qwen4ExpMtpAcceptance.hpp"
+#include "Qwen4ExpMtpAlign.hpp"
 
 } // namespace
 
@@ -689,6 +707,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string(argv[1]) == "--mtp-model") {
             test_mtp_probe(argv[2]);
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--mtp-align") {
+            test_mtp_align(argv[2]);
             return 0;
         }
         Context ctx;

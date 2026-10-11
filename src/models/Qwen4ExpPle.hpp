@@ -195,6 +195,10 @@ public:
     Tensor& norm_conv_weight() { return norm_conv_w_; }
     const sycl::ext::oneapi::bfloat16* conv1d_weight_ptr() const { return conv1d_w_ptr_; }
 
+    // Opt-in alignment (B4-2): treat a 2..4 token verify window as independent
+    // single-row projections so it matches sequential B1 decode bit-for-bit.
+    void set_rows_decode(bool value) { rows_decode_ = value; }
+
 private:
     void cleanup();
     void ensure_compute_capacity(Context& ctx, int rows);
@@ -208,6 +212,7 @@ private:
     int max_tokens_ = 2048;
     int compute_capacity_ = 0;
     float eps_ = 1e-6f;
+    bool rows_decode_ = false;
 
     std::array<int64_t, 3> layer_multipliers_{};
     std::array<int64_t, 16> ngram_heads_vocab_sizes_{};

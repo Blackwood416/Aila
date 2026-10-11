@@ -199,6 +199,8 @@ public:
         }
         std::vector<Qwen4ExpLayerCache>& layer_caches_for_testing() { return layerCaches_; }
         int& current_length_for_testing() { return currentLength_; }
+        int& consecutive_no_miss_layers_for_testing() { return consecutive_no_miss_layers_; }
+        Qwen4ExpPleState& ple_state_for_testing() { return ple_state_; }
         int consecutive_no_miss_layers() const { return consecutive_no_miss_layers_; }
 
     private:
@@ -443,6 +445,24 @@ private:
     // diagnostic caller owns it through verification and prefix replay.
     bf16* verification_linear_inputs_for_test_ = nullptr;
     bf16* verification_router_inputs_for_test_ = nullptr;
+    // Opt-in alignment probe (B4-2). When set together with
+    // verification_stage_rows_for_test_ > 0, decode_verification forwards with
+    // count <= rows copy the per-layer attention output (post o_proj, pre
+    // MLP-HC) and per-layer router input (post MLP-HC, pre MoE) for every row
+    // into caller-owned [layers, rows, hidden] bf16 buffers. These copies ride
+    // the in-order queue and never change arithmetic.
+    bf16* verification_attn_out_for_test_ = nullptr;
+    bf16* verification_router_x_for_test_ = nullptr;
+    bf16* verification_hidden_in_for_test_ = nullptr;
+    bf16* verification_attn_in_for_test_ = nullptr;   // HC output = attention module input, [layers, rows, hidden]
+    bf16* verification_attn_raw_for_test_ = nullptr;  // attention module raw output (pre o_proj), [layers, rows, 6144]
+    int verification_stage_rows_for_test_ = 0;
+    // Opt-in alignment (AILA_Q4E_VERIFY_SMALL_ROWS): while a 2..4 row
+    // decode_verification forward runs, route the attention/shared projections,
+    // the hyper-connections, PLE and the LM head through the single-row decode
+    // kernels so the window matches sequential B1 decode. Default false keeps
+    // the legacy multi-row GEMM schedule byte-for-byte unchanged.
+    bool verify_rows_alignment_ = false;
     std::optional<sycl::kernel_bundle<sycl::bundle_state::executable>> verification_attention_pair_bundle_;
     bool component_profile_active_for_test_ = false;
     std::array<double, 5> component_profile_ms_for_test_{};

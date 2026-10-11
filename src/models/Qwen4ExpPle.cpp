@@ -715,9 +715,12 @@ void Qwen4ExpPle::consume(
     Tensor& dev_embed = dev_embed_slots_[ticket.staging_slot];
 
     // 3. Projections
-    if (num_tokens == 1) {
-        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf_, 1);
-        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf_, 1);
+    if (num_tokens == 1 || rows_decode_) {
+        // The multi-row decode GEMV keeps one subgroup per output row and the
+        // original vec8/FMA order, so rows_decode_ makes a 2..4 token window
+        // bit-identical to sequential single-row projections.
+        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf_, num_tokens);
+        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf_, num_tokens);
     } else {
         key_proj_.forward(ctx, scratch_key_, dev_embed, key_buf_, num_tokens);
         value_proj_.forward(ctx, scratch_val_, dev_embed, value_buf_, num_tokens);
