@@ -513,7 +513,8 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 if (verify_decode_attention && verify_attention_pair && allowQ8 && count == 2 &&
                     start_pos+1 >= 1024 && !interior && decode_window <= 0 && decode_sink <= 0 &&
                     cache.k.dtype()==dnnl::memory::data_type::bf16 &&
-                    buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272) {
+                    buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272 &&
+                    !verify_rows_alignment_) {
                     static const bool logged=[] {
                         AILA_LOG_INFO("[Q4E VerifyAttentionPair] active=1 rows=2 bf16_kv_reuse=1 phase_scratch_reuse=1");
                         return true;

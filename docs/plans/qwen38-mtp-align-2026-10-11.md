@@ -48,6 +48,22 @@ T1 与多行 verify 的分歧**主要不是算子舍入，而是调度**：`coun
 - >2048 sparse-QSA 分支未覆盖（MTP 资格为 dense ≤2048）。
 - 未跑生产 harness/server，未做性能回归——verify 窗口投影逐行执行**预期降吞吐**（B4-③ 需实测）。
 
+## B4-④：活线分歧定位与修复（2026-10-11 晚）
+
+三个候选逐一裁决：
+
+| 候选 | 结论 | 证据 |
+|---|---|---|
+| `VerifyRows(1) != 普通 decode` | **否证** | 新增 `AILA_Q4E_MTP_ALIGN_T1=decode`；prompt=512 下 `VerifyRows(4) == 4×普通 decode` 逐位（logits + 48 层 GDN 态 + 全 stage 探针），叠加 B 臂数值开关后仍逐位 |
+| draft 共享状态污染 | **否证** | 进程内活线 MTP（含拒绝 + state-only replay）`single_row_target_mismatches=[]`；小规模真实 A/B 内容 hash 相同 |
+| 活线首个分歧 | **定位 = attention-pair 核** | `ATTN_PAIR=1` → 119 tok "a large number"；`ATTN_PAIR=0` → 首请求与 T1 **逐字节相同**（sha `f72a0da0fb2f`，126 tok "a series"）。prompt=1447 复现：width=4（逐行 `attention_decode`）逐位；width=2（`q4e_attention_decode_pair`）从 layer 15/16 起分歧 → **长 KV 下 pair 核 partial-merge 与两次单行不等价** |
+
+**修复（opt-in）**：`Qwen4ExpPrefill.cpp:513-517` pair 核条件追加 `&& !verify_rows_alignment_`——`VERIFY_SMALL_ROWS=1` 时 2 行 verify 窗口回避 pair 核。修复后 prompt=1447 width=2/4 全 rows 逐位、全尺寸 A/B 首请求与 T1 逐字节相同。
+
+**残余阻塞（B4-⑤ 目标）**：续轮（prefix reuse）仍分歧（111 tok vs T1 128 tok），尽管续轮 prompt_tokens/cached 与 T1 相同（1574/1550）→ 差异在 MTP 请求结束后的**会话缓存态**（KV/状态内容），非提示词或 pair 核。
+
+**工作方式修正**（用户反馈）：已移除测试命令中的固定 ~420s 硬等待，改为 1–2s 轮询完成条件（进程/`result.json`/日志结束标记，上界 900s），长测试前台运行；受影响的运行已用新方式补齐。
+
 ## 移交
 
 - 继续项：① layer≥1 阶段纳入 small-rows；② 长 prompt（≥1100）覆盖 attention-pair/dense-QSA；③ 全过后开 B4-③（协议见路线图）。

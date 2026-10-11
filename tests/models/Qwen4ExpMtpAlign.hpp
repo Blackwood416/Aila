@@ -9,6 +9,7 @@ void test_mtp_align(const std::string& directory) {
     const int capacity = aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048);
     const int rowsMax = aila::env::read_int("AILA_Q4E_MTP_ALIGN_ROWS", 4);
     const std::string promptFile = aila::env::read_string("AILA_Q4E_MTP_PROMPT_FILE", "");
+    const std::string t1Mode = aila::env::read_string("AILA_Q4E_MTP_ALIGN_T1", "verify1");
     expect(capacity == 640 || capacity == 2048, "MTP align context must be 640 or 2048");
     expect((promptCount == 30 || promptCount == 512 || !promptFile.empty()),
            "MTP align prompt must be 30, 512 or a file");
@@ -137,10 +138,16 @@ void test_mtp_align(const std::string& directory) {
         ctx.synchronize();
         expect(length == P, "MTP align checkpoint anchor mismatch");
         int next = promptTop1;
+        auto t1Step = [&](const int* idsPtr, int n) -> Tensor& {
+            // "decode": exactly the live T1 dispatch (lastTokenOnly, no
+            // decode_verification). "verify1": the previous driver reference.
+            if (t1Mode == "decode") return Access::DecodeStep(engine, idsPtr, n);
+            return Access::VerifyRows(engine, idsPtr, n);
+        };
         for (int r = 0; r < rowsMax; ++r) {
             cont.push_back(next);
             ctx.memcpy_h2d(ids.data(), &next, sizeof(int));
-            auto& lg = Access::VerifyRows(engine, ids.data_as<int>(), 1);
+            auto& lg = t1Step(ids.data_as<int>(), 1);
             ctx.memcpy_d2h(refLog.data() + size_t(r) * V, lg.data_as<bf16>(), size_t(V) * sizeof(bf16));
             ctx.memcpy_d2h(refAttn.data() + size_t(r) * L * H, attn1.data(), size_t(L) * H * sizeof(bf16));
             ctx.memcpy_d2h(refRouter.data() + size_t(r) * L * H, router1.data(), size_t(L) * H * sizeof(bf16));
@@ -243,7 +250,7 @@ void test_mtp_align(const std::string& directory) {
         return worst;
     };
     std::cout << "[MTP ALIGN] {\"context\":" << capacity << ",\"prompt\":" << P << ",\"rows\":" << rowsMax
-              << ",\"prompt_top1\":" << promptTop1 << ",\"start\":";
+              << ",\"t1_mode\":\"" << t1Mode << "\",\"prompt_top1\":" << promptTop1 << ",\"start\":";
     std::cout << '['; for (size_t i = 0; i < cont.size(); ++i) { if (i) std::cout << ','; std::cout << cont[i]; } std::cout << "]}\n";
     for (int rows : {rowsMax, 2}) {
         const std::vector<bf16>& bl = rows == 4 ? bat4Log : bat2Log;

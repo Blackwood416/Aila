@@ -1961,7 +1961,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStagePle);
 
         // 2.1. Attn Hyper-Connection
-        if (verification_hidden_in_for_test_ && options.decode_verification &&
+        if (verification_hidden_in_for_test_ &&
             count <= verification_stage_rows_for_test_) {
             ctx.queue().memcpy(
                 verification_hidden_in_for_test_ + size_t(L) * verification_stage_rows_for_test_ * 10240,
@@ -1971,8 +1971,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             RunHyperConnectionCombined(ctx, layer.attn_hc, 1, true, nullptr, nullptr, &pending_mlp);
         else
             RunHyperConnection(ctx, layer.attn_hc, count, true);
-        if (verification_attn_in_for_test_ && options.decode_verification &&
-            count <= verification_stage_rows_for_test_) {
+        if (verification_attn_in_for_test_ && count <= verification_stage_rows_for_test_) {
             ctx.queue().memcpy(
                 verification_attn_in_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
                 buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));
@@ -1981,14 +1980,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // Attention tiles advance this layer's state before routing the whole window.
         RunAttentionWindow(ctx, session, L, count, start_pos, interior, checkpoint_after, !is_prefill);
-        if (verification_attn_raw_for_test_ && options.decode_verification &&
-            count <= verification_stage_rows_for_test_) {
+        if (verification_attn_raw_for_test_ && count <= verification_stage_rows_for_test_) {
             ctx.queue().memcpy(
                 verification_attn_raw_for_test_ + size_t(L) * verification_stage_rows_for_test_ * 6144,
                 buf_.attn_out.data(), size_t(count) * 6144 * sizeof(bf16));
         }
-        if (verification_attn_out_for_test_ && options.decode_verification &&
-            count <= verification_stage_rows_for_test_) {
+        if (verification_attn_out_for_test_ && count <= verification_stage_rows_for_test_) {
             ctx.queue().memcpy(
                 verification_attn_out_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
                 buf_.y.data(), size_t(count) * hidden_size_ * sizeof(bf16));
@@ -2059,8 +2056,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (verification_router_inputs_for_test_ && options.decode_verification && count == 2)
             ctx.queue().memcpy(verification_router_inputs_for_test_ + size_t(L) * 2 * hidden_size_,
                 buf_.x.data(), size_t(2) * hidden_size_ * sizeof(bf16));
-        if (verification_router_x_for_test_ && options.decode_verification &&
-            count <= verification_stage_rows_for_test_) {
+        if (verification_router_x_for_test_ && count <= verification_stage_rows_for_test_) {
             ctx.queue().memcpy(
                 verification_router_x_for_test_ + size_t(L) * verification_stage_rows_for_test_ * hidden_size_,
                 buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));

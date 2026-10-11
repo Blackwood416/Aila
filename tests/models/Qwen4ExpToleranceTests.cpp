@@ -72,6 +72,13 @@ struct Qwen4ExpGenerationTestAccess {
         options.decode_verification = true;
         return b.ForwardImpl(Ctx(e), Session(e), ids, count, false, options);
     }
+    // Ordinary single-token decode exactly as the live T1 path issues it:
+    // decode_verification=false, lastTokenOnly=true (Model::ForwardImpl).
+    static Tensor& DecodeStep(InferenceEngine& e, const int* ids, int count) {
+        auto& b = Backend(e);
+        ForwardOptions options{SnapshotPolicy::None, true};
+        return b.Forward(Ctx(e), Session(e), ids, count, options);
+    }
     static void ReserveVerifyLogits(InferenceEngine& e, int rows) {
         auto& b = Backend(e);
         if (b.buf_.logits.shape(0) < rows)
