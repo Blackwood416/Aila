@@ -24,11 +24,29 @@ T1 与多行 verify 的分歧**主要不是算子舍入，而是调度**：`coun
 - layer-1 残差 max_abs 1.25e-3 → 7.46e-4；全部 4 行 top-1 与 T1 贪心一致；
 - CPU/ABI ctest 19/19（`ctest-cpu-abi.log`）。
 
-## 未覆盖（B4-③ 仍未开）
+## 第二段：全 48 层逐位对齐（完成）
 
-- layer≥1 的 router gate、shared-expert gate、MoE rank 合并、indexer 投影仍是 count 相关 GEMM → 修复后首个残差从 layer 1 开始。要全逐位需把这些也纳入 `VERIFY_SMALL_ROWS`（或等价逐位路径）。
-- `VERIFY_ATTN_PAIR`（`start_pos+1≥1024 && count==2`）prompt=512 未触发；需 ≥1100 token prompt 覆盖。
-- 未跑生产 harness/server，未做性能回归。
+把 layer≥1 仍走 count 相关 GEMM 的阶段全部纳入 `VERIFY_SMALL_ROWS`：
+- `Qwen4ExpBnb4Backend.cpp`：router gate、shared-expert gate 在 verify 窗口内逐行走 `bf16_gemv_bf16`；shared gate_up/down 逐行走 count==1 融合链（count==1 分支代码原样）。
+- `Qwen4ExpPrefill.cpp`：indexer k / qk 投影在 verify 窗口内逐行。
+
+### 结果（两种 prompt、两种宽度，全部逐位）
+
+| prompt | width | 结果 |
+|---|---|---|
+| 512 | 4 / 2 | rows 0..3 全部 `logit_different=0`、所有 stage `first_diff_layer=-1`、无任何 `[MTP ALIGN STATE]` 行（全 48 层 GDN 末态逐位） |
+| 1182（触发 `VERIFY_ATTN_PAIR` active=1） | 4 / 2 | 同上全部逐位（dense-QSA 索引分支同） |
+
+### B4-③ 开启条件（实测最小集，均可逐位复现）
+
+必需：`AILA_Q4E_VERIFY_SMALL_ROWS=1`、`AILA_Q4E_VERIFY_GDN_ORDER=1`、`AILA_Q4E_VERIFY_DECODE_PREPARE=1`、`AILA_Q4E_VERIFY_DECODE_ATTN=1`、`AILA_Q4E_ARENA_VERIFY_ROWS=1`。
+推荐：`AILA_Q4E_VERIFY_ATTN_PAIR=1`（长上下文 count==2 pair 核；关掉退回逐行 `attention_decode`，同样逐位）、`AILA_Q4E_VERIFY_ASYNC_ROUTE=1`、`AILA_Q4E_VERIFY_CPU_ROWS=4`。
+
+## 残余风险（未覆盖）
+
+- 每个 prompt 只测一个窗口位置；多窗口连续 verify 的跨窗口状态累积未测。
+- >2048 sparse-QSA 分支未覆盖（MTP 资格为 dense ≤2048）。
+- 未跑生产 harness/server，未做性能回归——verify 窗口投影逐行执行**预期降吞吐**（B4-③ 需实测）。
 
 ## 移交
 

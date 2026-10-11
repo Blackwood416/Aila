@@ -270,15 +270,37 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     // A2: K-only projection for dense prefill chunks (start_pos + count <= 2051).
                     // Skips 512 Q projection rows for all count tokens.
                     const int k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
-                    Tensor k_target = Tensor::view(
-                        ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
-                        {count, k_dim});
-                    DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_target,
-                                count, k_dim, hidden_size_);
+                    if (verify_rows_alignment_) {
+                        // Verify-path alignment: one BF16 GEMV per row so the
+                        // window matches sequential B1 decode bit-for-bit.
+                        for (int r = 0; r < count; ++r) {
+                            auto in_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
+                            auto k_row = Tensor::view(ctx, cache.indexer_k.data_as<bf16>() +
+                                static_cast<size_t>(start_pos + r) * k_dim, {1, k_dim});
+                            DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, in_row, k_row,
+                                        1, k_dim, hidden_size_);
+                        }
+                    } else {
+                        Tensor k_target = Tensor::view(
+                            ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            {count, k_dim});
+                        DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_target,
+                                    count, k_dim, hidden_size_);
+                    }
                 } else {
                     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
-                    DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, input, buf_.indexer_qk,
-                                count, indexer_out_dim, hidden_size_);
+                    if (verify_rows_alignment_) {
+                        for (int r = 0; r < count; ++r) {
+                            auto in_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
+                            auto out_row = Tensor::view(ctx, buf_.indexer_qk.data_as<bf16>() +
+                                size_t(r) * indexer_out_dim, {1, indexer_out_dim});
+                            DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, in_row, out_row,
+                                        1, indexer_out_dim, hidden_size_);
+                        }
+                    } else {
+                        DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, input, buf_.indexer_qk,
+                                    count, indexer_out_dim, hidden_size_);
+                    }
                 }
             }
 

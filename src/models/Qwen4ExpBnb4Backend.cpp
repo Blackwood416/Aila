@@ -1856,6 +1856,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, input, output, count);
         else projection.forward(ctx, linear_scratch_, input, output, count);
     };
+    // Verify-path alignment: a raw-weight BF16 GEMV per row so router/shared
+    // gate projections in a 2..4 row window match sequential B1 decode. Inert
+    // (single GEMM) unless AILA_Q4E_VERIFY_SMALL_ROWS is on.
+    auto dense_rows = [&](Linear& linear, Tensor* raw_weight, Tensor& input, Tensor& output,
+                          int out_features, int in_features) {
+        if (!verify_rows_alignment_) {
+            DenseLinear(ctx, linear, raw_weight, input, output, count, out_features, in_features);
+            return;
+        }
+        for (int r = 0; r < count; ++r) {
+            auto in_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * in_features, {1, in_features});
+            auto out_row = Tensor::view(ctx, output.data_as<bf16>() + size_t(r) * out_features, {1, out_features});
+            DenseLinear(ctx, linear, raw_weight, in_row, out_row, 1, out_features, in_features);
+        }
+    };
     static const std::string s_dump_dir = aila::env::read_string("AILA_DEBUG_Q4E_DUMP_DIR", "");
     static const bool s_profile = aila::env::read_flag("AILA_PROFILE_Q4E_DECODE", false);
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
@@ -2038,8 +2053,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 moeFrontFusedLogged_ = true;
             }
         } else {
-            DenseLinear(ctx, layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
-                        count, cfg_.num_experts, hidden_size_);
+            dense_rows(layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
+                       cfg_.num_experts, hidden_size_);
         }
         if (verification_router_inputs_for_test_ && options.decode_verification && count == 2)
             ctx.queue().memcpy(verification_router_inputs_for_test_ + size_t(L) * 2 * hidden_size_,
@@ -2160,8 +2175,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
         // concurrently while the host fills missed routed experts and sets up dispatch.
         if (!moe_front_fused)
-            DenseLinear(ctx, layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
-                        count, 1, hidden_size_);
+            dense_rows(layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
+                       1, hidden_size_);
         if (count == 1) {
             bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
                 ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
@@ -2171,6 +2186,25 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                                static_cast<bf16*>(buf_.shared_inter_buf.data()), 1, cfg_.shared_expert_intermediate_size);
             }
             layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, 1);
+        } else if (verify_rows_alignment_) {
+            // One row at a time keeps the fused shared gate/up/SiLU/down kernels
+            // identical to B1 decode for every row of a 2..4 row verify window.
+            for (int r = 0; r < count; ++r) {
+                auto x_row = Tensor::view(ctx, buf_.x.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
+                auto gu_row = Tensor::view(ctx, buf_.shared_gate_up_buf.data_as<bf16>() + size_t(r) * cfg_.shared_expert_intermediate_size,
+                                           {1, cfg_.shared_expert_intermediate_size});
+                auto si_row = Tensor::view(ctx, buf_.shared_inter_buf.data_as<bf16>() + size_t(r) * cfg_.shared_expert_intermediate_size,
+                                           {1, cfg_.shared_expert_intermediate_size});
+                auto so_row = Tensor::view(ctx, buf_.shared_out_buf.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
+                bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                    ctx, layer.shared_gate_up_proj, x_row, si_row, cfg_.shared_expert_intermediate_size);
+                if (!fused_ok) {
+                    layer.shared_gate_up_proj.ForwardDecodeRows(ctx, linear_scratch_, x_row, gu_row, 1);
+                    ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(gu_row.data()),
+                                                   static_cast<bf16*>(si_row.data()), 1, cfg_.shared_expert_intermediate_size);
+                }
+                layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, si_row, so_row, 1);
+            }
         } else {
             project_prefill(layer.shared_gate_up_proj, buf_.x, buf_.shared_gate_up_buf);
             ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
