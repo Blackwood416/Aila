@@ -601,6 +601,11 @@ void Qwen4ExpExpertExecutor::cleanup() {
         if (gpu_tokens_dev_) { ctx_->free_device(gpu_tokens_dev_); gpu_tokens_dev_ = nullptr; }
         if (weights_dev_) { ctx_->free_device(weights_dev_); weights_dev_ = nullptr; }
         if (down_acc_dev_) { ctx_->free_device(down_acc_dev_); down_acc_dev_ = nullptr; }
+        if (xq_dev_) { ctx_->free_device(xq_dev_); xq_dev_ = nullptr; }
+        if (xs_dev_) { ctx_->free_device(xs_dev_); xs_dev_ = nullptr; }
+        if (hq_dev_) { ctx_->free_device(hq_dev_); hq_dev_ = nullptr; }
+        if (hs_dev_) { ctx_->free_device(hs_dev_); hs_dev_ = nullptr; }
+        q8_adaptive_ = false;
     }
     initialized_ = false;
     cpu_result_packet_active_=false;
@@ -672,6 +677,27 @@ void Qwen4ExpExpertExecutor::init(
 
     const size_t max_down_acc = 4ULL * top_k_ * hidden_size_;
     down_acc_dev_ = static_cast<float*>(ctx_->alloc_device(max_down_acc * sizeof(float)));
+
+    // Opt-in W4A8 adaptive decode. The Q8 variant only exists for the
+    // production expert geometry, so any other shape silently keeps the BF16
+    // kernels and never allocates these arenas.
+    q8_adaptive_ = aila::env::read_flag("AILA_Q4E_GPU_Q8_ADAPTIVE", false) &&
+        ctx_->queue().get_device().is_gpu() && hidden_size_ == 2560 &&
+        intermediate_size_ == 640 && hidden_size_ % 64 == 0 && intermediate_size_ % 64 == 0 &&
+        top_k_ >= 1 && top_k_ <= 16;
+    if (q8_adaptive_) {
+        const size_t max_tokens = 4;
+        xq_dev_ = static_cast<int8_t*>(ctx_->alloc_device(max_tokens * size_t(hidden_size_)));
+        xs_dev_ = static_cast<float*>(
+            ctx_->alloc_device(max_tokens * size_t(hidden_size_ / 64) * sizeof(float)));
+        hq_dev_ = static_cast<int8_t*>(
+            ctx_->alloc_device(max_gpu_tasks * size_t(intermediate_size_)));
+        hs_dev_ = static_cast<float*>(ctx_->alloc_device(
+            max_gpu_tasks * size_t(intermediate_size_ / 64) * sizeof(float)));
+        AILA_LOG_INFO("[Q4E Adaptive Q8] enabled=1 hidden=%d intermediate=%d top_k=%d "
+                      "activation_block=64 experts_capacity=%zu",
+            hidden_size_, intermediate_size_, top_k_, max_gpu_tasks);
+    }
 
     const size_t max_pending = static_cast<size_t>(max_seq_len_) * top_k_;
     pending_experts_buf_.assign(max_pending, 0);
@@ -1493,6 +1519,40 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
         x_d2h_ev = ctx.queue().memcpy(x_host_, x_dev, static_cast<size_t>(token_count) * hidden_size_ * sizeof(bf16));
     }
     const bool async_cpu = cpu_worker_ && plan.cpu_tasks > 0;
+
+    // Opt-in W4A8 adaptive decode: identical scheduling, signed-Q8 activations.
+    // h_rank_offset is the expert-slice origin inside the shared expert-major
+    // scratch, so the ready/pending split keeps its existing layout.
+    const bool q8 = q8_adaptive_;
+    const size_t hq_stride = static_cast<size_t>(intermediate_size_);
+    const size_t hs_stride = static_cast<size_t>(intermediate_size_ / 64);
+    auto launch_gate_up = [&](const ops::MoeExpertSlotDev* slots, int count, int h_rank_offset,
+                              const int* tokens, const sycl::event* dep) -> sycl::event {
+        bf16* h = moe_h_dev + static_cast<size_t>(h_rank_offset) * intermediate_size_;
+        if (!q8) {
+            return ops::moe_decode_gate_up_swiglu_grouped(
+                ctx, slots, nullptr, x_dev, h, count, hidden_size_, intermediate_size_, 64,
+                dep, tokens, uses_nested);
+        }
+        return ops::moe_decode_gate_up_swiglu_grouped_q8(
+            ctx, slots, xq_dev_, xs_dev_, h, hq_dev_ + static_cast<size_t>(h_rank_offset) * hq_stride,
+            hs_dev_ + static_cast<size_t>(h_rank_offset) * hs_stride, count, hidden_size_,
+            intermediate_size_, tokens, dep, uses_nested);
+    };
+    auto launch_down = [&](const ops::MoeExpertSlotDev* slots, const int* ranks, int count,
+                           int h_rank_offset, const int* tokens, const sycl::event& dep) -> sycl::event {
+        if (!q8) {
+            return ops::moe_decode_down_to_rank_f32(
+                ctx, slots, ranks, moe_h_dev + static_cast<size_t>(h_rank_offset) * intermediate_size_,
+                down_acc_dev_, count, top_k, intermediate_size_, hidden_size_, 64, tokens, nullptr,
+                &dep, uses_nested);
+        }
+        return ops::moe_decode_down_to_rank_f32_q8(
+            ctx, slots, ranks, hq_dev_ + static_cast<size_t>(h_rank_offset) * hq_stride,
+            hs_dev_ + static_cast<size_t>(h_rank_offset) * hs_stride, down_acc_dev_, count, top_k,
+            intermediate_size_, hidden_size_, tokens, &dep, uses_nested);
+    };
+
     acquire_begin_ns_ = acquire_end_ns_ = 0;
     if (async_cpu) {
         CpuWorker::Job job;
@@ -1509,6 +1569,10 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
         cache_->record_first_consumer_start();
         stats_.gpu_tasks_dispatched += plan.gpu_tasks;
         const int num_slots = cache_->num_slots();
+        if (q8) {
+            // Quantize every decode row once; both subsets read this arena.
+            ops::quantize_moe_input_q8_64_rows(ctx, x_dev, xq_dev_, xs_dev_, token_count, hidden_size_);
+        }
 
         if (plan.ready_gpu_tasks > 0 && plan.pending_gpu_tasks > 0) {
             const int ready_count = plan.ready_gpu_tasks;
@@ -1538,15 +1602,10 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
                 eff_tokens = gpu_tokens_dev_;
             }
 
-            sycl::event gu_ev_ready = ops::moe_decode_gate_up_swiglu_grouped(
-                ctx, eff_slots, nullptr, x_dev, moe_h_dev, ready_count,
-                hidden_size_, intermediate_size_, 64,
-                nullptr, eff_tokens, uses_nested);
+            sycl::event gu_ev_ready = launch_gate_up(eff_slots, ready_count, 0, eff_tokens, nullptr);
 
-            sycl::event down_ev_ready = ops::moe_decode_down_to_rank_f32(
-                ctx, eff_slots, eff_ranks, moe_h_dev, down_acc_dev_,
-                ready_count, top_k, intermediate_size_, hidden_size_, 64,
-                eff_tokens, nullptr, &gu_ev_ready, uses_nested);
+            sycl::event down_ev_ready = launch_down(eff_slots, eff_ranks, ready_count, 0,
+                eff_tokens, gu_ev_ready);
 
             for (int idx : plan.ready_gpu_indices) {
                 cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev_ready);
@@ -1577,18 +1636,12 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
                 ctx.queue().memcpy(gpu_tokens_dev_ + ready_count, gpu_tokens_host_ + ready_count, pending_count * sizeof(int));
             }
 
-            sycl::event gu_ev_pending = ops::moe_decode_gate_up_swiglu_grouped(
-                ctx, eff_slots + ready_count, nullptr, x_dev,
-                moe_h_dev + static_cast<size_t>(ready_count) * intermediate_size_,
-                pending_count, hidden_size_, intermediate_size_, 64,
-                plan.final_dma_event != sycl::event{} ? &plan.final_dma_event : nullptr,
-                eff_tokens + ready_count, uses_nested);
+            sycl::event gu_ev_pending = launch_gate_up(eff_slots + ready_count, pending_count,
+                ready_count, eff_tokens + ready_count,
+                plan.final_dma_event != sycl::event{} ? &plan.final_dma_event : nullptr);
 
-            sycl::event down_ev_pending = ops::moe_decode_down_to_rank_f32(
-                ctx, eff_slots + ready_count, eff_ranks + ready_count,
-                moe_h_dev + static_cast<size_t>(ready_count) * intermediate_size_,
-                down_acc_dev_, pending_count, top_k, intermediate_size_, hidden_size_, 64,
-                eff_tokens + ready_count, nullptr, &gu_ev_pending, uses_nested);
+            sycl::event down_ev_pending = launch_down(eff_slots + ready_count, eff_ranks + ready_count,
+                pending_count, ready_count, eff_tokens + ready_count, gu_ev_pending);
 
             for (int idx : plan.pending_gpu_indices) {
                 cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev_pending);
@@ -1638,15 +1691,9 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
             const sycl::event* dep = (plan.pending_gpu_tasks > 0 && plan.final_dma_event != sycl::event{})
                 ? &plan.final_dma_event : nullptr;
 
-            sycl::event gu_ev = ops::moe_decode_gate_up_swiglu_grouped(
-                ctx, eff_slots, nullptr, x_dev, moe_h_dev, plan.gpu_tasks,
-                hidden_size_, intermediate_size_, 64,
-                dep, eff_tokens, uses_nested);
+            sycl::event gu_ev = launch_gate_up(eff_slots, plan.gpu_tasks, 0, eff_tokens, dep);
 
-            down_ev = ops::moe_decode_down_to_rank_f32(
-                ctx, eff_slots, eff_ranks, moe_h_dev, down_acc_dev_,
-                plan.gpu_tasks, top_k, intermediate_size_, hidden_size_, 64,
-                eff_tokens, nullptr, &gu_ev, uses_nested);
+            down_ev = launch_down(eff_slots, eff_ranks, plan.gpu_tasks, 0, eff_tokens, gu_ev);
 
             for (int idx : plan.ready_gpu_indices) {
                 cache_->record_consumer_reader_fence(plan.entries[idx].gpu_slot, down_ev);

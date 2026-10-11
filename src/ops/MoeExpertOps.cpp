@@ -1,5 +1,6 @@
 #include "MoeExpertOps.hpp"
 #include <sycl/ext/intel/math.hpp>
+#include <type_traits>
 #include "utils/EnvUtils.hpp"
 
 namespace ops {
@@ -524,11 +525,25 @@ sycl::event launch_moe_quantize_q8_64(Context& ctx, const bf16* input,
     });
 }
 
-template <bool UseNested, int WorkGroup, bool FixedNested256 = false>
+// Shared by the retired resident path and the adaptive decode path. With
+// selected == nullptr every rank uses its own descriptor index (adaptive),
+// and token_ids selects the Q8 input row per rank (nullptr means token 0).
+// Descriptors and tokens are passed as either device-visible pointers or
+// by-value 16-entry mirrors captured into the kernel (matching the BF16
+// grouped path, so no raw host stack pointer is ever dereferenced on device).
+template <typename Tokens>
+inline int moe_q8_token_of(const Tokens& tokens, int rank) {
+    if constexpr (std::is_pointer_v<Tokens>) return tokens ? tokens[rank] : 0;
+    else return tokens[static_cast<size_t>(rank)];
+}
+
+template <bool UseNested, int WorkGroup, bool FixedNested256 = false,
+          typename Slots, typename Tokens = const int*>
 sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
-    const MoeExpertSlotDev* descriptors, const int* selected,
+    const Slots& descriptors, const int* selected,
     const int8_t* xq, const float* xs, bf16* h, int8_t* hq, float* hs,
-    int top_k, int hidden, int intermediate) {
+    int top_k, int hidden, int intermediate, Tokens token_ids = nullptr,
+    const sycl::event* dep_event = nullptr) {
     constexpr int sg_size = 16;
     constexpr int rows_per_group = WorkGroup / sg_size;
     const int groups_per_rank = intermediate / rows_per_group;
@@ -537,6 +552,9 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
     constexpr float lut_scale = 1.0f / 127.0f;
     const bool fast_rte = moe_q8_fast_rte_enabled();
     return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
         sycl::local_accessor<int32_t, 1> qmap(sycl::range<1>(16), cgh);
         sycl::local_accessor<float, 1> h_block(sycl::range<1>(64), cgh);
         sycl::local_accessor<float, 1> h_scale(sycl::range<1>(1), cgh);
@@ -544,9 +562,12 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
                 const int rank = static_cast<int>(item.get_group(0) / groups_per_rank);
                 const int tile = static_cast<int>(item.get_group(0) % groups_per_rank);
-                const int slot_index = selected[rank];
+                const int slot_index = selected ? selected[rank] : rank;
                 // I%64 and rows_per_group|64 ensure the ENTIRE WG shares rank.
                 if (slot_index < 0) return;
+                const size_t token_base = static_cast<size_t>(moe_q8_token_of(token_ids, rank)) * hidden;
+                const int8_t* xq_token = xq + token_base;
+                const float* xs_token = xs + token_base / 64;
                 const int lid = static_cast<int>(item.get_local_id(0));
                 const int sg_id = lid / sg_size;
                 const int lane = lid % sg_size;
@@ -575,14 +596,14 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
                     const float ua8 = sycl::group_broadcast(sg, ua_leader, 8);
                     const float ga = lane < 8 ? ga0 : ga8;
                     const float ua = lane < 8 ? ua0 : ua8;
-                    const int8_t* input = xq + byte_offset * 2;
+                    const int8_t* input = xq_token + byte_offset * 2;
                     const int32_t x0 = *reinterpret_cast<const int32_t*>(input);
                     const int32_t x1 = *reinterpret_cast<const int32_t*>(input + 4);
                     const int32_t gate_dot = moe_q8_dot_acc(pack_moe_nf4_q8_half(g4, 0, qmap), x0, 0)
                         + moe_q8_dot_acc(pack_moe_nf4_q8_half(g4, 1, qmap), x1, 0);
                     const int32_t up_dot = moe_q8_dot_acc(pack_moe_nf4_q8_half(u4, 0, qmap), x0, 0)
                         + moe_q8_dot_acc(pack_moe_nf4_q8_half(u4, 1, qmap), x1, 0);
-                    const float input_scale = xs[input_block];
+                    const float input_scale = xs_token[input_block];
                     gate_acc = sycl::fma(static_cast<float>(gate_dot), (ga * lut_scale) * input_scale, gate_acc);
                     up_acc = sycl::fma(static_cast<float>(up_dot), (ua * lut_scale) * input_scale, up_acc);
                 }
@@ -620,22 +641,33 @@ sycl::event launch_moe_resident_gate_up_q8_64(Context& ctx,
     });
 }
 
-template <bool UseNested, bool FixedNested256 = false>
+// Shared by the retired resident path and the adaptive decode path. With
+// selected == nullptr every rank uses its own descriptor index. When
+// decode_top_k is positive the rank result lands in the (token, ranks[rank])
+// slot of the decode-wide down accumulator instead of the compact
+// [top_k, hidden] resident buffer.
+template <bool UseNested, bool FixedNested256 = false, typename Slots,
+          typename Tokens = const int*, typename Ranks = const int*>
 sycl::event launch_moe_resident_down_q8_64(Context& ctx,
-    const MoeExpertSlotDev* descriptors, const int* selected,
+    const Slots& descriptors, const int* selected,
     const int8_t* hq, const float* hs, float* down,
-    int top_k, int hidden, int intermediate) {
+    int top_k, int hidden, int intermediate, Tokens token_ids = nullptr,
+    Ranks ranks = nullptr, int decode_top_k = 0,
+    const sycl::event* dep_event = nullptr) {
     constexpr int wg = 256, sg_size = 16, rows_per_group = wg / sg_size;
     constexpr float lut_scale = 1.0f / 127.0f;
     const int groups_per_rank = hidden / rows_per_group;
     const int packed_per_row = intermediate / 2;
     const int blocks_per_row = intermediate / 64;
     return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
         sycl::local_accessor<int32_t, 1> qmap(sycl::range<1>(16), cgh);
         cgh.parallel_for(sycl::nd_range<1>(size_t(top_k) * groups_per_rank * wg, wg),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
                 const int rank = static_cast<int>(item.get_group(0) / groups_per_rank);
-                const int slot_index = selected[rank];
+                const int slot_index = selected ? selected[rank] : rank;
                 if (slot_index < 0) return;
                 const int lid = static_cast<int>(item.get_local_id(0));
                 const int lane = lid % sg_size;
@@ -664,7 +696,18 @@ sycl::event launch_moe_resident_down_q8_64(Context& ctx,
                     acc = sycl::fma(static_cast<float>(dot), (da * lut_scale) * scales[input_block], acc);
                 }
                 const float sum = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
-                if (lane == 0) down[size_t(rank) * hidden + row] = sum;
+                if (lane == 0) {
+                    // The adaptive decode accumulator is indexed by the
+                    // (token, rank) route slot, exactly like the BF16 path;
+                    // the resident path keeps its compact [top_k, hidden] form.
+                    size_t out_rank = static_cast<size_t>(rank);
+                    if (decode_top_k > 0) {
+                        out_rank = static_cast<size_t>(moe_q8_token_of(token_ids, rank)) *
+                                       static_cast<size_t>(decode_top_k) +
+                                   static_cast<size_t>(moe_q8_token_of(ranks, rank));
+                    }
+                    down[out_rank * hidden + row] = sum;
+                }
             });
     });
 }
@@ -3678,6 +3721,157 @@ sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descri
     if (nested) return nested_fixed256 ? launch_moe_resident_down_q8_64<true,true>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate)
         : launch_moe_resident_down_q8_64<true,false>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
     return launch_moe_resident_down_q8_64<false>(ctx, descriptors, selected, hq, hs, down, top_k, hidden, intermediate);
+}
+
+sycl::event quantize_moe_input_q8_64_rows(Context& ctx, const bf16* x,
+    int8_t* xq, float* xs, int rows, int hidden) {
+    if (rows <= 0 || hidden <= 0 || hidden % 64 || !x || !xq || !xs)
+        throw std::invalid_argument("Adaptive Q8 input shape or arena");
+    return launch_moe_quantize_q8_64(ctx, x, xq, xs, rows, hidden, nullptr);
+}
+
+// Adaptive decode Q8 gate/up. Reuses the resident signed-dot kernel with the
+// per-rank token offset; descriptor arrays that live in host USM are mirrored
+// into kernel by-value arrays exactly like the BF16 grouped path.
+sycl::event moe_decode_gate_up_swiglu_grouped_q8(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int8_t* xq,
+    const float* xs,
+    bf16* h,
+    int8_t* hq,
+    float* hs,
+    int num_active_experts,
+    int in_features,
+    int intermediate_size,
+    const int* token_ids,
+    const sycl::event* dep_event,
+    bool use_nested,
+    bool nested_fixed256) {
+    if (num_active_experts <= 0) return {};
+    if (in_features <= 0 || in_features % 64 || intermediate_size <= 0 ||
+        intermediate_size % 64 || !slots || !xq || !xs || !h || !hq || !hs)
+        throw std::invalid_argument("Adaptive Q8 gate/up shape or arena");
+
+    bool is_nested = use_nested;
+    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
+    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    if (!is_nested && !is_device) {
+        is_nested = (slots[0].gate_up_nested.codes != nullptr);
+    }
+
+    const size_t max_group = moe_q8_max_work_group_size(ctx);
+    if (max_group < 256)
+        throw std::invalid_argument("Adaptive Q8 gate/up needs work-group size >=256");
+    // WG1024 fuses SwiGLU quantization into the projection; smaller devices
+    // write the BF16 boundary first and quantize it in a second pass.
+    // AILA_Q4E_GPU_Q8_ADAPTIVE_WG is an opt-in experiment knob: 0 keeps the
+    // automatic choice, 256 forces the two-pass WG256 grid.
+    static const int wg_override = aila::env::read_int("AILA_Q4E_GPU_Q8_ADAPTIVE_WG", 0);
+    const bool fused = wg_override == 0 ? (max_group >= 1024)
+                                        : (wg_override >= 1024 && max_group >= 1024);
+
+    auto launch = [&](const auto& descriptor_source, const auto& tokens) -> sycl::event {
+        if (fused) {
+            if (is_nested) {
+                if (nested_fixed256) return launch_moe_resident_gate_up_q8_64<true, 1024, true>(
+                    ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                    intermediate_size, tokens, dep_event);
+                return launch_moe_resident_gate_up_q8_64<true, 1024, false>(
+                    ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                    intermediate_size, tokens, dep_event);
+            }
+            return launch_moe_resident_gate_up_q8_64<false, 1024>(
+                ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                intermediate_size, tokens, dep_event);
+        }
+        if (is_nested) {
+            if (nested_fixed256) launch_moe_resident_gate_up_q8_64<true, 256, true>(
+                ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                intermediate_size, tokens, dep_event);
+            else launch_moe_resident_gate_up_q8_64<true, 256, false>(
+                ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                intermediate_size, tokens, dep_event);
+        } else {
+            launch_moe_resident_gate_up_q8_64<false, 256>(
+                ctx, descriptor_source, nullptr, xq, xs, h, hq, hs, num_active_experts, in_features,
+                intermediate_size, tokens, dep_event);
+        }
+        return launch_moe_quantize_q8_64(ctx, h, hq, hs, num_active_experts, intermediate_size, nullptr);
+    };
+
+    if (!is_device) {
+        if (num_active_experts > 16)
+            throw std::invalid_argument("Adaptive Q8 gate/up host descriptor array exceeds 16 experts");
+        std::array<MoeExpertSlotDev, 16> slot_ptrs{};
+        std::array<int, 16> token_ptrs{};
+        for (int i = 0; i < num_active_experts; ++i) {
+            slot_ptrs[static_cast<size_t>(i)] = slots[i];
+            token_ptrs[static_cast<size_t>(i)] = token_ids ? token_ids[i] : 0;
+        }
+        return launch(slot_ptrs, token_ptrs);
+    }
+    return launch(slots, token_ids);
+}
+
+sycl::event moe_decode_down_to_rank_f32_q8(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* ranks,
+    const int8_t* hq,
+    const float* hs,
+    float* down_acc,
+    int num_active_experts,
+    int top_k,
+    int in_features,
+    int out_features,
+    const int* token_ids,
+    const sycl::event* dep_event,
+    bool use_nested,
+    bool nested_fixed256) {
+    if (num_active_experts <= 0 || out_features <= 0 || in_features <= 0) return {};
+    if (in_features % 64 || out_features % 64 || top_k < 1 || top_k > 16 ||
+        !slots || !hq || !hs || !down_acc)
+        throw std::invalid_argument("Adaptive Q8 down shape or arena");
+
+    bool is_nested = use_nested;
+    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
+    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    if (!is_nested && !is_device) {
+        is_nested = (slots[0].down_nested.codes != nullptr);
+    }
+
+    auto launch = [&](const auto& descriptor_source, const auto& tokens,
+                      const auto& route_ranks) -> sycl::event {
+        if (is_nested) {
+            if (nested_fixed256) return launch_moe_resident_down_q8_64<true, true>(
+                ctx, descriptor_source, nullptr, hq, hs, down_acc, num_active_experts, out_features,
+                in_features, tokens, route_ranks, top_k, dep_event);
+            return launch_moe_resident_down_q8_64<true, false>(
+                ctx, descriptor_source, nullptr, hq, hs, down_acc, num_active_experts, out_features,
+                in_features, tokens, route_ranks, top_k, dep_event);
+        }
+        return launch_moe_resident_down_q8_64<false>(
+            ctx, descriptor_source, nullptr, hq, hs, down_acc, num_active_experts, out_features,
+            in_features, tokens, route_ranks, top_k, dep_event);
+    };
+
+    if (!ranks)
+        throw std::invalid_argument("Adaptive Q8 down needs the route rank map");
+    if (!is_device) {
+        if (num_active_experts > 16)
+            throw std::invalid_argument("Adaptive Q8 down host descriptor array exceeds 16 experts");
+        std::array<MoeExpertSlotDev, 16> slot_ptrs{};
+        std::array<int, 16> token_ptrs{};
+        std::array<int, 16> rank_ptrs{};
+        for (int i = 0; i < num_active_experts; ++i) {
+            slot_ptrs[static_cast<size_t>(i)] = slots[i];
+            token_ptrs[static_cast<size_t>(i)] = token_ids ? token_ids[i] : 0;
+            rank_ptrs[static_cast<size_t>(i)] = ranks[i];
+        }
+        return launch(slot_ptrs, token_ptrs, rank_ptrs);
+    }
+    return launch(slots, token_ids, ranks);
 }
 
 sycl::event moe_decode_gate_up_swiglu_grouped(

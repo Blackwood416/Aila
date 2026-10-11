@@ -280,6 +280,15 @@ private:
     float* down_acc_dev_ = nullptr;
     std::vector<bool> slot_seen_;
 
+    // Opt-in adaptive Q8 (W4A8) decode activations. Allocated once at init only
+    // when AILA_Q4E_GPU_Q8_ADAPTIVE selects the production geometry, so the
+    // BF16 path keeps its exact arena set and steady-state behavior.
+    int8_t* xq_dev_ = nullptr;   // [max_cpu_tokens, hidden_size] signed bytes
+    float* xs_dev_ = nullptr;    // [max_cpu_tokens, hidden_size / 64]
+    int8_t* hq_dev_ = nullptr;   // [max_gpu_tasks, intermediate_size]
+    float* hs_dev_ = nullptr;    // [max_gpu_tasks, intermediate_size / 64]
+    bool q8_adaptive_ = false;
+
     // Zero-allocation preallocated staging for ensure_gpu_pending
     std::vector<int> pending_experts_buf_;
     std::vector<int> assigned_slots_buf_;

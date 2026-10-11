@@ -164,6 +164,32 @@ sycl::event moe_resident_down_q8_64(Context& ctx, const MoeExpertSlotDev* descri
     int top_k, int hidden, int intermediate, bool nested,
     bool nested_fixed256 = false);
 
+// Adaptive-pipeline (continuous-batching) NF4/Q8 decode. Same descriptor,
+// arena and geometry contract as the BF16 decode pair below, but activations
+// cross the expert boundary as signed Q8 with per-64 block scales:
+//   xq[rows, hidden] + xs[rows, hidden/64]
+//   hq[experts, intermediate] + hs[experts, intermediate/64]
+// h keeps receiving the BF16 SwiGLU boundary the BF16 path writes so existing
+// diagnostics stay comparable. token_ids[expert] selects the input row for
+// gate/up and the (token, rank) rank slot for down; nullptr means a single
+// token. The default NF4 codebook is assumed (quant_map overrides are not
+// consumed). hidden and intermediate must be multiples of 64. All arenas and
+// descriptors are caller-owned and must outlive the returned event.
+sycl::event quantize_moe_input_q8_64_rows(Context& ctx, const bf16* x,
+    int8_t* xq, float* xs, int rows, int hidden);
+sycl::event moe_decode_gate_up_swiglu_grouped_q8(Context& ctx,
+    const MoeExpertSlotDev* slots, const int8_t* xq, const float* xs,
+    bf16* h, int8_t* hq, float* hs, int num_active_experts,
+    int in_features, int intermediate_size, const int* token_ids = nullptr,
+    const sycl::event* dep_event = nullptr, bool use_nested = false,
+    bool nested_fixed256 = false);
+sycl::event moe_decode_down_to_rank_f32_q8(Context& ctx,
+    const MoeExpertSlotDev* slots, const int* ranks, const int8_t* hq,
+    const float* hs, float* down_acc, int num_active_experts, int top_k,
+    int in_features, int out_features, const int* token_ids = nullptr,
+    const sycl::event* dep_event = nullptr, bool use_nested = false,
+    bool nested_fixed256 = false);
+
 // Slotted expert decode gate_up GEMV with SwiGLU: h[k, intermediate_size] = silu(gate) * up
 // in_features = 2560, intermediate_size = 640
 sycl::event moe_decode_gate_up_swiglu_grouped(
