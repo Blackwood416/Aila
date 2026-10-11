@@ -721,7 +721,7 @@ void Qwen4ExpExpertExecutor::init(
 }
 
 void Qwen4ExpExpertExecutor::StageResidentInput(const bf16* x_dev, int rows) {
-    if(rows<1 || rows>max_cpu_tokens_ || verify_async_rows_ || cold_count_ || async_route_pending_ || async_route_collected_ || cpu_host_result_active_)throw std::logic_error("CPU cold slot has an unfinished batch or invalid rows");
+    if(rows<1 || rows>max_cpu_tokens_ || verify_async_rows_ || cold_count_ || async_route_pending_ || async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)throw std::logic_error("CPU cold slot has an unfinished batch or invalid rows");
     static const bool deferArenaWait = aila::env::read_flag("AILA_Q4E_CPU_DEFER_ARENA_WAIT", false);
     // The unfinished-job guard above excludes CPU input readers. Copies on
     // the same in-order queue retain GPU write ordering without a host wait.
@@ -745,7 +745,7 @@ void Qwen4ExpExpertExecutor::PrepareAsyncResidentSources(int layers, int experts
 bool Qwen4ExpExpertExecutor::CanStartAsyncResidentRoute(int layer) const {
     return initialized_ && cpu_worker_ && cache_ && cache_->frozen() && !cache_->host_pool_enabled() &&
         cpu_mmap_cold_ && cold_policy_==1 && top_k_<=16 && max_cpu_credits_>=top_k_ &&
-        !cache_->cpu_packed_source_slots() && !verify_async_rows_ && !cold_count_ && !async_route_pending_ && !async_route_collected_ && !cpu_host_result_active_ &&
+        !cache_->cpu_packed_source_slots() && !verify_async_rows_ && !cold_count_ && !async_route_pending_ && !async_route_collected_ && !arena_verify_pending_ && !cpu_host_result_active_ &&
         layer>=0 && async_route_experts_==512 &&
         (cache_->ResidentLayerSources(layer) || (size_t(layer)+1)*async_route_experts_<=async_route_sources_.size());
 }
@@ -813,7 +813,7 @@ void Qwen4ExpExpertExecutor::RetireAsyncResidentRoute(GpuReadyLease& route) {
 }
 
 int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* x_dev) {
-    if (!cpu_worker_ || !cache_->frozen() || route.cold_count>16 || cold_count_ || async_route_pending_ || async_route_collected_ || cpu_host_result_active_)
+    if (!cpu_worker_ || !cache_->frozen() || route.cold_count>16 || cold_count_ || async_route_pending_ || async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)
         throw std::logic_error("Invalid resident CPU cold service");
     if (prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
     prev_cpu_h2d_ev_={}; active_cpu_leases_.clear(); cold_layer_=route.layer;
@@ -892,7 +892,7 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
     const int* ids, const int* ranks, int count, const bf16* x_dev) {
     if (!cpu_worker_ || count<=0) return 0;
     if (!ids || !ranks || count>16 || cold_count_ || async_route_pending_ ||
-        async_route_collected_ || cpu_host_result_active_)
+        async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)
         throw std::logic_error("Invalid native arena CPU batch");
     try {
         if (prev_cpu_h2d_ev_!=sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
@@ -936,7 +936,11 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
             cold_source_slots_[c]=cache_->large_page_resident()
                 ? cache_->CpuExpertHostSource(cold_layer_,cold_ids_[c])
                 : async_route_sources_[size_t(cold_layer_)*async_route_experts_+cold_ids_[c]];
-        async_route_ranks_=cold_ranks_;async_route_ids_=cold_ids_;async_route_count_=cold_count_;
+        // The async resident route is single-row (count==1), so cold_count_<=16
+        // fits the fixed legacy reconciliation arrays.
+        std::copy_n(cold_ranks_.begin(),cold_count_,async_route_ranks_.begin());
+        std::copy_n(cold_ids_.begin(),cold_count_,async_route_ids_.begin());
+        async_route_count_=cold_count_;
         async_route_pending_=false;async_route_collected_=true;
         ++stats_.cpu_route_async_layers;
         stats_.cpu_route_wait_ns+=result.route_end_ns-result.route_begin_ns;
@@ -1055,6 +1059,7 @@ void Qwen4ExpExpertExecutor::AbortResidentCold() noexcept {
     cpu_host_result_active_=false;cpu_host_rows_={};cpu_output_reader_event_={};
     async_route_pending_=false;async_route_collected_=false;async_route_count_=0;
     verify_async_rows_=0;verify_async_layer_=-1;
+    arena_verify_pending_=false;
 }
 
 bool Qwen4ExpExpertExecutor::CanExecuteVerifyRows(int rows, int top_k) const {
@@ -1063,6 +1068,7 @@ bool Qwen4ExpExpertExecutor::CanExecuteVerifyRows(int rows, int top_k) const {
         top_k == top_k_ && top_k <= 10 && max_cpu_credits_ >= top_k &&
         hidden_size_ == ops::cpu::kHiddenDim && intermediate_size_ == ops::cpu::kIntermediateDim &&
         !cold_count_ && !async_route_pending_ && !async_route_collected_ && active_cpu_leases_.empty() &&
+        !arena_verify_pending_ &&
         !cpu_result_packet_host_ && !cpu_result_host_read_ && !cpu_host_result_active_;
 }
 
@@ -1251,6 +1257,148 @@ sycl::event Qwen4ExpExpertExecutor::ExecuteVerifyRows(Context& ctx, int layer, c
     ++stats_.layers_hetero_executed;
     guard.finished = true;
     return merge;
+}
+
+bool Qwen4ExpExpertExecutor::CanExecuteArenaVerifyRows(const Qwen4ExpHostArena& arena, int rows, int top_k) const {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_ARENA_VERIFY_ROWS", false);
+    return enabled && initialized_ && cpu_worker_ && rows >= 2 && rows <= 4 && rows <= max_cpu_tokens_ &&
+        top_k == top_k_ && top_k <= 10 && rows * top_k <= ops::cpu::kMaxExpertBatchTasks &&
+        hidden_size_ == ops::cpu::kHiddenDim && intermediate_size_ == ops::cpu::kIntermediateDim &&
+        arena.IsAllocated() && arena.NumLayers() > 0 && arena.NumExpertsPerLayer() > 0 &&
+        arena.NumExpertsPerLayer() <= 512 &&
+        !cold_count_ && !async_route_pending_ && !async_route_collected_ && !verify_async_rows_ &&
+        !arena_verify_pending_ && active_cpu_leases_.empty() &&
+        !cpu_result_packet_host_ && !cpu_result_host_read_ && !cpu_host_result_active_;
+}
+
+int Qwen4ExpExpertExecutor::StartArenaVerifyRows(const Qwen4ExpHostArena& arena, int layer, int rows,
+    const int* ids, const sycl::event& route_event) {
+    if (!CanExecuteArenaVerifyRows(arena, rows, top_k_) || !ids || layer < 0 || layer >= arena.NumLayers() ||
+        resident_input_event_ == sycl::event{})
+        throw std::logic_error("Invalid arena multi-row verification route");
+    const int experts = arena.NumExpertsPerLayer();
+    try {
+        // The previous CPU result transfer still reads these pinned arenas.
+        static const bool deferArenaWait = aila::env::read_flag("AILA_Q4E_CPU_DEFER_ARENA_WAIT", false);
+        const sycl::event transferReader = deferArenaWait ? prev_cpu_h2d_ev_ : sycl::event{};
+        if (!deferArenaWait && prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
+        prev_cpu_h2d_ev_ = {}; active_cpu_leases_.clear();
+        cold_layer_ = layer; cold_source_slots_ = {}; cold_mapped_count_ = 0; cold_cached_count_ = 0;
+        // The arena is the native RAM complement of the GPU residency table: a
+        // non-null owner is a CPU cold expert. Record the immutable per-layer
+        // source table once; the worker reads only it and never the arena.
+        arena_verify_sources_.resize(size_t(experts));
+        int predicted = 0;
+        for (int e = 0; e < experts; ++e) {
+            arena_verify_sources_[size_t(e)] = arena.GetExpertSlotHost(layer, e);
+        }
+        CpuWorker::Job job;
+        job.hidden = hidden_size_; job.intermediate = intermediate_size_; job.tokens = rows;
+        job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
+        job.activation = resident_input_event_; job.route_event = route_event;
+        job.output_reader = cpu_output_reader_event_; job.transfer_reader = transferReader;
+        job.route_ids = ids; job.route_selected = nullptr;
+        job.route_top_k = top_k_; job.route_experts = experts;
+        // Native large-page sources need no mmap prefetch, matching StartArenaCold.
+        job.route_sources_resident = true;
+        job.route_sources = arena_verify_sources_.data();
+        for (int e = 0; e < experts; ++e)
+            job.route_cpu_eligible[e] = arena.GetExpertPointer(layer, e) != nullptr;
+        for (int rank = 0; rank < rows * top_k_; ++rank) {
+            const int id = ids[rank];
+            // Mirror the worker's own admission test exactly.
+            if (id >= 0 && id < experts && job.route_cpu_eligible[id] &&
+                arena_verify_sources_[size_t(id)].gate_up_packed &&
+                arena_verify_sources_[size_t(id)].down_packed) ++predicted;
+        }
+        cold_submit_ns_ = steady_ns();
+        arena_verify_pending_ = true;
+        arena_verify_arena_ = &arena;
+        cpu_worker_->submit(job);
+        if (!arena_verify_logged_) {
+            AILA_LOG_INFO("[Q4E ArenaVerifyRowsEnabled] layer=%d rows=%d topk=%d experts=%d capacity=%d",
+                layer, rows, top_k_, experts, ops::cpu::kMaxExpertBatchTasks);
+            arena_verify_logged_ = true;
+        }
+        return predicted;
+    } catch (...) { AbortResidentCold(); throw; }
+}
+
+sycl::event Qwen4ExpExpertExecutor::JoinArenaVerifyRows(float* rank_output) {
+    if (!rank_output) throw std::invalid_argument("Arena verification needs a rank output buffer");
+    if (!arena_verify_pending_) return {};
+    const auto join = steady_ns();
+    const auto result = cpu_worker_->finish();
+    // finish() is the publication fence for rank metadata and CPU output rows.
+    cold_count_ = result.route_count;
+    cold_mapped_count_ = 0; cold_cached_count_ = 0;
+    std::copy_n(result.route_ranks.begin(), cold_count_, cold_ranks_.begin());
+    std::copy_n(result.route_ids.begin(), cold_count_, cold_ids_.begin());
+    for (int c = 0; c < cold_count_; ++c)
+        cold_source_slots_[c] = arena_verify_arena_
+            ? arena_verify_arena_->GetExpertSlotHost(cold_layer_, cold_ids_[c]) : ops::MoeExpertSlotHost{};
+    arena_verify_pending_ = false;
+    stats_.cpu_route_wait_ns += result.route_end_ns - result.route_begin_ns;
+    stats_.cpu_join_wait_ns += steady_ns() - join;
+    if (!cold_count_) { active_cpu_leases_.clear(); cold_source_slots_ = {}; return {}; }
+    ++stats_.cpu_route_async_layers;
+    stats_.cpu_activation_wait_ns += result.activation_ns;
+    stats_.cpu_mmap_prefetch_ns += result.prefetch_ns;
+    stats_.cpu_mmap_prefetch_calls += result.prefetch_calls;
+    stats_.cpu_mmap_prefetch_ranges += result.prefetch_ranges;
+    stats_.cpu_mmap_prefetch_bytes += result.prefetch_bytes;
+    stats_.cpu_mmap_prefetch_failures += result.prefetch_failures;
+    stats_.cpu_mmap_touch_ns += result.touch_ns;
+    stats_.cpu_mmap_touch_pages += result.touch_pages;
+    stats_.cpu_scale_cache_bytes = std::max(stats_.cpu_scale_cache_bytes, result.scale_cache_bytes);
+    stats_.cpu_scale_cache_hits += result.scale_cache_hits;
+    stats_.cpu_scale_cache_misses += result.scale_cache_misses;
+    stats_.cpu_scale_cache_fills += result.scale_cache_fills;
+    stats_.cpu_scale_cache_evictions += result.scale_cache_evictions;
+    stats_.cpu_scale_cache_fallbacks += result.scale_cache_fallbacks;
+    stats_.cpu_scale_cache_prepare_ns += result.scale_cache_prepare_ns;
+    stats_.cpu_diagnostic_batches += result.diagnostic_batches;
+    stats_.cpu_diagnostic_failures += result.diagnostic_failures;
+    stats_.cpu_verify_batches += result.verify_batches;
+    stats_.cpu_a64_verify_batches += result.a64_verify_batches;
+    stats_.cpu_process_faults += result.process_faults;
+    stats_.cpu_process_user_ns += result.process_user_ns;
+    stats_.cpu_process_kernel_ns += result.process_kernel_ns;
+    stats_.cpu_gate_up_ns += result.phases.gate_up_ns;
+    stats_.cpu_quantize_ns += result.phases.quantize_ns;
+    stats_.cpu_down_ns += result.phases.down_ns;
+    stats_.cpu_gate_chunks += result.phases.gate_chunks;
+    stats_.cpu_down_chunks += result.phases.down_chunks;
+    stats_.cpu_compute_ns += result.end_ns - result.begin_ns;
+    if (cache_->tracing()) {
+        cache_->trace_host_interval("cold_cpu_compute", cold_layer_, result.begin_ns, result.end_ns);
+        cache_->trace_host_interval("cold_cpu_join", cold_layer_, join, steady_ns());
+        cache_->TraceDeviceEvent("cold_input_copy", cold_layer_, resident_input_event_);
+    }
+    for (int c = 0; c < cold_count_; ++c) if (cpu_observer_) {
+        RouteRankEntry entry;
+        entry.token_idx = cold_ranks_[c] / top_k_; entry.rank = cold_ranks_[c] % top_k_;
+        entry.expert_id = cold_ids_[c]; entry.is_gpu = false;
+        cpu_observer_(cpu_observer_state_, *ctx_, cold_layer_, entry, cold_source_slots_[c],
+            x_host_ + size_t(entry.token_idx) * hidden_size_,
+            scratch_h_ + size_t(c) * intermediate_size_, cpu_out_host_ + size_t(c) * hidden_size_);
+    }
+    // The worker emits ranks in ascending order, so contiguous spans coalesce.
+    for (int c = 0; c < cold_count_;) {
+        int end = c + 1;
+        while (end < cold_count_ && cold_ranks_[end] == cold_ranks_[end - 1] + 1) ++end;
+        const size_t bytes = size_t(end - c) * hidden_size_ * sizeof(float);
+        prev_cpu_h2d_ev_ = ctx_->queue().memcpy(
+            rank_output + size_t(cold_ranks_[c]) * hidden_size_, cpu_out_host_ + size_t(c) * hidden_size_, bytes);
+        ++stats_.cpu_result_copies; stats_.cpu_result_bytes += bytes;
+        c = end;
+    }
+    stats_.cold_eligible += cold_count_;
+    stats_.cpu_tasks_dispatched += cold_count_; stats_.cpu_tasks_completed += cold_count_;
+    stats_.cpu_max_batch_tasks = std::max(stats_.cpu_max_batch_tasks, uint64_t(cold_count_));
+    ++stats_.cpu_async_layers;
+    active_cpu_leases_.clear(); cold_source_slots_ = {}; cold_count_ = 0;
+    return prev_cpu_h2d_ev_;
 }
 
 LayerMoePlan& Qwen4ExpExpertExecutor::plan_layer(

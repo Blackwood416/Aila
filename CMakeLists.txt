@@ -891,6 +891,24 @@ target_link_libraries(AilaQwen4ExpAdaptiveCacheTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpAdaptiveCacheTests COMMAND AilaQwen4ExpAdaptiveCacheTests)
 set_tests_properties(AilaQwen4ExpAdaptiveCacheTests PROPERTIES LABELS "gpu;models;qwen4_exp;cache" TIMEOUT 300)
 
+add_executable(AilaQwen4ExpArenaVerifyTests
+    tests/models/Qwen4ExpArenaVerifyTests.cpp
+)
+target_compile_definitions(AilaQwen4ExpArenaVerifyTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpArenaVerifyTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpArenaVerifyTests PRIVATE AilaLib)
+if(MSVC)
+    target_compile_options(AilaQwen4ExpArenaVerifyTests PRIVATE /arch:AVX2)
+else()
+    target_compile_options(AilaQwen4ExpArenaVerifyTests PRIVATE -mavx2 -mfma)
+endif()
+add_test(NAME AilaQwen4ExpArenaVerifyTests COMMAND AilaQwen4ExpArenaVerifyTests)
+set_tests_properties(AilaQwen4ExpArenaVerifyTests PROPERTIES LABELS "gpu;models;qwen4_exp;verify" TIMEOUT 300)
+
 add_executable(AilaDiffusionGemmaModelSpecTests
     tests/models/DiffusionGemmaModelSpecTests.cpp
 )

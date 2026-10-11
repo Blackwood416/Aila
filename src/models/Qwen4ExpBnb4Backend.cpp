@@ -290,6 +290,14 @@ void Qwen4ExpBnb4Backend::PrepareDecodeVerification(Context& ctx) {
     // Keep the bundle alive until backend teardown has drained this Context.
     if (!verification_attention_pair_bundle_)
         verification_attention_pair_bundle_.emplace(ops::prepare_q4e_attention_pair(ctx));
+    // Multi-row (2..4 token) CPU verifier scratch, allocated once here so the
+    // verification window itself performs zero device allocations. Only the
+    // arena verifier consumes these; ordinary decode never touches them.
+    const int top_k = cfg_.num_experts_per_tok;
+    if (!verify_down_.valid())
+        verify_down_ = Tensor::allocate(ctx, {4LL * top_k * hidden_size_}, dnnl::memory::data_type::f32);
+    if (!verify_weights_.valid())
+        verify_weights_ = Tensor::allocate(ctx, {4LL * top_k}, dnnl::memory::data_type::f32);
 }
 
 void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
@@ -1091,7 +1099,8 @@ Qwen4ExpBnb4Backend::ResidentColdWork::~ResidentColdWork() noexcept {
     if (active) executor.AbortResidentCold();
 }
 
-sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count) {
+sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count,
+                                                   bool verify_rows) {
     if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated()) {
         constexpr int kMaxTopK = 16;
         const int top_k = cfg_.num_experts_per_tok, intermediate = cfg_.moe_intermediate_size;
@@ -1110,6 +1119,62 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
         sycl::event last{};
         ResidentColdWork cpu_work{expert_executor_};
+
+        // Opt-in multi-row CPU verification. The native host arena is the RAM
+        // complement of the GPU hotset, so every routed miss can be served by
+        // the bounded CPU worker in one rows-token batch while the resident
+        // hotset runs on the GPU. Enabled only through AILA_Q4E_ARENA_VERIFY_ROWS
+        // with the PrepareDecodeVerification scratch present (MTP path) and a
+        // complete arena/GPU cover for every routed rank; otherwise the
+        // per-token loop below is byte-for-byte unchanged.
+        bool arena_verify = verify_rows && count >= 2 && count <= 4 && !decodeHcReferenceForTest_ &&
+            verify_down_.valid() && verify_weights_.valid() &&
+            expert_executor_.CanExecuteArenaVerifyRows(host_arena_, count, top_k);
+        if (arena_verify)
+            for (int t = 0; t < count && arena_verify; ++t)
+                for (int k = 0; k < top_k; ++k) {
+                    const int e = router_host_ids_[t * top_k + k];
+                    if (adaptive_cache_.GetSlot(layer, e) < 0 && !host_arena_.GetExpertPointer(layer, e)) {
+                        arena_verify = false;
+                        break;
+                    }
+                }
+        if (arena_verify) {
+            expert_executor_.StageResidentInput(x_base, count);
+            float* verify_down = verify_down_.data_as<float>();
+            expert_executor_.StartArenaVerifyRows(host_arena_, layer, count, router_host_ids_, sycl::event{});
+            ctx.queue().memcpy(verify_weights_.data_as<float>(), router_host_weights_,
+                               size_t(count) * top_k * sizeof(float));
+            for (int t = 0; t < count; ++t) {
+                const int* t_ids = router_host_ids_ + t * top_k;
+                const bf16* x_t = x_base + size_t(t) * hidden_size_;
+                std::array<int, kMaxTopK> hit_slots{}, hit_ranks{};
+                int hit_count = 0;
+                for (int k = 0; k < top_k; ++k) {
+                    const int slot = adaptive_cache_.GetSlot(layer, t_ids[k]);
+                    if (slot >= 0) { hit_slots[hit_count] = slot; hit_ranks[hit_count] = k; ++hit_count; }
+                }
+                adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+                if (!hit_count) continue;
+                std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
+                for (int i = 0; i < hit_count; ++i)
+                    hot[i] = adaptive_cache_.GetResidentSlotDev(hit_slots[i], &nested_meta);
+                float* t_down = verify_down + size_t(t) * top_k * hidden_size_;
+                last = ops::moe_decode_gate_up_swiglu_grouped(ctx, hot.data(), nullptr, x_t, h_base,
+                    hit_count, hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(), nullptr,
+                    nested, nested_fixed256);
+                last = ops::moe_decode_down_to_rank_f32(ctx, hot.data(), hit_ranks.data(), h_base, t_down,
+                    hit_count, top_k, intermediate, hidden_size_, 64, nullptr, nullptr, &last, nested,
+                    nested_fixed256);
+                adaptive_cache_.RecordResidentConsumer(last);
+            }
+            const auto cpu_ready = expert_executor_.JoinArenaVerifyRows(verify_down);
+            if (cpu_ready != sycl::event{}) last = cpu_ready;
+            last = ops::moe_ordered_accumulate_down_rows(ctx, verify_down, verify_weights_.data_as<float>(),
+                y_base, count, top_k, hidden_size_, sh_out_base, sh_gate_base, &last);
+            if (resident_probe_) resident_probe_(resident_probe_data_, *this, layer);
+            return last;
+        }
 
 
         for (int t = 0; t < count; ++t) {
@@ -2101,7 +2166,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // Unified Prefill and Decode via Qwen4ExpAdaptiveCache + Qwen4ExpHostArena
         if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated()) {
             if (count>4) RunAdaptivePrefill(ctx,L,s_fuse_shared,count);
-            else RunResidentDecode(ctx,L,s_fuse_shared,count);
+            else RunResidentDecode(ctx,L,s_fuse_shared,count, options.decode_verification);
         } else {
             throw std::runtime_error("Qwen4Exp: legacy expert_cache pipeline has been removed; please enable adaptive pipeline.");
         }

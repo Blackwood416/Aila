@@ -472,11 +472,16 @@ private:
     bool resident_prefill_ = false;
     bool cold_epoch_enabled_ = true; // disabled explicitly during synthetic engine warmup
     Tensor resident_down_, resident_weights_, resident_route_ids_, resident_selected_;
+    // Opt-in adaptive multi-row verification scratch: device [4*top_k, hidden]
+    // rank rows and [4*top_k] routed weights. Allocated only by
+    // PrepareDecodeVerification, so ordinary decode never grows device memory.
+    Tensor verify_down_, verify_weights_;
     int* resident_selected_host_ = nullptr;
     sycl::event resident_hot_reader_{};
     void* resident_probe_data_ = nullptr;
     void (*resident_probe_)(void*,Qwen4ExpBnb4Backend&,int) = nullptr;
-    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count);
+    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count,
+                                  bool verify_rows = false);
     sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared,
                                   GpuReadyLease* device_lease = nullptr,
                                   ResidentColdWork* early_cold = nullptr);

@@ -213,6 +213,20 @@ public:
         const float* weights, const bf16* x, bf16* h, bf16* y, int rows, int top_k,
         const bf16* shared_out = nullptr, const bf16* shared_gate = nullptr);
 
+    // Opt-in 2..4-row verification against the adaptive native host arena.
+    // The arena is the RAM complement of the GPU residency table, so a non-null
+    // native owner marks a CPU cold expert. Scheduling reuses the existing
+    // single CPU slot, worker and 40-task capacity; the arithmetic is the
+    // unchanged cpu_expert_batch_forward multi-token path. Start resolves the
+    // arena sources and submits the batch (it never touches the legacy cache);
+    // the caller submits the GPU hotset work, then Join writes each CPU rank's
+    // [hidden] row into rank_output[global_rank] and returns the H2D event.
+    // ids must already be published on the host (call after route bind).
+    bool CanExecuteArenaVerifyRows(const Qwen4ExpHostArena& arena, int rows, int top_k) const;
+    int StartArenaVerifyRows(const Qwen4ExpHostArena& arena, int layer, int rows,
+                             const int* ids, const sycl::event& route_event);
+    sycl::event JoinArenaVerifyRows(float* rank_output);
+
     int max_cpu_credits() const { return max_cpu_credits_; }
     void set_max_cpu_credits(int credits) { max_cpu_credits_ = std::clamp(credits, 0, ops::cpu::kMaxExpertBatchTasks); }
     int max_cpu_tokens() const { return max_cpu_tokens_; }
@@ -303,8 +317,10 @@ private:
     std::array<int,16> async_route_ranks_{}, async_route_ids_{};
     int async_route_count_ = 0;
     int verify_async_rows_ = 0, verify_async_layer_ = -1;
-    std::array<int, 16> cold_ranks_{}, cold_ids_{};
-    std::array<ops::MoeExpertSlotHost, 16> cold_source_slots_{};
+    // Sized for the full multi-row CPU batch (rows<=4 * top_k<=10 = 40 tasks);
+    // legacy single-row paths only ever fill the first 16 entries.
+    std::array<int, ops::cpu::kMaxExpertBatchTasks> cold_ranks_{}, cold_ids_{};
+    std::array<ops::MoeExpertSlotHost, ops::cpu::kMaxExpertBatchTasks> cold_source_slots_{};
     std::array<ops::cpu::CpuExpertTask,16> cold_reference_tasks_{};
     std::array<double, 17> cold_cost_ns_{};
     int cold_count_ = 0, cold_layer_ = -1;
@@ -315,6 +331,14 @@ private:
     int cold_policy_ = 0; // 0 C1 budget, 1 all host-Ready cold, 2 recoverable budget, 3 Strata PCIe fraction
     int cold_pcie_num_ = 141; // 0.55 rounded to 256ths, explicitly selected candidate
     uint64_t cold_batches_seen_ = 0;
+
+    // Opt-in adaptive arena multi-row verifier. The coordinator owns the
+    // immutable per-layer source table for the duration of the batch; the
+    // worker never dereferences the arena itself.
+    bool arena_verify_pending_ = false;
+    bool arena_verify_logged_ = false;
+    const Qwen4ExpHostArena* arena_verify_arena_ = nullptr;
+    std::vector<ops::MoeExpertSlotHost> arena_verify_sources_;
 };
 
 } // namespace aila
