@@ -1,5 +1,6 @@
 #include "inference/Request.hpp"
 #include "profile/Profiling.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -168,6 +169,16 @@ StepResult RequestState::Finish(RequestStatus status, std::string_view error,
     if (errorSize) snapshot.error.assign(error.data(), errorSize);
     pendingToken = -1;
     verifiedBonus.reset();
+    // B4-5 opt-in accounting probe: records the session boundary at terminal
+    // time so the MTP window path can be compared with plain T1 decode.
+    static const bool s_account_log = aila::env::read_flag("AILA_Q4E_WINDOW_ACCOUNT_LOG", false);
+    if (s_account_log) {
+        int ctx = -1;
+        try { if (session) ctx = session->ContextLength(); } catch (...) {}
+        AILA_LOG_INFO("[Q4E Account] status=%d emitted=%llu ctx=%d used_window=%d",
+            static_cast<int>(status),
+            static_cast<unsigned long long>(snapshot.generatedIds.size()), ctx, int(usedDecodeWindow));
+    }
     if (ownsSession) {
         ownsSession = false;
         session->Release();

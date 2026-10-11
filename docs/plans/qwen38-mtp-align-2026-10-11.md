@@ -64,6 +64,19 @@ T1 与多行 verify 的分歧**主要不是算子舍入，而是调度**：`coun
 
 **工作方式修正**（用户反馈）：已移除测试命令中的固定 ~420s 硬等待，改为 1–2s 轮询完成条件（进程/`result.json`/日志结束标记，上界 900s），长测试前台运行；受影响的运行已用新方式补齐。
 
+## B4-⑤：会话缓存态定位（结果：状态相同、触发条件收敛到 stop 结束路径）
+
+- **持久状态逐字节对比**（扩展 `--mtp-align`）：一次 4 行 verify 窗口 vs 4 次普通 count=1 decode，结束后 24 层 KV、indexer k/compressed、GDN state+conv、PLE conv_state（含 `conv_head`/`prev_tokens`）、`session no_miss`、每层 `num_compressed_blocks` → **differing_tensors = 0**：窗口算术在等长度下与 T1 状态完全一致，分歧不在窗口内部。
+- **触发条件 = stop-token 结束**（全尺寸 A/B 只改 `--generate`）：
+
+| 运行 | 请求 1 结束 | 首请求 | 续轮 |
+|---|---|---|---|
+| `--generate 8` | length（ctx=1432） | 逐字节相同（sha `b2bd7b018f8d`） | **逐字节相同** |
+| `--generate 128` | stop（126 tok，ctx=1550） | 逐字节相同（sha `f72a0da0fb2f`） | **分歧（128 vs 111 tok）** |
+
+- opt-in 记账日志（`AILA_Q4E_WINDOW_ACCOUNT_LOG`）显示两臂请求 1 均为 emitted=126 / ctx=1550 → 不是长度 off-by-one，而是 **stop 结束分支的会话边界/内容差异**（"MTP 窗口 + bonus/接受提交 + `PublishSample` stop 分支跳过 Finalizing flush" 记账链）。
+- 结论：等价门仍未通过（首请求相等、stop 场景续轮分歧）；MTP 保持默认关闭。下一步（B4-⑥）：把快照扩到 (a) adaptive 驻留槽/路由计数、(b) draft `mtpState`（KV 行 + `lastHidden` + 可见长度），dump 续轮第一个 forward 前后；`--generate 128`（stop）复现、`--generate 8`（length）对照——若是 stop 分支 boundary 则小修可闭；若是 session 复用 draft 态则需失效/重建。
+
 ## 移交
 
 - 继续项：① layer≥1 阶段纳入 small-rows；② 长 prompt（≥1100）覆盖 attention-pair/dense-QSA；③ 全过后开 B4-③（协议见路线图）。

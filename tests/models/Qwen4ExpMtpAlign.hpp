@@ -157,6 +157,46 @@ void test_mtp_align(const std::string& directory) {
             next = argmax(refLog.data() + size_t(r) * V);
         }
     }
+    // B4-5: full persistence-state snapshot (KV / GDN / PLE / indexer). Taken
+    // right after the sequential T1 steps; both the T1 and the window run start
+    // from the same checkpoint and write the same token positions, so the
+    // captured region is exactly comparable.
+    auto captureState = [&]() {
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> out;
+        auto add = [&](const std::string& name, const Tensor& t) {
+            if (!t.valid()) return;
+            std::vector<uint8_t> buf(t.size_bytes());
+            ctx.memcpy_d2h(buf.data(), t.data(), buf.size());
+            out.emplace_back(name, std::move(buf));
+        };
+        for (size_t l = 0; l < layerCaches.size(); ++l) {
+            auto& c = layerCaches[l];
+            const std::string ls = ":l" + std::to_string(l);
+            add("k" + ls, c.k);
+            add("v" + ls, c.v);
+            add("indexer_k" + ls, c.indexer_k);
+            add("indexer_compressed_k" + ls, c.indexer_compressed_k);
+            add("linear_state" + ls, c.linear_state);
+            add("linear_conv_state" + ls, c.linear_conv_state);
+        }
+        add("ple_conv_state", pleState.conv_state);
+        // Scalar / bookkeeping state that the next forward also depends on.
+        auto addInt = [&](const std::string& name, long long value) {
+            std::vector<uint8_t> buf(sizeof(long long));
+            std::memcpy(buf.data(), &value, sizeof(long long));
+            out.emplace_back(name, std::move(buf));
+        };
+        addInt("ple_conv_head", pleState.conv_head);
+        addInt("ple_prev_t0", pleState.prev_tokens[0]);
+        addInt("ple_prev_t1", pleState.prev_tokens[1]);
+        addInt("session_no_miss", session.consecutive_no_miss_layers_for_testing());
+        for (size_t l = 0; l < layerCaches.size(); ++l) {
+            addInt("conv_head:l" + std::to_string(l), layerCaches[l].linear_conv_head);
+            addInt("blocks:l" + std::to_string(l), layerCaches[l].num_compressed_blocks);
+        }
+        return out;
+    };
+    auto baselineState = captureState();
     std::vector<std::vector<float>> refStateF;
     for (size_t l = 0; l < layerCaches.size(); ++l) {
         auto& st = layerCaches[l].linear_state;
@@ -180,6 +220,31 @@ void test_mtp_align(const std::string& directory) {
         ctx.memcpy_d2h(outAttnRaw.data(), attnRawR.data(), size_t(L) * rowsMax * 6144 * sizeof(bf16));
     };
     runBatched(4, bat4Log, batAttn, batRouter, batHidden, batAttnIn, batAttnRaw);
+    {
+        auto currentState = captureState();
+        size_t differing = 0;
+        size_t reported = 0;
+        for (size_t i = 0; i < baselineState.size() && i < currentState.size(); ++i) {
+            const auto& a = baselineState[i].second;
+            const auto& b = currentState[i].second;
+            if (a == b) continue;
+            ++differing;
+            if (reported >= 8) continue;
+            ++reported;
+            size_t off = 0;
+            while (off < a.size() && off < b.size() && a[off] == b[off]) ++off;
+            float maxAbs = 0;
+            for (size_t k = 0; k + 1 < a.size() && k + 1 < b.size(); k += 2) {
+                const bf16 va = *reinterpret_cast<const bf16*>(&a[k]);
+                const bf16 vb = *reinterpret_cast<const bf16*>(&b[k]);
+                maxAbs = std::max(maxAbs, std::abs(float(va) - float(vb)));
+            }
+            std::cout << "[MTP ALIGN STATE5] {\"tensor\":\"" << baselineState[i].first
+                      << "\",\"bytes\":" << a.size() << ",\"first_diff_byte\":" << off
+                      << ",\"max_abs_bf16\":" << maxAbs << "}\n";
+        }
+        std::cout << "[MTP ALIGN STATE5 END] {\"differing_tensors\":" << differing << "}\n";
+    }
     std::vector<std::vector<float>> bstate;
     for (size_t l = 0; l < layerCaches.size(); ++l) {
         auto& st = layerCaches[l].linear_state;
