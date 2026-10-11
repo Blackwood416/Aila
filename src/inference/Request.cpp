@@ -171,7 +171,9 @@ StepResult RequestState::Finish(RequestStatus status, std::string_view error,
     verifiedBonus.reset();
     // B4-5 opt-in accounting probe: records the session boundary at terminal
     // time so the MTP window path can be compared with plain T1 decode.
-    static const bool s_account_log = aila::env::read_flag("AILA_Q4E_WINDOW_ACCOUNT_LOG", false);
+    // Raw int read: keep this TU free of the CLI-driven KV-quant override
+    // symbol so lightweight worker/test targets can link it without CLI.cpp.
+    static const bool s_account_log = aila::env::read_int_raw("AILA_Q4E_WINDOW_ACCOUNT_LOG", 0) != 0;
     if (s_account_log) {
         int ctx = -1;
         try { if (session) ctx = session->ContextLength(); } catch (...) {}

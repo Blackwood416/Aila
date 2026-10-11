@@ -28,6 +28,13 @@
 #error "The fake inference Worker must use the same AILA_BUILD_ID as its host test"
 #endif
 
+// The fake worker links Request.cpp (which includes EnvUtils.hpp) but not the
+// main library that defines the CLI-driven KV-quant override. Follow the other
+// test binaries and provide the default locally.
+namespace aila::env {
+bool g_kv_quant_override = false;
+}
+
 namespace {
 
 namespace fs = std::filesystem;
