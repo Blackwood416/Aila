@@ -9,16 +9,21 @@
 #include "ops/Qwen4ExpAttentionPair.hpp"
 #include "utils/EnvUtils.hpp"
 #include "../models/Qwen4ExpGreedyProbe.hpp"
+#include <sycl/ext/intel/esimd.hpp>
+#include "Qwen4ExpEsimdDpasProbe.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -4436,6 +4441,14 @@ int main(int argc, char** argv) {
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("INT8 DPAS attention teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--esimd-dpas-probe") {
+            test_esimd_dpas_probe(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("ESIMD DPAS probe teardown USM leak");
+            std::cout << "ESIMD DPAS probe completed; teardown USM zero\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-fp8-only") {
