@@ -4013,15 +4013,16 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
                 Tensor q_h_dev = Tensor::allocate(ctx, {4 * total_quads * intermediate_size}, dnnl::memory::data_type::bf16);
                 Tensor q_dn_dev = Tensor::allocate(ctx, {4 * total_quads * out_features}, dnnl::memory::data_type::f32);
 
+                const bf16* x_rows = static_cast<const bf16*>(x_dev.data());
                 auto launch_quads = [&](int share) {
                     sycl::event gu = share
                         ? ops::moe_expert_major_prefill_gate_up_4token_wgshare(
                               ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
-                              nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(q_h_dev.data()),
+                              nullptr, x_rows, static_cast<bf16*>(q_h_dev.data()),
                               total_quads, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, share, false)
                         : ops::moe_expert_major_prefill_gate_up_4token(
                               ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()), static_cast<const int*>(q_rnk_dev.data()),
-                              nullptr, static_cast<const bf16*>(x_dev.data()), static_cast<bf16*>(q_h_dev.data()),
+                              nullptr, x_rows, static_cast<bf16*>(q_h_dev.data()),
                               total_quads, num_active_experts, in_features, intermediate_size, blocksize, nullptr, false, false);
                     sycl::event dn = share
                         ? ops::moe_expert_major_prefill_down_4token_wgshare(
@@ -4046,6 +4047,41 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
                 double ms_4t = bench_quads(0);
                 std::cout << "    WG-share quads=" << total_quads << " (tokens=" << tokens << ")\n";
                 std::cout << "      4token share=0: " << ms_4t << " ms\n";
+                // Diagnostic: point every quad at token 0 so the activation
+                // rows are L1/L2 resident. If the time barely moves, the ALU
+                // family is instruction/register bound rather than limited by
+                // the activation stream (used to judge int8-activation ideas).
+                if (aila::env::read_flag("AILA_Q4E_BENCH_XLOCALITY", false)) {
+                    std::vector<int> zero_tok(q_tok.size(), 0);
+                    ctx.memcpy_h2d(q_tok_dev.data(), zero_tok.data(),
+                                   zero_tok.size() * sizeof(int));
+                    const double ms_zero = bench_quads(4);
+                    // Production-scale activations: 4096 distinct rows (20 MiB for
+                    // H=2560) so the quad reads stream instead of hitting L2.
+                    constexpr int kBigRows = 4096;
+                    Tensor x_big = Tensor::allocate(
+                        ctx, {kBigRows, in_features}, dnnl::memory::data_type::bf16);
+                    {
+                        std::vector<bf16> xh(size_t(kBigRows) * in_features);
+                        for (size_t i = 0; i < xh.size(); ++i)
+                            xh[i] = bf16(float(int((i * 2654435761u) % 2001) - 1000) / 1000.0f);
+                        ctx.memcpy_h2d(x_big.data(), xh.data(), xh.size() * sizeof(bf16));
+                    }
+                    std::vector<int> spread_tok(q_tok.size());
+                    for (size_t i = 0; i < spread_tok.size(); ++i)
+                        spread_tok[i] = int((i * 2654435761u) % kBigRows);
+                    ctx.memcpy_h2d(q_tok_dev.data(), spread_tok.data(),
+                                   spread_tok.size() * sizeof(int));
+                    x_rows = x_big.data_as<bf16>();
+                    const double ms_big = bench_quads(4);
+                    x_rows = static_cast<const bf16*>(x_dev.data());
+                    ctx.memcpy_h2d(q_tok_dev.data(), q_tok.data(),
+                                   q_tok.size() * sizeof(int));
+                    std::cout << "      [x-locality] all-quads-token0 share=4: " << ms_zero
+                              << " ms (real ids share=4 measured below)\n";
+                    std::cout << "      [x-locality] 4096-row streaming x share=4: " << ms_big
+                              << " ms\n";
+                }
                 for (int share : {2, 4, 8}) {
                     double ms = bench_quads(share);
                     std::cout << "      4token share=" << share << ": " << ms << " ms ("
@@ -4346,6 +4382,16 @@ int main(int argc, char** argv) {
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("W4A8 teardown USM leak");
             std::cout << "W4A8 adaptive decode checks PASSED; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--prefill-bench-only") {
+            test_moe_prefill_gate_up_and_down(ctx);
+            test_moe_prefill_wgshare_mapping_edges(ctx);
+            test_moe_prefill_weight_reuse_benchmark(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Prefill bench teardown USM leak");
+            std::cout << "Prefill benchmark completed; teardown USM zero\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-tests") {
