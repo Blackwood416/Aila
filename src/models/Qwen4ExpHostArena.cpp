@@ -1,5 +1,6 @@
 #include "models/Qwen4ExpHostArena.hpp"
 #include "memory/LargePages.hpp"
+#include "utils/EnvUtils.hpp"
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -67,10 +68,16 @@ bool Qwen4ExpHostArena::AllocateStorage(const HostArenaConfig& cfg,
         resident_experts_=total_experts_;
         for (auto* p:gpu_owners) if (p) --resident_experts_;
         const size_t per_chunk=std::max(size_t(1),std::min(cfg.chunk_bytes,size_t(256ULL<<20))/geom_.slot_bytes);
+        // Default: native large pages. AILA_Q4E_HOST_ARENA_PINNED=1 switches
+        // the complement to the pinned host allocator so the two can be
+        // compared on CPU TLB pressure versus large-page availability.
+        const bool pinned_arena = aila::env::read_flag("AILA_Q4E_HOST_ARENA_PINNED", false);
         for (size_t n=0;n<resident_experts_;) {
             const size_t count=std::min(per_chunk,resident_experts_-n);
             const size_t bytes=memory::LargePageAllocationSize(count*geom_.slot_bytes);
-            auto* ptr=static_cast<uint8_t*>(ctx_ ? ctx_->alloc_large_host(bytes) : memory::AllocateLargePages(bytes));
+            auto* ptr=static_cast<uint8_t*>(
+                ctx_ ? (pinned_arena ? ctx_->alloc_host(bytes) : ctx_->alloc_large_host(bytes))
+                     : memory::AllocateLargePages(bytes));
             chunks_.push_back(ptr); chunk_sizes_.push_back(count);
             allocated_bytes_+=bytes; n+=count;
         }
