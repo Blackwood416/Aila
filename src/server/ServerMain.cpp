@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
             else if (name == "--model-id") { options.modelId = value; modelIdProvided = true; }
             else if (name == "--port") options.port = static_cast<uint16_t>(Number(value, 1, 65535, name));
             else if (name == "--context") options.contextTokens = static_cast<uint32_t>(Number(value, 32, 262144, name));
-            else if (name == "--prefill-chunk-size") options.prefillChunkSize = static_cast<uint32_t>(Number(value, 1, 4096, name));
+            else if (name == "--prefill-chunk-size") options.prefillChunkSize = static_cast<uint32_t>(Number(value, 1, 8192, name));
             else if (name == "--reuse-sessions") options.reuseSessions = Number(value, 0, 1, name) != 0;
             else if (name == "--sessions") options.maxSessions = static_cast<uint32_t>(Number(value, 1, 4, name));
             else if (name == "--decode-batch-size") options.maxDecodeBatchSize = static_cast<uint32_t>(Number(value, 1, 4, name));

@@ -131,7 +131,7 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     if (cfg.num_layers<=0 || cfg.num_experts_per_layer<=0 || cfg.hidden_size<=0 ||
         cfg.moe_intermediate_size<=0 || cfg.blocksize!=64 || !cfg.compact_nested ||
         cfg.hidden_size%64 || cfg.moe_intermediate_size%64 || cfg.staging_slots_per_buffer<1 ||
-        cfg.staging_slots_per_buffer>16 || cfg.num_gpu_slots>cfg.num_layers*cfg.num_experts_per_layer) {
+        cfg.staging_slots_per_buffer>AdaptiveCacheConfig::kMaxStagingSlots || cfg.num_gpu_slots>cfg.num_layers*cfg.num_experts_per_layer) {
         if (error_message) *error_message="Invalid Qwen4Exp adaptive cache geometry";
         return false;
     }
@@ -197,7 +197,7 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     if (cfg.num_layers<=0 || cfg.num_experts_per_layer<=0 || cfg.hidden_size<=0 ||
         cfg.moe_intermediate_size<=0 || cfg.blocksize!=64 || !cfg.compact_nested ||
         cfg.hidden_size%64 || cfg.moe_intermediate_size%64 || cfg.staging_slots_per_buffer<1 ||
-        cfg.staging_slots_per_buffer>16 || cfg.num_gpu_slots>cfg.num_layers*cfg.num_experts_per_layer) {
+        cfg.staging_slots_per_buffer>AdaptiveCacheConfig::kMaxStagingSlots || cfg.num_gpu_slots>cfg.num_layers*cfg.num_experts_per_layer) {
         if (error_message) *error_message="Invalid Qwen4Exp adaptive cache geometry";
         return false;
     }
@@ -605,7 +605,7 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     stats_.staging_wait_ns += fill_begin - wait_begin;
     StagingBatch batch{};
     batch.ping_pong_index=pp; batch.layer=layer; batch.count=count;
-    std::array<const uint8_t*,16> sources{};
+    std::array<const uint8_t*,AdaptiveCacheConfig::kMaxStagingSlots> sources{};
     // Validate the complete batch before any copy task can start, so a missing
     // RAM owner cannot leave a partially refreshed staging bank.
     for (int i=0;i<count;++i) {

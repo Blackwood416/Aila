@@ -107,7 +107,7 @@ Limits extended_generation_limits() noexcept;
 inline constexpr std::string_view kExtendedContextCapability = "extended_context_v1";
 inline constexpr uint32_t kExtendedMaxPromptTokens = 262144;
 inline constexpr uint32_t kExtendedMaxAttachmentBytes = 1024 * 1024;
-inline constexpr uint32_t kExtendedMaxPrefillChunkSize = 4096;
+inline constexpr uint32_t kExtendedMaxPrefillChunkSize = 8192;
 inline constexpr uint64_t kExtendedMaxOutstandingTokens =
     4ULL * (kExtendedMaxPromptTokens + kExtendedMaxGeneratedTokens);
 Limits extended_context_limits() noexcept;

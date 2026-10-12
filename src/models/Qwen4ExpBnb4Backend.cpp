@@ -717,7 +717,9 @@ bool Qwen4ExpBnb4Backend::load(
     cache_cfg.num_experts_per_layer=cfg_.num_experts;
     cache_cfg.hidden_size=hidden_size_;
     cache_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
-    cache_cfg.staging_slots_per_buffer=16;
+    cache_cfg.staging_slots_per_buffer=std::clamp(
+        aila::env::read_int_raw("AILA_Q4E_STAGING_SLOTS", 16), 1,
+        aila::AdaptiveCacheConfig::kMaxStagingSlots);
     const size_t slot_bytes=size_t(3)*hidden_size_*cfg_.moe_intermediate_size*33/64;
     // The 32K session and prefill projections reserve more VRAM than the CLI's
     // 4K smoke. Fit the cache after those reservations, including both banks.

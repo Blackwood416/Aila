@@ -22,6 +22,10 @@ inline constexpr int32_t kAdaptiveNotResident = -1;
 
 /// Configuration for Qwen4ExpAdaptiveCache
 struct AdaptiveCacheConfig {
+    // Upper bound for the ping-pong staging depth; the live value is
+    // configurable (AILA_Q4E_STAGING_SLOTS) so the prefill fill/DMA pipeline
+    // can be deepened at the cost of resident expert slots.
+    static constexpr int kMaxStagingSlots = 64;
     int num_layers = 48;
     int num_experts_per_layer = 512;
     int num_gpu_slots = 2800;            // Fixed resident VRAM slots (2,800 experts ≈ 6.8GB VRAM)
@@ -55,8 +59,8 @@ struct StagingBatch {
     int ping_pong_index = 0;              // 0 for Buffer A, 1 for Buffer B
     int layer = -1;
     int count = 0;                        // Number of cold experts staged
-    std::array<int, 16> expert_ids{};      // Expert IDs staged
-    std::array<int, 16> staging_slots{};   // Staging slot indices (0 .. count-1)
+    std::array<int, AdaptiveCacheConfig::kMaxStagingSlots> expert_ids{};    // Expert IDs staged
+    std::array<int, AdaptiveCacheConfig::kMaxStagingSlots> staging_slots{}; // Staging slot indices
     sycl::event ready_event{};            // Hardware DMA completion event
 };
 
@@ -322,7 +326,7 @@ private:
     // Ping-Pong Staging Buffers [Buffer A (0), Buffer B (1)]
     uint8_t* staging_dev_[2] = {nullptr, nullptr};
     uint8_t* staging_host_[2] = {nullptr, nullptr};
-    std::array<std::array<int, 16>, 2> staging_experts_{};
+    std::array<std::array<int, AdaptiveCacheConfig::kMaxStagingSlots>, 2> staging_experts_{};
     sycl::event staging_copy_[2]{}, staging_reader_[2]{};
     bool staging_pending_[2]{}, staging_read_[2]{};
     sycl::event resident_ready_{}, resident_reader_{};
