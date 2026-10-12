@@ -3690,6 +3690,71 @@ static void test_attention_prefill_qsa_batched(Context& ctx) {
 
     check_close(gpu_out, ref_f32, "attention_prefill_qsa_batched (with gate)", 2e-2f);
 
+    // Test 2b: int8 KV cache with per-(head, token) symmetric scales. The host
+    // reference runs on the dequantized int8 values, so this checks the scale
+    // application rather than the quantization error itself.
+    {
+        std::vector<int8_t> k_i8_h(k_cache_h.size()), v_i8_h(v_cache_h.size());
+        std::vector<float> k_scale_h(size_t(num_kv_heads) * capacity),
+            v_scale_h(size_t(num_kv_heads) * capacity);
+        std::vector<bf16> k_deq_h(k_cache_h.size()), v_deq_h(v_cache_h.size());
+        auto quantize = [&](const std::vector<bf16>& src, std::vector<int8_t>& codes,
+                            std::vector<float>& scales, std::vector<bf16>& deq) {
+            for (int h = 0; h < num_kv_heads; ++h) {
+                for (int t = 0; t < capacity; ++t) {
+                    const size_t base = (size_t(h) * capacity + t) * head_dim;
+                    float amax = 0.0f;
+                    for (int d = 0; d < head_dim; ++d)
+                        amax = (std::max)(amax, std::fabs(static_cast<float>(src[base + d])));
+                    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+                    scales[size_t(h) * capacity + t] = s;
+                    for (int d = 0; d < head_dim; ++d) {
+                        const int code = static_cast<int>(sycl::rint(
+                            static_cast<float>(src[base + d]) / s));
+                        codes[base + d] = static_cast<int8_t>(
+                            (std::max)(-127, (std::min)(127, code)));
+                        deq[base + d] = bf16(static_cast<float>(codes[base + d]) * s);
+                    }
+                }
+            }
+        };
+        quantize(k_cache_h, k_i8_h, k_scale_h, k_deq_h);
+        quantize(v_cache_h, v_i8_h, v_scale_h, v_deq_h);
+
+        Tensor k_i8_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim},
+                                           dnnl::memory::data_type::s8);
+        Tensor v_i8_dev = Tensor::allocate(ctx, {num_kv_heads, capacity, head_dim},
+                                           dnnl::memory::data_type::s8);
+        Tensor k_scale_dev = Tensor::allocate(ctx, {num_kv_heads, capacity},
+                                              dnnl::memory::data_type::f32);
+        Tensor v_scale_dev = Tensor::allocate(ctx, {num_kv_heads, capacity},
+                                              dnnl::memory::data_type::f32);
+        ctx.memcpy_h2d(k_i8_dev.data(), k_i8_h.data(), k_i8_h.size());
+        ctx.memcpy_h2d(v_i8_dev.data(), v_i8_h.data(), v_i8_h.size());
+        ctx.memcpy_h2d(k_scale_dev.data(), k_scale_h.data(), k_scale_h.size() * sizeof(float));
+        ctx.memcpy_h2d(v_scale_dev.data(), v_scale_h.data(), v_scale_h.size() * sizeof(float));
+
+        ops::attention_prefill_qsa_batched(
+            ctx, q_dev, k_i8_dev, v_i8_dev, active_dev, out_dev,
+            count, start_pos, num_heads, num_kv_heads, head_dim,
+            block_topk, compress_ratio, nullptr, nullptr,
+            &k_scale_dev, &v_scale_dev);
+        ctx.synchronize();
+
+        std::vector<bf16> ref_i8_out(count * num_heads * head_dim);
+        ops::attention_prefill_qsa_batched_host(
+            q_h.data(), k_deq_h.data(), v_deq_h.data(), active_blocks_h.data(),
+            ref_i8_out.data(), count, start_pos, capacity, num_heads, num_kv_heads,
+            head_dim, block_topk, compress_ratio, nullptr);
+
+        std::vector<bf16> gpu_i8_out(count * num_heads * head_dim);
+        ctx.memcpy_d2h(gpu_i8_out.data(), out_dev.data(), gpu_i8_out.size() * sizeof(bf16));
+        std::vector<float> ref_i8_f32(ref_i8_out.size());
+        for (size_t i = 0; i < ref_i8_out.size(); ++i)
+            ref_i8_f32[i] = static_cast<float>(ref_i8_out[i]);
+        check_close(gpu_i8_out, ref_i8_f32, "attention_prefill_qsa_batched int8 KV", 2e-2f);
+    }
+
     // Test 3: Guard checks (invalid head_dim)
     try {
         ops::attention_prefill_qsa_batched(
@@ -4392,6 +4457,14 @@ int main(int argc, char** argv) {
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("Prefill bench teardown USM leak");
             std::cout << "Prefill benchmark completed; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-prefill-only") {
+            test_attention_prefill_qsa_batched(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA prefill teardown USM leak");
+            std::cout << "QSA prefill checks PASSED; teardown USM zero\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-tests") {

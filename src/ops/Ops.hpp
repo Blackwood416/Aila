@@ -457,7 +457,9 @@ namespace ops {
         int block_topk,
         int compress_ratio,
         const Tensor* gate_buf = nullptr,
-        const Tensor* valid_counts = nullptr);
+        const Tensor* valid_counts = nullptr,
+        const Tensor* k_scale = nullptr,
+        const Tensor* v_scale = nullptr);
 
     void attention_prefill_qsa_batched_host(
         const bf16* q,

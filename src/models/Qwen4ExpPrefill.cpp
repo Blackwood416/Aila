@@ -412,7 +412,8 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         ops::attention_prefill_qsa_batched(
                             ctx, q_full_tile, cache.k, cache.v, buf_.qsa_tile_active_blocks, attn_out_tile,
                             tile_count, tile_start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
-                            block_topk, compress_ratio, &z_tile, &valid_counts_tile);
+                            block_topk, compress_ratio, &z_tile, &valid_counts_tile,
+                            &cache.k_scale, &cache.v_scale);
                     }
                 } else {
                     // Fallback: cache raw K and compress blocks before row-by-row execution

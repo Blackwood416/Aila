@@ -4491,7 +4491,8 @@ void attention_prefill_masked(Context& ctx,
         });
 }
 
-void attention_prefill_qsa_batched(
+template <int Fmt>
+void attention_prefill_qsa_batched_impl(
     Context& ctx,
     const Tensor& q,
     const Tensor& k_cache,
@@ -4506,21 +4507,27 @@ void attention_prefill_qsa_batched(
     int block_topk,
     int compress_ratio,
     const Tensor* gate_buf,
-    const Tensor* valid_counts) {
+    const Tensor* valid_counts,
+    const Tensor* k_scale, const Tensor* v_scale) {
   if (count <= 0) return;
   if (head_dim != 256) {
     throw std::invalid_argument("attention_prefill_qsa_batched requires head_dim == 256");
   }
-  if (k_cache.dtype() != dnnl::memory::data_type::bf16 ||
-      v_cache.dtype() != dnnl::memory::data_type::bf16) {
-    throw std::invalid_argument("attention_prefill_qsa_batched requires bf16 KV cache");
+  if constexpr (Fmt == kKvFmtInt8) {
+    if (!k_scale || !v_scale || !k_scale->valid() || !v_scale->valid())
+      throw std::invalid_argument(
+          "attention_prefill_qsa_batched: int8 KV cache requires k_scale/v_scale");
   }
   if (block_topk <= 0 || compress_ratio <= 0) {
     throw std::invalid_argument("attention_prefill_qsa_batched requires positive block_topk and compress_ratio");
   }
   const bf16* q_ptr = q.data_as<bf16>();
-  const bf16* k_ptr = k_cache.data_as<bf16>();
-  const bf16* v_ptr = v_cache.data_as<bf16>();
+  const bf16* k_ptr = static_cast<const bf16*>(k_cache.data());
+  const bf16* v_ptr = static_cast<const bf16*>(v_cache.data());
+  const int8_t* k8_ptr = static_cast<const int8_t*>(k_cache.data());
+  const int8_t* v8_ptr = static_cast<const int8_t*>(v_cache.data());
+  const float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
+  const float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
   const int* active_blocks_ptr = active_blocks.data_as<int>();
   bf16* o_ptr = output.data_as<bf16>();
   const bf16* gate_ptr = (gate_buf && gate_buf->valid()) ? gate_buf->data_as<bf16>() : nullptr;
@@ -4552,6 +4559,23 @@ void attention_prefill_qsa_batched(
             const int lid = item.get_local_id(0);
             const int h0 = g_idx * 4;
             const int kv_head = h0 / heads_per_kv;
+
+            auto k_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(k8_ptr[off + d]) *
+                       k_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(k_ptr[off + d]);
+              }
+            };
+            auto v_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(v8_ptr[off + d]) *
+                       v_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(v_ptr[off + d]);
+              }
+            };
 
             int num_active_blocks = 0;
             int tail_len = 0;
@@ -4604,10 +4628,10 @@ void attention_prefill_qsa_batched(
               for (int c = 0; c < compress_ratio; ++c) {
                 const int cache_t = base_t + c;
                 const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+                const float k0 = k_at(cache_t, d0, tok_offset);
+                const float k1 = k_at(cache_t, d1, tok_offset);
+                const float k2 = k_at(cache_t, d2, tok_offset);
+                const float k3 = k_at(cache_t, d3, tok_offset);
 
                 float rescale[4];
                 float exp_score[4];
@@ -4622,10 +4646,10 @@ void attention_prefill_qsa_batched(
                   running_max[k] = new_max;
                 }
 
-                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+                const float v0 = v_at(cache_t, d0, tok_offset);
+                const float v1 = v_at(cache_t, d1, tok_offset);
+                const float v2 = v_at(cache_t, d2, tok_offset);
+                const float v3 = v_at(cache_t, d3, tok_offset);
 
                 for (int k = 0; k < 4; ++k) {
                   acc0[k] = acc0[k] * rescale[k] + exp_score[k] * v0;
@@ -4640,10 +4664,10 @@ void attention_prefill_qsa_batched(
             for (int t = 0; t < tail_len; ++t) {
               const int cache_t = tail_start + t;
               const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+              const float k0 = k_at(cache_t, d0, tok_offset);
+              const float k1 = k_at(cache_t, d1, tok_offset);
+              const float k2 = k_at(cache_t, d2, tok_offset);
+              const float k3 = k_at(cache_t, d3, tok_offset);
 
               float rescale[4];
               float exp_score[4];
@@ -4658,10 +4682,10 @@ void attention_prefill_qsa_batched(
                 running_max[k] = new_max;
               }
 
-              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+              const float v0 = v_at(cache_t, d0, tok_offset);
+              const float v1 = v_at(cache_t, d1, tok_offset);
+              const float v2 = v_at(cache_t, d2, tok_offset);
+              const float v3 = v_at(cache_t, d3, tok_offset);
 
               for (int k = 0; k < 4; ++k) {
                 acc0[k] = acc0[k] * rescale[k] + exp_score[k] * v0;
@@ -4715,6 +4739,23 @@ void attention_prefill_qsa_batched(
             const int head1 = pair_idx * 2 + 1;
             const int kv_head = head0 / heads_per_kv;
 
+            auto k_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(k8_ptr[off + d]) *
+                       k_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(k_ptr[off + d]);
+              }
+            };
+            auto v_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(v8_ptr[off + d]) *
+                       v_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(v_ptr[off + d]);
+              }
+            };
+
             int num_active_blocks = 0;
             int tail_len = 0;
             int tail_start = 0;
@@ -4764,10 +4805,10 @@ void attention_prefill_qsa_batched(
               for (int c = 0; c < compress_ratio; ++c) {
                 const int cache_t = base_t + c;
                 const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+                const float k0 = k_at(cache_t, d0, tok_offset);
+                const float k1 = k_at(cache_t, d1, tok_offset);
+                const float k2 = k_at(cache_t, d2, tok_offset);
+                const float k3 = k_at(cache_t, d3, tok_offset);
 
                 const float local_dot0 = q_cache0[d0] * k0 + q_cache0[d1] * k1 + q_cache0[d2] * k2 + q_cache0[d3] * k3;
                 const float local_dot1 = q_cache1[d0] * k0 + q_cache1[d1] * k1 + q_cache1[d2] * k2 + q_cache1[d3] * k3;
@@ -4790,10 +4831,10 @@ void attention_prefill_qsa_batched(
                 running_sum1 = running_sum1 * rescale1 + exp_score1;
                 running_max1 = new_max1;
 
-                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+                const float v0 = v_at(cache_t, d0, tok_offset);
+                const float v1 = v_at(cache_t, d1, tok_offset);
+                const float v2 = v_at(cache_t, d2, tok_offset);
+                const float v3 = v_at(cache_t, d3, tok_offset);
 
                 acc0_0 = acc0_0 * rescale0 + exp_score0 * v0;
                 acc1_0 = acc1_0 * rescale0 + exp_score0 * v1;
@@ -4811,10 +4852,10 @@ void attention_prefill_qsa_batched(
             for (int t = 0; t < tail_len; ++t) {
               const int cache_t = tail_start + t;
               const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+              const float k0 = k_at(cache_t, d0, tok_offset);
+              const float k1 = k_at(cache_t, d1, tok_offset);
+              const float k2 = k_at(cache_t, d2, tok_offset);
+              const float k3 = k_at(cache_t, d3, tok_offset);
 
               const float local_dot0 = q_cache0[d0] * k0 + q_cache0[d1] * k1 + q_cache0[d2] * k2 + q_cache0[d3] * k3;
               const float local_dot1 = q_cache1[d0] * k0 + q_cache1[d1] * k1 + q_cache1[d2] * k2 + q_cache1[d3] * k3;
@@ -4837,10 +4878,10 @@ void attention_prefill_qsa_batched(
               running_sum1 = running_sum1 * rescale1 + exp_score1;
               running_max1 = new_max1;
 
-              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+              const float v0 = v_at(cache_t, d0, tok_offset);
+              const float v1 = v_at(cache_t, d1, tok_offset);
+              const float v2 = v_at(cache_t, d2, tok_offset);
+              const float v3 = v_at(cache_t, d3, tok_offset);
 
               acc0_0 = acc0_0 * rescale0 + exp_score0 * v0;
               acc1_0 = acc1_0 * rescale0 + exp_score0 * v1;
@@ -4913,6 +4954,23 @@ void attention_prefill_qsa_batched(
             const int lid = item.get_local_id(0);
             const int kv_head = head / heads_per_kv;
 
+            auto k_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(k8_ptr[off + d]) *
+                       k_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(k_ptr[off + d]);
+              }
+            };
+            auto v_at = [&](int tok, int d, size_t off) -> float {
+              if constexpr (Fmt == kKvFmtInt8) {
+                return static_cast<float>(v8_ptr[off + d]) *
+                       v_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + tok];
+              } else {
+                return static_cast<float>(v_ptr[off + d]);
+              }
+            };
+
             int num_active_blocks = 0;
             int tail_len = 0;
             int tail_start = 0;
@@ -4959,10 +5017,10 @@ void attention_prefill_qsa_batched(
               for (int c = 0; c < compress_ratio; ++c) {
                 const int cache_t = base_t + c;
                 const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-                const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-                const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-                const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-                const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+                const float k0 = k_at(cache_t, d0, tok_offset);
+                const float k1 = k_at(cache_t, d1, tok_offset);
+                const float k2 = k_at(cache_t, d2, tok_offset);
+                const float k3 = k_at(cache_t, d3, tok_offset);
                 const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
                 const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
                 const float score = dot * scale;
@@ -4973,10 +5031,10 @@ void attention_prefill_qsa_batched(
                 running_sum = running_sum * rescale + exp_score;
                 running_max = new_max;
 
-                const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-                const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-                const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-                const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+                const float v0 = v_at(cache_t, d0, tok_offset);
+                const float v1 = v_at(cache_t, d1, tok_offset);
+                const float v2 = v_at(cache_t, d2, tok_offset);
+                const float v3 = v_at(cache_t, d3, tok_offset);
 
                 acc0 = acc0 * rescale + exp_score * v0;
                 acc1 = acc1 * rescale + exp_score * v1;
@@ -4989,10 +5047,10 @@ void attention_prefill_qsa_batched(
             for (int t = 0; t < tail_len; ++t) {
               const int cache_t = tail_start + t;
               const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim;
-              const float k0 = static_cast<float>(k_ptr[tok_offset + d0]);
-              const float k1 = static_cast<float>(k_ptr[tok_offset + d1]);
-              const float k2 = static_cast<float>(k_ptr[tok_offset + d2]);
-              const float k3 = static_cast<float>(k_ptr[tok_offset + d3]);
+              const float k0 = k_at(cache_t, d0, tok_offset);
+              const float k1 = k_at(cache_t, d1, tok_offset);
+              const float k2 = k_at(cache_t, d2, tok_offset);
+              const float k3 = k_at(cache_t, d3, tok_offset);
               const float local_dot = q_cache[d0] * k0 + q_cache[d1] * k1 + q_cache[d2] * k2 + q_cache[d3] * k3;
               const float dot = sycl::reduce_over_group(item.get_group(), local_dot, sycl::plus<float>());
               const float score = dot * scale;
@@ -5003,10 +5061,10 @@ void attention_prefill_qsa_batched(
               running_sum = running_sum * rescale + exp_score;
               running_max = new_max;
 
-              const float v0 = static_cast<float>(v_ptr[tok_offset + d0]);
-              const float v1 = static_cast<float>(v_ptr[tok_offset + d1]);
-              const float v2 = static_cast<float>(v_ptr[tok_offset + d2]);
-              const float v3 = static_cast<float>(v_ptr[tok_offset + d3]);
+              const float v0 = v_at(cache_t, d0, tok_offset);
+              const float v1 = v_at(cache_t, d1, tok_offset);
+              const float v2 = v_at(cache_t, d2, tok_offset);
+              const float v3 = v_at(cache_t, d3, tok_offset);
 
               acc0 = acc0 * rescale + exp_score * v0;
               acc1 = acc1 * rescale + exp_score * v1;
@@ -5039,6 +5097,42 @@ void attention_prefill_qsa_batched(
           });
     });
   }
+}
+
+
+void attention_prefill_qsa_batched(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& k_cache,
+    const Tensor& v_cache,
+    const Tensor& active_blocks,
+    Tensor& output,
+    int count,
+    int start_pos,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_topk,
+    int compress_ratio,
+    const Tensor* gate_buf,
+    const Tensor* valid_counts,
+    const Tensor* k_scale,
+    const Tensor* v_scale) {
+  const int fmt = kv_cache_format_of(k_cache);
+  if (fmt == kKvFmtInt8) {
+    attention_prefill_qsa_batched_impl<kKvFmtInt8>(
+        ctx, q, k_cache, v_cache, active_blocks, output, count, start_pos,
+        num_heads, num_kv_heads, head_dim, block_topk, compress_ratio, gate_buf,
+        valid_counts, k_scale, v_scale);
+    return;
+  }
+  if (fmt != kKvFmtBf16)
+    throw std::invalid_argument(
+        "attention_prefill_qsa_batched requires a bf16 or int8 KV cache");
+  attention_prefill_qsa_batched_impl<kKvFmtBf16>(
+      ctx, q, k_cache, v_cache, active_blocks, output, count, start_pos,
+      num_heads, num_kv_heads, head_dim, block_topk, compress_ratio, gate_buf,
+      valid_counts, k_scale, v_scale);
 }
 
 void attention_prefill_qsa_batched_host(
