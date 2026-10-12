@@ -62,6 +62,9 @@ struct ModelOptions {
     // Hybrid models: keep the latest N recurrent checkpoints; zero disables
     // snapshots. Truncate may restore an earlier checkpoint or reset to zero.
     size_t maxRecurrentSnapshots = 4;
+    // Shared-model loader: allow the explicitly requested quantized KV layout.
+    // Off by default; the worker sets it only for an int8 ModelLoad command.
+    bool allowQuantizedKv = false;
 };
 
 // Shared text execution supports Qwen3 NF4, Qwen3.5 NF4/BF16 and Qwen4Exp NF4. Other

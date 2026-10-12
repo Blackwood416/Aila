@@ -71,6 +71,9 @@ struct InferenceModelOptions {
     uint32_t maxSessions = 4;
     uint64_t maxSessionCacheBytes = 0;
     std::optional<wire::AllocationLimits> allocationLimits;
+    // "bf16" (default) or "int8" for backends that advertise an int8 KV
+    // capability; must match the worker-side KV layout selection.
+    std::string kvType = "bf16";
 };
 
 struct InferenceRequestOptions {

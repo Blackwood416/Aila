@@ -945,7 +945,7 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     if (options.memorySampleInterval < 0ms || options.memorySampleInterval > 60000ms ||
         (options.memorySampleInterval != 0ms && options.memorySampleInterval < 100ms))
         throw std::invalid_argument("--memory-sample-ms must be 0 or 100..60000");
-    const auto capability = wire::model_capability(options.backend);
+    const auto capability = wire::model_capability(options.backend, options.kvType);
     if (capability.empty()) throw std::invalid_argument("Unsupported server backend: " + options.backend);
     wire::Limits serverLimits;
     serverLimits.maxActiveRequests = options.maxSessions;
@@ -979,6 +979,7 @@ int RunHttpServer(const ServerOptions& options, std::atomic<bool>& stopRequested
     host::InferenceModelOptions modelOptions;
     modelOptions.maxSequenceLength = options.contextTokens;
     modelOptions.maxSessions = options.maxSessions;
+    modelOptions.kvType = options.kvType;
     modelOptions.allocationLimits = wire::AllocationLimits{
         options.maxDeviceBytes, options.maxPinnedHostBytes, options.maxSessionHostBytes};
     std::shared_ptr<host::InferenceModel> model;

@@ -73,6 +73,7 @@ private:
         modelOptions.maxSessions = options.maxSessions;
         modelOptions.maxSessionCacheBytes = options.maxSessionCacheBytes;
         modelOptions.maxSessionHostBytes = static_cast<size_t>(limits.maxSessionHostBytes);
+        modelOptions.allowQuantizedKv = options.kvType == "int8";
         // IPC has no rollback API. Keep the required Hybrid host mirrors but
         // allocate no recurrent snapshots. Host mirrors have a separate byte
         // limit when allocation_limits_v1 is requested.

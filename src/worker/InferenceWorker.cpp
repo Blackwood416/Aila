@@ -556,7 +556,7 @@ struct InferenceWorker::State : std::enable_shared_from_this<State> {
         if (limits.maxSessionCacheBytes && (!record->cacheLimit || record->cacheLimit > limits.maxSessionCacheBytes))
             record->cacheLimit = static_cast<size_t>(limits.maxSessionCacheBytes);
         const InferenceModelOptions options{static_cast<int>(command.maxSequenceLength), record->sessionLimit,
-                                             record->cacheLimit, command.allocationLimits};
+                                             record->cacheLimit, command.allocationLimits, command.kvType};
         auto self = shared_from_this();
         ++liveModels;
         try {

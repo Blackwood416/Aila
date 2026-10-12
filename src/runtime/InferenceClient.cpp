@@ -1239,6 +1239,7 @@ std::shared_ptr<InferenceModel> InferenceClient::LoadModel(
     command.maxSessions = options.maxSessions;
     command.maxSessionCacheBytes = options.maxSessionCacheBytes;
     command.allocationLimits = options.allocationLimits;
+    command.kvType = options.kvType;
     const auto response = connection_->Call(std::move(command), timeout);
     std::unique_ptr<InferenceModel> handle;
     try { handle.reset(new InferenceModel(connection_, response.model)); }

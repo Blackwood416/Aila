@@ -721,7 +721,10 @@ bool Qwen4ExpBnb4Backend::load(
     const size_t slot_bytes=size_t(3)*hidden_size_*cfg_.moe_intermediate_size*33/64;
     // The 32K session and prefill projections reserve more VRAM than the CLI's
     // 4K smoke. Fit the cache after those reservations, including both banks.
-    cache_cfg.num_gpu_slots=std::min(2800,int(expert_cache_bytes/slot_bytes)-32);
+    // The hard cap only guards against pathological budgets; raise it when a
+    // smaller KV layout (AILA_KV_QUANT_FORMAT=int8) frees device bytes.
+    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", 2800);
+    cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-32);
     if (cache_cfg.num_gpu_slots<=0) {
         if (error_message) *error_message="Qwen4Exp resident cache exceeds the admitted VRAM budget";
         return false;

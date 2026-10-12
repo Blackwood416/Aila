@@ -17,6 +17,9 @@ struct ServerOptions {
     std::string expectedBuildId;
     std::string modelId = "qwen3";
     std::string backend = "qwen3_nf4";
+    // "bf16" (default) or "int8"; the int8 layout must also be selected inside
+    // the worker (AILA_KV_QUANT=1 + AILA_KV_QUANT_FORMAT=int8).
+    std::string kvType = "bf16";
     uint16_t port = 8080;
     uint32_t maxSessions = 4;
     uint32_t maxDecodeBatchSize = 1;

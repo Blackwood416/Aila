@@ -17,6 +17,7 @@ struct InferenceModelOptions {
     size_t maxSessions = 4;
     size_t maxSessionCacheBytes = 0;
     std::optional<ipc::v2::AllocationLimits> allocationLimits;
+    std::string kvType = "bf16";
 };
 
 // The protocol/controller is ordinary C++. Only the real factory adapter

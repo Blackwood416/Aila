@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <charconv>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -35,6 +36,7 @@ uint64_t Number(std::string_view text, uint64_t minimum, uint64_t maximum, const
 void Usage() {
     std::cout << "AilaServer --worker <AilaWorker.exe> --model <model directory> [options]\n"
                  "  --backend NAME              qwen3_nf4 (default), qwen35_nf4, qwen35_bf16 or qwen4exp_nf4\n"
+                 "  --kv-type TYPE              bf16 (default) or int8 (qwen4exp_nf4 only; worker must also set AILA_KV_QUANT=1 + AILA_KV_QUANT_FORMAT=int8)\n"
                  "  --port N                    Local 127.0.0.1 port (8080)\n"
                  "  --model-id NAME             HTTP model name (qwen3 / qwen3.5)\n"
                  "  --context N                 Session capacity, 32..262144 (4096)\n"
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
         aila::server::ServerOptions options;
         options.expectedBuildId = AILA_WORKER_BUILD_ID;
         bool modelIdProvided = false;
+        bool kvTypeProvided = false;
         for (int index = 1; index < argc; ++index) {
             const std::string name(argv[index]);
             if (name == "--help" || name == "-h") { Usage(); return 0; }
@@ -72,6 +75,7 @@ int main(int argc, char** argv) {
             if (name == "--worker") options.workerExecutable = std::filesystem::u8path(value);
             else if (name == "--model") options.modelDirectory = std::filesystem::u8path(value);
             else if (name == "--backend") options.backend = value;
+            else if (name == "--kv-type") { options.kvType = value; kvTypeProvided = true; }
             else if (name == "--model-id") { options.modelId = value; modelIdProvided = true; }
             else if (name == "--port") options.port = static_cast<uint16_t>(Number(value, 1, 65535, name));
             else if (name == "--context") options.contextTokens = static_cast<uint32_t>(Number(value, 32, 262144, name));
@@ -100,6 +104,13 @@ int main(int argc, char** argv) {
         if (options.backend != "qwen3_nf4" && options.backend != "qwen35_nf4" &&
             options.backend != "qwen35_bf16" && options.backend != "qwen4exp_nf4")
             throw std::invalid_argument("--backend must be qwen3_nf4, qwen35_nf4, qwen35_bf16 or qwen4exp_nf4");
+        if (!kvTypeProvided) {
+            if (const char* value = std::getenv("AILA_SERVER_KV_TYPE")) options.kvType = value;
+        }
+        if (options.kvType != "bf16" && options.kvType != "int8")
+            throw std::invalid_argument("--kv-type must be bf16 or int8");
+        if (options.kvType == "int8" && options.backend != "qwen4exp_nf4")
+            throw std::invalid_argument("--kv-type int8 is only supported by qwen4exp_nf4");
         if (!modelIdProvided) options.modelId = options.backend == "qwen3_nf4" ? "qwen3"
             : options.backend == "qwen4exp_nf4" ? "qwen4exp" : "qwen3.5";
         if (options.modelId.empty() || options.modelId.size() > 128 ||

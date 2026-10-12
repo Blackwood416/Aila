@@ -624,9 +624,14 @@ std::vector<std::string> supported_capabilities() {
     capabilities.emplace_back("runtime_memory_v1");
     capabilities.emplace_back("continuous_batching_v1");
     capabilities.emplace_back("qwen4exp_nf4_bf16_kv");
+    capabilities.emplace_back("qwen4exp_nf4_int8_kv");
     return capabilities;
 }
 std::string_view model_capability(std::string_view backend, std::string_view kvType) noexcept {
+    if (kvType == "int8") {
+        if (backend == "qwen4exp_nf4") return "qwen4exp_nf4_int8_kv";
+        return {};
+    }
     if (kvType != "bf16") return {};
     if (backend == "qwen3_nf4") return "qwen3_nf4_bf16_kv";
     if (backend == "qwen35_nf4") return "qwen35_nf4_bf16_kv";

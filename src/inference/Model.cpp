@@ -700,7 +700,7 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
     const bool quantizedCache = hybrid
         ? aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")
         : aila::env::read_flag("AILA_KV_QUANT", false);
-    if (quantizedCache) {
+    if (quantizedCache && !(qwen4exp && options.allowQuantizedKv)) {
         throw Error(ErrorCode::InvalidArgument,
                     hybrid ? "Qwen3.5 shared sessions require BF16 KV; set AILA_VLM_KV_QUANT=0"
                            : qwen4exp ? "Qwen4Exp shared sessions require BF16 KV; set AILA_KV_QUANT=0"
@@ -744,8 +744,14 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
             if (config.vocab_size <= 0 || config.max_position_embeddings <= 0)
                 throw Error(ErrorCode::InvalidArgument, "Invalid Qwen4Exp vocabulary or context capacity");
             options.maxSequenceLength = std::min(options.maxSequenceLength, config.max_position_embeddings);
+            // The session builder allocates 1-byte K/V plus two F32 per-token
+            // scales when int8 KV is opted in; the reservation must mirror the
+            // same layout or the worker rejects the session at creation.
+            const size_t kvElementBytes =
+                (quantizedCache && aila::env::kv_quant_format_is_int8()) ? 1 : 2;
             reservation = aila::memory::qwen4exp_session_memory(
-                config, options.maxSequenceLength, options.maxRecurrentSnapshots);
+                config, options.maxSequenceLength, options.maxRecurrentSnapshots,
+                kvElementBytes);
             loaded->vocabSize = config.vocab_size;
         } else {
             const auto& config = spec.qwen3;

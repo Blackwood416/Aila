@@ -95,7 +95,8 @@ inline SessionMemoryReservation qwen35_session_memory(
 // payload is the persistent DeltaNet mirror plus retained snapshots; the PLE
 // convolution state is device-only but every snapshot keeps a float copy.
 inline SessionMemoryReservation qwen4exp_session_memory(
-    const Qwen4ExpTextConfig& config, int capacity, size_t maxSnapshots) {
+    const Qwen4ExpTextConfig& config, int capacity, size_t maxSnapshots,
+    size_t kvElementBytes = 2) {
     if (!is_exact_qwen4exp_text_spec(config)) {
         throw std::invalid_argument("Unsupported Qwen4Exp text dimensions");
     }
@@ -137,9 +138,17 @@ inline SessionMemoryReservation qwen4exp_session_memory(
     const auto headDim = positive_memory_dimension(config.head_dim);
     const auto cached = positive_memory_dimension(capacity);
 
-    size_t fullBytes = 4; // K and V, each BF16.
+    // K and V, each `kvElementBytes` wide. The int8 layout also allocates a
+    // per-token F32 scale for K and for V ({kvHeads, capacity} each).
+    size_t fullBytes = checked_memory_product(size_t{2}, kvElementBytes);
     fullBytes = checked_memory_product(fullBytes, checked_memory_product(kvHeads, headDim));
     fullBytes = checked_memory_product(fullBytes, checked_memory_product(cached, fullLayers));
+    if (kvElementBytes == 1) {
+        const size_t scaleBytes = checked_memory_product(
+            checked_memory_product(size_t{2} * sizeof(float), kvHeads), cached);
+        fullBytes = checked_memory_sum(
+            fullBytes, checked_memory_product(scaleBytes, fullLayers));
+    }
 
     const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
     size_t indexerBytes = checked_memory_product(
