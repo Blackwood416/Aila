@@ -357,15 +357,20 @@ void TestModelCapabilities() {
     current.emplace_back("runtime_memory_v1");
     current.emplace_back("continuous_batching_v1");
     current.emplace_back("qwen4exp_nf4_bf16_kv");
+    current.emplace_back("qwen4exp_nf4_int8_kv");
     Expect(wire::supported_capabilities() == current, "Worker capabilities omitted a backend or changed Qwen3");
     Expect(wire::model_capability("qwen3_nf4") == "qwen3_nf4_bf16_kv" &&
            wire::model_capability("qwen35_nf4", "bf16") == "qwen35_nf4_bf16_kv" &&
            wire::model_capability("qwen35_bf16", "bf16") == "qwen35_bf16_bf16_kv" &&
-           wire::model_capability("qwen4exp_nf4", "bf16") == "qwen4exp_nf4_bf16_kv",
+           wire::model_capability("qwen4exp_nf4", "bf16") == "qwen4exp_nf4_bf16_kv" &&
+           wire::model_capability("qwen4exp_nf4", "int8") == "qwen4exp_nf4_int8_kv",
            "Backend capability mapping was incorrect");
     Expect(wire::model_capability("qwen35_nf4", "fp8").empty() &&
            wire::model_capability("qwen35_bf16", "fp8").empty() &&
            wire::model_capability("qwen4exp_nf4", "fp8").empty() &&
+           wire::model_capability("qwen3_nf4", "int8").empty() &&
+           wire::model_capability("qwen35_nf4", "int8").empty() &&
+           wire::model_capability("qwen35_bf16", "int8").empty() &&
            wire::model_capability("qwen3_nf4", "BF16").empty() &&
            wire::model_capability("future_nf4").empty(), "Unknown backend or KV type was advertised");
 
