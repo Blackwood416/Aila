@@ -77,8 +77,29 @@ T1 与多行 verify 的分歧**主要不是算子舍入，而是调度**：`coun
 - opt-in 记账日志（`AILA_Q4E_WINDOW_ACCOUNT_LOG`）显示两臂请求 1 均为 emitted=126 / ctx=1550 → 不是长度 off-by-one，而是 **stop 结束分支的会话边界/内容差异**（"MTP 窗口 + bonus/接受提交 + `PublishSample` stop 分支跳过 Finalizing flush" 记账链）。
 - 结论：等价门仍未通过（首请求相等、stop 场景续轮分歧）；MTP 保持默认关闭。下一步（B4-⑥）：把快照扩到 (a) adaptive 驻留槽/路由计数、(b) draft `mtpState`（KV 行 + `lastHidden` + 可见长度），dump 续轮第一个 forward 前后；`--generate 128`（stop）复现、`--generate 8`（length）对照——若是 stop 分支 boundary 则小修可闭；若是 session 复用 draft 态则需失效/重建。
 
+## B4-⑥：状态快照扩展 + 活线 boundary 探针（结果：等价门未过，根因钉到 verify 行）
+
+- 新探针 `AILA_Q4E_MTP_BOUNDARY_DUMP`（提交 `40d6bf6`，默认关闭）：每次 `ForwardImpl`/`ForwardWindow` 前后 dump
+  session 指纹（24 层 KV、indexer k/压缩、GDN state+conv、PLE、计数器）+ adaptive 槽表/路由计数 + draft `mtpState`。
+- 结果（全尺寸 A/B，`--generate 128` stop 场景，两轮独立复现 b6/b6b）：
+  - 两臂请求 1 文本逐字节相同（sha `f72a0da0fb2f`，126 tok，ctx=1550），但**请求 1 结束时的持久状态已逐位不同**；
+    续轮（A `d76fb23bc0` 128 tok vs B `86c43a4f98` 111 tok）是下游后果——**B4-⑤ 的 "stop 结束路径" 假设被否证**。
+  - 首分歧 pos=1492（1491 相同）= 请求 1 内 start=1491 的**被拒绝 MTP 窗口 row0**：该行由 2 行 verify forward 写出，
+    token 选择一致，但整条残差流与其下游张量与单行 decode 不逐位相同；漂移永久保留到续轮 resume 点 1550 与 1574。
+  - 分歧集合 `kv/kvv/idxk/idxc/gdn/gdnc` 同时不同；`idxn`/`ple`/`scal` 全程相同 → 是逐行数值差，非长度/计数记账。
+    逐层：full-attention 12/12 层 KV 全分歧，linear 层 GDN 从 layer 2 起分歧（layer 0/1 相同）。
+- 排除项（全尺寸差分否证）：stop/bonus/Finalizing 记账、draft 态复用、adaptive 驻留槽集合、压缩块计数，以及
+  `GDN_HISTORY_FUSED`/`DECODE_PENDING_MLP_RESIDUAL`（b6c 关闭后两臂状态逐位不变、首分歧仍在 1492）。
+- 结论：残留唯一解释 = **verify 窗口的单行路径与单行 decode 不逐位等价**（状态相关的稀有行）。闭环选项：
+  (a) env 化 live stage 探针在 1491 行定位具体算子；(b) verify 窗口按逐行 `count==1` 完整 decode 体执行
+  （构造上逐位等价，代价 = 放弃核内多行收益，B4-③ 吞吐需重做）。
+- B4-③ 判定：**等价门未通过 → MTP 维持默认关闭**（仅 `AILA_Q4E_SERVER_MTP=1` opt-in）；吞吐沿用 MTP ~15.0–15.3 vs T1 15.6 tok/s。
+- 证据：`tmp/q4e-mtp-alignment-20261011/{candidate-b6.patch,run_mtp_ab_b6.py,analyze_bnd*.py,summarize_bnd.py,content_sha.py,b6-*,b6b-*,b6c-*,analysis-*.txt,b6-harness-prod.log,ctest-cpu-abi-b6.log}`；
+  官方 pair `retained5`（`40d6bf6`，worker `436719a8…` / server `82336e2f…`）；CPU/ABI 19/19。
+
 ## 移交
 
-- 继续项：① layer≥1 阶段纳入 small-rows；② 长 prompt（≥1100）覆盖 attention-pair/dense-QSA；③ 全过后开 B4-③（协议见路线图）。
+- 继续项（按路线图顺序）：① B1 int8 KV DPAS（设计见 `tmp/q4e-int8kv-dpas-20261012/DESIGN.md`，s8 组合已探明 n=8/k=32）；
+  ② B2 prefill W4A8；③ B3 卸载结构重整；④ MTP 闭环只在 B3 之后按上面 (a)/(b) 选项重评（当前多行 verify 既慢又不等价，不投入）。
 - 工具：`tests/models/Qwen4ExpMtpAlign.hpp` + `--mtp-align` 驱动；逐阶段探针仅在 `verification_stage_rows_for_test_>0` 时触发，普通 forward 零改动。
 - 证据：`tmp/q4e-mtp-alignment-20261011/{candidate.patch,REPORT.md,align-*.log,ctest-cpu-abi.log,run-*.ps1}`。
