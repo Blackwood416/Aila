@@ -4387,6 +4387,7 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
 #include "Qwen4ExpGdnDecodeOrder.hpp"
 #include "Qwen4ExpGreedyTests.hpp"
 #include "Qwen4ExpKvFp8Tests.hpp"
+#include "Qwen4ExpDpasProbe.hpp"
 #include "Qwen4ExpAttentionPairTests.hpp"
 #include "Qwen4ExpW4A8Tests.hpp"
 
@@ -4420,6 +4421,21 @@ int main(int argc, char** argv) {
             test_mtp_greedy(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
             if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())throw std::runtime_error("Greedy teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--dpas-probe") {
+            test_int8_dpas_probe(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("DPAS probe teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--kv-int8-dpas-only") {
+            test_int8_dpas_probe(ctx);
+            test_int8_dpas_attention(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("INT8 DPAS attention teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-fp8-only") {

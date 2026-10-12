@@ -307,7 +307,128 @@ inline bool kv_int8_vector_reads() {
   return enabled;
 }
 
-template <int Quantized>
+bool kv_int8_dpas_enabled(const sycl::device &dev) {
+  static const bool requested = aila::env::read_flag("AILA_KV_QUANT_DPAS", false);
+  if (!requested) return false;
+  auto supports = [](const sycl::device &device) {
+    if (!device.has(sycl::aspect::ext_intel_matrix)) return false;
+    using sycl::ext::oneapi::experimental::info::device::matrix_combinations;
+    for (const auto &c : device.get_info<matrix_combinations>()) {
+      if ((c.msize == 0 || c.msize == 1) && c.nsize == 8 && c.ksize == 32 &&
+          c.atype == matrix_type::sint8 && c.btype == matrix_type::sint8 &&
+          c.ctype == matrix_type::sint32 && c.dtype == matrix_type::sint32)
+        return true;
+    }
+    return false;
+  };
+  static thread_local sycl::device cached_device = dev;
+  static thread_local bool supported = supports(dev);
+  if (cached_device != dev) {
+    cached_device = dev;
+    supported = supports(dev);
+  }
+  return supported;
+}
+
+void attention_decode_int8_dpas_partials(
+    Context &ctx, const bf16 *q, const int8_t *k, const int8_t *v,
+    const float *ks, const float *vs, float *partials, int num_heads,
+    int heads_per_kv, int max_seq_len, int max_tiles, int tail_start,
+    int effective_len) {
+  constexpr int dim = 256, tile = kDecodeExact256Tile, wg = kDecodeExact256TileWg;
+  constexpr int sg_size = 8, bk = 32;
+  const int num_tiles = (effective_len + tile - 1) / tile;
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> qc(dim, cgh);
+    sycl::local_accessor<int8_t, 1> q8(dim, cgh), qr8(dim, cgh);
+    sycl::local_accessor<int32_t, 1> dots(2 * tile, cgh);
+    sycl::local_accessor<float, 1> logits(tile, cgh), stats(2, cgh);
+    cgh.parallel_for(sycl::nd_range<1>(num_heads * num_tiles * wg, wg),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(8)]] {
+          const int head = item.get_group(0) / num_tiles;
+          const int tile_start = (item.get_group(0) % num_tiles) * tile;
+          const int len = sycl::min(tile, effective_len - tile_start);
+          const int lid = item.get_local_id(0), kv_head = head / heads_per_kv;
+          const size_t cache_base = size_t(kv_head) * max_seq_len;
+          float *partial = partials + (head * max_tiles + item.get_group(0) % num_tiles) *
+              kDecodeExact256PartialStride;
+          float amax = 0.0f;
+          for (int d = lid; d < dim; d += wg) {
+            qc[d] = float(q[head * dim + d]);
+            amax = sycl::fmax(amax, sycl::fabs(qc[d]));
+          }
+          amax = sycl::reduce_over_group(item.get_group(), amax, sycl::maximum<float>());
+          const float qs = amax / 127.0f, qi = qs > 0.0f ? 1.0f / qs : 0.0f;
+          float rmax = 0.0f;
+          for (int d = lid; d < dim; d += wg) {
+            q8[d] = int8_t(sycl::rint(sycl::clamp(qc[d] * qi, -127.0f, 127.0f)));
+            rmax = sycl::fmax(rmax, sycl::fabs(qc[d] - float(q8[d]) * qs));
+          }
+          rmax = sycl::reduce_over_group(item.get_group(), rmax, sycl::maximum<float>());
+          const float rs = rmax / 127.0f, ri = rs > 0.0f ? 1.0f / rs : 0.0f;
+          for (int d = lid; d < dim; d += wg) {
+            qr8[d] = int8_t(sycl::rint(sycl::clamp((qc[d] - float(q8[d]) * qs) * ri,
+                                                -127.0f, 127.0f)));
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          auto sg = item.get_sub_group();
+          const int t0 = int(sg.get_group_linear_id()) * sg_size;
+          float score = -1e30f;
+          // One SG8 owns one N8 chunk and a distinct result slice. A short
+          // chunk uses scalar QK so matrix loads never cross the live KV end.
+          if (t0 + sg_size <= len) {
+            joint_matrix<sycl::sub_group, int8_t, use::a, 1, bk, layout::row_major> a;
+            joint_matrix<sycl::sub_group, int8_t, use::b, bk, sg_size, layout::col_major> b;
+            joint_matrix<sycl::sub_group, int32_t, use::accumulator, 1, sg_size> base, resid;
+            joint_matrix_fill(sg, base, int32_t(0));
+            joint_matrix_fill(sg, resid, int32_t(0));
+            const int8_t *kt = k + (cache_base + tail_start + tile_start + t0) * dim;
+            for (int d = 0; d < dim; d += bk) {
+              joint_matrix_load(sg, b, sycl::address_space_cast<
+                  sycl::access::address_space::global_space, sycl::access::decorated::no>(kt + d), dim);
+              joint_matrix_load(sg, a, q8.get_multi_ptr<sycl::access::decorated::no>() + d, dim);
+              joint_matrix_mad(sg, base, a, b, base);
+              joint_matrix_load(sg, a, qr8.get_multi_ptr<sycl::access::decorated::no>() + d, dim);
+              joint_matrix_mad(sg, resid, a, b, resid);
+            }
+            auto dp = dots.get_multi_ptr<sycl::access::decorated::no>();
+            joint_matrix_store(sg, base, dp + t0, sg_size, layout::row_major);
+            joint_matrix_store(sg, resid, dp + tile + t0, sg_size, layout::row_major);
+            sycl::group_barrier(sg);
+            score = (float(dots[lid]) * qs + float(dots[tile + lid]) * rs) *
+                ks[cache_base + tail_start + tile_start + lid] * (1.0f / 16.0f);
+          } else if (lid < len) {
+            const size_t row = cache_base + tail_start + tile_start + lid;
+            score = 0.0f;
+            for (int d = 0; d < dim; ++d) score += qc[d] * (float(k[row * dim + d]) * ks[row]);
+            score *= 1.0f / 16.0f;
+          }
+          logits[lid] = score;
+          const float tile_max = sycl::reduce_over_group(item.get_group(), score, sycl::maximum<float>());
+          if (lid == 0) stats[0] = tile_max;
+          item.barrier(sycl::access::fence_space::local_space);
+          const float p = lid < len ? sycl::native::exp(logits[lid] - stats[0]) : 0.0f;
+          logits[lid] = p;
+          const float tile_sum = sycl::reduce_over_group(item.get_group(), p, sycl::plus<float>());
+          if (lid == 0) {
+            partial[0] = tile_max;
+            partial[1] = tile_sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          float lo = 0.0f, hi = 0.0f;
+          for (int t = 0; t < len; ++t) {
+            const size_t row = cache_base + tail_start + tile_start + t;
+            const float s = vs[row], prob = logits[t];
+            lo += prob * (float(v[row * dim + lid]) * s);
+            hi += prob * (float(v[row * dim + lid + wg]) * s);
+          }
+          partial[kDecodeExact256PartialAccOffset + lid] = lo;
+          partial[kDecodeExact256PartialAccOffset + lid + wg] = hi;
+        });
+  });
+}
+
+template <int Quantized, bool Dpas = false>
 void attention_decode_exact_head256_partial_merge_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
@@ -347,6 +468,11 @@ void attention_decode_exact_head256_partial_merge_impl(
   const bool kv_i8_vec = kv_int8_vector_reads();
 
   // Phase 1: compute per-tile exact softmax stats and exp-weighted V partials.
+  if constexpr (Dpas) {
+    attention_decode_int8_dpas_partials(ctx, q_ptr, static_cast<const int8_t *>(k_ptr),
+        static_cast<const int8_t *>(v_ptr), k_scale, v_scale, partials_ptr,
+        num_heads, heads_per_kv, max_seq_len, max_tiles, tail_start, effective_len);
+  } else {
   ctx.queue().submit([&](sycl::handler &cgh) {
     sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
     sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
@@ -554,6 +680,8 @@ void attention_decode_exact_head256_partial_merge_impl(
         });
   });
 
+  }
+
   // Phase 2: merge per-tile statistics and partial outputs exactly.
   ctx.queue().submit([&](sycl::handler &cgh) {
     sycl::local_accessor<float, 1> tile_factors(sycl::range<1>(num_tiles), cgh);
@@ -630,7 +758,13 @@ void attention_decode_exact_head256_partial_merge(
         tail_start, sink_len, effective_len, gate_ptr, active_indices,
         active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
   };
-  if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
+  if (fmt == kKvFmtInt8 && !active_indices && !active_blocks && sink_len == 0 &&
+      kv_int8_dpas_enabled(ctx.queue().get_device())) {
+    attention_decode_exact_head256_partial_merge_impl<kKvFmtInt8, true>(
+        ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+        tail_start, sink_len, effective_len, gate_ptr, active_indices,
+        active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+  } else if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
   else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
   else run(std::integral_constant<int, kKvFmtBf16>{});
 }

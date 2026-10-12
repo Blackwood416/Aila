@@ -787,6 +787,10 @@ add_test(NAME AilaQwen4ExpToleranceTests COMMAND AilaQwen4ExpToleranceTests)
 set_tests_properties(AilaQwen4ExpToleranceTests PROPERTIES LABELS "gpu;models;qwen4_exp;tolerance" TIMEOUT 60)
 add_test(NAME AilaQwen4ExpDpasSmoke COMMAND AilaQwen4ExpToleranceTests --dpas-smoke)
 set_tests_properties(AilaQwen4ExpDpasSmoke PROPERTIES LABELS "gpu;models;qwen4_exp;dpas" TIMEOUT 30)
+add_test(NAME AilaQwen4ExpInt8DpasAttention COMMAND AilaQwen4ExpKernelTests --kv-int8-dpas-only)
+set_tests_properties(AilaQwen4ExpInt8DpasAttention PROPERTIES
+    LABELS "gpu;ops;qwen4_exp;dpas" TIMEOUT 60
+    ENVIRONMENT "AILA_KV_QUANT_DPAS=1;AILA_ATTN_DECODE_WINDOW=0;AILA_ATTN_DECODE_SINK=0")
 add_test(NAME AilaQwen4ExpGroupedXmxTests COMMAND AilaQwen4ExpToleranceTests --grouped-kernel)
 set_tests_properties(AilaQwen4ExpGroupedXmxTests PROPERTIES LABELS "gpu;ops;qwen4_exp" TIMEOUT 60)
 
