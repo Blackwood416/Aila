@@ -9,6 +9,7 @@
 #include "models/Qwen35HybridTextBackend.hpp"
 #include "models/Qwen4ExpBnb4Backend.hpp"
 #include "models/Qwen4ExpMtpRuntime.hpp"
+#include "models/Qwen4ExpStateDigest.hpp"
 #include "ops/GreedyOps.hpp"
 #include "ops/Ops.hpp"
 #include "profile/Profiling.hpp"
@@ -201,7 +202,10 @@ public:
             if (!model->mtp || !mtpState->valid || mtpState->length != cache->CurrentLength() ||
                 cache->CurrentLength() < 1 || cache->CurrentLength() + 2 > Capacity()) return std::nullopt;
             try {
-                return model->mtp->ForwardWindow(*cache, *mtpState, pending, selector);
+                LogSessionBoundary(device.context, "win-pre", 2, -1, pending);
+                auto window = model->mtp->ForwardWindow(*cache, *mtpState, pending, selector);
+                LogSessionBoundary(device.context, "win-post", 2, -1, window.tokenId);
+                return window;
             } catch (const std::exception& error) {
                 device.RecordFaultNoThrow(error.what()); device.DrainNoThrow();
                 throw Error(ErrorCode::RuntimeFault, device.FaultMessage());
@@ -261,6 +265,50 @@ public:
     }
 
 private:
+    // B4-6 opt-in boundary dump: fingerprints the live session state (and the
+    // MTP draft when one is loaded) so a T1 run and an MTP run can be compared
+    // through the worker log. Purely diagnostic: inert unless
+    // AILA_Q4E_MTP_BOUNDARY_DUMP is set, and it never touches device state.
+    void LogSessionBoundary(Context& context, const char* phase, int count,
+                            int prefillRemaining, int sampledToken) {
+        static const bool enabled = aila::env::read_flag("AILA_Q4E_MTP_BOUNDARY_DUMP", false);
+        if (!enabled) return;
+        if constexpr (!std::is_same_v<Backend, Qwen4ExpBnb4Backend>) return;
+        else {
+            const int position = cache->CurrentLength();
+            const auto digest = aila::q4ediag::DigestSession(context, *cache);
+            std::string draft = "none";
+            if (model->mtp && mtpState)
+                draft = aila::q4ediag::DescribeMtpState(context, *mtpState, position);
+            uint64_t slots = 0, routeQueries = 0, hits = 0, misses = 0;
+            const auto& adaptive = ModelBackend().adaptive_cache();
+            if (adaptive.IsAllocated()) {
+                slots = aila::q4ediag::DigestBytes(1469598103934665603ull, adaptive.HostSlotTable(),
+                    size_t(adaptive.NumLayers()) * size_t(adaptive.NumExpertsPerLayer()) * sizeof(int32_t));
+                const auto& stats = adaptive.Stats();
+                routeQueries = stats.route_queries;
+                hits = stats.cache_hits;
+                misses = stats.cache_misses;
+            }
+            const std::string sessionText = aila::q4ediag::DescribeSession(digest);
+            AILA_LOG_INFO("[Q4E BND] phase=%s pos=%d n=%d rem=%d mtp=%d mtpLen=%d mtpValid=%d next=%d "
+                          "slots=%s rq=%llu hits=%llu miss=%llu draft=%s %s",
+                phase, position, count, prefillRemaining, model->mtp ? 1 : 0,
+                mtpState ? mtpState->length : -1, (mtpState && mtpState->valid) ? 1 : 0, sampledToken,
+                aila::q4ediag::Hex(slots).c_str(),
+                static_cast<unsigned long long>(routeQueries),
+                static_cast<unsigned long long>(hits),
+                static_cast<unsigned long long>(misses),
+                draft.c_str(), sessionText.c_str());
+            // Per-layer hashes need their own lines: a single AILA_LOG_INFO
+            // message is truncated near 1 KiB.
+            AILA_LOG_INFO("[Q4E BNDL] phase=%s pos=%d layer=kv %s", phase, position,
+                          aila::q4ediag::DescribeLayerList(digest.kvLayers).c_str());
+            AILA_LOG_INFO("[Q4E BNDL] phase=%s pos=%d layer=gdn %s", phase, position,
+                          aila::q4ediag::DescribeLayerList(digest.gdnLayers).c_str());
+        }
+    }
+
     ExecutionResult ForwardImpl(const std::vector<int>& tokenIds,
                                 const SamplingInput* sampling,
                                 bool captureLogits,
@@ -283,6 +331,7 @@ private:
         fields.phase = tokenIds.size() == 1 ? ExecutionPhase::Decode : ExecutionPhase::Prefill;
         ExecutionScope stage(device.trace.get(), ExecutionStage::Forward, fields);
         try {
+            LogSessionBoundary(context, "pre", static_cast<int>(tokenIds.size()), prefillRemaining, -1);
             slot.Ensure(context, tokenIds.size());
             context.memcpy_h2d_async(slot.tokenIds.data(), tokenIds.data(),
                                      tokenIds.size() * sizeof(int));
@@ -332,6 +381,8 @@ private:
             // No device work may still refer to borrowed input or mutable
             // bindings when the caller destroys/switches the session.
             context.synchronize();
+            LogSessionBoundary(context, "post", static_cast<int>(tokenIds.size()), prefillRemaining,
+                               result.tokenId);
             if (workSummary) {
                 const auto end = WorkClock::now();
                 const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b-a).count(); };
