@@ -11,6 +11,7 @@
 #include <trantor/net/TcpConnection.h>
 #include <algorithm>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -28,6 +29,17 @@ namespace aila::server {
 namespace {
 
 namespace host = runtime;
+
+// P1 prefix-reuse diagnostics (AILA_SERVER_PREFIX_DIAG=1). The server runs at
+// Warning level, so the lines are emitted as warnings; they never change the
+// reuse decision itself.
+bool prefix_diag_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("AILA_SERVER_PREFIX_DIAG");
+        return value && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
 namespace wire = ipc::v2;
 using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
@@ -258,6 +270,27 @@ public:
                 selected = i; longest = tokens.size();
             }
         }
+        if (prefix_diag_enabled()) {
+            // Report why each cached session did or did not qualify: the first
+            // divergence index is what the agent-side re-render has to explain.
+            for (size_t i = 0; i < cachedSessions.size(); ++i) {
+                const auto& tokens = cachedSessions[i].tokens;
+                const size_t common = std::min(tokens.size(), prompt.size());
+                size_t diverge = common;
+                for (size_t k = 0; k < common; ++k) {
+                    if (tokens[k] != prompt[k]) { diverge = k; break; }
+                }
+                const bool qualifies = tokens.size() > 0 && tokens.size() < prompt.size() &&
+                                       diverge == tokens.size();
+                AILA_LOG_WARN("[PfxDiag] take slot=%zu cached_len=%zu prompt_len=%zu "
+                              "diverge_at=%zu qualifying=%d cached_tok=%lld prompt_tok=%lld",
+                    i, tokens.size(), prompt.size(), diverge, qualifies ? 1 : 0,
+                    diverge < tokens.size() ? (long long)tokens[diverge] : -1,
+                    diverge < prompt.size() ? (long long)prompt[diverge] : -1);
+            }
+            AILA_LOG_WARN("[PfxDiag] take prompt_len=%zu idle=%zu selected_slot=%zu selected_len=%zu",
+                prompt.size(), cachedSessions.size(), selected, longest);
+        }
         auto result = std::move(cachedSessions[selected]);
         cachedSessions.erase(cachedSessions.begin() + selected);
         if (!longest) result.tokens.clear(); // Caller resets before reusing storage.
@@ -266,7 +299,13 @@ public:
 
     void KeepSession(CachedSession value) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (options.reuseSessions && !stopping.load() && cachedSessions.size() < options.maxSessions)
+        const bool keep = options.reuseSessions && !stopping.load() &&
+                          cachedSessions.size() < options.maxSessions;
+        if (prefix_diag_enabled()) {
+            AILA_LOG_WARN("[PfxDiag] keep tokens=%zu idle_before=%zu max_sessions=%u stored=%d",
+                value.tokens.size(), cachedSessions.size(), options.maxSessions, keep ? 1 : 0);
+        }
+        if (keep)
             cachedSessions.push_back(std::move(value));
     }
 
@@ -856,7 +895,15 @@ void RequestRun::Execute() noexcept {
             !cancelled.load() && !ioFailed.load()) {
             try {
                 const auto state = session->Query(2s);
-                if (!state.busy && state.contextLength && *state.contextLength == completedTokens.size())
+                const bool keep = !state.busy && state.contextLength &&
+                                  *state.contextLength == completedTokens.size();
+                if (prefix_diag_enabled()) {
+                    AILA_LOG_WARN("[PfxDiag] release busy=%d ctx_len=%lld completed=%zu keep=%d",
+                        state.busy ? 1 : 0,
+                        state.contextLength ? (long long)*state.contextLength : -1LL,
+                        completedTokens.size(), keep ? 1 : 0);
+                }
+                if (keep)
                     service->KeepSession({std::move(session), std::move(completedTokens)});
             } catch (...) { /* A cache miss does not invalidate generated output. */ }
         }
