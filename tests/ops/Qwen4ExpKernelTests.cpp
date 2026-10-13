@@ -4598,6 +4598,72 @@ void test_queue_overlap_probe(Context& ctx, bool json_output = false) {
     ctx.free_device(sink);
 }
 
+// Strata C3 screen: time the production decode gate/up GEMV at the real
+// per-token shape (10 experts) with and without the split activation load
+// (AILA_Q4E_DECODE_XSPLIT). Bit-identical math; two processes, one flag.
+void test_decode_gate_up_bench(Context& ctx) {
+    constexpr int in_features = 2560;
+    constexpr int intermediate = 640;
+    constexpr int blocksize = 64;
+    constexpr int experts = 10;
+    const int packed_bytes = 2 * intermediate * (in_features / 2);
+    const int absmax_count = 2 * intermediate * (in_features / blocksize);
+
+    std::mt19937 rng(777);
+    std::uniform_int_distribution<int> u8_dist(0, 255);
+    std::uniform_real_distribution<float> f_dist(0.01f, 0.5f);
+    std::vector<bf16> x_host(in_features);
+    std::uniform_real_distribution<float> in_dist(-0.2f, 0.2f);
+    for (auto& v : x_host) v = bf16(in_dist(rng));
+    Tensor x_dev = Tensor::allocate(ctx, {in_features}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(x_dev.data(), x_host.data(), x_host.size() * sizeof(bf16));
+
+    std::vector<Tensor> packed_dev, absmax_dev;
+    std::vector<ops::MoeExpertSlotDev> slots(experts);
+    std::vector<uint8_t> packed_host(packed_bytes);
+    std::vector<float> absmax_host(absmax_count);
+    for (int e = 0; e < experts; ++e) {
+        for (auto& v : packed_host) v = static_cast<uint8_t>(u8_dist(rng));
+        for (auto& v : absmax_host) v = f_dist(rng);
+        packed_dev.push_back(Tensor::allocate(ctx, {packed_bytes}, dnnl::memory::data_type::u8));
+        absmax_dev.push_back(Tensor::allocate(ctx, {absmax_count}, dnnl::memory::data_type::f32));
+        ctx.memcpy_h2d(packed_dev.back().data(), packed_host.data(), packed_bytes);
+        ctx.memcpy_h2d(absmax_dev.back().data(), absmax_host.data(),
+                       absmax_count * sizeof(float));
+        slots[e].gate_up_packed = static_cast<const uint8_t*>(packed_dev.back().data());
+        slots[e].gate_up_absmax = static_cast<const float*>(absmax_dev.back().data());
+    }
+    auto* slots_dev = static_cast<ops::MoeExpertSlotDev*>(
+        ctx.alloc_device(experts * sizeof(ops::MoeExpertSlotDev)));
+    ctx.memcpy_h2d(slots_dev, slots.data(), experts * sizeof(ops::MoeExpertSlotDev));
+    Tensor h_dev = Tensor::allocate(ctx, {experts * intermediate}, dnnl::memory::data_type::bf16);
+
+    auto run = [&]() {
+        return ops::moe_decode_gate_up_swiglu_grouped(
+            ctx, slots_dev, nullptr, static_cast<const bf16*>(x_dev.data()),
+            static_cast<bf16*>(h_dev.data()), experts, in_features, intermediate, blocksize);
+    };
+    for (int i = 0; i < 5; ++i) run();
+    ctx.synchronize();
+    constexpr int iters = 200;
+    std::vector<double> samples;
+    for (int r = 0; r < 3; ++r) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) run();
+        ctx.synchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count() / iters);
+    }
+    std::sort(samples.begin(), samples.end());
+    const bool xsplit = aila::env::read_flag("AILA_Q4E_DECODE_XSPLIT", false);
+    std::cout << "  [decode-gu-bench] experts=" << experts << " iters=" << iters
+              << " xsplit=" << int(xsplit)
+              << " median_ms=" << samples[1]
+              << " rounds=" << samples[0] << "/" << samples[1] << "/" << samples[2]
+              << " rows=" << (experts * intermediate) << "\n";
+    ctx.free_device(slots_dev);
+}
+
 void test_direct_prefill_io(Context& ctx) {
     constexpr int dim = 2560;
     constexpr int block = 64;
@@ -4879,6 +4945,13 @@ int main(int argc, char** argv) {
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("Queue overlap probe teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--decode-gu-bench") {
+            test_decode_gate_up_bench(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Decode GU bench teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-int8-dpas-only") {

@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | C1 | prefill 双制度暂存 + stream-ahead | **完成** | **NO-GO**：transfer 与流式 compute 在 memory path 上相加，不可藏；并行 fill/直拷大页均不改变 chunk wall | [C1 报告](qwen38-strata-c1-prefill-staging-screen-2026-10-13.md) |
 | C2 | copy-only 队列（blitter engine） | **完成** | **NO-GO**：UR copy-engine 已默认启用且 ALU 负载下重叠（4.0 vs 7.1 ms），但内存型负载下相加（6.70 vs 7.16）；2026.1 无 L0 头/库；Strata 自家 A750 仅 +1.4% 且有挂死 | [C2 报告](qwen38-strata-c2-copy-queue-screen-2026-10-13.md) |
-| C3 | 16B 对齐装载（`load16_a2`） | 未开始 | — | — |
+| C3 | 16B 对齐装载（`load16_a2`） | **完成** | **NO-GO**：权重布局本就 16B 对齐（行 1280/320 B、块 32 B、scale 独立数组）；唯一错位的激活 16B 装载拆成 2×8B 后 −0.5%（噪声内），内核非装载宽度受限（68 GB/s ≪ 500） | [C3 报告](qwen38-strata-c3-aligned-loads-screen-2026-10-13.md) |
 | C4 | 路由画像工具链（mix + 留一 + 回存） | **完成** | **NO-GO（增量）**：导出/回存/留一已在 P3；多源 mix 仅 +1.1pp（门 3pp）。oracle 覆盖 62.74% vs agent6k 53.06%，剩余 headroom 是实例特异 | [C4 报告](qwen38-strata-c4-profile-mix-screen-2026-10-13.md) |
 | C5 | adaptive 异步/重叠 + 交换旋转 | 未开始 | — | — |
 | C6 | verify 窗口 route tail skip | 未开始 | — | — |
