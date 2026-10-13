@@ -7,7 +7,7 @@
 | # | 候选 | 状态 | 结论 | 证据 |
 |---|---|---|---|---|
 | C1 | prefill 双制度暂存 + stream-ahead | **完成** | **NO-GO**：transfer 与流式 compute 在 memory path 上相加，不可藏；并行 fill/直拷大页均不改变 chunk wall | [C1 报告](qwen38-strata-c1-prefill-staging-screen-2026-10-13.md) |
-| C2 | copy-only 队列（blitter engine） | 进行中 | 探针实现中（DG2 是否暴露 copy-only 组 + ordinal-1 队列下内存型负载是否仍重叠） | — |
+| C2 | copy-only 队列（blitter engine） | **完成** | **NO-GO**：UR copy-engine 已默认启用且 ALU 负载下重叠（4.0 vs 7.1 ms），但内存型负载下相加（6.70 vs 7.16）；2026.1 无 L0 头/库；Strata 自家 A750 仅 +1.4% 且有挂死 | [C2 报告](qwen38-strata-c2-copy-queue-screen-2026-10-13.md) |
 | C3 | 16B 对齐装载（`load16_a2`） | 未开始 | — | — |
 | C4 | 路由画像工具链（mix + 留一 + 回存） | 未开始 | — | — |
 | C5 | adaptive 异步/重叠 + 交换旋转 | 未开始 | — | — |
