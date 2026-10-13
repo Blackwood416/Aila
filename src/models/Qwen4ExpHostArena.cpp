@@ -2,6 +2,7 @@
 #include "memory/LargePages.hpp"
 #include "utils/EnvUtils.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -43,6 +44,7 @@ bool Qwen4ExpHostArena::Allocate(sycl::queue& q, const HostArenaConfig& cfg, std
 }
 bool Qwen4ExpHostArena::AllocateStorage(const HostArenaConfig& cfg,
                                        const std::vector<uint8_t*>& gpu_owners, std::string* error) {
+    std::string failure_detail;
     try {
         config_=cfg;
         if (cfg.num_layers<=0 || cfg.num_experts_per_layer<=0 || cfg.hidden_size<=0 ||
@@ -75,9 +77,38 @@ bool Qwen4ExpHostArena::AllocateStorage(const HostArenaConfig& cfg,
         for (size_t n=0;n<resident_experts_;) {
             const size_t count=std::min(per_chunk,resident_experts_-n);
             const size_t bytes=memory::LargePageAllocationSize(count*geom_.slot_bytes);
-            auto* ptr=static_cast<uint8_t*>(
-                ctx_ ? (pinned_arena ? ctx_->alloc_host(bytes) : ctx_->alloc_large_host(bytes))
-                     : memory::AllocateLargePages(bytes));
+            uint8_t* ptr=nullptr;
+            try {
+                ptr=static_cast<uint8_t*>(
+                    ctx_ ? (pinned_arena ? ctx_->alloc_host(bytes) : ctx_->alloc_large_host(bytes))
+                         : memory::AllocateLargePages(bytes));
+            } catch (const std::exception& e) {
+                // Fatal startup path: bypass the deferred log buffer so the
+                // numbers survive an early exit, and keep them in the error
+                // string the caller reports.
+                unsigned long long avail_mb=0,total_mb=0;
+#ifdef _WIN32
+                MEMORYSTATUSEX status{};
+                status.dwLength=sizeof(status);
+                if(GlobalMemoryStatusEx(&status)) {
+                    avail_mb=status.ullAvailPhys>>20; total_mb=status.ullTotalPhys>>20;
+                }
+#endif
+                char detail[512];
+                std::snprintf(detail,sizeof(detail),
+                    "chunks=%zu allocated=%.1f MiB chunk_bytes=%zu per_chunk=%zu "
+                    "count=%zu bytes=%.1f MiB resident_experts=%zu host_avail=%.0f MiB "
+                    "host_total=%.0f MiB pinned=%d err=%s",
+                    chunks_.size(),double(allocated_bytes_)/1048576.0,cfg.chunk_bytes,per_chunk,
+                    count,double(bytes)/1048576.0,resident_experts_,double(avail_mb),
+                    double(total_mb),pinned_arena?1:0,e.what());
+                failure_detail=detail;
+                std::fprintf(stderr,"[Q4E Arena] allocation failed: %s\n",detail);
+                std::fflush(stderr);
+                if (error) *error=std::string("Qwen4Exp host arena allocation failed: ")+detail;
+                Release();
+                return false;
+            }
             chunks_.push_back(ptr); chunk_sizes_.push_back(count);
             allocated_bytes_+=bytes; n+=count;
         }
@@ -92,7 +123,9 @@ bool Qwen4ExpHostArena::AllocateStorage(const HostArenaConfig& cfg,
         layer_nested_.resize(cfg.num_layers);
         return true;
     } catch (const std::exception& e) {
-        if (error) *error=e.what();
+        if (error) *error = failure_detail.empty()
+            ? std::string(e.what())
+            : std::string(e.what()) + " (" + failure_detail + ")";
         Release(); return false;
     }
 }

@@ -669,6 +669,12 @@ bool Qwen4ExpBnb4Backend::load(
     // driving a display, ~1 GB free after warmup already slowed every kernel ~2x (WDDM paging);
     // ~2 GB free did not.
     size_t expert_cache_bytes = 0;
+    // Keep the admission accounting on the same KV layout the session builder
+    // allocates: bf16, or the opt-in int8 codes plus the two per-token F32
+    // scale tensors. A single source lives in SessionMemory.
+    const bool int8_kv = aila::env::read_flag("AILA_KV_QUANT", false) &&
+                         aila::env::kv_quant_format_is_int8();
+    const size_t kv_element_bytes = int8_kv ? 1 : sizeof(bf16);
     const int expert_cache_mb = aila::env::read_int("AILA_Q4E_EXPERT_CACHE_MB", 0);
     if (expert_cache_mb > 0) {
         expert_cache_bytes = static_cast<size_t>(expert_cache_mb) << 20;
@@ -678,12 +684,14 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t full_layers = static_cast<size_t>(
             std::count_if(layers_.begin(), layers_.end(), [](const Qwen4ExpLayer& l) { return !l.is_linear; }));
         const size_t linear_layers = layers_.size() - full_layers;
-        const size_t kv_bytes = full_layers * 2 * cfg_.num_key_value_heads * cfg_.head_dim * sizeof(bf16) *
-                                static_cast<size_t>(max_seq_len_);
+        const auto kv_layout = aila::memory::qwen4exp_kv_bytes(
+            cfg_, static_cast<size_t>(max_seq_len_), kv_element_bytes);
+        const size_t kv_bytes = kv_layout.kv;
+        const size_t kv_scale_bytes = kv_layout.scales;
         const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
         const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
-        const size_t total_session_state = kv_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
+        const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20;
         const size_t reserve = max_reserve + total_session_state;
@@ -693,12 +701,14 @@ bool Qwen4ExpBnb4Backend::load(
 
         AILA_LOG_INFO(
             "[Qwen4Exp] Memory Admission Accounting: Total VRAM=%.0f MB, Static Weights=%.1f MB, "
-            "Session State=%.1f MB (KV=%.1f MB, IndexerK=%.1f MB, IndexerCompressedK=%.1f MB, Recurrent=%.1f MB), "
-            "Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
+            "Session State=%.1f MB (KV=%.1f MB element_bytes=%zu kv_scales=%.1f MB, IndexerK=%.1f MB, "
+            "IndexerCompressedK=%.1f MB, Recurrent=%.1f MB), Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
             vram / (1024.0 * 1024.0),
             ctx.current_allocated_bytes() / (1024.0 * 1024.0),
             total_session_state / (1024.0 * 1024.0),
             kv_bytes / (1024.0 * 1024.0),
+            kv_element_bytes,
+            kv_scale_bytes / (1024.0 * 1024.0),
             indexer_k_bytes / (1024.0 * 1024.0),
             indexer_compressed_k_bytes / (1024.0 * 1024.0),
             recurrent_bytes / (1024.0 * 1024.0),
@@ -726,7 +736,9 @@ bool Qwen4ExpBnb4Backend::load(
     // The hard cap only guards against pathological budgets; raise it when a
     // smaller KV layout (AILA_KV_QUANT_FORMAT=int8) frees device bytes.
     const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", 2800);
-    cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-32);
+    // Reserve the staging banks by their configured depth (2 buffers).
+    const int staging_reserve_slots = 2 * cache_cfg.staging_slots_per_buffer;
+    cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-staging_reserve_slots);
     if (cache_cfg.num_gpu_slots<=0) {
         if (error_message) *error_message="Qwen4Exp resident cache exceeds the admitted VRAM budget";
         return false;
@@ -769,8 +781,10 @@ bool Qwen4ExpBnb4Backend::load(
             const int key=policy.ranking[i];
             initial_ranked_profile.emplace_back(key/cfg_.num_experts,key%cfg_.num_experts);
         }
-        AILA_LOG_INFO("[Q4E Adaptive Residency] profile=%s identity=%s ranked_keys=%zu resident_slots=%d",
-            hotset_profile_path.c_str(),identity.c_str(),initial_ranked_profile.size(),cache_cfg.num_gpu_slots);
+        AILA_LOG_INFO("[Q4E Adaptive Residency] profile=%s identity=%s profile_total_keys=%zu "
+                      "ranked_keys=%zu admitted_slots=%d kv_element_bytes=%zu",
+            hotset_profile_path.c_str(),identity.c_str(),policy.ranking.size(),
+            initial_ranked_profile.size(),cache_cfg.num_gpu_slots,kv_element_bytes);
     }
     if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
     auto gpu_owners=adaptive_cache_.InitializeResidency(

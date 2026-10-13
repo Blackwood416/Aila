@@ -91,6 +91,41 @@ inline SessionMemoryReservation qwen35_session_memory(
 //
 // Device payload mirrors the per-session tensors: Full K/V plus QSA indexer
 // and 4:1 compressed indexer keys (BF16), the DeltaNet recurrent matrix and
+// Qwen4Exp always alternates three linear layers then one full-attention layer;
+// the session builder hardcodes that interval.
+inline constexpr size_t kQwen4ExpFullAttentionInterval = 4;
+
+// Device bytes of the full-attention KV caches for one session. Single source
+// for the session reservation and the backend expert-cache admission: the int8
+// layout halves K/V and adds one F32 per-token scale for K and for V.
+struct Qwen4ExpKvBytes {
+    size_t kv = 0;
+    size_t scales = 0;
+    size_t total() const { return checked_memory_sum(kv, scales); }
+};
+
+inline Qwen4ExpKvBytes qwen4exp_kv_bytes(
+    const Qwen4ExpTextConfig& config, size_t capacity, size_t kvElementBytes) {
+    if (kvElementBytes != 1 && kvElementBytes != 2)
+        throw std::invalid_argument("Qwen4Exp KV element width must be 1 or 2 bytes");
+    const size_t layers = positive_memory_dimension(config.num_hidden_layers);
+    const size_t fullLayers = layers / kQwen4ExpFullAttentionInterval;
+    const auto kvHeads = positive_memory_dimension(config.num_key_value_heads);
+    const auto headDim = positive_memory_dimension(config.head_dim);
+    positive_memory_dimension(capacity);
+    Qwen4ExpKvBytes bytes;
+    bytes.kv = checked_memory_product(
+        checked_memory_product(size_t{2} * kvElementBytes,
+                               checked_memory_product(kvHeads, headDim)),
+        checked_memory_product(capacity, fullLayers));
+    if (kvElementBytes == 1) {
+        bytes.scales = checked_memory_product(
+            checked_memory_product(size_t{2} * sizeof(float), kvHeads),
+            checked_memory_product(capacity, fullLayers));
+    }
+    return bytes;
+}
+
 // convolution history (F32), and the PLE convolution state (F32). The host
 // payload is the persistent DeltaNet mirror plus retained snapshots; the PLE
 // convolution state is device-only but every snapshot keeps a float copy.
@@ -131,7 +166,7 @@ inline SessionMemoryReservation qwen4exp_session_memory(
             }
         }
     }
-    const size_t fullLayers = layers / kIndexerCompressRatio;
+    const size_t fullLayers = layers / kQwen4ExpFullAttentionInterval;
     const size_t linearLayers = layers - fullLayers;
 
     const auto kvHeads = positive_memory_dimension(config.num_key_value_heads);
@@ -140,15 +175,7 @@ inline SessionMemoryReservation qwen4exp_session_memory(
 
     // K and V, each `kvElementBytes` wide. The int8 layout also allocates a
     // per-token F32 scale for K and for V ({kvHeads, capacity} each).
-    size_t fullBytes = checked_memory_product(size_t{2}, kvElementBytes);
-    fullBytes = checked_memory_product(fullBytes, checked_memory_product(kvHeads, headDim));
-    fullBytes = checked_memory_product(fullBytes, checked_memory_product(cached, fullLayers));
-    if (kvElementBytes == 1) {
-        const size_t scaleBytes = checked_memory_product(
-            checked_memory_product(size_t{2} * sizeof(float), kvHeads), cached);
-        fullBytes = checked_memory_sum(
-            fullBytes, checked_memory_product(scaleBytes, fullLayers));
-    }
+    const size_t fullBytes = qwen4exp_kv_bytes(config, cached, kvElementBytes).total();
 
     const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
     size_t indexerBytes = checked_memory_product(
