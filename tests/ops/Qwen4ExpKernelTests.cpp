@@ -4363,6 +4363,224 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
     std::cout << "======================================================================\n\n";
 }
 
+// Strata C1/C2 screening: can an H2D staging-style memcpy submitted to a
+// separate in-order "copy" queue overlap a compute kernel running on the main
+// queue on this device/driver? If the two serialize, no amount of prefill
+// stream-ahead can hide the staging DMA and the fix has to change where the
+// copies execute (copy-only queue / engine).
+void test_queue_overlap_probe(Context& ctx) {
+    constexpr size_t kCopyBytes = 32ull << 20; // ~one 16-expert staging batch
+    constexpr int kRounds = 16;
+    constexpr int kBurnItems = 1 << 18;
+    constexpr int kBurnIters = 8192;
+
+    void* dev = ctx.alloc_device(kCopyBytes);
+    void* host = ctx.alloc_host(kCopyBytes);
+    std::memset(host, 0x5A, kCopyBytes);
+    float* sink = static_cast<float*>(ctx.alloc_device(4 * sizeof(float)));
+    sycl::queue copy_q(ctx.queue().get_context(), ctx.queue().get_device(),
+                       sycl::property_list{sycl::property::queue::in_order()});
+
+    auto burn_with_dep = [&](const sycl::event& dep) {
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (dep != sycl::event{}) cgh.depends_on(dep);
+            cgh.parallel_for(sycl::nd_range<1>(kBurnItems, 256),
+                             [=](sycl::nd_item<1> item) {
+                                 const int gid = static_cast<int>(item.get_global_id(0));
+                                 const float base = float(gid & 255) * 1e-3f;
+                                 float a0 = base;
+                                 float a1 = base + 1.0f;
+                                 float a2 = base + 2.0f;
+                                 float a3 = base + 3.0f;
+                                 float b0 = base + 4.0f;
+                                 float b1 = base + 5.0f;
+                                 float b2 = base + 6.0f;
+                                 float b3 = base + 7.0f;
+                                 for (int i = 0; i < kBurnIters; ++i) {
+                                     a0 = sycl::fma(a0, 1.000001f, 1e-6f);
+                                     a1 = sycl::fma(a1, 1.000001f, 1e-6f);
+                                     a2 = sycl::fma(a2, 1.000001f, 1e-6f);
+                                     a3 = sycl::fma(a3, 1.000001f, 1e-6f);
+                                     b0 = sycl::fma(b0, 1.000001f, 1e-6f);
+                                     b1 = sycl::fma(b1, 1.000001f, 1e-6f);
+                                     b2 = sycl::fma(b2, 1.000001f, 1e-6f);
+                                     b3 = sycl::fma(b3, 1.000001f, 1e-6f);
+                                 }
+                                 const float v = a0 + a1 + a2 + a3 + b0 + b1 + b2 + b3;
+                                 if (v == 123456.789f) {
+                                     sink[gid & 3] = v;
+                                 }
+                             });
+        });
+    };
+    auto burn = [&]() { return burn_with_dep(sycl::event{}); };
+    auto copy = [&]() { return copy_q.submit([&](sycl::handler& cgh) {
+                            cgh.memcpy(dev, host, kCopyBytes);
+                        }); };
+    auto wall_ms = [](const std::chrono::high_resolution_clock::time_point& a,
+                      const std::chrono::high_resolution_clock::time_point& b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    for (int i = 0; i < 3; ++i) burn();          // warmup / JIT
+    copy(); copy_q.wait(); ctx.queue().wait();
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) burn();
+    ctx.queue().wait();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    const double burn_ms = wall_ms(t0, t1) / kRounds;
+
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) copy();
+    copy_q.wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double copy_ms = wall_ms(t0, t1) / kRounds;
+
+    // Dependent pipeline: kernel k waits for copy k, exactly like staging.
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        const sycl::event cp = copy();
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.depends_on(cp);
+            cgh.single_task([] {});
+        });
+        burn();
+    }
+    ctx.queue().wait(); copy_q.wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double dep_ms = wall_ms(t0, t1) / kRounds;
+
+    // Independent pipeline: no dependency between copy k and kernel k.
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        copy();
+        burn();
+    }
+    ctx.queue().wait(); copy_q.wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double indep_ms = wall_ms(t0, t1) / kRounds;
+
+    // Full two-bank ping-pong exactly like the staging pipeline: copy k waits
+    // for the previous consumer of its bank (compute k-2), compute k waits for
+    // copy k. This reverse dependency is what the real prefill inserts.
+    void* bank_dev[2] = {ctx.alloc_device(kCopyBytes), ctx.alloc_device(kCopyBytes)};
+    sycl::event bank_reader[2];
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        const int bank = i & 1;
+        const sycl::event reader = bank_reader[bank];
+        const sycl::event cp = copy_q.submit([&](sycl::handler& cgh) {
+            if (reader != sycl::event{}) cgh.depends_on(reader);
+            cgh.memcpy(bank_dev[bank], host, kCopyBytes);
+        });
+        bank_reader[bank] = burn_with_dep(cp);
+    }
+    ctx.queue().wait(); copy_q.wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double pingpong_ms = wall_ms(t0, t1) / kRounds;
+
+    // Memory-heavy compute variant: the real expert kernels stream the staged
+    // weights from VRAM, so screen whether the DMA stays hidden behind SM
+    // memory traffic (which a pure-ALU burn kernel cannot answer).
+    constexpr size_t kStreamBytes = 256ull << 20;
+    float* stream = static_cast<float*>(ctx.alloc_device(kStreamBytes));
+    const int64_t stream_elems = static_cast<int64_t>(kStreamBytes / sizeof(float));
+    constexpr int kStreamPasses = 6;
+    auto burn_mem_with_dep = [&](const sycl::event& dep) {
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (dep != sycl::event{}) cgh.depends_on(dep);
+            cgh.parallel_for(sycl::nd_range<1>(kBurnItems, 256),
+                             [=](sycl::nd_item<1> item) {
+                                 const int gid = static_cast<int>(item.get_global_id(0));
+                                 float acc = 0.0f;
+                                 for (int pass = 0; pass < kStreamPasses; ++pass) {
+                                     for (int64_t i = gid; i < stream_elems; i += kBurnItems) {
+                                         acc = sycl::fma(stream[i], 1.000001f, acc);
+                                     }
+                                 }
+                                 if (acc == 123456.789f) sink[gid & 3] = acc;
+                             });
+        });
+    };
+    for (int i = 0; i < 2; ++i) burn_mem_with_dep(sycl::event{}).wait();
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) burn_mem_with_dep(sycl::event{});
+    ctx.queue().wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double burn_mem_ms = wall_ms(t0, t1) / kRounds;
+    sycl::event mem_reader[2];
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        const int bank = i & 1;
+        const sycl::event reader = mem_reader[bank];
+        const sycl::event cp = copy_q.submit([&](sycl::handler& cgh) {
+            if (reader != sycl::event{}) cgh.depends_on(reader);
+            cgh.memcpy(bank_dev[bank], host, kCopyBytes);
+        });
+        mem_reader[bank] = burn_mem_with_dep(cp);
+    }
+    ctx.queue().wait(); copy_q.wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double pingpong_mem_ms = wall_ms(t0, t1) / kRounds;
+
+    std::cout << "  [queue-overlap-mem] burn_mem=" << burn_mem_ms
+              << " ms pingpong_mem=" << pingpong_mem_ms
+              << " ms (serial_sum=" << (burn_mem_ms + copy_ms)
+              << ", max=" << std::max(burn_mem_ms, copy_ms) << ")\n";
+
+    // Everything on the main in-order queue: the strictly serial reference.
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < kRounds; ++i) {
+        ctx.queue().memcpy(dev, host, kCopyBytes);
+        burn();
+    }
+    ctx.queue().wait();
+    t1 = std::chrono::high_resolution_clock::now();
+    const double same_ms = wall_ms(t0, t1) / kRounds;
+
+    std::cout << "  [queue-overlap] burn=" << burn_ms << " ms copy=" << copy_ms
+              << " ms dep=" << dep_ms << " ms pingpong=" << pingpong_ms
+              << " ms indep=" << indep_ms
+              << " ms same-queue=" << same_ms << " ms"
+              << " (serial_sum=" << (burn_ms + copy_ms) << ")\n";
+
+    // Source-type screen: can the staging H2D read straight from the large-page
+    // arena memory instead of the pinned bounce buffer (which costs a second
+    // full host copy per byte)?
+    auto time_copy_src = [&](void* src) {
+        copy_q.wait();
+        auto a = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < kRounds; ++i) {
+            copy_q.submit([&](sycl::handler& cgh) { cgh.memcpy(dev, src, kCopyBytes); });
+        }
+        copy_q.wait();
+        auto b = std::chrono::high_resolution_clock::now();
+        return wall_ms(a, b) / kRounds;
+    };
+    void* large = ctx.alloc_large_host(kCopyBytes);
+    std::memset(large, 0x3C, kCopyBytes);
+    const double pinned_ms = time_copy_src(host);
+    const double large_ms = time_copy_src(large);
+    void* dev_src = ctx.alloc_device(kCopyBytes);
+    const double d2d_ms = time_copy_src(dev_src);
+    std::cout << "  [stage-src] 32MiB H2D pinned=" << pinned_ms
+              << " ms (" << (kCopyBytes / (pinned_ms * 1e-3) / 1e9) << " GB/s)"
+              << " large-page=" << large_ms << " ms ("
+              << (kCopyBytes / (large_ms * 1e-3) / 1e9) << " GB/s)"
+              << " d2d=" << d2d_ms << " ms ("
+              << (kCopyBytes / (d2d_ms * 1e-3) / 1e9) << " GB/s)\n";
+
+    ctx.free_device(dev_src);
+    ctx.free_host(large);
+    ctx.free_device(stream);
+    ctx.free_device(bank_dev[1]);
+    ctx.free_device(bank_dev[0]);
+    ctx.free_device(dev);
+    ctx.free_host(host);
+    ctx.free_device(sink);
+}
+
 void test_direct_prefill_io(Context& ctx) {
     constexpr int dim = 2560;
     constexpr int block = 64;
@@ -4628,6 +4846,14 @@ int main(int argc, char** argv) {
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("DPAS probe teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--queue-overlap-probe") {
+            test_queue_overlap_probe(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Queue overlap probe teardown USM leak");
+            std::cout << "Queue overlap probe completed; teardown USM zero\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-int8-dpas-only") {
