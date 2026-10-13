@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
@@ -175,24 +176,49 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
     check(gu,geom_.gu_packed_bytes,geom_.gu_absmax_count);
     check(dn,geom_.dn_packed_bytes,geom_.dn_absmax_count);
     if (layer_nested_[layer].valid) throw std::logic_error("Qwen4Exp arena layer already loaded");
+    // Strata C7 screen (opt-in): the 58 GiB arena fill runs at ~0.5 GB/s when
+    // single-threaded because it is page-fault/IO bound. Spread the RAM-destined
+    // experts over worker threads; GPU-owned slots keep the serialized staging
+    // path below. Default 1 keeps the historical path byte-identical.
+    static const int s_fill_threads = std::clamp(
+        aila::env::read_int("AILA_Q4E_ARENA_FILL_THREADS", 1), 1, 16);
+    auto fill_range = [&](size_t begin, size_t end) {
+        for (size_t e=begin;e<end;++e) {
+            auto* dst=GetExpertPointer(layer,int(e));
+            if (!dst) continue;
+            std::memcpy(dst+geom_.gu_packed_offset,gu.packed_weight.ptr+e*geom_.gu_packed_bytes,geom_.gu_packed_bytes);
+            std::memcpy(dst+geom_.gu_absmax_offset,gu.absmax.ptr+e*geom_.gu_absmax_count,geom_.gu_absmax_bytes);
+            std::memcpy(dst+geom_.dn_packed_offset,dn.packed_weight.ptr+e*geom_.dn_packed_bytes,geom_.dn_packed_bytes);
+            std::memcpy(dst+geom_.dn_absmax_offset,dn.absmax.ptr+e*geom_.dn_absmax_count,geom_.dn_absmax_bytes);
+        }
+    };
+    if (s_fill_threads>1) {
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<size_t>(s_fill_threads));
+        const size_t per=(experts+static_cast<size_t>(s_fill_threads)-1)/static_cast<size_t>(s_fill_threads);
+        for (int t=0;t<s_fill_threads;++t) {
+            const size_t begin=static_cast<size_t>(t)*per;
+            const size_t end=std::min(experts,begin+per);
+            if (begin<end) pool.emplace_back(fill_range,begin,end);
+        }
+        for (auto& th:pool) th.join();
+    } else {
+        fill_range(0,experts);
+    }
     for (size_t e=0;e<experts;++e) {
         auto* dst=GetExpertPointer(layer,int(e));
-        uint8_t* gpu=nullptr;
-        if (!dst) {
-            if (initial_gpu_owners_.empty()) throw std::logic_error("Missing Qwen4Exp expert owner while loading");
-            gpu=initial_gpu_owners_[size_t(layer)*experts+e];
-            if (!gpu) throw std::logic_error("Missing Qwen4Exp initial GPU owner");
-            if (load_copy_pending_) load_copy_event_.wait_and_throw();
-            dst=load_staging_;
-        }
+        if (dst) continue;
+        if (initial_gpu_owners_.empty()) throw std::logic_error("Missing Qwen4Exp expert owner while loading");
+        uint8_t* gpu=initial_gpu_owners_[size_t(layer)*experts+e];
+        if (!gpu) throw std::logic_error("Missing Qwen4Exp initial GPU owner");
+        if (load_copy_pending_) load_copy_event_.wait_and_throw();
+        dst=load_staging_;
         std::memcpy(dst+geom_.gu_packed_offset,gu.packed_weight.ptr+e*geom_.gu_packed_bytes,geom_.gu_packed_bytes);
         std::memcpy(dst+geom_.gu_absmax_offset,gu.absmax.ptr+e*geom_.gu_absmax_count,geom_.gu_absmax_bytes);
         std::memcpy(dst+geom_.dn_packed_offset,dn.packed_weight.ptr+e*geom_.dn_packed_bytes,geom_.dn_packed_bytes);
         std::memcpy(dst+geom_.dn_absmax_offset,dn.absmax.ptr+e*geom_.dn_absmax_count,geom_.dn_absmax_bytes);
-        if (gpu) {
-            load_copy_event_=Queue().memcpy(gpu,dst,geom_.slot_bytes);
-            load_copy_pending_=true;
-        }
+        load_copy_event_=Queue().memcpy(gpu,dst,geom_.slot_bytes);
+        load_copy_pending_=true;
     }
     auto& m=layer_nested_[layer];
     m.gu_nested_absmax.assign(gu.nested_absmax_ptr(),gu.nested_absmax_ptr()+gu.nested_absmax.bytes/sizeof(float));

@@ -12,7 +12,7 @@
 | C4 | 路由画像工具链（mix + 留一 + 回存） | **完成** | **NO-GO（增量）**：导出/回存/留一已在 P3；多源 mix 仅 +1.1pp（门 3pp）。oracle 覆盖 62.74% vs agent6k 53.06%，剩余 headroom 是实例特异 | [C4 报告](qwen38-strata-c4-profile-mix-screen-2026-10-13.md) |
 | C5 | adaptive 异步/重叠 + 交换旋转 | 未开始 | — | — |
 | C6 | verify 窗口 route tail skip | 未开始 | — | — |
-| C7 | 专家填充流水线 | 未开始 | — | — |
+| C7 | 专家填充流水线 | **完成** | 部分采纳（opt-in）：`AILA_Q4E_ARENA_FILL_THREADS`（默认 1）；启动 116.6/118.7 → 105.5(8T)/102.9(16T) s，−10~−12%；默认路径不变 | [C7 报告](qwen38-strata-c7-fill-pipeline-2026-10-13.md) |
 | C8 | 工程方法学包 | **完成** | 已落地：收据 schema `perf/templates/bench-receipt-v1.json`、生成器 `tools/perf/ab_receipt.py`（A/A 噪声底示例 0.08%）、探针 `--json` 机器可读输出、3% 发射规则等 6 条纪律 | [C8 方法](qwen38-strata-c8-methods-2026-10-13.md) |
 | C9 | suffix-lookup drafter + DraftPolicy | 未开始 | — | — |
 | C10 | batch-MTP 取舍 + batch exactness 配方 | 未开始 | — | — |
