@@ -1,6 +1,8 @@
 #include "models/Qwen4ExpHostArena.hpp"
 #include "memory/LargePages.hpp"
 #include "utils/EnvUtils.hpp"
+#include "profile/Profiling.hpp"
+#include <chrono>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -176,6 +178,7 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
     check(gu,geom_.gu_packed_bytes,geom_.gu_absmax_count);
     check(dn,geom_.dn_packed_bytes,geom_.dn_absmax_count);
     if (layer_nested_[layer].valid) throw std::logic_error("Qwen4Exp arena layer already loaded");
+    const auto copy_t0 = std::chrono::steady_clock::now();
     // Strata C7 screen (opt-in): the 58 GiB arena fill runs at ~0.5 GB/s when
     // single-threaded because it is page-fault/IO bound. Spread the RAM-destined
     // experts over worker threads; GPU-owned slots keep the serialized staging
@@ -204,6 +207,21 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
         for (auto& th:pool) th.join();
     } else {
         fill_range(0,experts);
+    }
+    const auto ram_copy_done = std::chrono::steady_clock::now();
+    if (aila::env::read_flag("AILA_Q4E_LOAD_TIMING", false)) {
+        // The layer loop is serial (fill threads have joined above), so plain
+        // statics are enough for this opt-in diagnostic.
+        static double s_ram_copy_ms = 0.0;
+        static int s_layers = 0;
+        s_ram_copy_ms +=
+            std::chrono::duration<double, std::milli>(ram_copy_done - copy_t0).count();
+        ++s_layers;
+        if (s_layers == config_.num_layers) {
+            AILA_LOG_WARN("[Q4E LoadTiming] arena RAM copies: %.1f s total (%.1f ms/layer)",
+                          s_ram_copy_ms / 1000.0,
+                          s_ram_copy_ms / std::max(1, s_layers));
+        }
     }
     for (size_t e=0;e<experts;++e) {
         auto* dst=GetExpertPointer(layer,int(e));
@@ -250,7 +268,9 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
 
 bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::string* error) {
     try {
+        const bool load_timing = aila::env::read_flag("AILA_Q4E_LOAD_TIMING", false);
         for (int layer=0;layer<config_.num_layers;++layer) {
+            const auto layer_t0 = std::chrono::steady_clock::now();
             const auto prefix="model.language_model.layers."+std::to_string(layer)+".mlp.experts.";
             Bnb4BitHostWeightRef gu,dn;
             auto load=[&](const std::string& base,Bnb4BitHostWeightRef& ref,int hint) {
@@ -260,7 +280,16 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             };
             load(prefix+"gate_up_proj",gu,config_.hidden_size);
             load(prefix+"down_proj",dn,config_.moe_intermediate_size);
+            const auto ref_done = std::chrono::steady_clock::now();
             LoadLayerDirect(layer,gu,dn);
+            if (load_timing) {
+                const auto now = std::chrono::steady_clock::now();
+                AILA_LOG_WARN("[Q4E LoadTiming] arena layer %d: total %.3f s (weight refs %.3f s, copy+upload %.3f s)",
+                              layer,
+                              std::chrono::duration<double>(now - layer_t0).count(),
+                              std::chrono::duration<double>(ref_done - layer_t0).count(),
+                              std::chrono::duration<double>(now - ref_done).count());
+            }
         }
         Queue().wait_and_throw();
         initial_gpu_owners_.clear(); // no runtime file-reader or mmap fallback

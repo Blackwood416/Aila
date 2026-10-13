@@ -376,6 +376,18 @@ bool Qwen4ExpBnb4Backend::load(
     Context& ctx, ModelWeights& weights, const ModelSpec& spec,
     int max_seq_len, std::string* error_message) {
     context_ = &ctx;
+    // Opt-in load-phase timing (C7 deep dive): the ~116 s startup needs a
+    // phase breakdown before any fill mechanism (batched reads, DirectStorage)
+    // can be judged.
+    const bool load_timing = aila::env::read_flag("AILA_Q4E_LOAD_TIMING", false);
+    auto load_since = std::chrono::steady_clock::now();
+    auto load_mark = [&](const char* what) {
+        if (!load_timing) return;
+        const auto now = std::chrono::steady_clock::now();
+        AILA_LOG_WARN("[Q4E LoadTiming] %s: %.3f s", what,
+                      std::chrono::duration<double>(now - load_since).count());
+        load_since = now;
+    };
     moe_compact_tile_ = 0; // adaptive prefill uses the existing ordered rank buffer
     if (moe_compact_tile_ && (moe_compact_tile_ != 256 && moe_compact_tile_ != 512 && moe_compact_tile_ != 1024))
         throw std::invalid_argument("AILA_Q4E_MOE_COMPACT_ACTS must be 0, 256, 512 or 1024");
@@ -818,17 +830,22 @@ bool Qwen4ExpBnb4Backend::load(
             }
         }
     }
+    load_mark("weights+embedding prep (before adaptive allocate)");
     if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
     auto gpu_owners=adaptive_cache_.InitializeResidency(
         profile_hotset ? &initial_ranked_profile : nullptr);
+    load_mark("adaptive_cache.Allocate+InitializeResidency");
     aila::HostArenaConfig arena_cfg;
     arena_cfg.num_layers=cfg_.num_hidden_layers; arena_cfg.num_experts_per_layer=cfg_.num_experts;
     arena_cfg.hidden_size=hidden_size_; arena_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
     if (!host_arena_.Allocate(ctx,arena_cfg,error_message,gpu_owners)) return false;
+    load_mark("host_arena.Allocate");
     AILA_LOG_INFO("[Qwen4Exp] Loading native RAM complement: %zu experts, %.2f GiB; GPU-only experts=%d",
         host_arena_.ResidentExperts(),host_arena_.TotalAllocatedBytes()/double(1ULL<<30),adaptive_cache_.NumGpuSlots());
     if (!host_arena_.LoadFromModelWeights(weights,error_message)) return false;
+    load_mark("host_arena.LoadFromModelWeights");
     adaptive_cache_.FinishInitialLoad(ctx.queue());
+    load_mark("FinishInitialLoad");
     copy_q_=std::make_unique<sycl::queue>(ctx.queue().get_context(),ctx.queue().get_device(),
         sycl::property_list{sycl::property::queue::in_order()});
     prefill_expert_uses_.assign(cfg_.num_experts,0);
@@ -838,6 +855,7 @@ bool Qwen4ExpBnb4Backend::load(
         adaptive_cache_.TotalStagingBytes()/double(1ULL<<20));
 
     ensure_runtime_buffers(ctx, 1);
+    load_mark("runtime buffers (ensure_runtime_buffers)");
     static const int s_resident_decode = aila::env::read_int("AILA_Q4E_RESIDENT_DECODE", 0);
     cold_mode_ = aila::env::read_int("AILA_Q4E_COLD_MODE",0);
     if(profile_hotset && !cold_mode_)cold_mode_=1;

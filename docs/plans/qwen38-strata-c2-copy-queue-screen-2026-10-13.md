@@ -59,3 +59,26 @@ build-refactor\AilaQwen4ExpKernelTests.exe --queue-overlap-probe            # co
 $env:UR_L0_USE_COPY_ENGINE='0'; $env:SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE='0'
 build-refactor\AilaQwen4ExpKernelTests.exe --queue-overlap-probe            # OFF 对照
 ```
+
+## 6. 追加：驱动自带 L0 SDK 的硬件级复核（2026-10-13 晚）
+
+前几节用的是 UR/SYCL 路径；补做 Strata 原版路径（`zeDeviceGetCommandQueueGroupProperties` +
+immediate command list），SDK 来自驱动自带安装：`C:\Program Files\LevelZeroSDK\1.28.2`
+（include\level_zero + lib\ze_loader.lib；oneAPI 2026.1 自身只带 UR 头）。
+探针：`tmp/q4e-strata-c2/l0_copy_probe.cpp`（独立 exe，cl + ze_loader.lib）。
+
+**实测（A770，32 MiB H2D ×16，中位数）**：
+
+| ordinal | flags | 每 32 MiB | 带宽 |
+|---|---|---:|---:|
+| 0 | COMPUTE+COPY | 3.436 ms | 9.76 GB/s |
+| 1 | **COPY only** | 3.422 ms | 9.81 GB/s |
+
+- A770 **确实暴露 copy-only 队列组**（这修正了"2026.1 无 L0 头/库"带来的不确定）；
+- 但 copy-only 引擎与默认队列的 H2D 速率**完全相同** → 上一节的"拷贝与内存型 compute 相加"
+  不是队列/引擎放置问题，而是整条 host→VRAM 通路的属性；Strata 的 A750 实测（+1.4%、有挂死）
+  与此一致。
+- 结论不变（**NO-GO**）。唯一未做的确认是"在 copy-only ordinal 上跑 SYCL interop 队列再测
+  重叠"——需要 `zeCommandQueueCreate(ordinal=1)` + `sycl::make_queue<backend::ext_level_zero>`；
+  鉴于两条 ordinal 的独立带宽一致、且 UR copy-engine 路径已证明"ALU 负载能重叠、内存型不能"，
+  预计不改变结论，列为可选复核（成本：中高）。
