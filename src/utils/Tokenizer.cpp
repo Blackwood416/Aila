@@ -446,7 +446,10 @@ bool Tokenizer::load(const std::string& model_dir) {
             std::string line;
             int rank = 0;
             while (std::getline(mf, line)) {
-                if (line.empty() || line[0] == '#') continue;
+                if (line.empty()) continue;
+                // '#' is a legitimate merge-rule character (e.g. "## ##",
+                // "# include"); only the optional "#version" header is a comment.
+                if (line[0] == '#' && line.rfind("#version", 0) == 0) continue;
                 auto space_pos = line.find(' ');
                 if (space_pos == std::string::npos) continue;
 
