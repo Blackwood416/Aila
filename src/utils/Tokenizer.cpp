@@ -736,11 +736,13 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
 
         if (is_whitespace_cp(cur.cp)) {
             size_t j = i;
+            size_t last_ws = i;
             while (j < text.size()) {
                 Utf8Char cp = decode_utf8_char(text, j);
                 if (!is_whitespace_cp(cp.cp) || is_newline_cp(cp.cp)) {
                     break;
                 }
+                last_ws = j;
                 j += cp.bytes;
             }
             if (j < text.size()) {
@@ -755,6 +757,15 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
                     }
                     result.push_back(text.substr(start, j - start));
                     i = j;
+                    continue;
+                }
+                // `\s+(?!\S)` on a run followed by a non-whitespace
+                // character: keep the final character for the next branch
+                // (`[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+`,
+                // ` ?[^\s\p{L}\p{M}\p{N}]+` or standalone `\s+`).
+                if (last_ws > start) {
+                    result.push_back(text.substr(start, last_ws - start));
+                    i = last_ws;
                     continue;
                 }
             }
