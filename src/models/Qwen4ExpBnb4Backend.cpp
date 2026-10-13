@@ -270,6 +270,19 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
+    if (export_enabled_ && !export_path_.empty()) {
+        // P3 calibration: write the collected decode/prefill counts as a full
+        // 24576-key profile in the legacy format before the caches go away.
+        try {
+            export_policy_.Save(export_path_, export_identity_);
+            AILA_LOG_INFO("[Q4E Hotset] adaptive export written: %s",
+                export_path_.c_str());
+        } catch (const std::exception& e) {
+            AILA_LOG_ERROR("[Q4E Hotset] adaptive export failed: %s", e.what());
+        }
+        export_enabled_ = false;
+        export_path_.clear();
+    }
     expert_executor_.AbortResidentCold();
     free_pinned_host_buffers();
     if (resident_selected_host_ && context_) context_->free_host(resident_selected_host_);
@@ -745,8 +758,10 @@ bool Qwen4ExpBnb4Backend::load(
     }
     const auto hotset_profile_path=aila::env::read_string("AILA_Q4E_HOTSET_PROFILE","");
     const bool profile_hotset=!hotset_profile_path.empty();
+    const auto hotset_export_path=aila::env::read_string("AILA_Q4E_HOTSET_EXPORT","");
+    const bool export_hotset=!hotset_export_path.empty();
     std::vector<std::pair<int,int>> initial_ranked_profile;
-    if (profile_hotset) {
+    if (profile_hotset || export_hotset) {
         // Build the same source-byte identity used by the legacy cache. The
         // adaptive arena's expert payload is always compact nested NF4.
         std::vector<aila::ExpertLayerSource> profile_sources(cfg_.num_hidden_layers);
@@ -766,25 +781,42 @@ bool Qwen4ExpBnb4Backend::load(
         }
         const std::string identity=Qwen4ExpHotsetPolicy::MakeIdentity(profile_sources,
             cfg_.num_hidden_layers,cfg_.num_experts,hidden_size_,cfg_.moe_intermediate_size,64,true);
-        Qwen4ExpHotsetPolicy policy;
-        policy.Init(cfg_.num_hidden_layers,cfg_.num_experts);
-        try {
-            policy.Load(hotset_profile_path,identity);
-        } catch (const std::exception& e) {
-            if (error_message) *error_message=e.what();
-            return false;
+        if (profile_hotset) {
+            Qwen4ExpHotsetPolicy policy;
+            policy.Init(cfg_.num_hidden_layers,cfg_.num_experts);
+            try {
+                policy.Load(hotset_profile_path,identity);
+            } catch (const std::exception& e) {
+                if (error_message) *error_message=e.what();
+                return false;
+            }
+            const size_t resident_rank_count=std::min<size_t>(
+                static_cast<size_t>(cache_cfg.num_gpu_slots),policy.ranking.size());
+            initial_ranked_profile.reserve(resident_rank_count);
+            for (size_t i=0;i<resident_rank_count;++i) {
+                const int key=policy.ranking[i];
+                initial_ranked_profile.emplace_back(key/cfg_.num_experts,key%cfg_.num_experts);
+            }
+            AILA_LOG_INFO("[Q4E Adaptive Residency] profile=%s identity=%s profile_total_keys=%zu "
+                          "ranked_keys=%zu admitted_slots=%d kv_element_bytes=%zu",
+                hotset_profile_path.c_str(),identity.c_str(),policy.ranking.size(),
+                initial_ranked_profile.size(),cache_cfg.num_gpu_slots,kv_element_bytes);
         }
-        const size_t resident_rank_count=std::min<size_t>(
-            static_cast<size_t>(cache_cfg.num_gpu_slots),policy.ranking.size());
-        initial_ranked_profile.reserve(resident_rank_count);
-        for (size_t i=0;i<resident_rank_count;++i) {
-            const int key=policy.ranking[i];
-            initial_ranked_profile.emplace_back(key/cfg_.num_experts,key%cfg_.num_experts);
+        // P3: opt-in routing collector for offline hotset re-ranking. The
+        // adaptive cache never re-ranks online, so a calibration run exports
+        // the full 24576-key profile at teardown in the legacy format.
+        if (export_hotset) {
+            if (!use_adaptive_pipeline_) {
+                AILA_LOG_WARN("[Q4E Hotset] AILA_Q4E_HOTSET_EXPORT is only wired for the adaptive pipeline");
+            } else {
+                export_policy_.Init(cfg_.num_hidden_layers,cfg_.num_experts);
+                export_identity_=identity;
+                export_path_=hotset_export_path;
+                export_enabled_=true;
+                AILA_LOG_INFO("[Q4E Hotset] adaptive export enabled: path=%s decode+prefill counts -> full profile",
+                    export_path_.c_str());
+            }
         }
-        AILA_LOG_INFO("[Q4E Adaptive Residency] profile=%s identity=%s profile_total_keys=%zu "
-                      "ranked_keys=%zu admitted_slots=%d kv_element_bytes=%zu",
-            hotset_profile_path.c_str(),identity.c_str(),policy.ranking.size(),
-            initial_ranked_profile.size(),cache_cfg.num_gpu_slots,kv_element_bytes);
     }
     if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
     auto gpu_owners=adaptive_cache_.InitializeResidency(
@@ -1174,6 +1206,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     if (slot >= 0) { hit_slots[hit_count] = slot; hit_ranks[hit_count] = k; ++hit_count; }
                 }
                 adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+                if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
                 if (!hit_count) continue;
                 std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
                 for (int i = 0; i < hit_count; ++i)
@@ -1228,6 +1261,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
             // 2. Observe routing for frequency tracking & stats
             adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+            if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
 
             // Native CPU sources remain owned until Join below. CPU work can
             // overlap the already submitted shared expert and resident kernels.
@@ -1383,6 +1417,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count) {
     const int top_k=cfg_.num_experts_per_tok;
     adaptive_cache_.ObserveRouting(layer,router_host_ids_,count*top_k);
+    if (export_enabled_) export_policy_.Observe(layer, router_host_ids_, count, top_k, true);
     std::fill(prefill_expert_uses_.begin(),prefill_expert_uses_.end(),0);
     prefill_unique_.clear();
     for (int i=0;i<count*top_k;++i) {

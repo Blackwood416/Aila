@@ -13,6 +13,7 @@
 #include "Qwen4ExpHostArena.hpp"
 #include "Qwen4ExpAdaptiveCache.hpp"
 #include "Qwen4ExpPle.hpp"
+#include "Qwen4ExpHotsetPolicy.hpp"
 #include "engine/Types.hpp"
 
 #include <cstddef>
@@ -434,6 +435,13 @@ private:
 
     ModelSpec spec_;
     Qwen4ExpTextConfig cfg_;
+    // P3: opt-in routing collector for offline hotset profile export
+    // (AILA_Q4E_HOTSET_EXPORT). Populated on the adaptive pipeline and written
+    // as a full 24576-key profile at teardown.
+    Qwen4ExpHotsetPolicy export_policy_;
+    bool export_enabled_ = false;
+    std::string export_path_;
+    std::string export_identity_;
     int hidden_size_ = 2560;
     int max_seq_len_ = 2048;
     int full_q_heads_ = 24, full_kv_heads_ = 2, full_head_dim_ = 256;
