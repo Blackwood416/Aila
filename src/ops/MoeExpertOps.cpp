@@ -2663,6 +2663,1009 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token_wgshare(
     });
 }
 
+template <bool UseNested, bool FixedNested256 = false, int ShareQuads = 2>
+sycl::event launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_wg = (wg_size / sub_group_size) / static_cast<size_t>(ShareQuads);
+    static_assert(ShareQuads == 2 || ShareQuads == 4 || ShareQuads == 8,
+                  "ShareQuads must be 2, 4 or 8");
+    const int row_blocks = (intermediate_size + static_cast<int>(rows_per_wg) - 1) / static_cast<int>(rows_per_wg);
+    const int quad_groups = (total_quads + ShareQuads - 1) / ShareQuads;
+    const size_t num_groups = static_cast<size_t>(row_blocks) * static_cast<size_t>(quad_groups);
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int sg_lane = lid % sub_group_size;
+                const int row_block = static_cast<int>(item.get_group(0)) / quad_groups;
+                const int quad_group = static_cast<int>(item.get_group(0)) % quad_groups;
+                const int row = row_block * static_cast<int>(rows_per_wg) + sg_id / ShareQuads;
+                const int quad_idx = quad_group * ShareQuads + sg_id % ShareQuads;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float gate_acc0 = 0.0f;
+                float up_acc0 = 0.0f;
+                float gate_acc1 = 0.0f;
+                float up_acc1 = 0.0f;
+                float gate_acc2 = 0.0f;
+                float up_acc2 = 0.0f;
+                float gate_acc3 = 0.0f;
+                float up_acc3 = 0.0f;
+
+                if (row < intermediate_size && quad_idx < total_quads) {
+
+                    const auto& slot = slots[quad_idx * 4];
+                    const int token0 = token_ids[quad_idx * 4];
+                    const int token1 = token_ids[quad_idx * 4 + 1];
+                    const int token2 = token_ids[quad_idx * 4 + 2];
+                    const int token3 = token_ids[quad_idx * 4 + 3];
+                    const bf16* x_token0 = x + static_cast<size_t>(token0) * in_features;
+                    const bf16* x_token1 = x + static_cast<size_t>(token1) * in_features;
+                    const bf16* x_token2 = x + static_cast<size_t>(token2) * in_features;
+                    const bf16* x_token3 = x + static_cast<size_t>(token3) * in_features;
+
+                    const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                    const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
+                    const size_t up_byte_base = static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
+                    const size_t up_block_base = static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+
+                    int byte_offset = sg_lane * 4;
+                    for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
+                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        const float gw0 = static_cast<float>(gb0 >> 4) *  ga;
+                        const float gw1 = static_cast<float>(gb0 & 0xF) *  ga;
+                        const float gw2 = static_cast<float>(gb1 >> 4) *  ga;
+                        const float gw3 = static_cast<float>(gb1 & 0xF) *  ga;
+                        const float gw4 = static_cast<float>(gb2 >> 4) *  ga;
+                        const float gw5 = static_cast<float>(gb2 & 0xF) *  ga;
+                        const float gw6 = static_cast<float>(gb3 >> 4) *  ga;
+                        const float gw7 = static_cast<float>(gb3 & 0xF) *  ga;
+
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[0]), gw0, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[0]), gw0, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[0]), gw0, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[1]), gw1, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[1]), gw1, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[1]), gw1, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[2]), gw2, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[2]), gw2, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[2]), gw2, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[3]), gw3, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[3]), gw3, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[3]), gw3, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[4]), gw4, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[4]), gw4, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[4]), gw4, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[5]), gw5, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[5]), gw5, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[5]), gw5, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[6]), gw6, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[6]), gw6, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[6]), gw6, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[7]), gw7, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[7]), gw7, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[7]), gw7, gate_acc3);
+
+                        const float uw0 = static_cast<float>(ub0 >> 4) *  ua;
+                        const float uw1 = static_cast<float>(ub0 & 0xF) *  ua;
+                        const float uw2 = static_cast<float>(ub1 >> 4) *  ua;
+                        const float uw3 = static_cast<float>(ub1 & 0xF) *  ua;
+                        const float uw4 = static_cast<float>(ub2 >> 4) *  ua;
+                        const float uw5 = static_cast<float>(ub2 & 0xF) *  ua;
+                        const float uw6 = static_cast<float>(ub3 >> 4) *  ua;
+                        const float uw7 = static_cast<float>(ub3 & 0xF) *  ua;
+
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[0]), uw0, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[0]), uw0, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[0]), uw0, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[1]), uw1, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[1]), uw1, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[1]), uw1, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[2]), uw2, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[2]), uw2, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[2]), uw2, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[3]), uw3, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[3]), uw3, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[3]), uw3, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[4]), uw4, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[4]), uw4, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[4]), uw4, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[5]), uw5, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[5]), uw5, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[5]), uw5, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[6]), uw6, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[6]), uw6, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[6]), uw6, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[7]), uw7, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[7]), uw7, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[7]), uw7, up_acc3);
+                    }
+                }
+
+                float gate_sum0 = sycl::reduce_over_group(item.get_sub_group(), gate_acc0, sycl::plus<>());
+                float up_sum0 = sycl::reduce_over_group(item.get_sub_group(), up_acc0, sycl::plus<>());
+                float gate_sum1 = sycl::reduce_over_group(item.get_sub_group(), gate_acc1, sycl::plus<>());
+                float up_sum1 = sycl::reduce_over_group(item.get_sub_group(), up_acc1, sycl::plus<>());
+                float gate_sum2 = sycl::reduce_over_group(item.get_sub_group(), gate_acc2, sycl::plus<>());
+                float up_sum2 = sycl::reduce_over_group(item.get_sub_group(), up_acc2, sycl::plus<>());
+                float gate_sum3 = sycl::reduce_over_group(item.get_sub_group(), gate_acc3, sycl::plus<>());
+                float up_sum3 = sycl::reduce_over_group(item.get_sub_group(), up_acc3, sycl::plus<>());
+
+                if (sg_lane == 0 && row < intermediate_size && quad_idx < total_quads) {
+
+                    const int token0 = token_ids[quad_idx * 4];
+                    const int rank0 = ranks[quad_idx * 4];
+                    const float silu_gate0 = gate_sum0 / (1.0f + sycl::native::exp(-gate_sum0));
+                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * intermediate_size + row;
+                    h[out_pos0] = bf16(silu_gate0 * up_sum0);
+
+                    const int token1 = token_ids[quad_idx * 4 + 1];
+                    const int rank1 = ranks[quad_idx * 4 + 1];
+                    const float silu_gate1 = gate_sum1 / (1.0f + sycl::native::exp(-gate_sum1));
+                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * intermediate_size + row;
+                    h[out_pos1] = bf16(silu_gate1 * up_sum1);
+
+                    const int token2 = token_ids[quad_idx * 4 + 2];
+                    const int rank2 = ranks[quad_idx * 4 + 2];
+                    const float silu_gate2 = gate_sum2 / (1.0f + sycl::native::exp(-gate_sum2));
+                    const size_t out_pos2 = (static_cast<size_t>(token2) * top_k + rank2) * intermediate_size + row;
+                    h[out_pos2] = bf16(silu_gate2 * up_sum2);
+
+                    const int token3 = token_ids[quad_idx * 4 + 3];
+                    const int rank3 = ranks[quad_idx * 4 + 3];
+                    const float silu_gate3 = gate_sum3 / (1.0f + sycl::native::exp(-gate_sum3));
+                    const size_t out_pos3 = (static_cast<size_t>(token3) * top_k + rank3) * intermediate_size + row;
+                    h[out_pos3] = bf16(silu_gate3 * up_sum3);
+                }
+            });
+    });
+}
+
+
+template <bool UseNested, bool FixedNested256 = false>
+sycl::event launch_moe_expert_major_prefill_gate_up_4token_wgshare_slm(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    constexpr int ShareQuads = 4;
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_wg = (wg_size / sub_group_size) / static_cast<size_t>(ShareQuads);
+    const int row_blocks = (intermediate_size + static_cast<int>(rows_per_wg) - 1) / static_cast<int>(rows_per_wg);
+    const int quad_groups = (total_quads + ShareQuads - 1) / ShareQuads;
+    const size_t num_groups = static_cast<size_t>(row_blocks) * static_cast<size_t>(quad_groups);
+    const int stride = static_cast<int>(sub_group_size) * 4;
+    // Full 64-byte chunks are processed with a uniform trip count so the
+    // producer/consumer barriers stay workgroup-uniform; only the per-lane
+    // remainder uses the original per-lane loop bound.
+    const int full_tiles = packed_bytes_per_row / 64;
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        // [row group][gate|up][16 lanes * 9-float padded tile] = 1152 floats.
+        sycl::local_accessor<float, 1> weight_tile(
+            sycl::range<1>(rows_per_wg * 2 * sub_group_size * 9), cgh);
+        sycl::local_accessor<int, 1> expert_shared(sycl::range<1>(rows_per_wg), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / static_cast<int>(sub_group_size);
+                const int sg_lane = lid % static_cast<int>(sub_group_size);
+                const int row_group = sg_id / ShareQuads;
+                const int sg_in_group = sg_id % ShareQuads;
+                const int row_block = static_cast<int>(item.get_group(0)) / quad_groups;
+                const int quad_group = static_cast<int>(item.get_group(0)) % quad_groups;
+                const int row = row_block * static_cast<int>(rows_per_wg) + row_group;
+                const int quad_idx = quad_group * ShareQuads + sg_in_group;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                if (lid < static_cast<int>(rows_per_wg)) {
+                    int same = 0;
+                    const int first_quad = quad_group * ShareQuads;
+                    if (first_quad < total_quads) {
+                        same = 1;
+                        const uint8_t* base = slots[first_quad * 4].gate_up_packed;
+                        for (int i = 1; i < ShareQuads; ++i) {
+                            if (first_quad + i >= total_quads ||
+                                slots[(first_quad + i) * 4].gate_up_packed != base) {
+                                same = 0;
+                                break;
+                            }
+                        }
+                    }
+                    expert_shared[lid] = same;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float gate_acc0 = 0.0f;
+                float up_acc0 = 0.0f;
+                float gate_acc1 = 0.0f;
+                float up_acc1 = 0.0f;
+                float gate_acc2 = 0.0f;
+                float up_acc2 = 0.0f;
+                float gate_acc3 = 0.0f;
+                float up_acc3 = 0.0f;
+
+                const bool row_valid = row < intermediate_size;
+                const bool consume = row_valid && quad_idx < total_quads;
+                const bool shared_path =
+                    row_valid && blocksize == 64 && expert_shared[row_group] != 0;
+                const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
+                const size_t up_byte_base =
+                    static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
+                const size_t up_block_base =
+                    static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+                float* gate_tile = &weight_tile[row_group * 2 * static_cast<int>(sub_group_size) * 9];
+                float* up_tile = &weight_tile[(row_group * 2 + 1) * static_cast<int>(sub_group_size) * 9];
+                const bf16* x_token0 = x;
+                const bf16* x_token1 = x;
+                const bf16* x_token2 = x;
+                const bf16* x_token3 = x;
+                if (consume) {
+                    x_token0 = x + static_cast<size_t>(token_ids[quad_idx * 4]) * in_features;
+                    x_token1 = x + static_cast<size_t>(token_ids[quad_idx * 4 + 1]) * in_features;
+                    x_token2 = x + static_cast<size_t>(token_ids[quad_idx * 4 + 2]) * in_features;
+                    x_token3 = x + static_cast<size_t>(token_ids[quad_idx * 4 + 3]) * in_features;
+                }
+
+                for (int t = 0; t < full_tiles; ++t) {
+                    const int byte_offset = sg_lane * 4 + 64 * t;
+                    if (shared_path) {
+                        const auto& slot = slots[(quad_group * ShareQuads) * 4];
+                        float ga_lo = 0.0f;
+                        float ga_hi = 0.0f;
+                        float ua_lo = 0.0f;
+                        float ua_hi = 0.0f;
+                        const size_t gate_scale = gate_block_base + 2 * t;
+                        const size_t up_scale = up_block_base + 2 * t;
+                        if (sg_lane == 0) {
+                            ga_lo = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale);
+                        } else if (sg_lane == 1) {
+                            ga_hi = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale + 1);
+                        } else if (sg_lane == 2) {
+                            ua_lo = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale);
+                        } else if (sg_lane == 3) {
+                            ua_hi = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale + 1);
+                        }
+                        const auto prod_sg = item.get_sub_group();
+                        ga_lo = sycl::group_broadcast(prod_sg, ga_lo, 0);
+                        ga_hi = sycl::group_broadcast(prod_sg, ga_hi, 1);
+                        ua_lo = sycl::group_broadcast(prod_sg, ua_lo, 2);
+                        ua_hi = sycl::group_broadcast(prod_sg, ua_hi, 3);
+                        const int producer_lane =
+                            sg_in_group * static_cast<int>(sub_group_size) + sg_lane;
+                        const float ga_prod = producer_lane < 32 ? ga_lo : ga_hi;
+                        const float ua_prod = producer_lane < 32 ? ua_lo : ua_hi;
+                        const uint8_t gate_byte = slot.gate_up_packed[
+                            gate_byte_base + static_cast<size_t>(64 * t + producer_lane)];
+                        const uint8_t up_byte = slot.gate_up_packed[
+                            up_byte_base + static_cast<size_t>(64 * t + producer_lane)];
+                        const int tile_slot = (producer_lane / 4) * 9 + 2 * (producer_lane % 4);
+                        gate_tile[tile_slot] = qmap[gate_byte >> 4] * ga_prod;
+                        gate_tile[tile_slot + 1] = qmap[gate_byte & 0xF] * ga_prod;
+                        up_tile[tile_slot] = qmap[up_byte >> 4] * ua_prod;
+                        up_tile[tile_slot + 1] = qmap[up_byte & 0xF] * ua_prod;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    float gw0 = 0.0f;
+                    float gw1 = 0.0f;
+                    float gw2 = 0.0f;
+                    float gw3 = 0.0f;
+                    float gw4 = 0.0f;
+                    float gw5 = 0.0f;
+                    float gw6 = 0.0f;
+                    float gw7 = 0.0f;
+                    float uw0 = 0.0f;
+                    float uw1 = 0.0f;
+                    float uw2 = 0.0f;
+                    float uw3 = 0.0f;
+                    float uw4 = 0.0f;
+                    float uw5 = 0.0f;
+                    float uw6 = 0.0f;
+                    float uw7 = 0.0f;
+                    if (shared_path) {
+                        if (consume) {
+                            const int tile_base = sg_lane * 9;
+                            gw0 = gate_tile[tile_base + 0];
+                            gw1 = gate_tile[tile_base + 1];
+                            gw2 = gate_tile[tile_base + 2];
+                            gw3 = gate_tile[tile_base + 3];
+                            gw4 = gate_tile[tile_base + 4];
+                            gw5 = gate_tile[tile_base + 5];
+                            gw6 = gate_tile[tile_base + 6];
+                            gw7 = gate_tile[tile_base + 7];
+                            uw0 = up_tile[tile_base + 0];
+                            uw1 = up_tile[tile_base + 1];
+                            uw2 = up_tile[tile_base + 2];
+                            uw3 = up_tile[tile_base + 3];
+                            uw4 = up_tile[tile_base + 4];
+                            uw5 = up_tile[tile_base + 5];
+                            uw6 = up_tile[tile_base + 6];
+                            uw7 = up_tile[tile_base + 7];
+                        }
+                    } else if (consume) {
+                        const auto& slot = slots[quad_idx * 4];
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        gw0 = qmap[gb0 >> 4] * ga;
+                        gw1 = qmap[gb0 & 0xF] * ga;
+                        gw2 = qmap[gb1 >> 4] * ga;
+                        gw3 = qmap[gb1 & 0xF] * ga;
+                        gw4 = qmap[gb2 >> 4] * ga;
+                        gw5 = qmap[gb2 & 0xF] * ga;
+                        gw6 = qmap[gb3 >> 4] * ga;
+                        gw7 = qmap[gb3 & 0xF] * ga;
+
+                        uw0 = qmap[ub0 >> 4] * ua;
+                        uw1 = qmap[ub0 & 0xF] * ua;
+                        uw2 = qmap[ub1 >> 4] * ua;
+                        uw3 = qmap[ub1 & 0xF] * ua;
+                        uw4 = qmap[ub2 >> 4] * ua;
+                        uw5 = qmap[ub2 & 0xF] * ua;
+                        uw6 = qmap[ub3 >> 4] * ua;
+                        uw7 = qmap[ub3 & 0xF] * ua;
+                    }
+                    if (consume) {
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
+                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[0]), gw0, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[0]), gw0, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[0]), gw0, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[1]), gw1, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[1]), gw1, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[1]), gw1, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[2]), gw2, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[2]), gw2, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[2]), gw2, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[3]), gw3, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[3]), gw3, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[3]), gw3, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[4]), gw4, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[4]), gw4, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[4]), gw4, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[5]), gw5, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[5]), gw5, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[5]), gw5, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[6]), gw6, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[6]), gw6, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[6]), gw6, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[7]), gw7, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[7]), gw7, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[7]), gw7, gate_acc3);
+
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[0]), uw0, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[0]), uw0, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[0]), uw0, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[1]), uw1, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[1]), uw1, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[1]), uw1, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[2]), uw2, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[2]), uw2, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[2]), uw2, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[3]), uw3, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[3]), uw3, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[3]), uw3, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[4]), uw4, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[4]), uw4, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[4]), uw4, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[5]), uw5, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[5]), uw5, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[5]), uw5, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[6]), uw6, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[6]), uw6, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[6]), uw6, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[7]), uw7, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[7]), uw7, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[7]), uw7, up_acc3);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                if (consume) {
+                    for (int byte_offset = sg_lane * 4 + 64 * full_tiles;
+                         byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const auto& slot = slots[quad_idx * 4];
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
+                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        const float gw0 = qmap[gb0 >> 4] * ga;
+                        const float gw1 = qmap[gb0 & 0xF] * ga;
+                        const float gw2 = qmap[gb1 >> 4] * ga;
+                        const float gw3 = qmap[gb1 & 0xF] * ga;
+                        const float gw4 = qmap[gb2 >> 4] * ga;
+                        const float gw5 = qmap[gb2 & 0xF] * ga;
+                        const float gw6 = qmap[gb3 >> 4] * ga;
+                        const float gw7 = qmap[gb3 & 0xF] * ga;
+
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[0]), gw0, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[0]), gw0, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[0]), gw0, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[1]), gw1, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[1]), gw1, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[1]), gw1, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[2]), gw2, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[2]), gw2, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[2]), gw2, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[3]), gw3, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[3]), gw3, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[3]), gw3, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[4]), gw4, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[4]), gw4, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[4]), gw4, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[5]), gw5, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[5]), gw5, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[5]), gw5, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[6]), gw6, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[6]), gw6, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[6]), gw6, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[7]), gw7, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[7]), gw7, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[7]), gw7, gate_acc3);
+
+                        const float uw0 = qmap[ub0 >> 4] * ua;
+                        const float uw1 = qmap[ub0 & 0xF] * ua;
+                        const float uw2 = qmap[ub1 >> 4] * ua;
+                        const float uw3 = qmap[ub1 & 0xF] * ua;
+                        const float uw4 = qmap[ub2 >> 4] * ua;
+                        const float uw5 = qmap[ub2 & 0xF] * ua;
+                        const float uw6 = qmap[ub3 >> 4] * ua;
+                        const float uw7 = qmap[ub3 & 0xF] * ua;
+
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[0]), uw0, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[0]), uw0, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[0]), uw0, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[1]), uw1, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[1]), uw1, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[1]), uw1, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[2]), uw2, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[2]), uw2, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[2]), uw2, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[3]), uw3, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[3]), uw3, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[3]), uw3, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[4]), uw4, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[4]), uw4, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[4]), uw4, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[5]), uw5, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[5]), uw5, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[5]), uw5, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[6]), uw6, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[6]), uw6, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[6]), uw6, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[7]), uw7, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[7]), uw7, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[7]), uw7, up_acc3);
+                    }
+                }
+
+                float gate_sum0 = sycl::reduce_over_group(item.get_sub_group(), gate_acc0, sycl::plus<>());
+                float up_sum0 = sycl::reduce_over_group(item.get_sub_group(), up_acc0, sycl::plus<>());
+                float gate_sum1 = sycl::reduce_over_group(item.get_sub_group(), gate_acc1, sycl::plus<>());
+                float up_sum1 = sycl::reduce_over_group(item.get_sub_group(), up_acc1, sycl::plus<>());
+                float gate_sum2 = sycl::reduce_over_group(item.get_sub_group(), gate_acc2, sycl::plus<>());
+                float up_sum2 = sycl::reduce_over_group(item.get_sub_group(), up_acc2, sycl::plus<>());
+                float gate_sum3 = sycl::reduce_over_group(item.get_sub_group(), gate_acc3, sycl::plus<>());
+                float up_sum3 = sycl::reduce_over_group(item.get_sub_group(), up_acc3, sycl::plus<>());
+
+                if (sg_lane == 0 && row < intermediate_size && quad_idx < total_quads) {
+
+                    const int token0 = token_ids[quad_idx * 4];
+                    const int rank0 = ranks[quad_idx * 4];
+                    const float silu_gate0 = gate_sum0 / (1.0f + sycl::native::exp(-gate_sum0));
+                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * intermediate_size + row;
+                    h[out_pos0] = bf16(silu_gate0 * up_sum0);
+
+                    const int token1 = token_ids[quad_idx * 4 + 1];
+                    const int rank1 = ranks[quad_idx * 4 + 1];
+                    const float silu_gate1 = gate_sum1 / (1.0f + sycl::native::exp(-gate_sum1));
+                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * intermediate_size + row;
+                    h[out_pos1] = bf16(silu_gate1 * up_sum1);
+
+                    const int token2 = token_ids[quad_idx * 4 + 2];
+                    const int rank2 = ranks[quad_idx * 4 + 2];
+                    const float silu_gate2 = gate_sum2 / (1.0f + sycl::native::exp(-gate_sum2));
+                    const size_t out_pos2 = (static_cast<size_t>(token2) * top_k + rank2) * intermediate_size + row;
+                    h[out_pos2] = bf16(silu_gate2 * up_sum2);
+
+                    const int token3 = token_ids[quad_idx * 4 + 3];
+                    const int rank3 = ranks[quad_idx * 4 + 3];
+                    const float silu_gate3 = gate_sum3 / (1.0f + sycl::native::exp(-gate_sum3));
+                    const size_t out_pos3 = (static_cast<size_t>(token3) * top_k + rank3) * intermediate_size + row;
+                    h[out_pos3] = bf16(silu_gate3 * up_sum3);
+                }
+            });
+    });
+}
+
+template <bool UseNested, bool FixedNested256 = false, int ShareQuads = 2>
+sycl::event launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event = nullptr) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr size_t wg_size = 256;
+    constexpr size_t sub_group_size = 16;
+    constexpr size_t rows_per_wg = (wg_size / sub_group_size) / static_cast<size_t>(ShareQuads);
+    static_assert(ShareQuads == 2 || ShareQuads == 4 || ShareQuads == 8,
+                  "ShareQuads must be 2, 4 or 8");
+    const int row_blocks = (intermediate_size + static_cast<int>(rows_per_wg) - 1) / static_cast<int>(rows_per_wg);
+    const int quad_groups = (total_quads + ShareQuads - 1) / ShareQuads;
+    const size_t num_groups = static_cast<size_t>(row_blocks) * static_cast<size_t>(quad_groups);
+
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) {
+            cgh.depends_on(*dep_event);
+        }
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int sg_lane = lid % sub_group_size;
+                const int row_block = static_cast<int>(item.get_group(0)) / quad_groups;
+                const int quad_group = static_cast<int>(item.get_group(0)) % quad_groups;
+                const int row = row_block * static_cast<int>(rows_per_wg) + sg_id / ShareQuads;
+                const int quad_idx = quad_group * ShareQuads + sg_id % ShareQuads;
+                const int stride = static_cast<int>(sub_group_size) * 4;
+
+                if (lid < 16) {
+                    qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                float gate_acc0 = 0.0f;
+                float up_acc0 = 0.0f;
+                float gate_acc1 = 0.0f;
+                float up_acc1 = 0.0f;
+                float gate_acc2 = 0.0f;
+                float up_acc2 = 0.0f;
+                float gate_acc3 = 0.0f;
+                float up_acc3 = 0.0f;
+
+                if (row < intermediate_size && quad_idx < total_quads) {
+
+                    const auto& slot = slots[quad_idx * 4];
+                    const int token0 = token_ids[quad_idx * 4];
+                    const int token1 = token_ids[quad_idx * 4 + 1];
+                    const int token2 = token_ids[quad_idx * 4 + 2];
+                    const int token3 = token_ids[quad_idx * 4 + 3];
+                    const bf16* x_token0 = x + static_cast<size_t>(token0) * in_features;
+                    const bf16* x_token1 = x + static_cast<size_t>(token1) * in_features;
+                    const bf16* x_token2 = x + static_cast<size_t>(token2) * in_features;
+                    const bf16* x_token3 = x + static_cast<size_t>(token3) * in_features;
+
+                    const size_t gate_byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
+                    const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
+                    const size_t up_byte_base = static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
+                    const size_t up_block_base = static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+
+                    int byte_offset = sg_lane * 4;
+                    for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + gate_byte_base + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
+                        const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
+                        float ga;
+                        float ua;
+                        if (blocksize == 64) {
+                            const float ga_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index)
+                                : 0.0f;
+                            const float ua_leader = (sg_lane == 0 || sg_lane == 8)
+                                ? load_expert_absmax<UseNested, FixedNested256>(
+                                      slot.gate_up_absmax, slot.gate_up_nested, up_scale_index)
+                                : 0.0f;
+                            const float ga0 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 0);
+                            const float ga8 = sycl::group_broadcast(
+                                item.get_sub_group(), ga_leader, 8);
+                            const float ua0 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 0);
+                            const float ua8 = sycl::group_broadcast(
+                                item.get_sub_group(), ua_leader, 8);
+                            ga = sg_lane < 8 ? ga0 : ga8;
+                            ua = sg_lane < 8 ? ua0 : ua8;
+                        } else {
+                            ga = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, gate_scale_index);
+                            ua = load_expert_absmax<UseNested, FixedNested256>(
+                                slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
+                        }
+                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
+                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+
+                        const uint8_t gb0 = static_cast<uint8_t>(g4);
+                        const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                        const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                        const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                        const uint8_t ub0 = static_cast<uint8_t>(u4);
+                        const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                        const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                        const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+
+                        const float gw0 = ga;
+                        const float gw1 = ga;
+                        const float gw2 = ga;
+                        const float gw3 = ga;
+                        const float gw4 = ga;
+                        const float gw5 = ga;
+                        const float gw6 = ga;
+                        const float gw7 = ga;
+
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[0]), gw0, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[0]), gw0, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[0]), gw0, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[1]), gw1, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[1]), gw1, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[1]), gw1, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[2]), gw2, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[2]), gw2, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[2]), gw2, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[3]), gw3, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[3]), gw3, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[3]), gw3, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[4]), gw4, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[4]), gw4, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[4]), gw4, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[5]), gw5, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[5]), gw5, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[5]), gw5, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[6]), gw6, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[6]), gw6, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[6]), gw6, gate_acc3);
+                        gate_acc0 = sycl::fma(static_cast<float>(in_v0[7]), gw7, gate_acc0);
+                        gate_acc1 = sycl::fma(static_cast<float>(in_v1[7]), gw7, gate_acc1);
+                        gate_acc2 = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc2);
+                        gate_acc3 = sycl::fma(static_cast<float>(in_v3[7]), gw7, gate_acc3);
+
+                        const float uw0 = ua;
+                        const float uw1 = ua;
+                        const float uw2 = ua;
+                        const float uw3 = ua;
+                        const float uw4 = ua;
+                        const float uw5 = ua;
+                        const float uw6 = ua;
+                        const float uw7 = ua;
+
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[0]), uw0, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[0]), uw0, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[0]), uw0, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[1]), uw1, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[1]), uw1, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[1]), uw1, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[2]), uw2, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[2]), uw2, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[2]), uw2, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[3]), uw3, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[3]), uw3, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[3]), uw3, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[4]), uw4, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[4]), uw4, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[4]), uw4, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[5]), uw5, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[5]), uw5, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[5]), uw5, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[6]), uw6, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[6]), uw6, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[6]), uw6, up_acc3);
+                        up_acc0 = sycl::fma(static_cast<float>(in_v0[7]), uw7, up_acc0);
+                        up_acc1 = sycl::fma(static_cast<float>(in_v1[7]), uw7, up_acc1);
+                        up_acc2 = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc2);
+                        up_acc3 = sycl::fma(static_cast<float>(in_v3[7]), uw7, up_acc3);
+                    }
+                }
+
+                float gate_sum0 = sycl::reduce_over_group(item.get_sub_group(), gate_acc0, sycl::plus<>());
+                float up_sum0 = sycl::reduce_over_group(item.get_sub_group(), up_acc0, sycl::plus<>());
+                float gate_sum1 = sycl::reduce_over_group(item.get_sub_group(), gate_acc1, sycl::plus<>());
+                float up_sum1 = sycl::reduce_over_group(item.get_sub_group(), up_acc1, sycl::plus<>());
+                float gate_sum2 = sycl::reduce_over_group(item.get_sub_group(), gate_acc2, sycl::plus<>());
+                float up_sum2 = sycl::reduce_over_group(item.get_sub_group(), up_acc2, sycl::plus<>());
+                float gate_sum3 = sycl::reduce_over_group(item.get_sub_group(), gate_acc3, sycl::plus<>());
+                float up_sum3 = sycl::reduce_over_group(item.get_sub_group(), up_acc3, sycl::plus<>());
+
+                if (sg_lane == 0 && row < intermediate_size && quad_idx < total_quads) {
+
+                    const int token0 = token_ids[quad_idx * 4];
+                    const int rank0 = ranks[quad_idx * 4];
+                    const float silu_gate0 = gate_sum0 / (1.0f + sycl::native::exp(-gate_sum0));
+                    const size_t out_pos0 = (static_cast<size_t>(token0) * top_k + rank0) * intermediate_size + row;
+                    h[out_pos0] = bf16(silu_gate0 * up_sum0);
+
+                    const int token1 = token_ids[quad_idx * 4 + 1];
+                    const int rank1 = ranks[quad_idx * 4 + 1];
+                    const float silu_gate1 = gate_sum1 / (1.0f + sycl::native::exp(-gate_sum1));
+                    const size_t out_pos1 = (static_cast<size_t>(token1) * top_k + rank1) * intermediate_size + row;
+                    h[out_pos1] = bf16(silu_gate1 * up_sum1);
+
+                    const int token2 = token_ids[quad_idx * 4 + 2];
+                    const int rank2 = ranks[quad_idx * 4 + 2];
+                    const float silu_gate2 = gate_sum2 / (1.0f + sycl::native::exp(-gate_sum2));
+                    const size_t out_pos2 = (static_cast<size_t>(token2) * top_k + rank2) * intermediate_size + row;
+                    h[out_pos2] = bf16(silu_gate2 * up_sum2);
+
+                    const int token3 = token_ids[quad_idx * 4 + 3];
+                    const int rank3 = ranks[quad_idx * 4 + 3];
+                    const float silu_gate3 = gate_sum3 / (1.0f + sycl::native::exp(-gate_sum3));
+                    const size_t out_pos3 = (static_cast<size_t>(token3) * top_k + rank3) * intermediate_size + row;
+                    h[out_pos3] = bf16(silu_gate3 * up_sum3);
+                }
+            });
+    });
+}
+
+
 template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
 sycl::event launch_moe_expert_major_prefill_down_4token(
     Context& ctx,
@@ -4329,6 +5332,173 @@ sycl::event moe_expert_major_prefill_gate_up_4token_wgshare(
                 in_features, intermediate_size, blocksize, dep_event);
         }
         return launch_moe_expert_major_prefill_gate_up_4token_wgshare<false, false, 8>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (use_nested) {
+        if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token<true, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_gate_up_4token<true, false>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    return launch_moe_expert_major_prefill_gate_up_4token<false>(
+        ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+        in_features, intermediate_size, blocksize, dep_event);
+}
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_nounpack(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event,
+    bool use_nested,
+    int share_quads,
+    bool nested_fixed256) {
+    if (total_quads <= 0) return {};
+    if (share_quads == 2) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, true, 2>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, false, 2>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<false, false, 2>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (share_quads == 4) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, true, 4>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, false, 4>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<false, false, 4>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (share_quads == 8) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, true, 8>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<true, false, 8>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack<false, false, 8>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (use_nested) {
+        if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token<true, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_gate_up_4token<true, false>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    return launch_moe_expert_major_prefill_gate_up_4token<false>(
+        ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+        in_features, intermediate_size, blocksize, dep_event);
+}
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_slm(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event,
+    bool use_nested,
+    bool nested_fixed256) {
+    if (total_quads <= 0) return {};
+    if (use_nested) {
+        if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_slm<true, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_slm<true, false>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    return launch_moe_expert_major_prefill_gate_up_4token_wgshare_slm<false, false>(
+        ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+        in_features, intermediate_size, blocksize, dep_event);
+}
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_nolut(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features,
+    int intermediate_size,
+    int blocksize,
+    const sycl::event* dep_event,
+    bool use_nested,
+    int share_quads,
+    bool nested_fixed256) {
+    if (total_quads <= 0) return {};
+    if (share_quads == 2) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, true, 2>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, false, 2>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<false, false, 2>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (share_quads == 4) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, true, 4>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, false, 4>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<false, false, 4>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
+    if (share_quads == 8) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, true, 8>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<true, false, 8>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token_wgshare_nolut<false, false, 8>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
             in_features, intermediate_size, blocksize, dep_event);
     }

@@ -503,6 +503,72 @@ sycl::event moe_expert_major_prefill_gate_up_4token_wgshare(
     int share_quads = 0,
     bool nested_fixed256 = false);
 
+// P4 bounding probe: identical row mapping and FMA schedule as the wgshare
+// gate/up kernel above, but the 16 per-lane NF4 LUT+scale multiplies are
+// replaced by the raw scale so the packed-weight loads and nibble extraction
+// compile away. Its wall time upper-bounds any same-math dequant-reuse
+// scheme; timing diagnostic only, never used for real inference.
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_nounpack(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false,
+    int share_quads = 0,
+    bool nested_fixed256 = false);
+
+// P4: share-4 SLM dequant reuse for the gate/up prefill quad kernel. Row
+// groups whose four quads reference the same expert unpack one FP32
+// gate/up tile per 64-byte K-chunk cooperatively into SLM; everything else
+// (mixed experts, row tails, blocksize != 64, per-lane remainders) keeps the
+// exact original unpack, and the FMA/reduction/ordered-write schedule is
+// unchanged, so outputs stay bit-exact against the wgshare gate/up kernel.
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_slm(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false,
+    bool nested_fixed256 = false);
+
+// P4 diagnostic V2: the wgshare gate/up kernel with its SLM LUT gathers
+// replaced by int-to-float converts of the raw nibbles. Timing only.
+sycl::event moe_expert_major_prefill_gate_up_4token_wgshare_nolut(
+    Context& ctx,
+    const MoeExpertSlotDev* slots,
+    const int* token_ids,
+    const int* ranks,
+    const float* quant_map,
+    const bf16* x,
+    bf16* h,
+    int total_quads,
+    int top_k,
+    int in_features = 2560,
+    int intermediate_size = 640,
+    int blocksize = 64,
+    const sycl::event* dep_event = nullptr,
+    bool use_nested = false,
+    int share_quads = 0,
+    bool nested_fixed256 = false);
+
 sycl::event moe_expert_major_prefill_down_4token_wgshare(
     Context& ctx,
     const MoeExpertSlotDev* slots,

@@ -4157,6 +4157,201 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
                     std::cout << "      4token share=" << share << ": " << ms << " ms ("
                               << (ms_4t / ms) << "x vs 4token, informational)\n";
                 }
+                // P4 bounding probe (opt-in AILA_Q4E_NOUNPACK_PROBE): the
+                // nounpack variant keeps the identical row mapping and every
+                // FMA, but replaces the 16 NF4 LUT+scale multiplies with the
+                // raw scale, so the packed-weight loads and nibble extraction
+                // vanish as dead code. Its delta upper-bounds what any
+                // same-math dequant-reuse scheme could ever recover.
+                if (aila::env::read_flag("AILA_Q4E_NOUNPACK_PROBE", false)) {
+                    auto launch_gu_only = [&](bool nounpack, int share) {
+                        if (nounpack) {
+                            return ops::moe_expert_major_prefill_gate_up_4token_wgshare_nounpack(
+                                ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                                static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                                static_cast<bf16*>(q_h_dev.data()), total_quads,
+                                num_active_experts, in_features, intermediate_size,
+                                blocksize, nullptr, false, share, false);
+                        }
+                        return ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+                            ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                            static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                            static_cast<bf16*>(q_h_dev.data()), total_quads,
+                            num_active_experts, in_features, intermediate_size,
+                            blocksize, nullptr, false, share, false);
+                    };
+                    auto bench_gu = [&](bool nounpack, int share) {
+                        for (int i = 0; i < 3; ++i) launch_gu_only(nounpack, share).wait();
+                        auto t0 = std::chrono::high_resolution_clock::now();
+                        for (int i = 0; i < q_iters; ++i) launch_gu_only(nounpack, share);
+                        ctx.synchronize();
+                        auto t1 = std::chrono::high_resolution_clock::now();
+                        return std::chrono::duration<double, std::milli>(t1 - t0).count() / q_iters;
+                    };
+                    for (int share : {2, 4, 8}) {
+                        std::vector<double> ms_orig, ms_nop;
+                        for (int round = 0; round < 3; ++round) {
+                            if ((round % 2) == 0) {
+                                ms_orig.push_back(bench_gu(false, share));
+                                ms_nop.push_back(bench_gu(true, share));
+                            } else {
+                                ms_nop.push_back(bench_gu(true, share));
+                                ms_orig.push_back(bench_gu(false, share));
+                            }
+                        }
+                        std::sort(ms_orig.begin(), ms_orig.end());
+                        std::sort(ms_nop.begin(), ms_nop.end());
+                        const double m_orig = ms_orig[1];
+                        const double m_nop = ms_nop[1];
+                        std::cout << "      [P4 probe] share=" << share
+                                  << " gate/up only orig=" << m_orig
+                                  << " ms nounpack=" << m_nop
+                                  << " ms delta=" << ((m_orig - m_nop) / m_orig * 100.0)
+                                  << "% (rounds orig=" << ms_orig[0] << "/" << ms_orig[1]
+                                  << "/" << ms_orig[2] << ", nounpack=" << ms_nop[0] << "/"
+                                  << ms_nop[1] << "/" << ms_nop[2] << ")\n";
+                    }
+                }
+                // P4 diagnostic V2 (opt-in AILA_Q4E_NOLUT_PROBE): same kernel
+                // with the SLM LUT gathers replaced by int-to-float converts.
+                // Discriminates "LUT gather chain is the cost" (shareable,
+                // SLM could pay) from "packed-load chain is the cost" (not
+                // shareable, P4 cannot pay).
+                if (aila::env::read_flag("AILA_Q4E_NOLUT_PROBE", false)) {
+                    auto launch_gu_only = [&](bool nolut, int share) {
+                        if (nolut) {
+                            return ops::moe_expert_major_prefill_gate_up_4token_wgshare_nolut(
+                                ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                                static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                                static_cast<bf16*>(q_h_dev.data()), total_quads,
+                                num_active_experts, in_features, intermediate_size,
+                                blocksize, nullptr, false, share, false);
+                        }
+                        return ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+                            ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                            static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                            static_cast<bf16*>(q_h_dev.data()), total_quads,
+                            num_active_experts, in_features, intermediate_size,
+                            blocksize, nullptr, false, share, false);
+                    };
+                    auto bench_gu = [&](bool nolut, int share) {
+                        for (int i = 0; i < 3; ++i) launch_gu_only(nolut, share).wait();
+                        auto t0 = std::chrono::high_resolution_clock::now();
+                        for (int i = 0; i < q_iters; ++i) launch_gu_only(nolut, share);
+                        ctx.synchronize();
+                        auto t1 = std::chrono::high_resolution_clock::now();
+                        return std::chrono::duration<double, std::milli>(t1 - t0).count() / q_iters;
+                    };
+                    for (int share : {4}) {
+                        std::vector<double> ms_orig, ms_nolut;
+                        for (int round = 0; round < 3; ++round) {
+                            if ((round % 2) == 0) {
+                                ms_orig.push_back(bench_gu(false, share));
+                                ms_nolut.push_back(bench_gu(true, share));
+                            } else {
+                                ms_nolut.push_back(bench_gu(true, share));
+                                ms_orig.push_back(bench_gu(false, share));
+                            }
+                        }
+                        std::sort(ms_orig.begin(), ms_orig.end());
+                        std::sort(ms_nolut.begin(), ms_nolut.end());
+                        std::cout << "      [P4 nolut] share=" << share
+                                  << " gate/up only orig=" << ms_orig[1]
+                                  << " ms nolut=" << ms_nolut[1]
+                                  << " ms delta=" << ((ms_orig[1] - ms_nolut[1]) / ms_orig[1] * 100.0)
+                                  << "% (rounds orig=" << ms_orig[0] << "/" << ms_orig[1]
+                                  << "/" << ms_orig[2] << ", nolut=" << ms_nolut[0] << "/"
+                                  << ms_nolut[1] << "/" << ms_nolut[2] << ")\n";
+                    }
+                }
+                // P4 step 2: the share-4 SLM dequant-reuse gate/up kernel must
+                // be bit-exact against the wgshare share=4 kernel; timing is a
+                // gate/up-only A/B/B/A against that same reference.
+                if (aila::env::read_flag("AILA_Q4E_SLM_REUSE", false)) {
+                    const size_t h_elems = size_t(4 * total_quads) * intermediate_size;
+                    Tensor h_ref_dev = Tensor::allocate(
+                        ctx, {static_cast<int64_t>(h_elems)}, dnnl::memory::data_type::bf16);
+                    Tensor h_slm_dev = Tensor::allocate(
+                        ctx, {static_cast<int64_t>(h_elems)}, dnnl::memory::data_type::bf16);
+                    // The quad map only covers complete 4-groups, so leftover
+                    // single-act slots are never written; pre-fill both buffers
+                    // identically before comparing.
+                    {
+                        std::vector<bf16> h_init(h_elems, bf16(0.375f));
+                        ctx.memcpy_h2d(h_ref_dev.data(), h_init.data(),
+                                       h_elems * sizeof(bf16));
+                        ctx.memcpy_h2d(h_slm_dev.data(), h_init.data(),
+                                       h_elems * sizeof(bf16));
+                    }
+                    auto launch_ref = [&]() {
+                        return ops::moe_expert_major_prefill_gate_up_4token_wgshare(
+                            ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                            static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                            static_cast<bf16*>(h_ref_dev.data()), total_quads,
+                            num_active_experts, in_features, intermediate_size,
+                            blocksize, nullptr, false, 4, false);
+                    };
+                    auto launch_slm = [&]() {
+                        return ops::moe_expert_major_prefill_gate_up_4token_wgshare_slm(
+                            ctx, q_slt_dev, static_cast<const int*>(q_tok_dev.data()),
+                            static_cast<const int*>(q_rnk_dev.data()), nullptr, x_rows,
+                            static_cast<bf16*>(h_slm_dev.data()), total_quads,
+                            num_active_experts, in_features, intermediate_size,
+                            blocksize, nullptr, false, false);
+                    };
+                    launch_ref().wait();
+                    launch_slm().wait();
+                    std::vector<bf16> h_ref_host(h_elems), h_slm_host(h_elems);
+                    ctx.memcpy_d2h(h_ref_host.data(), h_ref_dev.data(),
+                                   h_elems * sizeof(bf16));
+                    ctx.memcpy_d2h(h_slm_host.data(), h_slm_dev.data(),
+                                   h_elems * sizeof(bf16));
+                    size_t mismatch = 0;
+                    size_t first_bad = 0;
+                    for (size_t i = 0; i < h_elems; ++i) {
+                        if (h_ref_host[i] != h_slm_host[i]) {
+                            if (mismatch == 0) first_bad = i;
+                            ++mismatch;
+                        }
+                    }
+                    std::cout << "      [P4 slm] gate/up bit-exact vs wgshare share=4: ";
+                    if (mismatch == 0) {
+                        std::cout << "PASS (" << h_elems << " elems)\n";
+                    } else {
+                        std::cout << "FAIL " << mismatch << "/" << h_elems
+                                  << " first=" << first_bad << "\n";
+                    }
+                    auto bench_lane = [&](bool slm_arm) {
+                        for (int i = 0; i < 3; ++i) {
+                            (slm_arm ? launch_slm() : launch_ref()).wait();
+                        }
+                        auto t0 = std::chrono::high_resolution_clock::now();
+                        for (int i = 0; i < q_iters; ++i) {
+                            slm_arm ? launch_slm() : launch_ref();
+                        }
+                        ctx.synchronize();
+                        auto t1 = std::chrono::high_resolution_clock::now();
+                        return std::chrono::duration<double, std::milli>(t1 - t0).count() / q_iters;
+                    };
+                    std::vector<double> ms_ref, ms_slm;
+                    for (int round = 0; round < 3; ++round) {
+                        if ((round % 2) == 0) {
+                            ms_ref.push_back(bench_lane(false));
+                            ms_slm.push_back(bench_lane(true));
+                        } else {
+                            ms_slm.push_back(bench_lane(true));
+                            ms_ref.push_back(bench_lane(false));
+                        }
+                    }
+                    std::sort(ms_ref.begin(), ms_ref.end());
+                    std::sort(ms_slm.begin(), ms_slm.end());
+                    std::cout << "      [P4 slm] gate/up only ref share=4=" << ms_ref[1]
+                              << " ms slm=" << ms_slm[1] << " ms delta="
+                              << ((ms_ref[1] - ms_slm[1]) / ms_ref[1] * 100.0)
+                              << "% (rounds ref=" << ms_ref[0] << "/" << ms_ref[1] << "/"
+                              << ms_ref[2] << ", slm=" << ms_slm[0] << "/" << ms_slm[1]
+                              << "/" << ms_slm[2] << ")\n";
+                }
                 ctx.free_device(q_slt_dev);
             }
         }
