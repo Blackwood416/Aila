@@ -281,8 +281,54 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             load(prefix+"gate_up_proj",gu,config_.hidden_size);
             load(prefix+"down_proj",dn,config_.moe_intermediate_size);
             const auto ref_done = std::chrono::steady_clock::now();
+            // C7 deep dive: the RAM copies run at ~0.43 GB/s because every
+            // copy faults in mmap source pages one after another. Warm the
+            // whole layer's source ranges in parallel first so the OS runs the
+            // disk reads concurrently; the copies then hit resident pages.
+            static const int s_prefetch_threads = std::clamp(
+                aila::env::read_int("AILA_Q4E_ARENA_FILL_PREFETCH", 0), 0, 16);
+            const auto prefetch_t0 = std::chrono::steady_clock::now();
+            if (s_prefetch_threads > 0) {
+                auto touch_range = [](const uint8_t* p, size_t bytes) {
+                    volatile uint8_t sink = 0;
+                    for (size_t off = 0; off < bytes; off += 4096) {
+                        sink ^= p[off];
+                    }
+                    (void)sink;
+                };
+                const std::array<std::pair<const uint8_t*, size_t>, 4> ranges{{
+                    {gu.packed_weight.ptr, gu.packed_weight.bytes},
+                    {gu.absmax.ptr, gu.absmax.bytes},
+                    {dn.packed_weight.ptr, dn.packed_weight.bytes},
+                    {dn.absmax.ptr, dn.absmax.bytes}}};
+                std::vector<std::thread> warm;
+                warm.reserve(static_cast<size_t>(s_prefetch_threads));
+                for (int t = 0; t < s_prefetch_threads; ++t) {
+                    warm.emplace_back([&, t] {
+                        for (const auto& range : ranges) {
+                            const size_t per =
+                                (range.second + s_prefetch_threads - 1) / s_prefetch_threads;
+                            const size_t begin = std::min(range.second, per * t);
+                            const size_t end = std::min(range.second, begin + per);
+                            if (begin < end) touch_range(range.first + begin, end - begin);
+                        }
+                    });
+                }
+                for (auto& th : warm) th.join();
+            }
+            if (load_timing && s_prefetch_threads > 0) {
+                static double s_prefetch_ms = 0.0;
+                s_prefetch_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - prefetch_t0).count();
+                if (layer + 1 == config_.num_layers) {
+                    AILA_LOG_WARN("[Q4E LoadTiming] source prefetch (%d threads): %.1f s total",
+                                  s_prefetch_threads, s_prefetch_ms / 1000.0);
+                }
+            }
             LoadLayerDirect(layer,gu,dn);
-            if (load_timing) {
+            // Per-layer lines go through the IPC log pipe; keep them sparse so
+            // the diagnostic itself does not distort the timing.
+            if (load_timing && (layer % 8 == 0 || layer + 1 == config_.num_layers)) {
                 const auto now = std::chrono::steady_clock::now();
                 AILA_LOG_WARN("[Q4E LoadTiming] arena layer %d: total %.3f s (weight refs %.3f s, copy+upload %.3f s)",
                               layer,
