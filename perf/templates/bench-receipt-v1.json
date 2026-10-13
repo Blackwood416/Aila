@@ -1,0 +1,60 @@
+{
+  "_comment": "Template for a bench receipt (Strata C8 method package). Fill every field; unknown values are \"null\" with a note, never omitted silently. Written by tools/perf/ab_receipt.py or by hand for GPU microbenchmarks.",
+  "schema": "aila-bench-receipt/1",
+  "date": "2026-10-13",
+  "owner": "main",
+  "question": "one sentence: what decision does this receipt support?",
+  "metric": "first_content_seconds | decode_rate | kernel_ms | bytes_per_sec ...",
+  "higher_is_better": false,
+  "label": "request label or kernel shape id",
+  "workload": {
+    "fixture": "tmp/q4e-agent-corpus-v1",
+    "prompt_tokens": 13944,
+    "generate": 128,
+    "chunk": 4096,
+    "kv_type": "bf16",
+    "sessions": 1,
+    "reuse": 1
+  },
+  "environment": {
+    "gpu": "Intel Arc A770 16GB",
+    "driver": "32.0.101.8724",
+    "oneapi": "2026.1",
+    "pcie_link": "measured 9.1-9.8 GB/s pinned H2D",
+    "other_load": "none (worker/server stopped before the run)"
+  },
+  "artifacts": {
+    "worker_build_id": "aila-0.2.0-abi1-<hash>",
+    "server_build_id": "aila-0.2.0-abi1-<hash>",
+    "worker_sha256": "<sha256>",
+    "server_sha256": "<sha256>",
+    "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+    "profile": "perf/qwen4exp/profiles/qwen38-nf4-h4-v1.profile",
+    "env_overrides": ["AILA_Q4E_...=..."],
+    "git": { "commit": "<hash>", "dirty": false }
+  },
+  "protocol": {
+    "warmup": "6K fixture request + N kernel warmups",
+    "order": "A/B/B/A interleaved",
+    "sample_unit": "one request or one kernel launch batch",
+    "samples_per_arm": 4,
+    "aa_noise_floor_pct": null,
+    "device_queue_span": "reported alongside host wall; empty-marker cost subtracted"
+  },
+  "arms": {
+    "a": { "config": "baseline", "n": 4, "median": null, "p10": null, "p90": null },
+    "b": { "config": "candidate", "n": 4, "median": null, "p10": null, "p90": null }
+  },
+  "pairs_won": { "a": null, "b": null },
+  "verdict": {
+    "gate": ">= +3% end-to-end (or >= +10% kernel complete-chain)",
+    "result": "GO | NO-GO | opt-in",
+    "emission_rule": "a change only becomes a default where BOTH measured shapes win by >=3%; ties and cross-shape disagreement stay off",
+    "counter_evidence": "gpu utilization / unitrace sample that rules out 'the kernel is the bottleneck' before optimizing it"
+  },
+  "correctness": {
+    "output_hash_or_raw_ids": "<path or sha256>",
+    "bit_exact_vs_reference": null,
+    "verifier": "command that a third party can run"
+  }
+}

@@ -13,7 +13,7 @@
 | C5 | adaptive 异步/重叠 + 交换旋转 | 未开始 | — | — |
 | C6 | verify 窗口 route tail skip | 未开始 | — | — |
 | C7 | 专家填充流水线 | 未开始 | — | — |
-| C8 | 工程方法学包 | 未开始 | — | — |
+| C8 | 工程方法学包 | **完成** | 已落地：收据 schema `perf/templates/bench-receipt-v1.json`、生成器 `tools/perf/ab_receipt.py`（A/A 噪声底示例 0.08%）、探针 `--json` 机器可读输出、3% 发射规则等 6 条纪律 | [C8 方法](qwen38-strata-c8-methods-2026-10-13.md) |
 | C9 | suffix-lookup drafter + DraftPolicy | 未开始 | — | — |
 | C10 | batch-MTP 取舍 + batch exactness 配方 | 未开始 | — | — |
 | C11 | 编译/稳健小项 | 未开始 | — | — |

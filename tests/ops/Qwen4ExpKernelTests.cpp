@@ -4368,7 +4368,7 @@ void test_moe_prefill_weight_reuse_benchmark(Context& ctx) {
 // queue on this device/driver? If the two serialize, no amount of prefill
 // stream-ahead can hide the staging DMA and the fix has to change where the
 // copies execute (copy-only queue / engine).
-void test_queue_overlap_probe(Context& ctx) {
+void test_queue_overlap_probe(Context& ctx, bool json_output = false) {
     constexpr size_t kCopyBytes = 32ull << 20; // ~one 16-expert staging batch
     constexpr int kRounds = 16;
     constexpr int kBurnItems = 1 << 18;
@@ -4524,10 +4524,7 @@ void test_queue_overlap_probe(Context& ctx) {
     t1 = std::chrono::high_resolution_clock::now();
     const double pingpong_mem_ms = wall_ms(t0, t1) / kRounds;
 
-    std::cout << "  [queue-overlap-mem] burn_mem=" << burn_mem_ms
-              << " ms pingpong_mem=" << pingpong_mem_ms
-              << " ms (serial_sum=" << (burn_mem_ms + copy_ms)
-              << ", max=" << std::max(burn_mem_ms, copy_ms) << ")\n";
+    // (output is emitted after all measurements; see the consolidated block)
 
     // Everything on the main in-order queue: the strictly serial reference.
     t0 = std::chrono::high_resolution_clock::now();
@@ -4538,12 +4535,6 @@ void test_queue_overlap_probe(Context& ctx) {
     ctx.queue().wait();
     t1 = std::chrono::high_resolution_clock::now();
     const double same_ms = wall_ms(t0, t1) / kRounds;
-
-    std::cout << "  [queue-overlap] burn=" << burn_ms << " ms copy=" << copy_ms
-              << " ms dep=" << dep_ms << " ms pingpong=" << pingpong_ms
-              << " ms indep=" << indep_ms
-              << " ms same-queue=" << same_ms << " ms"
-              << " (serial_sum=" << (burn_ms + copy_ms) << ")\n";
 
     // Source-type screen: can the staging H2D read straight from the large-page
     // arena memory instead of the pinned bounce buffer (which costs a second
@@ -4564,12 +4555,38 @@ void test_queue_overlap_probe(Context& ctx) {
     const double large_ms = time_copy_src(large);
     void* dev_src = ctx.alloc_device(kCopyBytes);
     const double d2d_ms = time_copy_src(dev_src);
-    std::cout << "  [stage-src] 32MiB H2D pinned=" << pinned_ms
-              << " ms (" << (kCopyBytes / (pinned_ms * 1e-3) / 1e9) << " GB/s)"
-              << " large-page=" << large_ms << " ms ("
-              << (kCopyBytes / (large_ms * 1e-3) / 1e9) << " GB/s)"
-              << " d2d=" << d2d_ms << " ms ("
-              << (kCopyBytes / (d2d_ms * 1e-3) / 1e9) << " GB/s)\n";
+    if (json_output) {
+        std::cout << "{\"probe\":\"queue-overlap\","
+                  << "\"burn_ms\":" << burn_ms << ","
+                  << "\"copy_ms\":" << copy_ms << ","
+                  << "\"dep_ms\":" << dep_ms << ","
+                  << "\"pingpong_ms\":" << pingpong_ms << ","
+                  << "\"indep_ms\":" << indep_ms << ","
+                  << "\"same_queue_ms\":" << same_ms << ","
+                  << "\"burn_mem_ms\":" << burn_mem_ms << ","
+                  << "\"pingpong_mem_ms\":" << pingpong_mem_ms << ","
+                  << "\"serial_sum_ms\":" << (burn_ms + copy_ms) << ","
+                  << "\"h2d_pinned_ms\":" << pinned_ms << ","
+                  << "\"h2d_large_page_ms\":" << large_ms << ","
+                  << "\"d2d_ms\":" << d2d_ms << ","
+                  << "\"copy_bytes\":" << kCopyBytes << "}\n";
+    } else {
+        std::cout << "  [queue-overlap] burn=" << burn_ms << " ms copy=" << copy_ms
+                  << " ms dep=" << dep_ms << " ms pingpong=" << pingpong_ms
+                  << " ms indep=" << indep_ms
+                  << " ms same-queue=" << same_ms << " ms"
+                  << " (serial_sum=" << (burn_ms + copy_ms) << ")\n";
+        std::cout << "  [queue-overlap-mem] burn_mem=" << burn_mem_ms
+                  << " ms pingpong_mem=" << pingpong_mem_ms
+                  << " ms (serial_sum=" << (burn_mem_ms + copy_ms)
+                  << ", max=" << std::max(burn_mem_ms, copy_ms) << ")\n";
+        std::cout << "  [stage-src] 32MiB H2D pinned=" << pinned_ms
+                  << " ms (" << (kCopyBytes / (pinned_ms * 1e-3) / 1e9) << " GB/s)"
+                  << " large-page=" << large_ms << " ms ("
+                  << (kCopyBytes / (large_ms * 1e-3) / 1e9) << " GB/s)"
+                  << " d2d=" << d2d_ms << " ms ("
+                  << (kCopyBytes / (d2d_ms * 1e-3) / 1e9) << " GB/s)\n";
+    }
 
     ctx.free_device(dev_src);
     ctx.free_host(large);
@@ -4854,6 +4871,14 @@ int main(int argc, char** argv) {
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("Queue overlap probe teardown USM leak");
             std::cout << "Queue overlap probe completed; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 3 && std::string(argv[1]) == "--queue-overlap-probe" &&
+            std::string(argv[2]) == "--json") {
+            test_queue_overlap_probe(ctx, true);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Queue overlap probe teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-int8-dpas-only") {
