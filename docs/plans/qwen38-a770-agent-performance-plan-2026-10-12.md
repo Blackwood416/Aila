@@ -320,12 +320,17 @@ oracle 探针 → 单变量判别探针 → 逐位精确实现。完整证据见
   另有独立的 `pretokenize` 空白/标点边界与 tokenizer.json 不一致（等长换 id），生成区内命中 content
   120-121 一处，是否影响本次复用需修复后 live 复跑判定。详见
   [P1 分叉定位](qwen38-p1-reencode-divergence-2026-10-13.md)。
-- **影响与路径**：agent 在长生成后立刻续轮会整段重跑 prefill（本机 14K ≈70 s）。当前路径：
-  ① 采纳 `Tokenizer.cpp:449` 一行修复并重建 pair，按同一 fixture 复跑确认 `qualifying=1`；
-  ② 若仍在生成区 miss，按新文档的残余清单继续对齐 `pretokenize`。边界不变：不引入 prefix trie /
-  多分支快照池，不对 DeltaNet/PLE 做任意 LCP 截断。原始现场：
-  `tmp/q4e-agent-plan-audit-20261012/p1-g128/{stdout,stderr}.log` 与
-  `tmp/q4e-resident-speed-20261009/p1-g32/…`。
+- **修复与验证（2026-10-13 完成）**：两处缺陷都已修并 live 复验：
+  ① `c1e9e60` merges 加载只跳过 `#version` 头行；② `2c51cc5` `pretokenize` 对齐参考
+  `\s+(?!\S)`（多空白后跟非空白时把末位空白留给下一分支，修复生成区 content 120-121 的
+  等长换 id）。离线逐 id 对齐：content 128/128、prompt1 13944/13944、prompt2 14096/14096
+  全部 EQUAL；live（`p1-g128-pretok-20261013`，pair `retained16`）续轮
+  **`diverge_at=14072=cached_len qualifying=1`、cached_prompt_tokens=14072、
+  first content 71.0 s → 1.486 s**。回归测试 `AilaTokenizerRegressionTests` 进 `cpu|abi`
+  （20/20 通过）。边界不变：不引入 prefix trie / 多分支快照池，不对 DeltaNet/PLE 做任意 LCP 截断。
+  原始现场：`tmp/q4e-agent-plan-audit-20261012/p1-g128{,-pretok-20261013}/{stdout,stderr}.log`
+  与 `tmp/q4e-resident-speed-20261009/p1-g32/…`。详见
+  [P1 分叉定位](qwen38-p1-reencode-divergence-2026-10-13.md)。
 
 ### P3（agent 工作负载热集排名，已完成 2026-10-13）
 

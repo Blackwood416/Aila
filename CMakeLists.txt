@@ -977,6 +977,16 @@ target_include_directories(AilaSafeTensorsTests PRIVATE
 target_link_libraries(AilaSafeTensorsTests PRIVATE AilaLib)
 add_test(NAME AilaSafeTensorsTests COMMAND AilaSafeTensorsTests)
 
+add_executable(AilaTokenizerRegressionTests tests/utils/TokenizerRegressionTests.cpp)
+target_compile_definitions(AilaTokenizerRegressionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaTokenizerRegressionTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(AilaTokenizerRegressionTests PRIVATE AilaLib)
+add_test(NAME AilaTokenizerRegressionTests COMMAND AilaTokenizerRegressionTests)
+set_tests_properties(AilaTokenizerRegressionTests PROPERTIES LABELS "cpu;tokenizer" TIMEOUT 30)
+
 add_executable(AilaMimiEncoderTests tests/audio/MimiEncoderTests.cpp)
 target_compile_definitions(AilaMimiEncoderTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_include_directories(AilaMimiEncoderTests PRIVATE

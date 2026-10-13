@@ -138,3 +138,38 @@ python $d/p1_spans.py --text $d/p1-g128/render-prompt2.txt `
 - 探针与日志：`p1_tokenizer_probe.exe`、`p1_tokenizer_probe_fixed.exe`、`Tokenizer_fixed.cpp`、
   `p1-g128/{cpp-prompt1-ids.txt,cpp-prompt2-ids.txt,fixed-*-ids.txt,verify-offline.log}`
 - 运行身份：`p1-g128/launch.json`（server sha256 `75f92518…`、worker sha256 `880a9158…`）
+
+## 修复落地与 live 验证（2026-10-13，全部完成）
+
+两个缺陷都已修进 `src/utils/Tokenizer.cpp` 并 live 验证：
+
+1. **`#` 合并规则**（`c1e9e60`）：merges 加载只跳过 `#version` 头行。
+2. **`\s+(?!\S)` 语义**（`2c51cc5`）：非换行空白串后跟非空白字符时，把**最后一个字符**留给
+   下一分支（`?[^\s…]+` / `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` / 独立 `\s+`）。此前
+   `'   **'` 出 `[262('ĠĠĠ'),332('**')]`，参考为 `[256('ĠĠ'),2972('Ġ**')]` —— 正是本现场
+   生成区唯一的残余 miss（content 120-121）。
+
+离线逐 id 对齐（同一 `p1-g128` fixture，`p1_tokenizer_probe_cur.exe` vs HF `tokenizers`）：
+
+| 文本 | C++（修复后） | 参考 | 结果 |
+|---|---:|---:|---|
+| content.txt | 128 | 128 | **EQUAL**（`[120:122]=[256,2972]`） |
+| render-prompt1.txt | 13944 | 13944 | **EQUAL** |
+| render-prompt2.txt | 14096 | 14096 | **EQUAL** |
+
+live 复跑（同 fixture、`--generate 128 --reuse 1`、`AILA_SERVER_PREFIX_DIAG=1`，pair
+`retained16`/build `2c51cc5`）：
+
+| | 修复前 | 仅 `#` 修复 | 两项修复后（`p1-g128-pretok-20261013`） |
+|---|---|---|---|
+| 续轮 prompt tokens | 14133 | 14107 | 14096 |
+| PfxDiag take | `diverge_at=14047 qualifying=0` | `diverge_at=14075 qualifying=0` | **`diverge_at=14072 qualifying=1`** |
+| 续轮 cached_prompt_tokens | 0（整段重跑 14K） | 0 | **14072（=13944+128）** |
+| 续轮 first content | 71.12 s | 71.04 s | **1.486 s** |
+| 续轮 tok/s | 15.51 | 16.01 | 15.29 |
+
+- 首轮/取消/PI 回合不受影响（PI 6K 回合本就 `qualifying=1`）。
+- 回归防护：新增 CPU 测试 `AilaTokenizerRegressionTests`（合成 vocab+merges：`#` 规则、
+  `"   **"`、`"  -"`、`"  a"`），`ctest -L 'cpu|abi'` 20/20 通过。
+- 残留：`pretokenize` 与参考 regex 在其他边缘（对 digit 前空白、少见标点类）未逐一对照；
+  本 fixture 已全量 id 一致，后续若发现新 miss 再按 conformance 语料推进。
