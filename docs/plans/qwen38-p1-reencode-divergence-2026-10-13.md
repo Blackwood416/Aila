@@ -169,6 +169,9 @@ live 复跑（同 fixture、`--generate 128 --reuse 1`、`AILA_SERVER_PREFIX_DIA
 | 续轮 tok/s | 15.51 | 16.01 | 15.29 |
 
 - 首轮/取消/PI 回合不受影响（PI 6K 回合本就 `qualifying=1`）。
+- 短生成对照（同 fixture `--generate 32`，`p1-g32-fixed-20261013`）：首轮 13944 token，
+  续轮 `cached=13976=13944+32`、`diverge_at=13976 qualifying=1`、first content 1.491 s
+  （修复前 1.488 s）→ g32 场景无回归。
 - 回归防护：新增 CPU 测试 `AilaTokenizerRegressionTests`（合成 vocab+merges：`#` 规则、
   `"   **"`、`"  -"`、`"  a"`），`ctest -L 'cpu|abi'` 20/20 通过。
 - 残留：`pretokenize` 与参考 regex 在其他边缘（对 digit 前空白、少见标点类）未逐一对照；
