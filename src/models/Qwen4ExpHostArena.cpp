@@ -269,6 +269,65 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
 bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::string* error) {
     try {
         const bool load_timing = aila::env::read_flag("AILA_Q4E_LOAD_TIMING", false);
+        // C7 deep dive: reading the layer through mmap page faults is capped at
+        // ~0.66 GB/s on Windows (parallel faults on one file mapping serialize).
+        // Read the four source ranges with explicit parallel ReadFile calls into
+        // a reusable bounce buffer and let the existing per-expert copies run
+        // from RAM (~6.7 GB/s). Buffered reads keep the memory behaviour of the
+        // historical mmap path, and the per-layer working-set trim stays on.
+        // AILA_Q4E_ARENA_READ_THREADS>0 enables it; default 0 keeps the mmap
+        // path, because with a warm OS cache the mmap path is already fast
+        // (measured 68 s vs 82 s explicit) while a cold cache favours explicit
+        // reads (116 s -> 64-83 s). Opt-in for cold starts only.
+        static const int s_read_threads = std::clamp(
+            aila::env::read_int("AILA_Q4E_ARENA_READ_THREADS", 0), 0, 32);
+        const auto& shard_paths = weights.shard_paths();
+        std::unique_ptr<uint8_t[]> bounce;
+        size_t bounce_bytes = 0;
+        bool read_fallback_logged = false;
+        auto read_range = [](const std::string& path, uint64_t offset, uint8_t* dst,
+                             size_t bytes, int threads) -> bool {
+            const auto wide = std::filesystem::u8path(path).wstring();
+            std::vector<std::thread> pool;
+            std::atomic<bool> ok{true};
+            pool.reserve(static_cast<size_t>(threads));
+            for (int t = 0; t < threads; ++t) {
+                pool.emplace_back([&, t] {
+                    const size_t per = (bytes + static_cast<size_t>(threads) - 1) /
+                                       static_cast<size_t>(threads);
+                    const size_t begin = std::min(bytes, per * static_cast<size_t>(t));
+                    const size_t end = std::min(bytes, begin + per);
+                    if (begin >= end) return;
+                    HANDLE h = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                           OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                                           nullptr);
+                    if (h == INVALID_HANDLE_VALUE) {
+                        ok = false;
+                        return;
+                    }
+                    LARGE_INTEGER pos{};
+                    pos.QuadPart = static_cast<LONGLONG>(offset + begin);
+                    bool good = SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) != 0;
+                    uint8_t* p = dst + begin;
+                    size_t left = end - begin;
+                    while (good && left > 0) {
+                        DWORD got = 0;
+                        const DWORD want = static_cast<DWORD>(std::min<size_t>(left, 4u << 20));
+                        if (!ReadFile(h, p, want, &got, nullptr) || got == 0) {
+                            good = false;
+                            break;
+                        }
+                        p += got;
+                        left -= got;
+                    }
+                    if (!good) ok = false;
+                    CloseHandle(h);
+                });
+            }
+            for (auto& th : pool) th.join();
+            return ok.load();
+        };
         for (int layer=0;layer<config_.num_layers;++layer) {
             const auto layer_t0 = std::chrono::steady_clock::now();
             const auto prefix="model.language_model.layers."+std::to_string(layer)+".mlp.experts.";
@@ -281,6 +340,51 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             load(prefix+"gate_up_proj",gu,config_.hidden_size);
             load(prefix+"down_proj",dn,config_.moe_intermediate_size);
             const auto ref_done = std::chrono::steady_clock::now();
+            Bnb4BitHostWeightRef gu_src = gu;
+            Bnb4BitHostWeightRef dn_src = dn;
+            if (s_read_threads > 0) {
+                const size_t need = gu.packed_weight.bytes + gu.absmax.bytes +
+                                    dn.packed_weight.bytes + dn.absmax.bytes;
+                if (!bounce || bounce_bytes < need) {
+                    bounce.reset(new uint8_t[need]);
+                    bounce_bytes = need;
+                }
+                std::array<HostTensorView*, 4> views{
+                    {&gu_src.packed_weight, &gu_src.absmax,
+                     &dn_src.packed_weight, &dn_src.absmax}};
+                size_t cursor = 0;
+                bool read_ok = true;
+                for (auto* view : views) {
+                    const FileSpan& span = view->file_span;
+                    if (!span.valid() ||
+                        span.shard_id >= static_cast<int>(shard_paths.size()) ||
+                        span.bytes < view->bytes ||
+                        !read_range(shard_paths[static_cast<size_t>(span.shard_id)],
+                                    span.absolute_offset, bounce.get() + cursor, view->bytes,
+                                    s_read_threads)) {
+                        read_ok = false;
+                        break;
+                    }
+                    view->ptr = bounce.get() + cursor;
+                    cursor += view->bytes;
+                }
+                if (!read_ok) {
+                    gu_src = gu;
+                    dn_src = dn;
+                    if (!read_fallback_logged) {
+                        AILA_LOG_WARN("[Q4E ArenaRead] explicit read failed; falling back to mmap path");
+                        read_fallback_logged = true;
+                    }
+                } else if (load_timing) {
+                    static double s_read_ms = 0.0;
+                    s_read_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ref_done).count();
+                    if (layer + 1 == config_.num_layers) {
+                        AILA_LOG_WARN("[Q4E LoadTiming] explicit reads: %.1f s total",
+                                      s_read_ms / 1000.0);
+                    }
+                }
+            }
             // C7 deep dive: the RAM copies run at ~0.43 GB/s because every
             // copy faults in mmap source pages one after another. Warm the
             // whole layer's source ranges in parallel first so the OS runs the
@@ -288,7 +392,9 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             static const int s_prefetch_threads = std::clamp(
                 aila::env::read_int("AILA_Q4E_ARENA_FILL_PREFETCH", 0), 0, 16);
             const auto prefetch_t0 = std::chrono::steady_clock::now();
-            if (s_prefetch_threads > 0) {
+            // With explicit reads the mmap source pages are never touched, so
+            // the prefetch would only add faults.
+            if (s_prefetch_threads > 0 && s_read_threads == 0) {
                 auto touch_range = [](const uint8_t* p, size_t bytes) {
                     volatile uint8_t sink = 0;
                     for (size_t off = 0; off < bytes; off += 4096) {
@@ -325,7 +431,7 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
                                   s_prefetch_threads, s_prefetch_ms / 1000.0);
                 }
             }
-            LoadLayerDirect(layer,gu,dn);
+            LoadLayerDirect(layer,gu_src,dn_src);
             // Per-layer lines go through the IPC log pipe; keep them sparse so
             // the diagnostic itself does not distort the timing.
             if (load_timing && (layer % 8 == 0 || layer + 1 == config_.num_layers)) {

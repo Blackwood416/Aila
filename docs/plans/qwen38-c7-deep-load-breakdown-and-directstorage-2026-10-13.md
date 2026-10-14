@@ -49,15 +49,32 @@
 而"不同文件并发读"可到 8.6 GB/s。进一步实测**同一文件 16 线程显式读**：3.2 GB/s
 （`nvme_read_bench.py --single-file`，0.87 GB 分片、含缓存成分），单线程 1.9-2.2 GB/s。
 
-### 1.2 由此得出的实施路径（未实现，已验证可行性证据）
+### 1.2 显式并行读（已实现，**opt-in**：`AILA_Q4E_ARENA_READ_THREADS`，默认 0）
 
-1. **显式并行读替代 mmap 缺页**：loader 已有 `MemoryMappedFile` + `TensorMeta.byte_offset_start/end`
-   （`src/utils/SafeTensors.hpp`），逐层把 gu/dn 的 4 个区间用 N 线程显式 pread（或 Overlapped/
-   FILE_FLAG_NO_BUFFERING）读入一个中转缓冲，再 memcpy 进 arena。目标：读 58 GiB 从 ~95 s
-   降到 20-25 s（按 2.5 GB/s 保守估计）。
-2. **GPU 上传流水线化**：批量 memcpy 到 staging + 单次 wait（或直接从大页 H2D，已测 9.2 GB/s）：
-   24 s → 3-5 s。
-3. 合计预期 startup **116-119 s → 45-55 s**。
+实现：默认 0 = 原 mmap 路径不变；>0 = 用 N 个线程对每层的 4 个源区间做显式
+`CreateFileW + SetFilePointerEx + ReadFile`（每线程独立句柄、4 MiB 读块）读入一个可复用的
+bounce 缓冲，随后沿用原有逐专家拷贝；每层 working-set trim **保持默认开启**（内存曲线与基线一致）。
+
+| 场景 | 旧 mmap 路径 | 显式读 8 线程 | 显式读 16 线程 |
+|---|---:|---:|---:|
+| 冷缓存（长时间未读模型后） | 116.6 / 118.7 s | 82.8 s（−29~−30%） | **63.8-64.4 s（−45~−46%）** |
+| 热缓存（连续开发跑） | **68.0 s** | — | 82.2 / 83.3 s（**更慢**） |
+| 峰值内存（min available / worker RSS） | 2.13 GiB / 5.70 GiB | — | 1.14-2.97 GiB / 5.72-6.43 GiB |
+
+- 热缓存下 mmap 缺页由缓存服务，显式读的额外 bounce 拷贝反而更慢；冷缓存下 mmap 的单文件
+  section 串行（0.66 GB/s）是硬伤，显式 16 线程可到 ~1.2-3 GB/s。
+- **结论**：该路径是冷启动优化，默认保持 mmap（不改变默认行为与内存曲线）；需要冷启动加速时
+  `AILA_Q4E_ARENA_READ_THREADS=16`。峰值内存没有改善（两条路径都会把 arena + 模型页带入内存）。
+- 未落地：`FILE_FLAG_NO_BUFFERING`（对齐窗口直读、零系统缓存占用）——首版在"边缘 slice 回退"时
+  句柄未重开导致整层读失败并退回 mmap（170 s + 缓存压力），修复版（对齐窗口 + 文件尾小回退）
+  未继续验证（用户指示先停止压缩 startup）；如需"冷启动快且峰值低"，这是首选续作。
+
+### 1.3 尚未落地的后续项
+
+1. **`FILE_FLAG_NO_BUFFERING` 对齐窗口直读**：见 §1.2 末条（修好回退句柄问题的版本值得再验一次）。
+2. **GPU 上传流水线化**：一轮 ring(6 槽) 实验未带来收益（64.3 s vs 63.8 s，逐专家 DMA 延迟不是
+   当时的瓶颈）；若要再动，先分别计量"staging memcpy"与"wait"两段。
+3. 两者合计上限仍指向 startup ≈ 40-55 s（冷缓存口径）。
 
 优先级顺序（按性价比）：
 （见 §1.2；`FILL_PREFETCH` 与 `ARENA_FILL_THREADS` 两个 opt-in 已入库，先各自省 10-13%，
