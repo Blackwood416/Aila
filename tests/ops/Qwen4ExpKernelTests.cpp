@@ -16,7 +16,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -4892,6 +4894,218 @@ void test_non_moe_prefill_dense_xmx_evaluation(Context& ctx) {
 #include "Qwen4ExpAttentionPairTests.hpp"
 #include "Qwen4ExpW4A8Tests.hpp"
 
+// R1-QSA route cost probe (2026-10-15). Hardened replacement for the
+// 2026-09-30 header probe, which printed nothing between the device banner
+// and the first per-length verification line, so a stall or a silent process
+// death looked like "starts and immediately exits". Every GPU phase now
+// prints a flushed [QSA PROBE] breadcrumb before it runs and the failure
+// path reports stage + length. Emits [QSA COST] rows for the 2048/2051 dense
+// controls (route keeps every block: pure selector overhead) and the
+// 2052/4096/8192 sparse route (512-block budget, 2052 = first sparse length).
+void run_qsa_route_cost_probe(Context& ctx) {
+    std::cout << std::unitbuf;
+    struct TerminateGuard {
+        std::terminate_handler previous = std::get_terminate();
+        TerminateGuard() {
+            std::set_terminate([] {
+                std::cout << "[QSA PROBE TERMINATE] unhandled termination inside the QSA probe; "
+                             "last [QSA PROBE] breadcrumb above names the stalled stage\n";
+                std::abort();
+            });
+        }
+        ~TerminateGuard() { std::set_terminate(previous); }
+    } terminate_guard;
+
+    constexpr int heads = 24;
+    constexpr int kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int topk = 512;
+    constexpr int max_len = 8192;
+    constexpr int tile = 128;
+    constexpr int partial_stride = 272;
+    constexpr int reps = 15;
+
+    const char* stage = "host_fill";
+    int length = 0;
+    try {
+        std::cout << "[QSA PROBE] stage=host_fill lengths=2048,2051,2052,4096,8192 seed=20261001\n";
+        std::mt19937 rng(20261001);
+        std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+        std::vector<bf16> q_h(heads * head_dim);
+        std::vector<bf16> k_h(kv_heads * max_len * head_dim);
+        std::vector<bf16> v_h(k_h.size());
+        std::vector<bf16> iq_h(4 * 128);
+        std::vector<bf16> ck_h((max_len / 4) * 128);
+        for (auto* values : {&q_h, &k_h, &v_h, &iq_h, &ck_h})
+            for (auto& x : *values) x = bf16(dist(rng));
+        std::cout << "[QSA PROBE] stage=host_fill_done\n";
+
+        stage = "allocate";
+        Tensor q = Tensor::allocate(ctx, {1, heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor k = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor out = Tensor::allocate(ctx, {1, heads * head_dim}, dnnl::memory::data_type::bf16);
+        Tensor iq = Tensor::allocate(ctx, {4, 128}, dnnl::memory::data_type::bf16);
+        Tensor ck = Tensor::allocate(ctx, {max_len / 4, 128}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {max_len / 4}, dnnl::memory::data_type::f32);
+        Tensor ids = Tensor::allocate(ctx, {topk + 4}, dnnl::memory::data_type::s32);
+        Tensor attn_scores = Tensor::allocate(ctx, {heads, max_len}, dnnl::memory::data_type::f32);
+        Tensor partials = Tensor::allocate(ctx, {heads, (max_len + tile - 1) / tile, partial_stride},
+                                           dnnl::memory::data_type::f32);
+        std::cout << "[QSA PROBE] stage=allocate_done\n";
+
+        stage = "upload";
+        ctx.memcpy_h2d(q.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k.data(), k_h.data(), k_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v.data(), v_h.data(), v_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(iq.data(), iq_h.data(), iq_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(ck.data(), ck_h.data(), ck_h.size() * sizeof(bf16));
+        const auto live = ctx.device_allocation_count();
+        std::cout << "[QSA PROBE] stage=upload_done\n";
+
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto elapsed_ms = [&](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        // Warm + drain first, then report the warm wall time so a first-use
+        // kernel build (seconds to tens of seconds) is visible in the log
+        // instead of looking like a hang.
+        auto measure_ms = [&](const char* what, auto&& fn) {
+            auto t_warm = now();
+            for (int i = 0; i < 3; ++i) fn();
+            ctx.synchronize();
+            std::cout << "[QSA PROBE] stage=warm_done what=" << what << " length=" << length
+                      << " warm_ms=" << elapsed_ms(t_warm) << "\n";
+            std::vector<double> us;
+            us.reserve(reps);
+            for (int i = 0; i < reps; ++i) {
+                auto t0 = now();
+                fn();
+                ctx.synchronize();
+                us.push_back(std::chrono::duration<double, std::micro>(now() - t0).count());
+            }
+            std::sort(us.begin(), us.end());
+            return us[reps / 2] / 1000.0;
+        };
+
+        for (int len : {2048, 2051, 2052, 4096, 8192}) {
+            length = len;
+            const int blocks = len / 4;
+            const int tail = len % 4;
+
+            stage = "score";
+            std::cout << "[QSA PROBE] stage=score length=" << len << " blocks=" << blocks << "\n";
+            auto score = [&] { ops::qsa_compute_block_scores_compressed(ctx, iq, ck, scores, blocks); };
+            auto t_score = now();
+            score();
+            ctx.synchronize();
+            std::cout << "[QSA PROBE] stage=score_done length=" << len
+                      << " ms=" << elapsed_ms(t_score) << "\n";
+
+            stage = "select";
+            std::cout << "[QSA PROBE] stage=select length=" << len << "\n";
+            auto select = [&] {
+                return ops::qsa_select_topk_blocks(ctx, scores, blocks, topk, len, 4, ids);
+            };
+            const int selected = select();
+            ctx.synchronize();
+            if (selected <= 0 || selected > topk || selected > blocks)
+                throw std::runtime_error("QSA probe: invalid selector block count " + std::to_string(selected) +
+                                         " at length " + std::to_string(len));
+            std::vector<float> scores_h(blocks);
+            std::vector<int> ids_h(selected + tail), ref_h(ids_h.size());
+            ctx.memcpy_d2h(scores_h.data(), scores.data(), scores_h.size() * sizeof(float));
+            ctx.memcpy_d2h(ids_h.data(), ids.data(), ids_h.size() * sizeof(int));
+            const int ref_selected =
+                ops::qsa_select_topk_blocks_host(scores_h.data(), blocks, topk, len, 4, ref_h.data());
+            if (ref_selected != selected || ids_h != ref_h)
+                throw std::runtime_error("QSA probe: selector IDs differ from the CPU oracle at length " +
+                                         std::to_string(len));
+            const bool drops_blocks = selected < blocks;
+            std::cout << "[QSA PROBE] stage=select_done length=" << len << " selected=" << selected
+                      << " tail=" << tail << " drops_blocks=" << (drops_blocks ? 1 : 0) << "\n";
+
+            auto attention = [&](bool routed) {
+                ops::attention_decode(ctx, q, k, v, out, attn_scores, heads, kv_heads, head_dim, len,
+                                      &partials, nullptr, nullptr, 0,
+                                      routed ? ids.data_as<int>() : nullptr, routed ? selected : 0);
+            };
+            auto verify = [&](bool routed) {
+                stage = routed ? "verify_routed" : "verify_dense";
+                std::cout << "[QSA PROBE] stage=" << stage << " length=" << len << "\n";
+                attention(routed);
+                ctx.synchronize();
+                std::vector<bf16> got(heads * head_dim);
+                ctx.memcpy_d2h(got.data(), out.data(), got.size() * sizeof(bf16));
+                for (auto x : got)
+                    if (!std::isfinite(float(x)))
+                        throw std::runtime_error("QSA probe: non-finite attention output at length " +
+                                                 std::to_string(len) + " routed=" + std::to_string(routed ? 1 : 0));
+                std::vector<int> active;
+                if (routed && drops_blocks) {
+                    for (int b = 0; b < selected; ++b)
+                        for (int j = 0; j < 4; ++j) active.push_back(ids_h[b] * 4 + j);
+                    for (int j = 0; j < tail; ++j) active.push_back(ids_h[selected + j]);
+                } else {
+                    for (int t = 0; t < len; ++t) active.push_back(t);
+                }
+                double max_err = 0.0;
+                for (int h : {0, 12}) {
+                    const int kv = h / (heads / kv_heads);
+                    std::vector<double> logits(active.size());
+                    double mx = -1e100, sum = 0.0;
+                    for (size_t t = 0; t < active.size(); ++t) {
+                        double dot = 0.0;
+                        for (int d = 0; d < head_dim; ++d)
+                            dot += double(q_h[h * head_dim + d]) *
+                                   double(k_h[(size_t(kv) * max_len + active[t]) * head_dim + d]);
+                        logits[t] = dot / 16.0;
+                        mx = std::max(mx, logits[t]);
+                    }
+                    for (auto& x : logits) { x = std::exp(x - mx); sum += x; }
+                    for (int d = 0; d < head_dim; ++d) {
+                        double value = 0.0;
+                        for (size_t t = 0; t < active.size(); ++t)
+                            value += logits[t] * double(v_h[(size_t(kv) * max_len + active[t]) * head_dim + d]);
+                        max_err = std::max(max_err, std::abs(double(got[h * head_dim + d]) - value / sum));
+                    }
+                }
+                if (max_err > 2e-4)
+                    throw std::runtime_error("QSA probe: CPU f64 reference mismatch at length " +
+                                             std::to_string(len) + " routed=" + std::to_string(routed ? 1 : 0) +
+                                             " max_abs=" + std::to_string(max_err));
+                std::cout << "[QSA CHECK] length=" << len << " routed=" << (routed ? 1 : 0)
+                          << " selected=" << selected << " max_abs=" << max_err
+                          << " reference_heads=2 finite_heads=" << heads << "\n";
+            };
+            verify(false);
+            verify(true);
+
+            auto routed = [&] {
+                score();
+                (void)select();
+                attention(true);
+            };
+            for (int round = 0; round < 2; ++round) {
+                const double dense_ms = measure_ms("dense", [&] { attention(false); });
+                const double routed_ms = measure_ms("routed_post_projection", routed);
+                const double net_pct = 100.0 * (dense_ms - routed_ms) / dense_ms;
+                std::cout << "[QSA COST] {\"length\":" << len << ",\"sparse\":" << (drops_blocks ? 1 : 0)
+                          << ",\"selected\":" << selected << ",\"round\":" << round
+                          << ",\"dense_attention_ms\":" << dense_ms
+                          << ",\"routed_post_projection_ms\":" << routed_ms
+                          << ",\"route_net_pct\":" << net_pct << ",\"reps\":" << reps << "}\n";
+            }
+        }
+        if (ctx.device_allocation_count() != live)
+            throw std::runtime_error("QSA probe: live USM changed during the run");
+        std::cout << "[QSA COST END] lengths=5 rounds=2 reps=" << reps << " model_free=1\n";
+    } catch (const std::exception& e) {
+        std::cout << "[QSA PROBE FAIL] stage=" << stage << " length=" << length << " what=" << e.what() << "\n";
+        throw;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -4983,7 +5197,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-probe") {
-            test_qsa_decode_cost_curve(ctx);
+            run_qsa_route_cost_probe(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
             if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("QSA probe teardown USM leak");

@@ -202,6 +202,7 @@ public:
 private:
     void cleanup();
     void ensure_compute_capacity(Context& ctx, int rows);
+    void prefetch_gather_pages(const int64_t* ids, int num_tokens) const;
     void dequant_to_staging(const int64_t* ids, int num_tokens, int slot);
     void execute_prepare_slot(int slot, int num_tokens, const std::array<int, 2>& prev_tokens);
     void worker_loop();

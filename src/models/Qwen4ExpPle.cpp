@@ -6,6 +6,10 @@
 #include <iostream>
 #include <stdexcept>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 static constexpr float kDefaultNf4QuantMap[16] = {
     -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
     -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
@@ -514,6 +518,43 @@ void Qwen4ExpPle::dequant_to_staging(const int64_t* ids, int num_tokens, int slo
     }
 }
 
+void Qwen4ExpPle::prefetch_gather_pages(const int64_t* ids, int num_tokens) const {
+#ifdef _WIN32
+    // File-backed SafeTensors pages are demand-paged; one 4096-token chunk
+    // faults ~131k random pages serially. Prefetching them in batches lets the
+    // cache manager use real queue depth (measured 12.2x on the cold path).
+    static const bool s_enabled = aila::env::read_flag("AILA_Q4E_PLE_PREFETCH", true);
+    if (!s_enabled || num_tokens < 64 || shards_.empty() || rows_per_shard_ <= 0) return;
+
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(static_cast<size_t>(num_tokens) * NUM_HEADS * 2);
+    for (int t = 0; t < num_tokens; ++t) {
+        const int64_t* head_ids = ids + static_cast<size_t>(t) * NUM_HEADS;
+        for (int h = 0; h < NUM_HEADS; ++h) {
+            int shard_idx = static_cast<int>(head_ids[h] / rows_per_shard_);
+            const int64_t row_in_shard = head_ids[h] % rows_per_shard_;
+            if (shard_idx >= static_cast<int>(shards_.size()))
+                shard_idx = static_cast<int>(shards_.size()) - 1;
+            const auto& shard = shards_[shard_idx];
+            if (!shard.packed_weight) continue;
+            ranges.push_back({const_cast<uint8_t*>(shard.packed_weight) + row_in_shard * 80, 80});
+            if (shard.absmax)
+                ranges.push_back({const_cast<float*>(shard.absmax) + row_in_shard * 5,
+                                  5 * sizeof(float)});
+        }
+    }
+    const HANDLE process = GetCurrentProcess();
+    constexpr size_t kBatch = 64; // PrefetchVirtualMemory accepts at most 64 entries.
+    for (size_t i = 0; i < ranges.size(); i += kBatch) {
+        const size_t count = std::min(kBatch, ranges.size() - i);
+        PrefetchVirtualMemory(process, count, ranges.data() + i, 0);
+    }
+#else
+    (void)ids;
+    (void)num_tokens;
+#endif
+}
+
 void Qwen4ExpPle::execute_prepare_slot(int slot, int num_tokens, const std::array<int, 2>& prev_tokens) {
     if (num_tokens <= 0 || !ctx_ || slot < 0 || slot >= kNumStagingSlots) return;
 
@@ -533,6 +574,7 @@ void Qwen4ExpPle::execute_prepare_slot(int slot, int num_tokens, const std::arra
                       layer_multipliers_.data(), ngram_heads_vocab_sizes_.data(),
                       ngram_heads_offsets_.data(), slot_ngram_ids_[slot].data(), EOS_TOKEN_ID);
 
+    prefetch_gather_pages(slot_ngram_ids_[slot].data(), num_tokens);
     dequant_to_staging(slot_ngram_ids_[slot].data(), num_tokens, slot);
 
     const size_t bytes = static_cast<size_t>(num_tokens) * EMBED_DIM * sizeof(bf16);
