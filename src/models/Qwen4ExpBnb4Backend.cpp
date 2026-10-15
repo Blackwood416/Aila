@@ -3,6 +3,7 @@
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
 #include "models/Qwen4ExpHotsetPolicy.hpp"
+#include "Qwen4ExpDecodeFusion.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
@@ -1737,9 +1738,65 @@ void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::ConsumeNorm(
     ++consumedNorm;
 }
 
+void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::MarkConsumed() {
+    if (!pending) throw std::logic_error("No pending MLP residual to mark consumed");
+    // Same discipline as ConsumeNorm: clear immediately after the fused
+    // submission that consumed the residual (the relocated in-place update is
+    // part of that submission's dependency chain, not of this host call).
+    pending = false;
+    ++consumedNorm;
+}
+
 void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
     const bf16* pending_y, const float* pending_inj, DecodePendingMlpResidual* pending_mlp) {
+    const int hc_dim = 4 * hidden_size_;
+    const int lowrank = cfg_.hc_lowrank;
+    static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
+
+    // F1 (AILA_Q4E_DECODE_FUSED_HC=1, default off): fused (inject-add + norm)
+    // + down in one submission with the in-place residual update relocated
+    // into the up kernel. Bit-exact mirror of hc_inject_add_and_grouped_rms_norm
+    // / grouped_rms_norm, hc_decode_down_inject and hc_decode_up_mix; removes
+    // one submission per HC call (97 per count==1 decode token). A shape the
+    // fused op rejects falls through to the production dispatch below,
+    // byte-identical to the flag-off path.
+    static const bool s_decode_fused_hc = aila::env::read_flag("AILA_Q4E_DECODE_FUSED_HC", false);
+    if (s_decode_fused_hc && count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w &&
+        (!with_inject || hc.inject_w)) {
+        const bf16* upd_y = nullptr;
+        const float* upd_inj = nullptr;
+        bf16* upd_h = nullptr;
+        const bf16* h_stack = static_cast<const bf16*>(buf_.hidden4.data());
+        if (pending_mlp && pending_mlp->pending) {
+            upd_y = pending_mlp->y;
+            upd_inj = pending_mlp->inject;
+            upd_h = pending_mlp->hidden;
+            h_stack = pending_mlp->hidden;
+        } else if (pending_y && pending_inj) {
+            upd_y = pending_y;
+            upd_inj = pending_inj;
+            upd_h = static_cast<bf16*>(buf_.hidden4.data());
+        }
+        if (q4e_fusion::run_hc_norm_down_fused(
+                ctx, h_stack, upd_y, upd_inj,
+                hc.hc_norm_weight->data_as<float>(), cfg_.rms_norm_eps,
+                hc.mix_down_w->data_as<bf16>(),
+                with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
+                buf_.hc_N.data_as<bf16>(), buf_.hc_mix_down.data_as<bf16>(),
+                with_inject ? buf_.hc_inject_f32.data_as<float>() : nullptr,
+                lowrank, hidden_size_, 4)) {
+            // Residual ownership transfers with the fused submission, before
+            // the up submission can throw (same discipline as ConsumeNorm).
+            if (pending_mlp && pending_mlp->pending) pending_mlp->MarkConsumed();
+            q4e_fusion::run_hc_up_mix_with_hidden_update(
+                ctx, buf_.hc_mix_down.data_as<bf16>(), hc.mix_up_w->data_as<bf16>(),
+                buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(),
+                upd_h, upd_y, upd_inj, lowrank, hidden_size_, 4);
+            return;
+        }
+    }
+
     if (pending_mlp && pending_mlp->pending) {
         pending_mlp->ConsumeNorm(hc.hc_norm_weight->data_as<float>(), cfg_.rms_norm_eps,
             buf_.hc_N.data_as<bf16>());
@@ -1758,10 +1815,6 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
             count, 4, hidden_size_, true);
     }
 
-    const int hc_dim = 4 * hidden_size_;
-    const int lowrank = cfg_.hc_lowrank;
-
-    static const bool s_fused_hc = aila::env::read_flag("AILA_Q4E_HC_FUSED", true);
     static const bool s_small_rows_hc = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_HC", false);
     static const int s_hc_down_wg = [] {
         const int value = aila::env::read_int_raw("AILA_Q4E_HC_DECODE_DOWN_WG", 256);

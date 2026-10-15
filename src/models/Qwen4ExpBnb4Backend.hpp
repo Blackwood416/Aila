@@ -395,6 +395,11 @@ private:
         void Materialize();
         void ConsumeNorm(const float* normWeight, float eps,
             sycl::ext::oneapi::bfloat16* normalized);
+        // F1 fused HC path (AILA_Q4E_DECODE_FUSED_HC=1): the pending residual
+        // was consumed by the fused (inject-add + norm) + down submission; its
+        // in-place update runs in the following up kernel, so no norm may be
+        // re-submitted on unwind. Mirrors ConsumeNorm's clear-after-submit.
+        void MarkConsumed();
     };
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly,
