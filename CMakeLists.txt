@@ -202,6 +202,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
     src/models/Qwen4ExpLayerMajor.cpp
+    src/models/Qwen4ExpDecodeFusion.cpp
     src/models/Qwen4ExpMtpDraft.cpp
     src/models/Qwen4ExpMtpRuntime.cpp
     src/models/Qwen4ExpPrefill.cpp
@@ -209,6 +210,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertReader.cpp
     src/models/Qwen4ExpHostArena.cpp
     src/models/Qwen4ExpAdaptiveCache.cpp
+    src/models/Qwen4ExpLayerStage.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -777,6 +779,16 @@ add_executable(AilaQwen4ExpDecodeMiscBench perf/qwen4exp/q4e_decode_misc_bench.c
 target_compile_definitions(AilaQwen4ExpDecodeMiscBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_include_directories(AilaQwen4ExpDecodeMiscBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(AilaQwen4ExpDecodeMiscBench PRIVATE AilaLib)
+
+add_executable(AilaQwen4ExpLayerStageBench perf/qwen4exp/q4e_layer_stage_bench.cpp)
+target_compile_definitions(AilaQwen4ExpLayerStageBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpLayerStageBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaQwen4ExpLayerStageBench PRIVATE AilaLib)
+
+add_executable(AilaQwen4ExpCpuMoePrefillBench perf/qwen4exp/q4e_cpu_moe_prefill_bench.cpp)
+target_compile_definitions(AilaQwen4ExpCpuMoePrefillBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpCpuMoePrefillBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaQwen4ExpCpuMoePrefillBench PRIVATE AilaLib TBB::tbb)
 
 add_executable(AilaQwen4ExpModuleTests
     tests/models/Qwen4ExpModuleTests.cpp
