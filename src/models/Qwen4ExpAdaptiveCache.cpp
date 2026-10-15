@@ -37,9 +37,8 @@ Qwen4ExpAdaptiveCache::Qwen4ExpAdaptiveCache(Qwen4ExpAdaptiveCache&& other) noex
       access_count_(std::move(other.access_count_)),
       stats_(other.stats_)
 {
-    staging_dev_[0] = other.staging_dev_[0];
-    staging_dev_[1] = other.staging_dev_[1];
-    for (int i=0;i<2;++i) {
+    for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
+        staging_dev_[i]=std::exchange(other.staging_dev_[i],nullptr);
         staging_host_[i]=std::exchange(other.staging_host_[i],nullptr);
         staging_experts_[i]=other.staging_experts_[i];
         staging_copy_[i]=other.staging_copy_[i]; staging_reader_[i]=other.staging_reader_[i];
@@ -51,8 +50,6 @@ Qwen4ExpAdaptiveCache::Qwen4ExpAdaptiveCache(Qwen4ExpAdaptiveCache&& other) noex
     resident_read_=std::exchange(other.resident_read_,false);
 
     other.ctx_ = nullptr;
-    other.staging_dev_[0] = nullptr;
-    other.staging_dev_[1] = nullptr;
     other.slot_table_dev_ = nullptr;
     other.num_slots_ = 0;
     other.total_experts_ = 0;
@@ -70,9 +67,8 @@ Qwen4ExpAdaptiveCache& Qwen4ExpAdaptiveCache::operator=(Qwen4ExpAdaptiveCache&& 
         standalone_queue_ = std::move(other.standalone_queue_);
         dev_pool_chunks_ = std::move(other.dev_pool_chunks_);
         slot_dev_base_ = std::move(other.slot_dev_base_);
-        staging_dev_[0] = other.staging_dev_[0];
-        staging_dev_[1] = other.staging_dev_[1];
-    for (int i=0;i<2;++i) {
+    for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
+        staging_dev_[i]=std::exchange(other.staging_dev_[i],nullptr);
         staging_host_[i]=std::exchange(other.staging_host_[i],nullptr);
         staging_experts_[i]=other.staging_experts_[i];
         staging_copy_[i]=other.staging_copy_[i]; staging_reader_[i]=other.staging_reader_[i];
@@ -90,8 +86,6 @@ Qwen4ExpAdaptiveCache& Qwen4ExpAdaptiveCache::operator=(Qwen4ExpAdaptiveCache&& 
         stats_ = other.stats_;
 
         other.ctx_ = nullptr;
-        other.staging_dev_[0] = nullptr;
-        other.staging_dev_[1] = nullptr;
         other.slot_table_dev_ = nullptr;
         other.num_slots_ = 0;
         other.total_experts_ = 0;
@@ -128,6 +122,11 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     ctx_ = &ctx;
     standalone_queue_.reset();
     config_ = cfg;
+    // Prefill supply depth (E6): number of staging banks. Default 2 keeps the
+    // historical ping-pong layout and ordering byte-for-byte identical.
+    config_.staging_banks = std::clamp(
+        env::read_int("AILA_Q4E_PREFILL_STAGING_BANKS", config_.staging_banks),
+        2, AdaptiveCacheConfig::kMaxStagingBanks);
     if (cfg.num_layers<=0 || cfg.num_experts_per_layer<=0 || cfg.hidden_size<=0 ||
         cfg.moe_intermediate_size<=0 || cfg.blocksize!=64 || !cfg.compact_nested ||
         cfg.hidden_size%64 || cfg.moe_intermediate_size%64 || cfg.staging_slots_per_buffer<1 ||
@@ -161,11 +160,11 @@ bool Qwen4ExpAdaptiveCache::Allocate(
                 slot_dev_base_[s0 + i] = chunk + static_cast<size_t>(i) * geom_.slot_bytes;
             }
         }
-        staging_dev_[0] = static_cast<uint8_t*>(ctx_->alloc_device(staging_bytes));
-        staging_dev_[1] = static_cast<uint8_t*>(ctx_->alloc_device(staging_bytes));
+        for (int b=0;b<config_.staging_banks;++b)
+            staging_dev_[b] = static_cast<uint8_t*>(ctx_->alloc_device(staging_bytes));
         slot_table_dev_ = static_cast<int32_t*>(ctx_->alloc_device(table_dev_bytes));
-        staging_host_[0]=static_cast<uint8_t*>(ctx_->alloc_host(staging_bytes));
-        staging_host_[1]=static_cast<uint8_t*>(ctx_->alloc_host(staging_bytes));
+        for (int b=0;b<config_.staging_banks;++b)
+            staging_host_[b]=static_cast<uint8_t*>(ctx_->alloc_host(staging_bytes));
     } catch (const std::exception& e) {
         if (error_message) {
             *error_message = std::string("Qwen4ExpAdaptiveCache: device allocation failed: ") + e.what();
@@ -194,6 +193,10 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     ctx_ = nullptr;
     standalone_queue_ = std::make_unique<sycl::queue>(q);
     config_ = cfg;
+    // Prefill supply depth (E6): see the Context overload above.
+    config_.staging_banks = std::clamp(
+        env::read_int("AILA_Q4E_PREFILL_STAGING_BANKS", config_.staging_banks),
+        2, AdaptiveCacheConfig::kMaxStagingBanks);
     if (cfg.num_layers<=0 || cfg.num_experts_per_layer<=0 || cfg.hidden_size<=0 ||
         cfg.moe_intermediate_size<=0 || cfg.blocksize!=64 || !cfg.compact_nested ||
         cfg.hidden_size%64 || cfg.moe_intermediate_size%64 || cfg.staging_slots_per_buffer<1 ||
@@ -227,11 +230,11 @@ bool Qwen4ExpAdaptiveCache::Allocate(
                 slot_dev_base_[s0 + i] = chunk + static_cast<size_t>(i) * geom_.slot_bytes;
             }
         }
-        staging_dev_[0] = sycl::malloc_device<uint8_t>(staging_bytes, *standalone_queue_);
-        staging_dev_[1] = sycl::malloc_device<uint8_t>(staging_bytes, *standalone_queue_);
+        for (int b=0;b<config_.staging_banks;++b)
+            staging_dev_[b] = sycl::malloc_device<uint8_t>(staging_bytes, *standalone_queue_);
         slot_table_dev_ = sycl::malloc_device<int32_t>(total_experts_, *standalone_queue_);
-        staging_host_[0]=sycl::malloc_host<uint8_t>(staging_bytes,*standalone_queue_);
-        staging_host_[1]=sycl::malloc_host<uint8_t>(staging_bytes,*standalone_queue_);
+        for (int b=0;b<config_.staging_banks;++b)
+            staging_host_[b]=sycl::malloc_host<uint8_t>(staging_bytes,*standalone_queue_);
     } catch (const std::exception& e) {
         if (error_message) {
             *error_message = std::string("Qwen4ExpAdaptiveCache: standalone device allocation failed: ") + e.what();
@@ -240,7 +243,13 @@ bool Qwen4ExpAdaptiveCache::Allocate(
         return false;
     }
 
-    if (!staging_dev_[0] || !staging_dev_[1] || !slot_table_dev_ || !staging_host_[0] || !staging_host_[1]) {
+    for (int b=0;b<config_.staging_banks;++b)
+        if (!staging_dev_[b] || !staging_host_[b]) {
+            if (error_message) *error_message = "Qwen4ExpAdaptiveCache: malloc_device returned nullptr";
+            Release();
+            return false;
+        }
+    if (!slot_table_dev_) {
         if (error_message) *error_message = "Qwen4ExpAdaptiveCache: malloc_device returned nullptr";
         Release();
         return false;
@@ -260,7 +269,7 @@ bool Qwen4ExpAdaptiveCache::Allocate(
 void Qwen4ExpAdaptiveCache::Release() noexcept {
     // Copy queue is independent of the compute queue. Drain both before any
     // USM or native source can be released, including partial startup failures.
-    for (int i=0;i<2;++i) {
+    for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
         if (staging_pending_[i]) { try { staging_copy_[i].wait_and_throw(); } catch (...) {} }
         if (staging_read_[i]) { try { staging_reader_[i].wait_and_throw(); } catch (...) {} }
         staging_pending_[i]=staging_read_[i]=false;
@@ -268,7 +277,7 @@ void Qwen4ExpAdaptiveCache::Release() noexcept {
     if (resident_pending_) { try { resident_ready_.wait_and_throw(); } catch (...) {} }
     if (resident_read_) { try { resident_reader_.wait_and_throw(); } catch (...) {} }
     resident_pending_=resident_read_=false;
-    for (int i=0;i<2;++i) {
+    for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
         if (staging_host_[i]) {
             try { if (ctx_) ctx_->free_host(staging_host_[i]); else sycl::free(staging_host_[i],*standalone_queue_); } catch (...) {}
             staging_host_[i]=nullptr;
@@ -281,8 +290,9 @@ void Qwen4ExpAdaptiveCache::Release() noexcept {
                 try { ctx_->free_device(chunk); } catch (...) {}
             }
         }
-        if (staging_dev_[0]) { try { ctx_->free_device(staging_dev_[0]); } catch (...) {} staging_dev_[0] = nullptr; }
-        if (staging_dev_[1]) { try { ctx_->free_device(staging_dev_[1]); } catch (...) {} staging_dev_[1] = nullptr; }
+        for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
+            if (staging_dev_[i]) { try { ctx_->free_device(staging_dev_[i]); } catch (...) {} staging_dev_[i] = nullptr; }
+        }
         if (slot_table_dev_) { try { ctx_->free_device(slot_table_dev_); } catch (...) {} slot_table_dev_ = nullptr; }
         ctx_ = nullptr;
     } else if (standalone_queue_) {
@@ -290,8 +300,9 @@ void Qwen4ExpAdaptiveCache::Release() noexcept {
         for (auto* chunk : dev_pool_chunks_) {
             if (chunk) sycl::free(chunk, *standalone_queue_);
         }
-        if (staging_dev_[0]) { sycl::free(staging_dev_[0], *standalone_queue_); staging_dev_[0] = nullptr; }
-        if (staging_dev_[1]) { sycl::free(staging_dev_[1], *standalone_queue_); staging_dev_[1] = nullptr; }
+        for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
+            if (staging_dev_[i]) { sycl::free(staging_dev_[i], *standalone_queue_); staging_dev_[i] = nullptr; }
+        }
         if (slot_table_dev_) { sycl::free(slot_table_dev_, *standalone_queue_); slot_table_dev_ = nullptr; }
         standalone_queue_.reset();
     }
@@ -336,7 +347,8 @@ ops::MoeExpertSlotDev Qwen4ExpAdaptiveCache::GetResidentSlotDev(
 ops::MoeExpertSlotDev Qwen4ExpAdaptiveCache::GetStagingSlotDev(
     int pp, int slot, const LayerNestedMetadata* nested) const {
     if (slot<0 || slot>=config_.staging_slots_per_buffer) return {};
-    return make_slot(GetStagingSlotDevicePtr(pp,slot),geom_,staging_experts_[pp&1][slot],nested);
+    const int bank=(pp%config_.staging_banks+config_.staging_banks)%config_.staging_banks;
+    return make_slot(GetStagingSlotDevicePtr(bank,slot),geom_,staging_experts_[bank][slot],nested);
 }
 
 std::vector<uint8_t*> Qwen4ExpAdaptiveCache::InitializeResidency(
@@ -554,7 +566,7 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
         throw std::invalid_argument("Qwen4Exp copy queue must be in order");
     // CPU exchanges reuse the same bounded staging banks; drain their H2D
     // readers before touching host bytes. GPU slot writes wait for consumers.
-    for (int i=0;i<2;++i) {
+    for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
         if (staging_pending_[i]) staging_copy_[i].wait_and_throw();
         staging_pending_[i]=false;
     }
@@ -598,7 +610,7 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         layer<0 || layer>=config_.num_layers || arena.SlotBytes()!=geom_.slot_bytes ||
         !q.has_property<sycl::property::queue::in_order>())
         throw std::invalid_argument("Invalid Qwen4Exp cold staging batch");
-    const int pp=index&1;
+    const int pp=(index%config_.staging_banks+config_.staging_banks)%config_.staging_banks;
     const auto wait_begin = work_time_ns();
     if (staging_pending_[pp]) staging_copy_[pp].wait_and_throw();
     const auto fill_begin = work_time_ns();

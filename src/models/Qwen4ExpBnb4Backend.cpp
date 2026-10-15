@@ -1503,16 +1503,42 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     }
     // A cold expert is uploaded once per layer/window, regardless of its row
     // count. Keep the original W4/G3/XMX math and rank-ordered accumulation.
-    for (int start=hits;start<int(prefill_unique_.size());) {
-        const int n=std::min(adaptive_cache_.StagingSlotsPerBuffer(),int(prefill_unique_.size())-start);
+    // E6 pump: stage up to (banks-1) chunks ahead of the chunk whose kernels
+    // are being submitted, so host fill for later chunks overlaps earlier DMA
+    // and the per-chunk RunGroupedExperts host work. With banks==2 this is the
+    // historical stage(k)->run(k)->stage(k+1) alternation verbatim. The bank
+    // selector still cycles through the cache's own bank map, and each chunk's
+    // kernels remain gated on that chunk's DMA event, so the bytes and the
+    // arithmetic order are unchanged.
+    const int staging_banks=adaptive_cache_.StagingBanks();
+    const int lookahead=std::max(1,staging_banks-1);
+    const int slots_per_chunk=adaptive_cache_.StagingSlotsPerBuffer();
+    static const bool staging_pump_logged=[&](){
+        AILA_LOG_INFO("[Q4E PrefillStage] banks=%d lookahead=%d slots_per_bank=%d",staging_banks,lookahead,slots_per_chunk);
+        return true;
+    }();
+    (void)staging_pump_logged;
+    const int total_unique=int(prefill_unique_.size());
+    const int num_chunks=total_unique>hits ? (total_unique-hits+slots_per_chunk-1)/slots_per_chunk : 0;
+    std::array<StagingBatch,aila::AdaptiveCacheConfig::kMaxStagingBanks> staged_window{};
+    auto chunk_begin=[&](int c){ return hits+c*slots_per_chunk; };
+    auto chunk_count=[&](int c){ return std::min(slots_per_chunk,total_unique-chunk_begin(c)); };
+    auto stage_chunk=[&](int c){
+        const int s=chunk_begin(c),n=chunk_count(c);
         auto batch=adaptive_cache_.StageColdExpertsAsync(host_arena_,*copy_q_,layer,
-            prefill_unique_.data()+start,n,ping_pong_index_,&expert_executor_);
-        ping_pong_index_^=1;
+            prefill_unique_.data()+s,n,ping_pong_index_,&expert_executor_);
+        ping_pong_index_=(ping_pong_index_+1)%staging_banks;
         for (int j=0;j<n;++j)
-            adaptive_prefill_slots_[prefill_unique_[start+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
-        last=RunGroupedExperts(ctx,layer,count,start,n,act_start,tile_start,min_rows,batch.ready_event);
+            adaptive_prefill_slots_[prefill_unique_[s+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
+        staged_window[c%aila::AdaptiveCacheConfig::kMaxStagingBanks]=batch;
+    };
+    for (int c=0;c<lookahead&&c<num_chunks;++c) stage_chunk(c);
+    for (int c=0;c<num_chunks;++c) {
+        const auto& batch=staged_window[c%aila::AdaptiveCacheConfig::kMaxStagingBanks];
+        last=RunGroupedExperts(ctx,layer,count,chunk_begin(c),chunk_count(c),act_start,tile_start,min_rows,batch.ready_event);
         adaptive_cache_.RecordStagingConsumer(batch.ping_pong_index,last);
-        start+=n;
+        const int next_chunk=c+lookahead;
+        if (next_chunk<num_chunks) stage_chunk(next_chunk);
     }
     if (act_start!=count*top_k) throw std::logic_error("Incomplete Qwen4Exp prefill routing map");
     ctx.queue().memcpy(batch_weights_dev_,router_host_weights_,size_t(count)*top_k*sizeof(float));

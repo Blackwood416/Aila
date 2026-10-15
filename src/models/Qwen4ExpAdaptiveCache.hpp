@@ -26,10 +26,16 @@ struct AdaptiveCacheConfig {
     // configurable (AILA_Q4E_STAGING_SLOTS) so the prefill fill/DMA pipeline
     // can be deepened at the cost of resident expert slots.
     static constexpr int kMaxStagingSlots = 64;
+    // Upper bound for the number of staging banks. The live value is
+    // configurable (AILA_Q4E_PREFILL_STAGING_BANKS, default 2 = historical
+    // ping-pong); deeper banks let the prefill pump keep host fill and DMA in
+    // flight across several chunks at the cost of VRAM/host staging bytes.
+    static constexpr int kMaxStagingBanks = 4;
     int num_layers = 48;
     int num_experts_per_layer = 512;
     int num_gpu_slots = 2800;            // Fixed resident VRAM slots (2,800 experts ≈ 6.8GB VRAM)
-    int staging_slots_per_buffer = 16;   // Ping-Pong A/B buffer capacity per buffer (16 cold experts)
+    int staging_slots_per_buffer = 16;   // Bank capacity (16 cold experts per bank by default)
+    int staging_banks = 2;               // Staging bank count (2..kMaxStagingBanks)
     int hidden_size = 2560;
     int moe_intermediate_size = 640;
     int blocksize = 64;
@@ -134,11 +140,15 @@ public:
     int NumExpertsPerLayer() const noexcept { return config_.num_experts_per_layer; }
     int NumGpuSlots() const noexcept { return num_slots_; }
     int StagingSlotsPerBuffer() const noexcept { return config_.staging_slots_per_buffer; }
+    int StagingBanks() const noexcept { return config_.staging_banks; }
     size_t SlotBytes() const noexcept { return geom_.slot_bytes; }
     const ExpertSlotGeometry& Geometry() const noexcept { return geom_; }
 
     size_t TotalResidentBytes() const noexcept { return static_cast<size_t>(num_slots_) * geom_.slot_bytes; }
-    size_t TotalStagingBytes() const noexcept { return static_cast<size_t>(config_.staging_slots_per_buffer * 2) * geom_.slot_bytes; }
+    size_t TotalStagingBytes() const noexcept {
+        return static_cast<size_t>(config_.staging_slots_per_buffer) *
+               static_cast<size_t>(config_.staging_banks) * geom_.slot_bytes;
+    }
     size_t TotalVramAllocatedBytes() const noexcept { return TotalResidentBytes() + TotalStagingBytes(); }
 
     // =========================================================================
@@ -179,7 +189,7 @@ public:
 
     /// Base GPU device pointer for ping-pong staging slot
     inline uint8_t* GetStagingSlotDevicePtr(int ping_pong_index, int staging_slot_idx) const noexcept {
-        const int pp = ping_pong_index & 1;
+        const int pp = (ping_pong_index % config_.staging_banks + config_.staging_banks) % config_.staging_banks;
         if (staging_slot_idx < 0 || staging_slot_idx >= config_.staging_slots_per_buffer) return nullptr;
         return staging_dev_[pp] + static_cast<size_t>(staging_slot_idx) * geom_.slot_bytes;
     }
@@ -207,7 +217,8 @@ public:
     const sycl::event* ResidentReady() const noexcept { return resident_pending_ ? &resident_ready_ : nullptr; }
     void RecordResidentConsumer(const sycl::event& e) { resident_reader_=e; resident_read_=true; }
     void RecordStagingConsumer(int index, const sycl::event& e) {
-        staging_reader_[index & 1]=e; staging_read_[index & 1]=true;
+        const int bank=(index%config_.staging_banks+config_.staging_banks)%config_.staging_banks;
+        staging_reader_[bank]=e; staging_read_[bank]=true;
     }
 
     // =========================================================================
@@ -289,7 +300,8 @@ public:
      * @param layer Layer index
      * @param cold_expert_ids Array of cold expert IDs
      * @param count Number of cold expert IDs
-     * @param ping_pong_index 0 for Buffer A, 1 for Buffer B
+     * @param ping_pong_index Bank selector; wraps modulo the configured bank
+     *        count (2 = historical A/B ping-pong, up to kMaxStagingBanks).
      * @return StagingBatch containing staged slot indices and DMA completion event
      */
     StagingBatch StageColdExpertsAsync(
@@ -323,12 +335,16 @@ private:
     std::vector<uint8_t*> dev_pool_chunks_;
     std::vector<uint8_t*> slot_dev_base_;
 
-    // Ping-Pong Staging Buffers [Buffer A (0), Buffer B (1)]
-    uint8_t* staging_dev_[2] = {nullptr, nullptr};
-    uint8_t* staging_host_[2] = {nullptr, nullptr};
-    std::array<std::array<int, AdaptiveCacheConfig::kMaxStagingSlots>, 2> staging_experts_{};
-    sycl::event staging_copy_[2]{}, staging_reader_[2]{};
-    bool staging_pending_[2]{}, staging_read_[2]{};
+    // Staging banks [0..staging_banks-1]; 2 banks reproduce the historical
+    // ping-pong A/B layout verbatim.
+    uint8_t* staging_dev_[AdaptiveCacheConfig::kMaxStagingBanks] = {nullptr, nullptr, nullptr, nullptr};
+    uint8_t* staging_host_[AdaptiveCacheConfig::kMaxStagingBanks] = {nullptr, nullptr, nullptr, nullptr};
+    std::array<std::array<int, AdaptiveCacheConfig::kMaxStagingSlots>,
+        AdaptiveCacheConfig::kMaxStagingBanks> staging_experts_{};
+    sycl::event staging_copy_[AdaptiveCacheConfig::kMaxStagingBanks]{};
+    sycl::event staging_reader_[AdaptiveCacheConfig::kMaxStagingBanks]{};
+    bool staging_pending_[AdaptiveCacheConfig::kMaxStagingBanks]{};
+    bool staging_read_[AdaptiveCacheConfig::kMaxStagingBanks]{};
     sycl::event resident_ready_{}, resident_reader_{};
     bool resident_pending_=false, resident_read_=false;
 
