@@ -18,8 +18,11 @@
 #include "utils/SafeTensors.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace aila::inference {
 
@@ -823,7 +826,66 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
     stage.Complete();
     loaded->device->CheckUsable();
     lock.unlock();
-    return std::shared_ptr<LoadedModel>(new LoadedModel(std::move(loaded)));
+    auto* warmup_state = loaded.get();
+    auto model = std::shared_ptr<LoadedModel>(new LoadedModel(std::move(loaded)));
+    // Opt-in first-use warmup for the Qwen4Exp worker path. The worker loads
+    // through ModelFactory::LoadQwen4Exp (this function), so the legacy
+    // InferenceEngine::init warmup never runs and the first real prefill pays
+    // ~80 s of first-touch kernel setup. One production-shaped chunk plus one
+    // decode step moves that cost into the load phase. Skipped while a hotset
+    // export is active so synthetic routes cannot pollute the profile.
+    static const int warmup_mode = aila::env::read_int_raw("AILA_INIT_WARMUP", -1);
+    if (qwen4exp && warmup_mode == 1 &&
+        aila::env::read_string("AILA_Q4E_HOTSET_EXPORT", "").empty()) {
+        auto* backend = dynamic_cast<Qwen4ExpBnb4Backend*>(warmup_state->backend.get());
+        if (!backend) {
+            AILA_LOG_WARN("[Q4E Warmup] Qwen4Exp backend unavailable; skipping warmup");
+        } else {
+            int warmup_rows = aila::env::read_int_raw("AILA_INIT_WARMUP_ROWS", 4096);
+            warmup_rows = std::clamp(warmup_rows, 1, warmup_state->options.maxSequenceLength);
+            const auto warmup_start = std::chrono::steady_clock::now();
+            backend->SetColdEpochEnabled(false);
+            double prefill_ms = 0.0;
+            double decode_ms = 0.0;
+            std::string failure;
+            try {
+                auto session = model->CreateSession();
+                // Varied ids: a constant dummy id leaves the PLE gather (and
+                // part of routing) for the first real request, which costs
+                // ~20 s on this model.
+                const int warmup_vocab = std::max(1, warmup_state->vocabSize);
+                std::vector<int> warmup_ids(static_cast<size_t>(warmup_rows));
+                for (int row = 0; row < warmup_rows; ++row) {
+                    warmup_ids[static_cast<size_t>(row)] = (row * 4099 + 12345) % warmup_vocab;
+                }
+                (void)session->ForwardLogits(warmup_ids);
+                const auto prefill_end = std::chrono::steady_clock::now();
+                std::vector<int> decode_ids{warmup_ids.back()};
+                (void)session->ForwardLogits(decode_ids);
+                const auto decode_end = std::chrono::steady_clock::now();
+                prefill_ms = std::chrono::duration<double, std::milli>(
+                    prefill_end - warmup_start).count();
+                decode_ms = std::chrono::duration<double, std::milli>(
+                    decode_end - prefill_end).count();
+                session->Reset();
+            } catch (const std::exception& error) {
+                failure = error.what();
+            } catch (...) {
+                failure = "unknown error";
+            }
+            backend->SetColdEpochEnabled(true);
+            const double total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - warmup_start).count();
+            if (failure.empty()) {
+                AILA_LOG_INFO("[Q4E Warmup] rows=%d prefill_ms=%.1f decode_ms=%.1f total_ms=%.1f",
+                              warmup_rows, prefill_ms, decode_ms, total_ms);
+            } else {
+                AILA_LOG_WARN("[Q4E Warmup] failed after %.1f ms: %s", total_ms, failure.c_str());
+            }
+            warmup_state->device->CheckUsable();
+        }
+    }
+    return model;
 }
 
 std::shared_ptr<SessionState> LoadedModel::CreateSession() {
