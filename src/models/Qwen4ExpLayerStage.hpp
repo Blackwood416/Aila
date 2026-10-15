@@ -49,6 +49,10 @@ struct LayerStageStats {
     uint64_t staged_experts = 0;
     uint64_t staged_bytes = 0;
     uint64_t skipped_no_source = 0;
+    // Consumer accounting (backend-side, see NoteConsume): routed experts
+    // served from the arena versus served by the staging-bank fallback.
+    uint64_t consumed_arena_experts = 0;
+    uint64_t consumed_bank_experts = 0;
     // Per-epoch host intervals of the most recent job (ms).
     double last_fill_ms = 0;
     double last_bank_wait_ms = 0;
@@ -119,6 +123,11 @@ public:
     // The last kernel that reads the arena for this epoch; the next Begin
     // without an explicit gate uses it.
     void RecordArenaConsumer(uint64_t epoch, const sycl::event& consumer);
+
+    // Consumer accounting: the backend calls this once per consumed epoch with
+    // the routed experts it took from the arena and from the bank fallback.
+    // Cheap counters; they make a silent zero-hit consumer impossible to miss.
+    void NoteConsume(int arena_hits, int bank_fallback) noexcept;
 
     // ------------------------------------------------------------- consumers
     // Routed experts split into arena hits and unique missed ids (bank

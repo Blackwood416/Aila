@@ -9,8 +9,8 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
     ModelWeights& weights, int cap) : ctx(c), target(b), capacity(cap) {
     try {
-        if (cap < 2 || cap > 2048 || target.gdn_chunk_mode_ != 0 || target.lmHeadQ8Enabled_)
-            throw std::invalid_argument("MTP requires dense context <=2048, batched GDN and BF16 head");
+        if (cap < 2 || cap > target.max_seq_len() || target.gdn_chunk_mode_ != 0 || target.lmHeadQ8Enabled_)
+            throw std::invalid_argument("MTP requires a draft window within the sequence budget, batched GDN and BF16 head");
         target.ensure_runtime_buffers(ctx, cap);
         draft = std::make_unique<Qwen4ExpMtpDraft>(ctx, target, weights);
         hiddenRows = Tensor::allocate(ctx, {cap, 10240});
@@ -37,6 +37,14 @@ size_t Qwen4ExpMtpRuntime::SessionBytes(int cap) {
         aila::memory::checked_memory_product(size_t(cap), 2304),
         size_t(std::max(1, cap / 4)) * 256 + 10240 * sizeof(bf16));
 }
+int Qwen4ExpMtpRuntime::EffectiveCapacity(int maxSequenceLength) {
+    // Read once per process like the other load-time switches. The default
+    // reproduces the original hard gate (dense draft within the QSA indexer
+    // budget); raising it must pay for draft KV (2.25 KB/token) and one draft
+    // catch-up step per prompt token, see qwen38-r1-mtp-longctx-2026-10-15.md.
+    static const int requested = aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048);
+    return std::clamp(requested, 2, std::max(2, maxSequenceLength));
+}
 std::unique_ptr<Qwen4ExpMtpRuntime::State> Qwen4ExpMtpRuntime::CreateState() {
     auto state = std::make_unique<State>();
     try {
@@ -48,6 +56,17 @@ std::unique_ptr<Qwen4ExpMtpRuntime::State> Qwen4ExpMtpRuntime::CreateState() {
 void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector<int>& tokens) {
     if (!state.valid || state.length != start) { state.valid = false; return; }
     const size_t count = tokens.size();
+    // Per-request enablement: a session (or one prefill chunk) reaching past
+    // the draft window silently falls back to T1. Invalidate before staging so
+    // the check also bounds hiddenRows: the copy below writes count rows and
+    // draft->Step writes position start+count-1, so count and position must
+    // both stay inside capacity. Invalidate, then keep length truthful so a
+    // later Truncate/Reset can restart catch-up.
+    if (start < 0 || int64_t(start) + int64_t(count) > int64_t(capacity)) {
+        state.valid = false;
+        state.length = start + int(count);
+        return;
+    }
     ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(), count * 10240 * sizeof(bf16));
     if (start) draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), tokens.front(), start - 1, true);
     for (size_t r = 0; r + 1 < count; ++r)

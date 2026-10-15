@@ -287,6 +287,14 @@ void Qwen4ExpLayerStage::RecordArenaConsumer(uint64_t epoch, const sycl::event& 
     arena_reader_ = consumer;
 }
 
+void Qwen4ExpLayerStage::NoteConsume(int arena_hits, int bank_fallback) noexcept {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (arena_hits > 0)
+        stats_.consumed_arena_experts += static_cast<uint64_t>(arena_hits);
+    if (bank_fallback > 0)
+        stats_.consumed_bank_experts += static_cast<uint64_t>(bank_fallback);
+}
+
 Qwen4ExpLayerStage::RouteDelta Qwen4ExpLayerStage::MissedExperts(
     uint64_t epoch, const int* route_ids, int count) const {
     RouteDelta delta;

@@ -196,6 +196,28 @@ public:
     int StartArenaCold(const Qwen4ExpHostArena& arena, int layer, const int* ids,
                        const int* ranks, int count, const bf16* x_dev,
                        int row_token = 0, int tokens = 1);
+    // Opt-in (AILA_Q4E_VERIFY_CPU_BATCH) single-call cold service for a 2..4
+    // row verify window: the caller classifies every row first (GetSlot is a
+    // pure lookup and ObserveRouting only updates counters) and passes the
+    // flattened task list, one entry per CPU-served (row, expert, rank) in row
+    // order, with row_task_begin/count a strict partition of [0, task_count).
+    // The whole window then runs as ONE worker job (a single
+    // cpu_expert_batch_forward over rows by tasks), so the coordinator pays one
+    // join instead of one per row. Per-task arithmetic is unchanged: the task's
+    // input row is its own `row`, output row is its task index, and the token
+    // count never enters a task (Qwen4ExpCpuExpertOps.cpp:818-928). Callers keep
+    // the per-row max_cpu_credits_ cap and the >cap GPU-staging overflow.
+    // Requires StageResidentInput(x_dev, rows) to have been submitted.
+    // Returns the accepted task count; 0 means nothing was submitted.
+    bool CanExecuteArenaColdRows(int rows) const;
+    int StartArenaColdRows(const Qwen4ExpHostArena& arena, int layer, int rows,
+                           const int* ids, const int* ranks, const int* row_task_begin,
+                           const int* row_task_count, int task_count, const bf16* x_dev);
+    // Per-row join of the shared job, called once per row in ascending order.
+    // The first call waits the worker; every call uploads that row's CPU rank
+    // spans into rank_output (that row's accumulator slice) and returns the H2D
+    // event. The last row clears the batch state.
+    sycl::event JoinArenaColdRowsRow(float* rank_output, int row);
     // Init-only immutable mapped views; no cache operation runs on the worker.
     void PrepareAsyncResidentSources(int layers, int experts);
     bool CanStartAsyncResidentRoute(int layer) const;
@@ -343,6 +365,16 @@ private:
     bool arena_verify_logged_ = false;
     const Qwen4ExpHostArena* arena_verify_arena_ = nullptr;
     std::vector<ops::MoeExpertSlotHost> arena_verify_sources_;
+
+    // Opt-in batched verify-window cold service (AILA_Q4E_VERIFY_CPU_BATCH).
+    // The row spans and the per-row join cursor are coordinator-only state; the
+    // fixed cold_* arrays above already cover rows<=4 * top_k<=10 tasks.
+    bool arena_cold_rows_pending_ = false;
+    bool arena_cold_rows_joined_ = false;
+    bool arena_cold_rows_logged_ = false;
+    int arena_cold_rows_ = 0;
+    int arena_cold_rows_next_row_ = 0;
+    std::array<int, 4> arena_cold_row_begin_{}, arena_cold_row_count_{};
 };
 
 } // namespace aila

@@ -582,6 +582,8 @@ void Qwen4ExpExpertExecutor::cleanup() {
     async_route_pending_=false; async_route_collected_=false; async_route_count_=0;
     verify_async_rows_=0; verify_async_layer_=-1;
     async_route_logged_=false;
+    arena_cold_rows_pending_=false; arena_cold_rows_joined_=false;
+    arena_cold_rows_=0; arena_cold_rows_next_row_=0;
     async_route_sources_.clear(); async_route_experts_=0;
     if (ctx_) {
         try { ctx_->synchronize(); } catch (...) {}
@@ -1045,6 +1047,149 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
     return prev_cpu_h2d_ev_;
 }
 
+bool Qwen4ExpExpertExecutor::CanExecuteArenaColdRows(int rows) const {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", false);
+    // The packet and host-read result modes publish a single-row view, so the
+    // batched window keeps the default per-row rank-span upload and is disabled
+    // whenever either of those layouts is selected.
+    return enabled && initialized_ && cpu_worker_ && rows >= 2 && rows <= 4 &&
+        rows <= max_cpu_tokens_ && hidden_size_ == ops::cpu::kHiddenDim &&
+        intermediate_size_ == ops::cpu::kIntermediateDim &&
+        !cpu_result_host_read_ && !cpu_result_packet_host_ &&
+        !cold_count_ && !async_route_pending_ && !async_route_collected_ &&
+        !verify_async_rows_ && !arena_verify_pending_ && !arena_cold_rows_pending_ &&
+        active_cpu_leases_.empty();
+}
+
+int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, int layer, int rows,
+    const int* ids, const int* ranks, const int* row_task_begin, const int* row_task_count,
+    int task_count, const bf16* x_dev) {
+    if (!CanExecuteArenaColdRows(rows))
+        throw std::logic_error("Invalid multi-row native arena CPU batch");
+    if (!ids || !ranks || !row_task_begin || !row_task_count || !x_dev ||
+        task_count < 1 || task_count > ops::cpu::kMaxExpertBatchTasks ||
+        layer < 0 || layer >= arena.NumLayers())
+        throw std::logic_error("Invalid multi-row native arena CPU batch");
+    try {
+        if (prev_cpu_h2d_ev_ != sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
+        prev_cpu_h2d_ev_ = {};
+        cold_layer_ = layer;
+        cold_count_ = task_count;
+        cold_cached_count_ = task_count; cold_mapped_count_ = 0;
+        CpuWorker::Job job;
+        job.count = task_count; job.hidden = hidden_size_; job.intermediate = intermediate_size_;
+        job.tokens = rows;
+        job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
+        job.output_reader = cpu_output_reader_event_;
+        job.activation = resident_input_event_ != sycl::event{} ? resident_input_event_ :
+            ctx_->queue().memcpy(x_host_, x_dev, size_t(hidden_size_) * size_t(rows) * sizeof(bf16));
+        int offset = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int begin = row_task_begin[r], count = row_task_count[r];
+            if (begin != offset || count < 0 || begin + count > task_count)
+                throw std::logic_error("Multi-row CPU task spans are not a strict partition");
+            arena_cold_row_begin_[r] = begin; arena_cold_row_count_[r] = count;
+            for (int c = 0; c < count; ++c) {
+                const int i = begin + c;
+                const auto source = arena.GetExpertSlotHost(layer, ids[i]);
+                if (!source.gate_up_packed || !source.down_packed || ranks[i] < 0 || ranks[i] >= top_k_)
+                    throw std::logic_error("CPU expert has no native RAM owner or rank");
+                cold_source_slots_[i] = source; cold_ids_[i] = ids[i]; cold_ranks_[i] = ranks[i];
+                // Each task reads its own row of the staged input; the task
+                // index (not the row) owns the output row.
+                job.tasks[i] = {source, r};
+            }
+            offset += count;
+        }
+        if (offset != task_count)
+            throw std::logic_error("Multi-row CPU task spans are not a strict partition");
+        arena_cold_rows_ = rows; arena_cold_rows_next_row_ = 0;
+        arena_cold_rows_joined_ = false; arena_cold_rows_pending_ = true;
+        cold_submit_ns_ = steady_ns();
+        cpu_worker_->submit(job);
+        stats_.cpu_tasks_dispatched += task_count;
+        stats_.cpu_cached_tasks_dispatched += task_count;
+        if (!arena_cold_rows_logged_) {
+            AILA_LOG_INFO("[Q4E ArenaColdRowsEnabled] rows=%d tasks=%d capacity=%d",
+                rows, task_count, ops::cpu::kMaxExpertBatchTasks);
+            arena_cold_rows_logged_ = true;
+        }
+        return task_count;
+    } catch (...) { AbortResidentCold(); throw; }
+}
+
+sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int row) {
+    if (!rank_output || !arena_cold_rows_pending_ || row != arena_cold_rows_next_row_ ||
+        row < 0 || row >= arena_cold_rows_)
+        throw std::logic_error("Invalid multi-row native arena CPU join");
+    if (!arena_cold_rows_joined_) {
+        const auto join = steady_ns();
+        const auto result = cpu_worker_->finish();
+        stats_.cpu_join_wait_ns += steady_ns() - join;
+        stats_.cpu_activation_wait_ns += result.activation_ns;
+        stats_.cpu_compute_ns += result.end_ns - result.begin_ns;
+        stats_.cpu_mmap_prefetch_ns += result.prefetch_ns;
+        stats_.cpu_mmap_touch_ns += result.touch_ns;
+        stats_.cpu_scale_cache_bytes = std::max(stats_.cpu_scale_cache_bytes, result.scale_cache_bytes);
+        stats_.cpu_scale_cache_hits += result.scale_cache_hits;
+        stats_.cpu_scale_cache_misses += result.scale_cache_misses;
+        stats_.cpu_scale_cache_prepare_ns += result.scale_cache_prepare_ns;
+        stats_.cpu_diagnostic_batches += result.diagnostic_batches;
+        stats_.cpu_diagnostic_failures += result.diagnostic_failures;
+        stats_.cpu_verify_batches += result.verify_batches;
+        stats_.cpu_a64_verify_batches += result.a64_verify_batches;
+        stats_.cpu_process_faults += result.process_faults;
+        stats_.cpu_process_user_ns += result.process_user_ns;
+        stats_.cpu_process_kernel_ns += result.process_kernel_ns;
+        stats_.cpu_gate_up_ns += result.phases.gate_up_ns;
+        stats_.cpu_quantize_ns += result.phases.quantize_ns;
+        stats_.cpu_down_ns += result.phases.down_ns;
+        stats_.cpu_gate_chunks += result.phases.gate_chunks;
+        stats_.cpu_down_chunks += result.phases.down_chunks;
+        for (int c = 0; c < cold_count_; ++c) if (cpu_observer_) {
+            int task_row = 0;
+            while (task_row + 1 < arena_cold_rows_ &&
+                   c >= arena_cold_row_begin_[task_row] + arena_cold_row_count_[task_row]) ++task_row;
+            RouteRankEntry entry;
+            entry.token_idx = task_row; entry.rank = cold_ranks_[c];
+            entry.expert_id = cold_ids_[c]; entry.is_gpu = false;
+            cpu_observer_(cpu_observer_state_, *ctx_, cold_layer_, entry, cold_source_slots_[c],
+                x_host_ + size_t(task_row) * hidden_size_,
+                scratch_h_ + size_t(c) * intermediate_size_, cpu_out_host_ + size_t(c) * hidden_size_);
+        }
+        if (cache_->tracing()) {
+            cache_->trace_host_interval("cold_cpu_compute", cold_layer_, result.begin_ns, result.end_ns);
+            cache_->trace_host_interval("cold_cpu_join", cold_layer_, join, steady_ns());
+            cache_->TraceDeviceEvent("cold_input_copy", cold_layer_, resident_input_event_);
+        }
+        arena_cold_rows_joined_ = true;
+    }
+    // Publish this row's CPU rank spans into its own accumulator slice; the
+    // in-order queue keeps later rows from overwriting it before the merge.
+    const int begin = arena_cold_row_begin_[row], count = arena_cold_row_count_[row];
+    sycl::event upload{};
+    for (int c = begin; c < begin + count;) {
+        int end = c + 1;
+        while (end < begin + count && cold_ranks_[end] == cold_ranks_[end - 1] + 1) ++end;
+        const size_t bytes = size_t(end - c) * hidden_size_ * sizeof(float);
+        upload = ctx_->queue().memcpy(rank_output + size_t(cold_ranks_[c]) * hidden_size_,
+                                      cpu_out_host_ + size_t(c) * hidden_size_, bytes);
+        ++stats_.cpu_result_copies; stats_.cpu_result_bytes += bytes;
+        c = end;
+    }
+    if (upload != sycl::event{}) prev_cpu_h2d_ev_ = upload;
+    ++arena_cold_rows_next_row_;
+    if (row == arena_cold_rows_ - 1) {
+        stats_.cpu_tasks_completed += cold_count_; ++stats_.cpu_async_layers;
+        stats_.cpu_max_batch_tasks = std::max(stats_.cpu_max_batch_tasks, uint64_t(cold_count_));
+        active_cpu_leases_.clear(); cold_source_slots_ = {};
+        cold_count_ = 0; cold_mapped_count_ = 0; cold_cached_count_ = 0;
+        arena_cold_rows_pending_ = false;
+        arena_cold_rows_ = 0; arena_cold_rows_next_row_ = 0;
+    }
+    return upload;
+}
+
 void Qwen4ExpExpertExecutor::FinishResidentCpuRead(const sycl::event& merge) {
     if(!cpu_host_result_active_) return;
     if(merge==sycl::event{})throw std::logic_error("CPU host result requires an actual merge reader event");
@@ -1061,6 +1206,8 @@ void Qwen4ExpExpertExecutor::AbortResidentCold() noexcept {
     async_route_pending_=false;async_route_collected_=false;async_route_count_=0;
     verify_async_rows_=0;verify_async_layer_=-1;
     arena_verify_pending_=false;
+    arena_cold_rows_pending_=false;arena_cold_rows_joined_=false;
+    arena_cold_rows_=0;arena_cold_rows_next_row_=0;
 }
 
 bool Qwen4ExpExpertExecutor::CanExecuteVerifyRows(int rows, int top_k) const {

@@ -146,8 +146,13 @@ void Qwen4ExpMtpDraft::Hc(const std::string& prefix, Qwen4ExpHyperConnectionLaye
 }
 
 std::unique_ptr<Qwen4ExpMtpDraft::State> Qwen4ExpMtpDraft::CreateState(int capacity) {
-    Require(capacity > 0 && capacity <= 2048 && capacity <= target_.cfg_.indexer_budget,
-            "MTP draft requires dense-QSA text positions within the model indexer budget");
+    // The draft attends densely over position+1 rows and stores one full
+    // indexer row per position, so the QSA indexer budget (2048) is a cost
+    // reference, not a correctness bound. Capacity is limited by the target's
+    // own sequence budget because the draft reuses its decode scratch. Callers
+    // gate sessions past their MTP window to T1 before Step is reached.
+    Require(capacity > 0 && capacity <= target_.max_seq_len(),
+            "MTP draft capacity exceeds the target sequence budget");
     auto state = std::make_unique<State>();
     state->cache.k = Tensor::allocate(ctx_, {2, capacity, 256}, dnnl::memory::data_type::bf16);
     state->cache.v = Tensor::allocate(ctx_, {2, capacity, 256}, dnnl::memory::data_type::bf16);

@@ -1325,6 +1325,54 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             count <= expert_executor_.max_cpu_tokens() && expert_executor_.cpu_overlap_enabled();
         if (verify_cpu_cold) expert_executor_.StageResidentInput(x_base, count);
 
+        // G1b (opt-in, AILA_Q4E_VERIFY_CPU_BATCH): same cold prefixes as G1,
+        // but the whole window runs as ONE CPU job so the coordinator pays one
+        // join instead of one per row. Every row is classified before any GPU
+        // work (GetSlot is a pure lookup and ObserveRouting only updates
+        // counters), the per-row max_cpu_credits_ cap and the >cap GPU-staging
+        // overflow are unchanged, and the loop below re-checks each row's
+        // prefix and fails closed on any drift. Any unmet condition drops back
+        // to the untouched per-row G1 path.
+        static const bool s_verify_cpu_batch = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", false);
+        bool verify_cpu_batch = s_verify_cpu_batch && verify_cpu_cold && !d1_stash_valid &&
+            expert_executor_.CanExecuteArenaColdRows(count);
+        std::array<std::array<int, kMaxTopK>, 4> batch_experts{}, batch_ranks{};
+        std::array<int, 4> batch_begin{}, batch_count{};
+        if (verify_cpu_batch) {
+            int batch_total = 0;
+            for (int t = 0; t < count && verify_cpu_batch; ++t) {
+                const int* b_ids = router_host_ids_ + t * top_k;
+                int b_miss = 0;
+                for (int k = 0; k < top_k; ++k)
+                    if (adaptive_cache_.GetSlot(layer, b_ids[k]) < 0) {
+                        batch_experts[t][b_miss] = b_ids[k];
+                        batch_ranks[t][b_miss] = k;
+                        ++b_miss;
+                    }
+                for (int c = 0; c < b_miss && verify_cpu_batch; ++c)
+                    verify_cpu_batch = host_arena_.GetExpertPointer(layer, batch_experts[t][c]) != nullptr;
+                batch_count[t] = std::min(b_miss, expert_executor_.max_cpu_credits());
+                batch_begin[t] = batch_total;
+                batch_total += batch_count[t];
+            }
+            if (batch_total < 1 || batch_total > ops::cpu::kMaxExpertBatchTasks) verify_cpu_batch = false;
+            if (verify_cpu_batch) {
+                // Strict row-major partition: the flattened list is exactly the
+                // per-row miss prefix the loop below would send one row at a
+                // time, so every (row, expert) task keeps its own bytes.
+                std::array<int, ops::cpu::kMaxExpertBatchTasks> flat_experts{}, flat_ranks{};
+                int offset = 0;
+                for (int t = 0; t < count; ++t)
+                    for (int c = 0; c < batch_count[t]; ++c, ++offset) {
+                        flat_experts[offset] = batch_experts[t][c];
+                        flat_ranks[offset] = batch_ranks[t][c];
+                    }
+                expert_executor_.StartArenaColdRows(host_arena_, layer, count, flat_experts.data(),
+                    flat_ranks.data(), batch_begin.data(), batch_count.data(), batch_total, x_base);
+                cpu_work.active = true;
+            }
+        }
+
         for (int t = 0; t < count; ++t) {
             const int* t_ids = router_host_ids_ + t * top_k;
             const float* t_weights = router_host_weights_ + t * top_k;
@@ -1382,6 +1430,14 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     if (d1_stash_ids[c]!=miss_experts[c] || d1_stash_ranks[c]!=miss_ranks[c])
                         throw std::logic_error("Qwen4Exp: early CPU route classification changed");
                 d1_stash_valid=false;
+            } else if (verify_cpu_batch) {
+                // G1b: this row's CPU share already runs inside the window's
+                // single job; the prefix must be exactly what was classified
+                // above or the CPU set would silently change, so fail closed.
+                cpu_count = batch_count[t];
+                for (int c = 0; c < cpu_count; ++c)
+                    if (batch_experts[t][c] != miss_experts[c] || batch_ranks[t][c] != miss_ranks[c])
+                        throw std::logic_error("Qwen4Exp: batched CPU route classification changed");
             } else if (expert_executor_.cpu_overlap_enabled() &&
                        (count==1 || (verify_cpu_cold && cpu_cold_ok))) {
                 // x_base equals x_t for count==1, so the single-row call is
@@ -1390,7 +1446,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_base,
                     t, count);
             }
-            cpu_work.active=cpu_count>0;
+            cpu_work.active=verify_cpu_batch || cpu_count>0;
             const int gpu_cold_count=miss_count-cpu_count;
             StagingBatch staging{};
             if (gpu_cold_count>0) {
@@ -1443,9 +1499,14 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 adaptive_cache_.RecordStagingConsumer(staging.ping_pong_index,last);
             }
 
-            const auto cpu_ready=expert_executor_.JoinResidentCold(down);
+            // G1b keeps one job outstanding for the whole window: the first
+            // per-row join waits it, every later row only publishes its own
+            // rank spans into this row's accumulator slice.
+            const auto cpu_ready=verify_cpu_batch
+                ? expert_executor_.JoinArenaColdRowsRow(down, t)
+                : expert_executor_.JoinResidentCold(down);
             if (cpu_count) last=cpu_ready;
-            cpu_work.active=false;
+            cpu_work.active=verify_cpu_batch && t + 1 < count;
             // 5. Accumulate ranked down rows into y
             ctx.queue().memcpy(resident_weights_.data(), t_weights, top_k * sizeof(float));
 
@@ -1566,6 +1627,10 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     if (layer_stage_epoch_) {
         for (int e : layer_stage_ids_) {
             if (!prefill_expert_uses_[e]) continue;
+            // A swap can admit a cold expert after Begin; that expert is served
+            // as a resident hit above, so never list it a second time off the
+            // arena map (which is only a residency snapshot taken at Begin).
+            if (adaptive_cache_.GetSlot(layer,e)>=0) continue;
             if (layer_stage_.SlotOf(layer_stage_epoch_,e)<0) continue;
             prefill_unique_.push_back(e);
             adaptive_prefill_slots_[e]=layer_stage_.GetSlotDev(layer_stage_epoch_,e,&metadata);
@@ -1613,6 +1678,10 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     (void)staging_pump_logged;
     const int total_unique=int(prefill_unique_.size());
     const int bank_first=hits+staged_count;
+    // G5: record how this epoch was served (arena vs bank fallback) so the
+    // prefill arms can prove the consumer path instead of inferring it.
+    if (layer_stage_epoch_)
+        layer_stage_.NoteConsume(staged_count, std::max(0, total_unique-bank_first));
     const int num_chunks=total_unique>bank_first ? (total_unique-bank_first+slots_per_chunk-1)/slots_per_chunk : 0;
     std::array<StagingBatch,aila::AdaptiveCacheConfig::kMaxStagingBanks> staged_window{};
     auto chunk_begin=[&](int c){ return bank_first+c*slots_per_chunk; };
@@ -2186,6 +2255,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     double prof_acquire_ms = 0.0;
     ExpertCacheStats prof_stats0{};
     const auto adaptive_stats0 = adaptive_cache_.Stats();
+    // G5: baseline for the one-line layer-stage consumer accounting below.
+    static const bool s_layer_stage_log = aila::env::read_flag("AILA_Q4E_LAYER_STAGE", false);
+    const aila::LayerStageStats layer_stage_stats0 = layer_stage_.Stats();
     aila::HeteroExecutionStats cold_stats0 = expert_executor_.stats();
     if (!use_adaptive_pipeline_) {
         expert_cache_.trace_forward(start_pos, count, true, options.need_logits);
@@ -2925,6 +2997,27 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             dev_ms[kDevMisc], dev_ms[kDevHc], dev_ms[kDevLinear], dev_ms[kDevFull], dev_ms[kDevRouter],
             dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead],
             dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter]);
+    }
+    // G5: one line per prefill forward that proves how the layer arena was
+    // consumed (arena_experts vs bank fallback). A zero-hit consumer would
+    // otherwise be invisible in [Q4E AdaptiveWork].
+    if (s_layer_stage_log && count > 4) {
+        const aila::LayerStageStats stage_stats1 = layer_stage_.Stats();
+        const uint64_t stage_epochs = stage_stats1.epochs - layer_stage_stats0.epochs;
+        const uint64_t arena_experts =
+            stage_stats1.consumed_arena_experts - layer_stage_stats0.consumed_arena_experts;
+        const uint64_t bank_experts =
+            stage_stats1.consumed_bank_experts - layer_stage_stats0.consumed_bank_experts;
+        AILA_LOG_INFO("[Q4E LayerStage] forward pos=%d count=%d epochs=%llu arena_experts=%llu "
+            "bank_experts=%llu arena_mb=%.1f",
+            start_pos, count, (unsigned long long)stage_epochs,
+            (unsigned long long)arena_experts, (unsigned long long)bank_experts,
+            (stage_stats1.staged_bytes - layer_stage_stats0.staged_bytes) / 1048576.0);
+        if (stage_epochs > 0 && arena_experts == 0 && bank_experts > 0) {
+            AILA_LOG_WARN("[Q4E LayerStage] zero arena consumption (epochs=%llu bank_experts=%llu); "
+                "consumer path not effective", (unsigned long long)stage_epochs,
+                (unsigned long long)bank_experts);
+        }
     }
     if (!use_adaptive_pipeline_ && s_work_summary) {
         const auto& supply = expert_cache_.stats();

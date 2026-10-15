@@ -16,6 +16,15 @@ public:
     Qwen4ExpMtpRuntime(Context&, Qwen4ExpBnb4Backend&, ModelWeights&, int capacity);
     ~Qwen4ExpMtpRuntime();
     static size_t SessionBytes(int capacity);
+    // Load-time policy for the draft window, clamped to the model's sequence
+    // budget. AILA_Q4E_MTP_MAX_CONTEXT (default 2048) keeps today's bound;
+    // raising it only widens which sessions may draft, never the T1 path.
+    static int EffectiveCapacity(int maxSequenceLength);
+    // MTP service window in tokens. Decode windows are used only while the
+    // session fits: AfterForward invalidates State past this length and the
+    // caller's admission check must reject windows at Capacity()-1 or above,
+    // so longer sessions silently take the plain T1 path.
+    int Capacity() const noexcept { return capacity; }
     std::unique_ptr<State> CreateState();
     void AfterForward(State&, int start, const std::vector<int>& tokens);
     aila::inference::DecodeWindowResult ForwardWindow(Qwen4ExpBnb4Backend::Session&,
