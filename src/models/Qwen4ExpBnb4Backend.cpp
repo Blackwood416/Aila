@@ -752,9 +752,14 @@ bool Qwen4ExpBnb4Backend::load(
     cache_cfg.num_experts_per_layer=cfg_.num_experts;
     cache_cfg.hidden_size=hidden_size_;
     cache_cfg.moe_intermediate_size=cfg_.moe_intermediate_size;
+    int staging_slots=aila::env::read_int_raw("AILA_Q4E_STAGING_SLOTS", 16);
+    if (aila::env::read_flag("AILA_Q4E_LAYER_MAJOR", false)) {
+        // Layer-major-only depth override; default keeps 16 so the env unset
+        // path is byte-for-byte unchanged in behavior and VRAM.
+        staging_slots=aila::env::read_int("AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS", staging_slots);
+    }
     cache_cfg.staging_slots_per_buffer=std::clamp(
-        aila::env::read_int_raw("AILA_Q4E_STAGING_SLOTS", 16), 1,
-        aila::AdaptiveCacheConfig::kMaxStagingSlots);
+        staging_slots, 1, aila::AdaptiveCacheConfig::kMaxStagingSlots);
     const size_t slot_bytes=size_t(3)*hidden_size_*cfg_.moe_intermediate_size*33/64;
     // The 32K session and prefill projections reserve more VRAM than the CLI's
     // 4K smoke. Fit the cache after those reservations, including both banks.
@@ -1060,6 +1065,9 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
     pred_scores_ = Tensor::allocate(ctx, {cap, cfg_.num_experts}, dnnl::memory::data_type::bf16);
     free_pinned_host_buffers();
+    // The map mirrors below are sized by cap; a layer-major forward that grows
+    // them beyond cap resets this on its next call.
+    layer_major_map_capacity_ = 0;
     router_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
     router_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     pred_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
@@ -1487,14 +1495,20 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
 
 sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     Context& ctx, int layer, int count, int firstUnique, int numUnique,
-    int& actStart, int& tileStart, int minRows, const sycl::event& ready) {
+    int& actStart, int& tileStart, int minRows, const sycl::event& ready,
+    int route_base, int token_base, const int* use_counts,
+    const bf16* x_base, bf16* moe_h_base, float* down_acc_base) {
     const int top_k = cfg_.num_experts_per_tok;
+    const int* uses = use_counts ? use_counts : prefill_expert_uses_.data();
+    const bf16* x_dev = x_base ? x_base : buf_.x.data_as<bf16>();
+    bf16* h_dev = moe_h_base ? moe_h_base : buf_.moe_h.data_as<bf16>();
+    float* down_dev = down_acc_base ? down_acc_base : buf_.moe_down_acc.data_as<float>();
     static const bool reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
     static const bool quads = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
     static const bool eights = aila::env::read_flag("AILA_Q4E_8TOKEN_REUSE", false);
     int ne = 0, nq = 0, np = 0, ns = 0, nx = 0;
     for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
-        const int n = prefill_expert_uses_[prefill_unique_[u]];
+        const int n = uses[prefill_unique_[u]];
         if (n >= minRows) nx += n;
         else {
             ne += reuse && eights ? n / 8 : 0;
@@ -1513,7 +1527,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     const int tileBegin = tileStart;
     std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
     for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
-        const int e = prefill_unique_[u], n = prefill_expert_uses_[e];
+        const int e = prefill_unique_[u], n = uses[e];
         expert_curr_pos_host_[e] = 0;
         expert_offsets_host_[e] = n >= minRows ? xo : -2;
         if (n >= minRows) {
@@ -1532,9 +1546,9 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         }
     }
     for (int i = 0; i < count * top_k; ++i) {
-        const int e = router_host_ids_[i], base = expert_offsets_host_[e];
+        const int e = router_host_ids_[route_base + i], base = expert_offsets_host_[e];
         if (base == -1) continue; // another ready/miss microbatch
-        const int seen = expert_curr_pos_host_[e]++, n = prefill_expert_uses_[e];
+        const int seen = expert_curr_pos_host_[e]++, n = uses[e];
         int pos;
         if (base >= 0) pos = base + seen;
         else {
@@ -1546,7 +1560,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
                 seen < g + q + p ? expert_pair_pos_host_[e] + seen - g - q :
                 expert_single_pos_host_[e] + seen - g - q - p;
         }
-        expert_map_token_host_[pos] = i / top_k;
+        expert_map_token_host_[pos] = token_base + i / top_k;
         expert_map_rank_host_[pos] = i % top_k;
         expert_map_slot_host_[pos] = use_adaptive_pipeline_ ? adaptive_prefill_slots_[e]
             : expert_cache_.get_slot_dev(prefill_expert_slot_[e]);
@@ -1565,20 +1579,20 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     if (alu) {
         last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
-            buf_.x.data_as<bf16>(), buf_.moe_h.data_as<bf16>(), alu, top_k,
+            x_dev, h_dev, alu, top_k,
             hidden_size_, cfg_.moe_intermediate_size, 64, &last, nested, np, nq, ne, nested_fixed256);
         last = ops::moe_expert_major_prefill_down(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
-            buf_.moe_h.data_as<bf16>(), buf_.moe_down_acc.data_as<float>(), alu, top_k,
+            h_dev, down_dev, alu, top_k,
             cfg_.moe_intermediate_size, hidden_size_, 64, &last, nested, np, nq, ne, false, nested_fixed256);
     }
     if (tiles) {
         last = ops::moe_grouped_xmx_gate_up(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,
-            expert_map_token_dev_, expert_map_rank_dev_, nullptr, buf_.x.data_as<bf16>(),
-            buf_.moe_h.data_as<bf16>(), top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
+            expert_map_token_dev_, expert_map_rank_dev_, nullptr, x_dev,
+            h_dev, top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
         last = ops::moe_grouped_xmx_down(ctx, expert_map_slot_dev_, tilesDev + tileBegin, tiles,
-            expert_map_token_dev_, expert_map_rank_dev_, nullptr, buf_.moe_h.data_as<bf16>(),
-            buf_.moe_down_acc.data_as<float>(), top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
+            expert_map_token_dev_, expert_map_rank_dev_, nullptr, h_dev,
+            down_dev, top_k, hidden_size_, cfg_.moe_intermediate_size, nested, &last);
         grouped_xmx_tiles_ += tiles;
         grouped_xmx_acts_ += nx;
         if (grouped_expert_probe_) grouped_expert_probe_(*this, layer, count, actStart + alu, tileBegin, tiles, last);
@@ -1757,6 +1771,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
+    static const bool s_layer_major = aila::env::read_flag("AILA_Q4E_LAYER_MAJOR", false);
+    if (s_layer_major && LayerMajorPrefillEligible(session, count, options)) {
+        return ForwardLayerMajorPrefill(ctx, session, tokenIdsDevice, count,
+                                        lastTokenOnly, options);
+    }
+    if (s_layer_major && count > 1) {
+        static bool logged_layer_major_fallback = false;
+        if (!logged_layer_major_fallback) {
+            logged_layer_major_fallback = true;
+            AILA_LOG_INFO("[Q4E LayerMajor] fallback chunk-major count=%d prefill_remaining=%d "
+                          "decode_verification=%d checkpoint_after=%d",
+                          count, options.prefill_remaining,
+                          int(options.decode_verification), options.checkpoint_after);
+        }
+    }
     static const bool profile_components = aila::env::read_flag("AILA_Q4E_PROFILE_COMPONENTS", false);
     component_profile_active_for_test_ = profile_components && options.decode_verification && count == 2;
     component_profile_ms_for_test_.fill(0);

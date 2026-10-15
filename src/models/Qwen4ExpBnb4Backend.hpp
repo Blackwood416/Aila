@@ -399,6 +399,14 @@ private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly,
                         const ForwardOptions& options);
+    // Layer-major prefill prototype (AILA_Q4E_LAYER_MAJOR=1). Only the exact
+    // two-full-chunk prefill shape is accepted; everything else falls back to
+    // the chunk-major ForwardImpl path unchanged.
+    bool LayerMajorPrefillEligible(const Session& session, int count,
+                                   const ForwardOptions& options) const;
+    Tensor& ForwardLayerMajorPrefill(Context& ctx, Session& session,
+                                     const int* tokenIdsDevice, int count,
+                                     bool lastTokenOnly, const ForwardOptions& options);
     sycl::event RunCompactExpertDown(Context& ctx, int first, int acts,
         int pairs, int quads, const sycl::event& ready);
     void RunAttentionLayerTile(Context& ctx, Session& session, int layer,
@@ -406,6 +414,11 @@ private:
         StateSnapshot* interior, int checkpointAfter, bool allowQ8 = false);
     void RunAttentionWindow(Context& ctx, Session& session, int layer, int count,
         int startPos, StateSnapshot* interior, int checkpointAfter, bool allowQ8 = false);
+    // Same tiling as RunAttentionWindow, but input/output rows start at
+    // row_offset in buf_.x / buf_.y. Layer-major runs chunk 0 and chunk 1 as
+    // two independent 4096-row attention windows inside one layer pass.
+    void RunAttentionWindowAt(Context& ctx, Session& session, int layer, int count,
+        int startPos, int row_offset, bool allowQ8 = false);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
@@ -420,7 +433,24 @@ private:
     void free_pinned_host_buffers();
     sycl::event RunGroupedExperts(Context& ctx, int layer, int count,
         int firstUnique, int numUnique, int& actStart, int& tileStart,
-        int minRows, const sycl::event& ready);
+        int minRows, const sycl::event& ready,
+        int route_base = 0, int token_base = 0, const int* use_counts = nullptr,
+        const sycl::ext::oneapi::bfloat16* x_base = nullptr,
+        sycl::ext::oneapi::bfloat16* moe_h_base = nullptr,
+        float* down_acc_base = nullptr);
+    // Layer-major variant of RunAdaptivePrefill: same union/resident ordering
+    // and staging ping-pong, but every expert launch is split into two
+    // 4096-row halves that share one staged bank, and resident hits are
+    // processed in bounded microbatches so a single large launch cannot stall
+    // the staging pipeline.
+    sycl::event RunAdaptivePrefillLayerMajor(Context& ctx, int layer,
+        bool fuse_shared, int count,
+        const sycl::ext::oneapi::bfloat16* x_base = nullptr,
+        sycl::ext::oneapi::bfloat16* y_base = nullptr,
+        sycl::ext::oneapi::bfloat16* moe_h_base = nullptr,
+        float* down_acc_base = nullptr,
+        const sycl::ext::oneapi::bfloat16* shared_out_base = nullptr,
+        const sycl::ext::oneapi::bfloat16* shared_gate_base = nullptr);
     // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
     void EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count);
     // bf16 Linear with raw [out, in] weight: native GEMV for one row, oneDNN otherwise.
@@ -533,6 +563,18 @@ private:
     uint64_t lmHeadQ8ForwardCount_ = 0, lmHeadQ8RowCount_ = 0;
     Tensor lastTokenLogits_;
     Tensor unusedLogits_; // Invalid output for forwards that only advance cached state.
+    // Layer-major v3 carries: 8192-row activation/window buffers that must
+    // outlive the two 4096-row halves while the standard runtime scratch stays
+    // at 4096 rows. Allocated on the first layer-major prefill and reused.
+    Tensor lm_hidden_, lm_x_, lm_y_, lm_inject_, lm_moe_h_, lm_down_;
+    Tensor lm_shared_out_, lm_shared_gate_;
+    std::vector<int> lm_ids_host_;
+    int layer_major_map_capacity_ = 0;
+    void EnsureLayerMajorCarries(Context& ctx, int count);
+    // The layer-major expert pass indexes activations over the full 8192-row
+    // window, so the route/map host and device mirrors need count slots even
+    // when the standard runtime scratch stays at the 4096-row chunk size.
+    void EnsureLayerMajorMaps(Context& ctx, int count);
 
     Qwen4ExpBuffers buf_;
     ops::GdnChunkScratch gdn_chunk_scratch_;

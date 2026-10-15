@@ -198,6 +198,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertCache.cpp
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
+    src/models/Qwen4ExpLayerMajor.cpp
     src/models/Qwen4ExpMtpDraft.cpp
     src/models/Qwen4ExpMtpRuntime.cpp
     src/models/Qwen4ExpPrefill.cpp

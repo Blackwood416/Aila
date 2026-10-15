@@ -615,8 +615,16 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     static const bool parallel_host_copy =
         aila::env::read_flag("AILA_Q4E_STAGE_COPY_PARALLEL", false);
     if (parallel_host_copy && count>1 && copy_executor) {
-        copy_executor->CopyColdStagingHostSlots(
-            sources.data(), staging_host_[pp], geom_.slot_bytes, count, true);
+        // The executor's parallel host copy is bounded to 16 slots per call;
+        // deeper staging banks (AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS) must split
+        // into several calls instead of tripping its input validation.
+        constexpr int kMaxHostCopySlots = 16;
+        for (int offset = 0; offset < count; offset += kMaxHostCopySlots) {
+            const int n = std::min(kMaxHostCopySlots, count - offset);
+            copy_executor->CopyColdStagingHostSlots(
+                sources.data() + offset, staging_host_[pp] + size_t(offset) * geom_.slot_bytes,
+                geom_.slot_bytes, n, true);
+        }
     } else {
         for (int i=0;i<count;++i)
             std::memcpy(staging_host_[pp]+size_t(i)*geom_.slot_bytes,

@@ -78,6 +78,24 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
         }
 
         chunk_size = std::min(chunk_size, static_cast<int>(token_input_staging_.numel()));
+        // Layer-major prototype: when exactly two full 4096-token chunks
+        // remain, hand both to the backend as one forward so Qwen4Exp can
+        // stage each layer's cold experts once for the whole window. Any other
+        // shape (or an interior checkpoint anchor inside the window) keeps the
+        // existing chunk-major loop below.
+        const bool layer_major_merge = model_spec_.family == ModelFamily::Qwen4Exp &&
+            chunk_size == 4096 &&
+            aila::env::read_flag("AILA_Q4E_LAYER_MAJOR", false);
+        if (model_spec_.family == ModelFamily::Qwen4Exp &&
+            aila::env::read_flag("AILA_Q4E_LAYER_MAJOR", false) && !layer_major_merge) {
+            static bool logged_layer_major_shape = false;
+            if (!logged_layer_major_shape) {
+                logged_layer_major_shape = true;
+                AILA_LOG_INFO("[Q4E LayerMajor] shape fallback: len=%d start=%d chunk=%d "
+                              "(needs exactly two full 4096-token chunks)",
+                              len, start, chunk_size);
+            }
+        }
         int* token_ids_device = token_input_staging_.data_as<int>();
         Tensor* logits_ptr = nullptr;
         const int end = start + len;
@@ -92,6 +110,14 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                 } else {
                     next = snapshot_after_len;
                 }
+            }
+            if (layer_major_merge && checkpoint_after == 0 &&
+                next == pos + chunk_size && end - pos == 2 * chunk_size &&
+                !(options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
+                  snapshot_after_len > pos && snapshot_after_len < end)) {
+                next = end;
+                AILA_LOG_INFO("[Q4E LayerMajor] merged two full chunks start=%d count=%d",
+                              pos, next - pos);
             }
             const int slice_len = next - pos;
             if (model_spec_.family == ModelFamily::Qwen4Exp && log_q4e_preset) {
