@@ -250,6 +250,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
     };
     double prof_router_sync_ms = 0.0;
     double prof_experts_ms = 0.0;
+    // v4 pipeline gate + module split (see the layer-major v4 plan). The module
+    // timers only run on the gated arm; the ungated path is byte-identical.
+    static const bool s_pipeline = aila::env::read_flag("AILA_Q4E_LAYER_MAJOR_PIPELINE", false);
+    double pip_ple_ms = 0.0, pip_halves_ms = 0.0, pip_shared_ms = 0.0;
+    double pip_mix_ms = 0.0, pip_head_ms = 0.0;
     const auto adaptive_stats0 = adaptive_cache_.Stats();
     const auto cold_stats0 = expert_executor_.stats();
 
@@ -291,6 +296,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
 
         // 1.0. PLE on layer 1, two 4096-token calls on the residual carry.
         if (L == 1) {
+            const auto pip_t0 = s_pipeline ? prof_clock::now() : prof_clock::time_point{};
             for (int c = 0; c < kChunks; ++c) {
                 const int off = c * chunk;
                 PleTicket ticket = ple_.prepare(
@@ -300,9 +306,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
                 ple_.consume(ctx, ticket, session.ple_state_, hidden, nullptr, hidden, 0, nullptr);
                 ple_.commit(ticket, session.ple_state_);
             }
+            if (s_pipeline) pip_ple_ms += prof_ms(pip_t0, prof_clock::now());
         }
 
         sycl::event route_events[kChunks];
+        const auto pip_halves_t0 = s_pipeline ? prof_clock::now() : prof_clock::time_point{};
         for (int c = 0; c < kChunks; ++c) {
             const int off = c * chunk;
             const size_t hidden_off = static_cast<size_t>(off) * 10240;
@@ -337,9 +345,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
                 router_host_weights_ + static_cast<size_t>(off) * top_k,
                 chunk, cfg_.num_experts, top_k, true);
         }
+        if (s_pipeline) pip_halves_ms += prof_ms(pip_halves_t0, prof_clock::now());
 
         // Shared expert per half, from the carried MoE input into the shared
         // carry; submitted before the route wait to overlap cold staging.
+        const auto pip_shared_t0 = s_pipeline ? prof_clock::now() : prof_clock::time_point{};
         for (int c = 0; c < kChunks; ++c) {
             const int off = c * chunk;
             Tensor x_view = Tensor::view(ctx,
@@ -362,6 +372,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
                                            cfg_.shared_expert_intermediate_size);
             layer.shared_down_proj.forward(ctx, linear_scratch_, inter_view, out_view, chunk);
         }
+        if (s_pipeline) pip_shared_ms += prof_ms(pip_shared_t0, prof_clock::now());
 
         // 1.5. Wait for both route halves, then one shared-staging expert pass
         //      over the carried 8192-row window (v2 pipelining retained).
@@ -394,6 +405,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
         }
 
         // 1.6. Per-half shared add (unless fused) and MLP residual injection.
+        const auto pip_mix_t0 = s_pipeline ? prof_clock::now() : prof_clock::time_point{};
         for (int c = 0; c < kChunks; ++c) {
             const int off = c * chunk;
             if (!s_fuse_shared) {
@@ -414,11 +426,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
                 lm_inject_.data_as<float>() + static_cast<size_t>(off) * 4,
                 chunk, hidden_size_, 4);
         }
+        if (s_pipeline) pip_mix_ms += prof_ms(pip_mix_t0, prof_clock::now());
+        // Cumulative checkpoints so the module split survives a truncated log
+        // tail (take per-layer deltas of consecutive rows).
+        if (s_pipeline && s_work_summary) {
+            AILA_LOG_INFO("[Q4E LayerMajorPipeline] progress layer=%d ple_ms=%.3f halves_ms=%.3f "
+                          "shared_ms=%.3f route_wait_ms=%.3f experts_ms=%.3f mix_ms=%.3f wall_ms=%.3f",
+                L, pip_ple_ms, pip_halves_ms, pip_shared_ms, prof_router_sync_ms,
+                prof_experts_ms, pip_mix_ms, prof_ms(prof_t0, prof_clock::now()));
+        }
     }
 
     // 2. Final mixer for the last 4096-row half only; the sampler reads the
     //    last row, and the mixer is row-independent.
     if (options.need_logits) {
+        const auto pip_head_t0 = s_pipeline ? prof_clock::now() : prof_clock::time_point{};
         const int off = (kChunks - 1) * chunk;
         ctx.queue().memcpy(buf_.hidden4.data(),
                            lm_hidden_.data_as<bf16>() + static_cast<size_t>(off) * 10240,
@@ -440,6 +462,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
                                         {1, static_cast<int64_t>(cfg_.vocab_size)},
                                         buf_.logits.dtype());
         (void)lastTokenOnly;
+        if (s_pipeline) pip_head_ms += prof_ms(pip_head_t0, prof_clock::now());
     }
 
     if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
@@ -477,6 +500,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
             (a_end.staging_wait_ns - adaptive_stats0.staging_wait_ns) * 1e-6,
             static_cast<unsigned long long>(a_end.cold_experts_staged - adaptive_stats0.cold_experts_staged),
             (a_end.cold_bytes_transferred - adaptive_stats0.cold_bytes_transferred) / 1048576.0);
+    }
+    if (s_pipeline && s_work_summary) {
+        AILA_LOG_INFO("[Q4E LayerMajorPipeline] window count=%d ple_ms=%.3f halves_ms=%.3f "
+                      "shared_ms=%.3f route_wait_ms=%.3f experts_ms=%.3f mix_ms=%.3f head_ms=%.3f",
+            count, pip_ple_ms, pip_halves_ms, pip_shared_ms, prof_router_sync_ms,
+            prof_experts_ms, pip_mix_ms, pip_head_ms);
     }
 
     return options.need_logits ? lastTokenLogits_ : unusedLogits_;
@@ -554,6 +583,12 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefillLayerMajor(
         AILA_LOG_INFO("[Q4E LayerMajor] expert batch=%d configured=%d cache_slots=%d",
                       batch, configured_batch, adaptive_cache_.StagingSlotsPerBuffer());
     }
+    static const bool s_pipeline = aila::env::read_flag("AILA_Q4E_LAYER_MAJOR_PIPELINE", false);
+    static bool logged_pipeline = false;
+    if (s_pipeline && !logged_pipeline) {
+        logged_pipeline = true;
+        AILA_LOG_INFO("[Q4E LayerMajor] pipeline=1 depth=2 (cold head staged before the resident phase)");
+    }
 
     int act_start = 0, tile_start = 0;
     auto run_batch = [&](int firstUnique, int numUnique, const sycl::event& ready) {
@@ -571,13 +606,6 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefillLayerMajor(
         }
         return out;
     };
-
-    const auto* resident_ready = adaptive_cache_.ResidentReady();
-    sycl::event last = resident_ready ? *resident_ready : sycl::event{};
-    for (int start = 0; start < hits; start += batch) {
-        last = run_batch(start, std::min(batch, hits - start), last);
-    }
-    if (hits) adaptive_cache_.RecordResidentConsumer(last);
 
     struct PendingStage {
         aila::StagingBatch batch{};
@@ -601,20 +629,43 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefillLayerMajor(
         pending.valid = true;
         return pending;
     };
-    PendingStage current;
-    if (hits < total_unique) {
-        current = stage_one(hits, std::min(batch, total_unique - hits));
+
+    const auto* resident_ready = adaptive_cache_.ResidentReady();
+    sycl::event last = resident_ready ? *resident_ready : sycl::event{};
+
+    // v4 (AILA_Q4E_LAYER_MAJOR_PIPELINE=1): the union is already known here, so
+    // both ping-pong banks can be primed with the head cold batches *before* the
+    // resident-hit microbatches are submitted. The head fill + H2D then overlap
+    // the hit kernels instead of sitting on the critical path of the first cold
+    // consumption. The loop below is the v3 one-deep look-ahead schedule, so an
+    // unprimed (ungated) call keeps its exact stage/consume order.
+    PendingStage fifo[2];
+    int fifo_count = 0, fifo_head = 0, stage_next = hits;
+    double head_stage_ms = 0.0;
+    auto push_stage = [&]() {
+        const int n = std::min(batch, total_unique - stage_next);
+        fifo[(fifo_head + fifo_count) & 1] = stage_one(stage_next, n);
+        stage_next += n;
+        ++fifo_count;
+    };
+    if (s_pipeline) {
+        const auto head_t0 = std::chrono::steady_clock::now();
+        while (fifo_count < 2 && stage_next < total_unique) push_stage();
+        head_stage_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - head_t0).count();
     }
-    while (current.valid) {
-        const int next_first = current.first + current.n;
-        PendingStage next;
-        if (next_first < total_unique) {
-            next = stage_one(next_first, std::min(batch, total_unique - next_first));
-        }
-        sycl::event consumed = run_batch(current.first, current.n, current.batch.ready_event);
-        adaptive_cache_.RecordStagingConsumer(current.batch.ping_pong_index, consumed);
+    for (int start = 0; start < hits; start += batch) {
+        last = run_batch(start, std::min(batch, hits - start), last);
+    }
+    if (hits) adaptive_cache_.RecordResidentConsumer(last);
+    while (fifo_count > 0 || stage_next < total_unique) {
+        while (fifo_count < 2 && stage_next < total_unique) push_stage();
+        const PendingStage cur = fifo[fifo_head];
+        fifo_head = (fifo_head + 1) & 1;
+        --fifo_count;
+        sycl::event consumed = run_batch(cur.first, cur.n, cur.batch.ready_event);
+        adaptive_cache_.RecordStagingConsumer(cur.batch.ping_pong_index, consumed);
         last = consumed;
-        current = next;
     }
     if (act_start != count * top_k) {
         throw std::logic_error("Incomplete Qwen4Exp layer-major routing map");
@@ -636,6 +687,11 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefillLayerMajor(
             fuse_shared ? shared_out_dev + y_off : nullptr,
             fuse_shared ? shared_gate_dev + token_base : nullptr,
             &dep, nullptr);
+    }
+    static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
+    if (s_pipeline && s_work_summary) {
+        AILA_LOG_INFO("[Q4E LayerMajorPipeline] layer=%d hits=%d cold=%d batch=%d stage_head_ms=%.3f",
+                      layer, hits, total_unique - hits, batch, head_stage_ms);
     }
     return last;
 }
