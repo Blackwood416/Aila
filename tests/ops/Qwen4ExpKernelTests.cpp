@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -5296,6 +5297,325 @@ void run_decode_attn_bench(Context& ctx) {
     }
 }
 
+// R3 decode-attention K/V reuse A/B arm (2026-10-15, role K5). Times the
+// production decode entry point (ops::attention_decode_rows) on the audit shape
+// Hq24/Hkv2/D256/bf16 KV at lengths {333, 1834, 4096, 8192, 14336} for rows
+// {1, 2}. The variant is selected by the process-wide AILA_ATTN_KVREUSE env
+// (read once inside AttentionOps.cpp; "pair2" = head-pair K/V reuse, anything
+// else = the unchanged default path), so one process measures one variant and
+// the A/B is a two-process comparison: run the arm once with
+// AILA_ATTN_KVREUSE=0 and once with AILA_ATTN_KVREUSE=pair2.
+//
+// Cross-process bit-exactness: AILA_ATTN_KVREUSE_REF=<path> points at a small
+// text ledger of FNV-1a 64 hashes over the raw bf16 bytes of output row 0. The
+// first process (ledger absent) writes it and reports bitwise_eq=-1; a later
+// process compares and reports bitwise_eq=1/0 per shape. Hashes are compared
+// only for rows=1, because at rows=2 the D256 dispatcher selects the multi-row
+// exact-merge kernel, which this round's variant does not modify: that row is a
+// timing control and its hash is printed for cross-run eyeballing only.
+// Pair2 is also inert below kDecodeExact256MinLen=1024 (len 333 keeps the
+// short-context baseline kernel), which makes 333 the no-change control and
+// 1834 the first shape the variant can move. Compare the two processes'
+// median_us_per_row per (length, rows): >=3% faster at 4096 and 8192 with an
+// A/A spread within +-1% adopts pair2; >2% slower at 333 or 1834 rejects it.
+// Every GPU stage prints a flushed [DECODE ATTN REUSE] breadcrumb first, so a
+// stall names its stage instead of looking like a silent exit.
+uint64_t reuse_bench_fnv1a64(const void* data, size_t bytes) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < bytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void run_decode_attn_reuse_bench(Context& ctx) {
+    std::cout << std::unitbuf;
+    struct TerminateGuard {
+        std::terminate_handler previous = std::get_terminate();
+        TerminateGuard() {
+            std::set_terminate([] {
+                std::cout << "[DECODE ATTN REUSE TERMINATE] unhandled termination inside the "
+                             "decode-attn reuse bench; last [DECODE ATTN REUSE] breadcrumb above "
+                             "names the stalled stage\n";
+                std::abort();
+            });
+        }
+        ~TerminateGuard() { std::set_terminate(previous); }
+    } terminate_guard;
+
+    constexpr int heads = 24;
+    constexpr int kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int tile = 128;
+    constexpr int partial_stride = 272;
+    constexpr int max_len = 14336;
+    constexpr int max_rows = 2;
+    constexpr int reps = 20;
+    constexpr int shape_count = 5;
+    const int lens[shape_count] = {333, 1834, 4096, 8192, 14336};
+    const int max_tiles = (max_len + tile - 1) / tile;
+    const int q_row_stride = heads * head_dim;
+    const int row_bytes = q_row_stride * static_cast<int>(sizeof(bf16));
+
+    const char* env_mode = std::getenv("AILA_ATTN_KVREUSE");
+    const std::string variant = env_mode ? std::string(env_mode) : std::string("<unset>");
+    const char* ref_path_env = std::getenv("AILA_ATTN_KVREUSE_REF");
+    const std::string ref_path = ref_path_env ? std::string(ref_path_env) : std::string();
+
+    // Reference ledger, one "length rows hex_hash" line per (length, rows).
+    std::vector<int> ref_len;
+    std::vector<int> ref_rows;
+    std::vector<uint64_t> ref_hash;
+    bool ref_compare = false;
+
+    const char* stage = "host_fill";
+    int length = 0;
+    int rows_now = 0;
+    try {
+        if (!ref_path.empty()) {
+            stage = "ref_load";
+            std::cout << "[DECODE ATTN REUSE] stage=ref_load path=" << ref_path << "\n";
+            std::ifstream in(ref_path);
+            if (in.good()) {
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (line.empty() || line[0] == '#') continue;
+                    const size_t p1 = line.find(' ');
+                    if (p1 == std::string::npos) continue;
+                    const size_t p2 = line.find(' ', p1 + 1);
+                    if (p2 == std::string::npos) continue;
+                    ref_len.push_back(std::atoi(line.substr(0, p1).c_str()));
+                    ref_rows.push_back(std::atoi(line.substr(p1 + 1, p2 - p1 - 1).c_str()));
+                    ref_hash.push_back(std::strtoull(line.substr(p2 + 1).c_str(), nullptr, 16));
+                }
+                ref_compare = true;
+            }
+            std::cout << "[DECODE ATTN REUSE] stage=ref_load_done mode="
+                      << (ref_compare ? "compare" : "write")
+                      << " entries=" << ref_len.size() << "\n";
+        }
+        std::cout << "[DECODE ATTN REUSE META] {\"kvreuse\":\"" << variant
+                  << "\",\"head_dim\":256,\"hq\":24,\"hkv\":2,\"dtype\":\"bf16\""
+                  << ",\"lengths\":[333,1834,4096,8192,14336],\"rows\":[1,2]"
+                  << ",\"reps\":" << reps
+                  << ",\"ref_mode\":\"" << (ref_compare ? "compare" : (ref_path.empty() ? "off" : "write"))
+                  << "\",\"pair2_len_floor\":1024,\"rows2_pair2_scope\":0,\"seed\":20261015}\n";
+
+        stage = "host_fill";
+        std::mt19937 rng(20261015);
+        std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+        std::vector<bf16> q_h(static_cast<size_t>(max_rows) * q_row_stride);
+        std::vector<bf16> k_h(static_cast<size_t>(kv_heads) * max_len * head_dim);
+        std::vector<bf16> v_h(k_h.size());
+        for (auto* values : {&q_h, &k_h, &v_h})
+            for (auto& x : *values) x = bf16(dist(rng));
+        // Row 1 duplicates row 0, so a row-mapping bug is a bitwise mismatch
+        // instead of a timing artifact.
+        for (int i = 0; i < q_row_stride; ++i) q_h[q_row_stride + i] = q_h[i];
+        std::cout << "[DECODE ATTN REUSE] stage=host_fill_done\n";
+
+        stage = "allocate";
+        Tensor q = Tensor::allocate(ctx, {max_rows, q_row_stride}, dnnl::memory::data_type::bf16);
+        Tensor k = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor out = Tensor::allocate(ctx, {max_rows, q_row_stride}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {heads, max_len}, dnnl::memory::data_type::f32);
+        Tensor partials = Tensor::allocate(ctx, {max_rows, heads, max_tiles, partial_stride},
+                                           dnnl::memory::data_type::f32);
+        const auto live = ctx.device_allocation_count();
+        std::cout << "[DECODE ATTN REUSE] stage=allocate_done partials_bytes="
+                  << partials.numel() * static_cast<int>(sizeof(float)) << "\n";
+
+        stage = "upload";
+        ctx.memcpy_h2d(q.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k.data(), k_h.data(), k_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v.data(), v_h.data(), v_h.size() * sizeof(bf16));
+        ctx.synchronize();
+        std::cout << "[DECODE ATTN REUSE] stage=upload_done\n";
+
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto elapsed_ms = [&](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+
+        ops::DecodeRowGeometry rows[max_rows];
+        auto run_rows = [&](int cached_len, int row_count) {
+            for (int r = 0; r < row_count; ++r) {
+                rows[r].k_cache = &k;
+                rows[r].v_cache = &v;
+                rows[r].cached_len = cached_len;
+            }
+            ops::attention_decode_rows(ctx, q, q_row_stride, out, scores, rows, row_count,
+                                       heads, kv_heads, head_dim, cached_len, &partials);
+        };
+
+        std::ofstream ref_out;
+        if (!ref_path.empty() && !ref_compare) {
+            ref_out.open(ref_path, std::ios::out | std::ios::trunc);
+            if (!ref_out.good())
+                throw std::runtime_error("decode-attn reuse bench: cannot write reference ledger " + ref_path);
+            ref_out << "# Aila decode-attn K/V reuse reference, FNV-1a 64 over the raw bf16 bytes of"
+                       " output row 0 (length rows hash)\n";
+        }
+        int missing_refs = 0;
+
+        for (int li = 0; li < shape_count; ++li) {
+            const int cached_len = lens[li];
+            length = cached_len;
+            stage = "reference";
+            std::cout << "[DECODE ATTN REUSE] stage=reference length=" << cached_len << "\n";
+            // f64 CPU reference for heads 0 and 12 (one per kv-head) on q row 0.
+            std::vector<double> ref_probs[2];
+            for (int hi = 0; hi < 2; ++hi) {
+                const int h = hi * 12;
+                const int kv = h / (heads / kv_heads);
+                std::vector<double> logits(cached_len);
+                double mx = -1e100, sum = 0.0;
+                for (int t = 0; t < cached_len; ++t) {
+                    double dot = 0.0;
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += double(q_h[h * head_dim + d]) *
+                               double(k_h[(size_t(kv) * max_len + t) * head_dim + d]);
+                    logits[t] = dot / 16.0;
+                    mx = std::max(mx, logits[t]);
+                }
+                for (auto& x : logits) { x = std::exp(x - mx); sum += x; }
+                for (auto& x : logits) x /= sum;
+                ref_probs[hi] = logits;
+            }
+            std::cout << "[DECODE ATTN REUSE] stage=reference_done length=" << cached_len << "\n";
+
+            for (int row_count : {1, 2}) {
+                rows_now = row_count;
+                stage = "warm";
+                std::cout << "[DECODE ATTN REUSE] stage=warm length=" << cached_len
+                          << " rows=" << row_count << "\n";
+                const auto t_warm = now();
+                for (int i = 0; i < 3; ++i) run_rows(cached_len, row_count);
+                ctx.synchronize();
+                const double warm_ms = elapsed_ms(t_warm);
+                std::cout << "[DECODE ATTN REUSE] stage=warm_done length=" << cached_len
+                          << " rows=" << row_count << " warm_ms=" << warm_ms << "\n";
+
+                stage = "verify";
+                std::vector<bf16> got(out.numel());
+                ctx.memcpy_d2h(got.data(), out.data(), got.size() * sizeof(bf16));
+                for (auto x : got)
+                    if (!std::isfinite(static_cast<float>(x)))
+                        throw std::runtime_error("decode-attn reuse bench: non-finite output at length " +
+                                                 std::to_string(cached_len));
+                const bool dup_eq = row_count == 1 ||
+                    std::memcmp(got.data(), got.data() + q_row_stride,
+                                static_cast<size_t>(row_bytes)) == 0;
+                if (!dup_eq)
+                    throw std::runtime_error("decode-attn reuse bench: duplicate rows differ at length " +
+                                             std::to_string(cached_len));
+                double max_err = 0.0;
+                for (int hi = 0; hi < 2; ++hi) {
+                    const int h = hi * 12;
+                    const int kv = h / (heads / kv_heads);
+                    for (int d = 0; d < head_dim; ++d) {
+                        double value = 0.0;
+                        for (int t = 0; t < cached_len; ++t)
+                            value += ref_probs[hi][t] *
+                                     double(v_h[(size_t(kv) * max_len + t) * head_dim + d]);
+                        max_err = std::max(max_err,
+                                           std::abs(double(got[h * head_dim + d]) - value));
+                    }
+                }
+                if (max_err > 2e-4)
+                    throw std::runtime_error("decode-attn reuse bench: CPU f64 reference mismatch at length " +
+                                             std::to_string(cached_len) + " max_abs=" + std::to_string(max_err));
+                // Row 0 of the output is the q row 0 result in both arms.
+                const uint64_t row_hash = reuse_bench_fnv1a64(got.data(), static_cast<size_t>(row_bytes));
+                std::cout << "[DECODE ATTN REUSE CHECK] length=" << cached_len
+                          << " rows=" << row_count << " max_abs=" << max_err
+                          << " duplicate_rows=" << (row_count == 2 ? 1 : 0)
+                          << " row0_hash=" << std::hex << row_hash << std::dec << "\n";
+
+                long long bitwise_eq = -1;
+                const char* ref_mode = ref_path.empty() ? "off" : (ref_compare ? "compare" : "write");
+                if (!ref_path.empty()) {
+                    stage = "ref_compare";
+                    if (ref_compare) {
+                        int found = -1;
+                        for (size_t i = 0; i < ref_len.size(); ++i)
+                            if (ref_len[i] == cached_len && ref_rows[i] == row_count) { found = static_cast<int>(i); break; }
+                        if (found < 0) {
+                            // Only rows=1 is pair2 scope, so a missing rows=2
+                            // entry is reported as absent, not as a failure.
+                            if (row_count == 1) ++missing_refs;
+                            bitwise_eq = -1;
+                            ref_mode = "compare_missing";
+                        } else {
+                            bitwise_eq = (ref_hash[found] == row_hash) ? 1 : 0;
+                        }
+                    } else if (ref_out.good()) {
+                        ref_out << cached_len << " " << row_count << " " << std::hex << row_hash
+                                << std::dec << "\n";
+                        ref_out.flush();
+                    }
+                }
+                if (bitwise_eq == 0) {
+                    std::cout << "[DECODE ATTN REUSE MISMATCH] length=" << cached_len
+                              << " rows=" << row_count << " variant=" << variant
+                              << " reference differs from this run's row-0 bytes\n";
+                    if (variant == "pair2" && row_count == 1)
+                        throw std::runtime_error("decode-attn reuse bench: pair2 row-0 output is not "
+                                                 "bit-identical to the reference at length " +
+                                                 std::to_string(cached_len));
+                }
+
+                stage = "measure";
+                std::vector<double> us_per_row;
+                us_per_row.reserve(reps);
+                for (int i = 0; i < reps; ++i) {
+                    const auto t0 = now();
+                    run_rows(cached_len, row_count);
+                    ctx.synchronize();
+                    us_per_row.push_back(
+                        std::chrono::duration<double, std::micro>(now() - t0).count() / row_count);
+                }
+                std::sort(us_per_row.begin(), us_per_row.end());
+                const double median_us_per_row = us_per_row[reps / 2];
+                std::cout << "[DECODE ATTN REUSE] {\"length\":" << cached_len
+                          << ",\"rows\":" << row_count
+                          << ",\"variant\":\"" << variant << "\""
+                          << ",\"reps\":" << reps
+                          << ",\"warm_ms\":" << warm_ms
+                          << ",\"median_ms_total\":" << median_us_per_row * row_count / 1000.0
+                          << ",\"median_us_per_row\":" << median_us_per_row
+                          << ",\"min_us_per_row\":" << us_per_row.front()
+                          << ",\"max_us_per_row\":" << us_per_row.back()
+                          << ",\"finite\":1"
+                          << ",\"rows_duplicate_eq\":" << (dup_eq ? 1 : 0)
+                          << ",\"max_abs\":" << max_err
+                          << ",\"row_hash\":\"" << std::hex << row_hash << std::dec << "\""
+                          << ",\"bitwise_eq\":" << bitwise_eq
+                          << ",\"ref_mode\":\"" << ref_mode << "\""
+                          << ",\"pair2_scope\":" << (row_count == 1 ? 1 : 0)
+                          << "}\n";
+            }
+        }
+        if (ref_out.is_open()) ref_out.close();
+        if (missing_refs > 0)
+            throw std::runtime_error("decode-attn reuse bench: reference ledger is missing " +
+                                     std::to_string(missing_refs) + " rows=1 entries");
+        if (ctx.device_allocation_count() != live)
+            throw std::runtime_error("decode-attn reuse bench: live USM changed during the run");
+        std::cout << "[DECODE ATTN REUSE END] shapes=" << shape_count << " rows=2 reps=" << reps
+                  << " variant=" << variant
+                  << " ref_mode=" << (ref_path.empty() ? "off" : (ref_compare ? "compare" : "write"))
+                  << " model_free=1\n";
+    } catch (const std::exception& e) {
+        std::cout << "[DECODE ATTN REUSE FAIL] stage=" << stage << " length=" << length
+                  << " rows=" << rows_now << " what=" << e.what() << "\n";
+        throw;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -5398,6 +5718,14 @@ int main(int argc, char** argv) {
             ctx.synchronize(); ctx.release_execution_resources();
             if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("Decode attention bench teardown USM leak");
+            return 0;
+        }
+        if ((argc == 2 || argc == 3) && std::string(argv[1]) == "--decode-attn-reuse-bench" &&
+            (argc == 2 || std::string(argv[2]) == "--json")) {
+            run_decode_attn_reuse_bench(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Decode attention reuse bench teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--w4a8-only") {

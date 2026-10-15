@@ -735,6 +735,309 @@ void attention_decode_exact_head256_partial_merge_impl(
   });
 }
 
+// AILA_ATTN_KVREUSE="pair2" selects the head-pair K/V reuse phase 1 below;
+// anything else (unset, "0", unknown spellings) keeps the unchanged default
+// path. Read once per process, so the variant is fixed for the process
+// lifetime and an A/B comparison runs one process per value.
+inline bool attn_kv_reuse_pair2() {
+  static const bool pair2 =
+      aila::env::read_string("AILA_ATTN_KVREUSE") == "pair2";
+  return pair2;
+}
+
+// D256 decode attention with a head group of G=2: one work-group owns a token
+// tile for two adjacent q-heads that share a kv-head, so a K row is loaded
+// once per token and each V element once per (tile, d) for both heads. The
+// grid becomes (num_heads/2)*num_tiles groups of 128 threads.
+//
+// Everything else is kept verbatim from
+// attention_decode_exact_head256_partial_merge_impl: the per-lane token
+// mapping, the per-head expression and accumulation order, both
+// reduce_over_group trees over the same 128 work items, the exp/max round trip
+// through SLM, and the [head][tile][stride] partials layout. At the moment a
+// head's reduction runs, every lane holds the same value it holds in the G=1
+// kernel for that head and lane index, so each per-tile statistic is bitwise
+// equal and the merged output is bitwise equal too.
+//
+// SLM: q_cache 2*256 f32 + logits 2*128 f32 + 2 f32 stats = 3.1 KB (G=1:
+// 2.0 KB), well inside the 128 KB per-Xe-core pool; the private register delta
+// is one float (score_b / acc_b) plus the live vec8. Only the bf16
+// instantiation is dispatched in this round; the accessor form also covers
+// fp8/int8, but the int8 vec-read specialization is deliberately not carried
+// into this variant (re-verify int8 before enabling it).
+template <int Quantized>
+void attention_decode_exact_head256_pair2_impl(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
+    int sink_len, int effective_len,
+    const bf16 *gate_ptr = nullptr,
+    const int *active_indices = nullptr,
+    const int *active_blocks = nullptr,
+    int num_active_blocks = 0,
+    const float *k_scale = nullptr,
+    const float *v_scale = nullptr) {
+  bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+  float *partials_ptr = static_cast<float *>(partials_buf.data());
+
+  constexpr int head_dim = 256;
+  constexpr int tile_t = kDecodeExact256Tile;
+  constexpr int tile_wg = kDecodeExact256TileWg;
+  constexpr int merge_wg = kDecodeExact256MergeWg;
+  constexpr int pair = 2;
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const int num_tiles = (effective_len + tile_t - 1) / tile_t;
+  const int max_tiles = static_cast<int>(
+      partials_buf.shape(partials_buf.ndim() == 4 ? 2 : 1));
+  const int num_pairs = num_heads / pair;
+
+  // Phase 1 (pair2): per-tile exact softmax stats and exp-weighted V partials
+  // for both heads of the pair, from one K/V read per element.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(pair * head_dim), cgh);
+    sycl::local_accessor<float, 1> logits(sycl::range<1>(pair * tile_t), cgh);
+    sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(num_pairs) * num_tiles * tile_wg,
+                          tile_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = item.get_group(0);
+          const int head_pair = group / num_tiles;
+          const int tile_idx = group % num_tiles;
+          const int lid = item.get_local_id(0);
+          const int head_a = head_pair * pair;
+          const int head_b = head_a + 1;
+          // heads_per_kv is even on this path (dispatcher guard), so the two
+          // heads of a pair always resolve to the same kv-head.
+          const int kv_head = head_a / heads_per_kv;
+          const int tile_start = tile_idx * tile_t;
+          const int tile_len = sycl::min(tile_t, effective_len - tile_start);
+          float *partial_a = partials_ptr +
+              (head_a * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+          float *partial_b = partials_ptr +
+              (head_b * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+
+          KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            q_cache[d] = static_cast<float>(q_ptr[head_a * head_dim + d]);
+            q_cache[head_dim + d] = static_cast<float>(q_ptr[head_b * head_dim + d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score_a = -1e30f;
+          float score_b = -1e30f;
+          if (lid < tile_len) {
+            const int t = tile_start + lid;
+            int cache_t = 0;
+            if (active_blocks != nullptr && num_active_blocks > 0) {
+              if (t < num_active_blocks * 4) {
+                cache_t = active_blocks[t / 4] * 4 + (t % 4);
+              } else {
+                cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+              }
+            } else if (active_indices) {
+              cache_t = active_indices[t];
+            } else {
+              cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+            }
+            score_a = 0.0f;
+            score_b = 0.0f;
+            if constexpr (!Quantized) {
+              using vec8 = sycl::vec<bf16, 8>;
+              const bf16 *k_tok = static_cast<const bf16 *>(k_ptr) + kv_head * max_seq_len * head_dim + cache_t * head_dim;
+              for (int d = 0; d < head_dim; d += 8) {
+                const vec8 k_vec = *reinterpret_cast<const vec8 *>(k_tok + d);
+                score_a += q_cache[d + 0] * static_cast<float>(k_vec[0]);
+                score_b += q_cache[head_dim + d + 0] * static_cast<float>(k_vec[0]);
+                score_a += q_cache[d + 1] * static_cast<float>(k_vec[1]);
+                score_b += q_cache[head_dim + d + 1] * static_cast<float>(k_vec[1]);
+                score_a += q_cache[d + 2] * static_cast<float>(k_vec[2]);
+                score_b += q_cache[head_dim + d + 2] * static_cast<float>(k_vec[2]);
+                score_a += q_cache[d + 3] * static_cast<float>(k_vec[3]);
+                score_b += q_cache[head_dim + d + 3] * static_cast<float>(k_vec[3]);
+                score_a += q_cache[d + 4] * static_cast<float>(k_vec[4]);
+                score_b += q_cache[head_dim + d + 4] * static_cast<float>(k_vec[4]);
+                score_a += q_cache[d + 5] * static_cast<float>(k_vec[5]);
+                score_b += q_cache[head_dim + d + 5] * static_cast<float>(k_vec[5]);
+                score_a += q_cache[d + 6] * static_cast<float>(k_vec[6]);
+                score_b += q_cache[head_dim + d + 6] * static_cast<float>(k_vec[6]);
+                score_a += q_cache[d + 7] * static_cast<float>(k_vec[7]);
+                score_b += q_cache[head_dim + d + 7] * static_cast<float>(k_vec[7]);
+              }
+            } else {
+              for (int d = 0; d < head_dim; d += 8) {
+                // One dequantized element per position, consumed by both heads;
+                // the accessor value is itself a pure function of the bytes.
+                const float kv0 = k_acc.load(kv_head, cache_t, d + 0);
+                score_a += q_cache[d + 0] * kv0;
+                score_b += q_cache[head_dim + d + 0] * kv0;
+                const float kv1 = k_acc.load(kv_head, cache_t, d + 1);
+                score_a += q_cache[d + 1] * kv1;
+                score_b += q_cache[head_dim + d + 1] * kv1;
+                const float kv2 = k_acc.load(kv_head, cache_t, d + 2);
+                score_a += q_cache[d + 2] * kv2;
+                score_b += q_cache[head_dim + d + 2] * kv2;
+                const float kv3 = k_acc.load(kv_head, cache_t, d + 3);
+                score_a += q_cache[d + 3] * kv3;
+                score_b += q_cache[head_dim + d + 3] * kv3;
+                const float kv4 = k_acc.load(kv_head, cache_t, d + 4);
+                score_a += q_cache[d + 4] * kv4;
+                score_b += q_cache[head_dim + d + 4] * kv4;
+                const float kv5 = k_acc.load(kv_head, cache_t, d + 5);
+                score_a += q_cache[d + 5] * kv5;
+                score_b += q_cache[head_dim + d + 5] * kv5;
+                const float kv6 = k_acc.load(kv_head, cache_t, d + 6);
+                score_a += q_cache[d + 6] * kv6;
+                score_b += q_cache[head_dim + d + 6] * kv6;
+                const float kv7 = k_acc.load(kv_head, cache_t, d + 7);
+                score_a += q_cache[d + 7] * kv7;
+                score_b += q_cache[head_dim + d + 7] * kv7;
+              }
+            }
+            score_a *= scale;
+            score_b *= scale;
+          }
+
+          // Head a, exact G=1 softmax order: stage, group max, exp, group sum.
+          logits[lid] = score_a;
+          const float tile_max_a = sycl::reduce_over_group(
+              item.get_group(), score_a, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max_a;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_a = 0.0f;
+          if (lid < tile_len) {
+            exp_a = sycl::native::exp(logits[lid] - stats[0]);
+            logits[lid] = exp_a;
+          } else {
+            logits[lid] = 0.0f;
+          }
+          const float tile_sum_a = sycl::reduce_over_group(
+              item.get_group(), exp_a, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum_a;
+            partial_a[0] = stats[0];
+            partial_a[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          // Head b: same sequence, same lane-to-token mapping, only the SLM
+          // slot differs.
+          logits[tile_t + lid] = score_b;
+          const float tile_max_b = sycl::reduce_over_group(
+              item.get_group(), score_b, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max_b;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_b = 0.0f;
+          if (lid < tile_len) {
+            exp_b = sycl::native::exp(logits[tile_t + lid] - stats[0]);
+            logits[tile_t + lid] = exp_b;
+          } else {
+            logits[tile_t + lid] = 0.0f;
+          }
+          const float tile_sum_b = sycl::reduce_over_group(
+              item.get_group(), exp_b, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum_b;
+            partial_b[0] = stats[0];
+            partial_b[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            float acc_a = 0.0f;
+            float acc_b = 0.0f;
+            for (int i = 0; i < tile_len; ++i) {
+              const int t = tile_start + i;
+              int cache_t = 0;
+              if (active_blocks != nullptr && num_active_blocks > 0) {
+                if (t < num_active_blocks * 4) {
+                  cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                } else {
+                  cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                }
+              } else if (active_indices) {
+                cache_t = active_indices[t];
+              } else {
+                cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              }
+              const float v_val = v_acc.load(kv_head, cache_t, d);
+              acc_a += logits[i] * v_val;
+              acc_b += logits[tile_t + i] * v_val;
+            }
+            partial_a[kDecodeExact256PartialAccOffset + d] = acc_a;
+            partial_b[kDecodeExact256PartialAccOffset + d] = acc_b;
+          }
+        });
+  });
+
+  // Phase 2: byte-for-byte the merge phase of the G=1 kernel, over the same
+  // [head][tile][stride] partials.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> tile_factors(sycl::range<1>(num_tiles), cgh);
+    sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(num_heads * merge_wg, merge_wg),
+        [=](sycl::nd_item<1> item) {
+          const int head = item.get_group(0);
+          const int lid = item.get_local_id(0);
+          if (lid == 0) {
+            float global_max = -1e30f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              global_max = sycl::fmax(global_max, partial[0]);
+            }
+            float sum = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              const float factor = sycl::native::exp(partial[0] - global_max);
+              tile_factors[tile_idx] = factor;
+              sum += factor * partial[1];
+            }
+            norm_sum[0] = sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float inv_sum = 1.0f / norm_sum[0];
+          for (int d = lid; d < head_dim; d += merge_wg) {
+            float acc = 0.0f;
+            for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * max_tiles + tile_idx) * kDecodeExact256PartialStride;
+              acc += tile_factors[tile_idx] *
+                     partial[kDecodeExact256PartialAccOffset + d];
+            }
+            float val = static_cast<float>(bf16(acc * inv_sum));
+            if (gate_ptr != nullptr) {
+              float g_v = static_cast<float>(gate_ptr[head * head_dim + d]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_ptr[head * head_dim + d] = bf16(val);
+          }
+        });
+  });
+}
+
 void attention_decode_exact_head256_partial_merge(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
     Tensor &partials_buf, int num_heads, int num_kv_heads, int tail_start,
@@ -751,6 +1054,34 @@ void attention_decode_exact_head256_partial_merge(
   const float *v_scale_ptr = kv_scale_ptr(v_scale);
   if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
     throw std::invalid_argument("attention_decode(exact256): int8 KV cache requires k_scale/v_scale");
+  }
+  // AILA_ATTN_KVREUSE=pair2 opt-in head-pair K/V reuse. Restricted to the bf16
+  // cache in this round: a quantized cache, or a head count that cannot be
+  // paired inside one kv-head, keeps the default path and reports that once.
+  if (attn_kv_reuse_pair2()) {
+    const bool eligible = fmt == kKvFmtBf16 && num_kv_heads > 0 &&
+        num_heads % 2 == 0 && (num_heads / num_kv_heads) % 2 == 0;
+    static bool kvreuse_logged = false;
+    if (!kvreuse_logged) {
+      kvreuse_logged = true;
+      if (eligible) {
+        AILA_LOG_INFO("[ATTN] kvreuse=pair2 head_dim=256 heads=%d kv_heads=%d groups=%d",
+                      num_heads, num_kv_heads,
+                      (num_heads / 2) *
+                          ((effective_len + kDecodeExact256Tile - 1) /
+                           kDecodeExact256Tile));
+      } else {
+        AILA_LOG_INFO("[ATTN] kvreuse=pair2 ignored fmt=%d heads=%d kv_heads=%d head_dim=256",
+                      fmt, num_heads, num_kv_heads);
+      }
+    }
+    if (eligible) {
+      attention_decode_exact_head256_pair2_impl<kKvFmtBf16>(
+          ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+          tail_start, sink_len, effective_len, gate_ptr, active_indices,
+          active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+      return;
+    }
   }
   auto run = [&](auto tag) {
     attention_decode_exact_head256_partial_merge_impl<decltype(tag)::value>(
