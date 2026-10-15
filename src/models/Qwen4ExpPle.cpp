@@ -524,7 +524,12 @@ void Qwen4ExpPle::prefetch_gather_pages(const int64_t* ids, int num_tokens) cons
     // faults ~131k random pages serially. Prefetching them in batches lets the
     // cache manager use real queue depth (measured 12.2x on the cold path).
     static const bool s_enabled = aila::env::read_flag("AILA_Q4E_PLE_PREFETCH", true);
-    if (!s_enabled || num_tokens < 64 || shards_.empty() || rows_per_shard_ <= 0) return;
+    // Decode gathers one token at a time; the historical 64-token floor left
+    // 16-32 demand faults per layer on the critical path (measured 9.05 ms
+    // slow mode vs 2.50 ms fast mode per token). Keep the floor configurable.
+    static const int s_min_tokens =
+        std::max(1, aila::env::read_int_raw("AILA_Q4E_PLE_PREFETCH_MIN", 64));
+    if (!s_enabled || num_tokens < s_min_tokens || shards_.empty() || rows_per_shard_ <= 0) return;
 
     std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
     ranges.reserve(static_cast<size_t>(num_tokens) * NUM_HEADS * 2);
