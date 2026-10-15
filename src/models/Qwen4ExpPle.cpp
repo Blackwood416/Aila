@@ -526,9 +526,10 @@ void Qwen4ExpPle::prefetch_gather_pages(const int64_t* ids, int num_tokens) cons
     static const bool s_enabled = aila::env::read_flag("AILA_Q4E_PLE_PREFETCH", true);
     // Decode gathers one token at a time; the historical 64-token floor left
     // 16-32 demand faults per layer on the critical path (measured 9.05 ms
-    // slow mode vs 2.50 ms fast mode per token). Keep the floor configurable.
+    // slow mode vs 2.50 ms fast mode per token). Default 1 after the A/B/B/A:
+    // per-token ForwardWall 64.17 -> 60.14 ms (-6.3%), ple_host 6.55 -> 0.26.
     static const int s_min_tokens =
-        std::max(1, aila::env::read_int_raw("AILA_Q4E_PLE_PREFETCH_MIN", 64));
+        std::max(1, aila::env::read_int_raw("AILA_Q4E_PLE_PREFETCH_MIN", 1));
     if (!s_enabled || num_tokens < s_min_tokens || shards_.empty() || rows_per_shard_ <= 0) return;
 
     std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
