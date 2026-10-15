@@ -1,5 +1,8 @@
 #include "models/Qwen4ExpLayerStage.hpp"
 
+#include "profile/Profiling.hpp"
+#include "utils/EnvUtils.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -23,6 +26,13 @@ bool Qwen4ExpLayerStage::Allocate(Context& ctx, const ExpertSlotGeometry& geom,
         if (error_message) *error_message = "Qwen4ExpLayerStage is already allocated";
         return false;
     }
+    LayerStageConfig resolved = cfg;
+    if (resolved.fill_threads <= 0) {
+        resolved.fill_threads =
+            std::clamp(aila::env::read_int("AILA_Q4E_LAYER_STAGE_THREADS", 6), 1, 32);
+    } else {
+        resolved.fill_threads = std::clamp(resolved.fill_threads, 1, 32);
+    }
     if (geom.slot_bytes == 0 || cfg.max_slots < 1 ||
         cfg.max_slots > cfg.num_experts_per_layer ||
         cfg.chunk_slots < 1 || cfg.chunk_slots > cfg.max_slots ||
@@ -32,7 +42,7 @@ bool Qwen4ExpLayerStage::Allocate(Context& ctx, const ExpertSlotGeometry& geom,
     }
     ctx_ = &ctx;
     geom_ = geom;
-    config_ = cfg;
+    config_ = resolved;
     try {
         arena_bytes_ = static_cast<size_t>(config_.max_slots) * geom_.slot_bytes;
         arena_dev_ = static_cast<uint8_t*>(ctx.alloc_device(arena_bytes_));
@@ -52,6 +62,22 @@ bool Qwen4ExpLayerStage::Allocate(Context& ctx, const ExpertSlotGeometry& geom,
     bank_events_.assign(static_cast<size_t>(config_.fill_banks), sycl::event{});
     bank_event_valid_.assign(static_cast<size_t>(config_.fill_banks), false);
     worker_ = std::thread([this] { WorkerLoop(); });
+    if (config_.fill_threads > 1) {
+        try {
+            fill_workers_.reserve(static_cast<size_t>(config_.fill_threads) - 1);
+            for (int i = 1; i < config_.fill_threads; ++i)
+                fill_workers_.emplace_back([this, i] { FillLoop(i); });
+        } catch (const std::exception& e) {
+            // The pool is optional; keep the serial fill on partial spawn.
+            fill_quit_.store(true, std::memory_order_release);
+            cv_fill_.notify_all();
+            for (auto& t : fill_workers_) if (t.joinable()) t.join();
+            fill_workers_.clear();
+            fill_quit_.store(false, std::memory_order_release);
+            config_.fill_threads = 1;
+            AILA_LOG_WARN("[Q4E LayerStage] fill pool spawn failed (%s); serial fill", e.what());
+        }
+    }
     return true;
 }
 
@@ -64,6 +90,17 @@ void Qwen4ExpLayerStage::Release() noexcept {
     }
     cv_job_.notify_all();
     if (worker_.joinable()) worker_.join();
+    {
+        std::lock_guard<std::mutex> lk(mu_fill_);
+        fill_quit_.store(true, std::memory_order_release);
+    }
+    cv_fill_.notify_all();
+    for (auto& t : fill_workers_) if (t.joinable()) t.join();
+    fill_workers_.clear();
+    fill_quit_.store(false, std::memory_order_release);
+    fill_bank_ = nullptr;
+    fill_sources_ = nullptr;
+    fill_count_ = 0;
     if (ctx_) {
         if (arena_dev_) { ctx_->free_device(arena_dev_); arena_dev_ = nullptr; }
         if (host_banks_) { ctx_->free_host(host_banks_); host_banks_ = nullptr; }
@@ -83,6 +120,45 @@ void Qwen4ExpLayerStage::Release() noexcept {
         failed_ = false;
         error_.clear();
         stats_ = LayerStageStats{};
+    }
+}
+
+void Qwen4ExpLayerStage::FillChunkShare(int index, int threads, uint8_t* bank,
+                                        const uint8_t* const* sources, int count,
+                                        size_t slot_bytes) {
+    if (!bank || !sources || count < 1 || threads < 1) return;
+    // Contiguous ranges give each thread whole slots to stream; the ranges are
+    // disjoint, so the copies never inspect the same bytes.
+    const int begin = (count * index) / threads;
+    const int end = (count * (index + 1)) / threads;
+    for (int i = begin; i < end; ++i)
+        std::memcpy(bank + static_cast<size_t>(i) * slot_bytes, sources[i], slot_bytes);
+}
+
+void Qwen4ExpLayerStage::FillLoop(int index) {
+    uint64_t seen = 0;
+    for (;;) {
+        uint8_t* bank = nullptr;
+        const uint8_t* const* sources = nullptr;
+        int count = 0;
+        {
+            std::unique_lock<std::mutex> lk(mu_fill_);
+            cv_fill_.wait(lk, [&] {
+                return fill_quit_.load(std::memory_order_acquire) ||
+                       fill_gen_.load(std::memory_order_acquire) != seen;
+            });
+            if (fill_quit_.load(std::memory_order_acquire)) return;
+            seen = fill_gen_.load(std::memory_order_acquire);
+            bank = fill_bank_;
+            sources = fill_sources_;
+            count = fill_count_;
+        }
+        FillChunkShare(index, config_.fill_threads, bank, sources, count, geom_.slot_bytes);
+        if (fill_remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            // Wake the staging worker: the chunk's host bank is complete.
+            std::lock_guard<std::mutex> lk(mu_fill_);
+            cv_fill_done_.notify_all();
+        }
     }
 }
 
@@ -356,9 +432,31 @@ void Qwen4ExpLayerStage::RunJob(uint64_t epoch, int layer, bool has_reader,
         uint8_t* bank = host_banks_ + static_cast<size_t>(b) * chunk_stride;
         {
             const auto t0 = Clock::now();
-            for (int i = 0; i < n; ++i)
-                std::memcpy(bank + static_cast<size_t>(i) * geom_.slot_bytes,
-                            work_sources_[static_cast<size_t>(s + i)], geom_.slot_bytes);
+            const uint8_t* const* sources = work_sources_.data() + s;
+            if (fill_workers_.empty()) {
+                // Serial fill: the pre-pool behavior verbatim.
+                for (int i = 0; i < n; ++i)
+                    std::memcpy(bank + static_cast<size_t>(i) * geom_.slot_bytes,
+                                sources[i], geom_.slot_bytes);
+            } else {
+                {
+                    std::lock_guard<std::mutex> lk(mu_fill_);
+                    fill_bank_ = bank;
+                    fill_sources_ = sources;
+                    fill_count_ = n;
+                    fill_remaining_.store(static_cast<int>(fill_workers_.size()),
+                                          std::memory_order_relaxed);
+                    fill_gen_.fetch_add(1, std::memory_order_release);
+                }
+                cv_fill_.notify_all();
+                // The staging worker owns share 0 so a 2-thread pool still
+                // splits the chunk; it then waits for the helpers.
+                FillChunkShare(0, config_.fill_threads, bank, sources, n, geom_.slot_bytes);
+                std::unique_lock<std::mutex> lk(mu_fill_);
+                cv_fill_done_.wait(lk, [&] {
+                    return fill_remaining_.load(std::memory_order_acquire) == 0;
+                });
+            }
             fill_ms += ms_since(t0);
         }
         uint8_t* dst = arena_dev_ + static_cast<size_t>(s) * geom_.slot_bytes;

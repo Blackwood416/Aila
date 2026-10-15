@@ -190,8 +190,12 @@ public:
     int StartResidentCold(GpuReadyLease& route, const bf16* x_dev);
     // The coordinator keeps arena ownership fixed until JoinResidentCold.
     // Reuses the existing bounded CPU worker and result banks.
+    // Multi-row verify callers pass row_token/tokens so each row keeps the
+    // exact single-row batch shape (and the max_cpu_credits_ cap) of the
+    // count==1 T1 body; x_host_ must already hold `tokens` staged rows.
     int StartArenaCold(const Qwen4ExpHostArena& arena, int layer, const int* ids,
-                       const int* ranks, int count, const bf16* x_dev);
+                       const int* ranks, int count, const bf16* x_dev,
+                       int row_token = 0, int tokens = 1);
     // Init-only immutable mapped views; no cache operation runs on the worker.
     void PrepareAsyncResidentSources(int layers, int experts);
     bool CanStartAsyncResidentRoute(int layer) const;

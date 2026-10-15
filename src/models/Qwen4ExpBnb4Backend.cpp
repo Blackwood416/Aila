@@ -285,6 +285,9 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
+    // V3 (G3): drain the layer stage first (its worker joins and its arena is
+    // freed through the still-valid Context before the caches tear down).
+    layer_stage_.Release();
     if (export_enabled_ && !export_path_.empty()) {
         // P3 calibration: write the collected decode/prefill counts as a full
         // 24576-key profile in the legacy format before the caches go away.
@@ -732,8 +735,21 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
         const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
+        // V3 (G3): with the layer arena gated on, the default reserve drops to
+        // 2450 MB so the resident pool stays at the 2800-slot cap while the
+        // arena (454 x 2.417 MiB = 1097 MiB) fits (E7 section 2.3, option C).
+        // An explicit AILA_Q4E_VRAM_RESERVE_MB always wins, so the launch
+        // scripts that pin 3584 MB keep working (set 2450 for the A/B arms).
+        static const bool s_layer_stage_reserve =
+            aila::env::read_flag("AILA_Q4E_LAYER_STAGE", false);
+        const int reserve_default = s_layer_stage_reserve ? 2450 : 2560;
         const size_t max_reserve =
-            static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20;
+            static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", reserve_default))) << 20;
+        if (s_layer_stage_reserve && max_reserve < (static_cast<size_t>(2450) << 20)) {
+            AILA_LOG_WARN("[Q4E LayerStage] AILA_Q4E_VRAM_RESERVE_MB=%.0f MB is below the "
+                          "2450 MB arena budget; admission may fail",
+                          max_reserve / double(1 << 20));
+        }
         const size_t reserve = max_reserve + total_session_state;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
@@ -873,6 +889,31 @@ bool Qwen4ExpBnb4Backend::load(
     adaptive_prefill_slots_.resize(cfg_.num_experts);
     AILA_LOG_INFO("[Qwen4Exp] Adaptive residency ready: expert_mmap_fallback=0 small_host_staging_mib=%.1f",
         adaptive_cache_.TotalStagingBytes()/double(1ULL<<20));
+    // V3 (G3): opt-in whole-layer staging arena (default off). The gate is
+    // consumed here, in the prefill layer loop and by the reserve default at
+    // the admission accounting above.
+    static const bool s_layer_stage = aila::env::read_flag("AILA_Q4E_LAYER_STAGE", false);
+    if (s_layer_stage) {
+        aila::LayerStageConfig stage_cfg;
+        stage_cfg.num_experts_per_layer = cfg_.num_experts;
+        // 454 covers the worst observed layer (2792-2800 resident over 48
+        // layers); a longer cold list is truncated and served by the banks.
+        stage_cfg.max_slots = aila::env::read_int("AILA_Q4E_LAYER_STAGE_SLOTS", 454);
+        stage_cfg.chunk_slots = aila::env::read_int("AILA_Q4E_LAYER_STAGE_CHUNK_SLOTS", 16);
+        stage_cfg.fill_banks = aila::env::read_int("AILA_Q4E_LAYER_STAGE_BANKS", 4);
+        std::string stage_err;
+        if (!layer_stage_.Allocate(ctx, host_arena_.Geometry(), stage_cfg, &stage_err)) {
+            AILA_LOG_WARN("[Q4E LayerStage] allocation failed; gate disabled: %s",
+                          stage_err.c_str());
+        } else {
+            AILA_LOG_INFO("[Q4E LayerStage] enabled: slots=%d chunk=%d banks=%d threads=%d "
+                          "arena=%.1f MB host_banks=%.1f MB",
+                          layer_stage_.MaxSlots(), layer_stage_.ChunkSlots(),
+                          layer_stage_.FillBanks(), layer_stage_.FillThreads(),
+                          layer_stage_.ArenaBytes() / double(1 << 20),
+                          layer_stage_.HostBytes() / double(1 << 20));
+        }
+    }
 
     ensure_runtime_buffers(ctx, 1);
     load_mark("runtime buffers (ensure_runtime_buffers)");
@@ -1270,6 +1311,20 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         }
 
 
+        // G1 (opt-in, AILA_Q4E_VERIFY_CPU_COLD): a 2..4 row verify window
+        // serves its cold experts through the same single-row arena CPU batch
+        // as the count==1 T1 body, one row at a time and capped per row by
+        // max_cpu_credits_ (AILA_Q4E_CPU_MAX_EXPERTS) exactly like T1. The
+        // GPU resident hotset and the GPU-staged overflow stay byte-for-byte
+        // the T1 path, so each verify row resolves every rank on the same
+        // device (and same slot bytes) that a sequential T1 decode of that
+        // row would. Stage all rows once so every per-row job indexes the
+        // same pinned host image.
+        static const bool s_verify_cpu_cold = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_COLD", false);
+        const bool verify_cpu_cold = s_verify_cpu_cold && verify_rows && count >= 2 && count <= 4 &&
+            count <= expert_executor_.max_cpu_tokens() && expert_executor_.cpu_overlap_enabled();
+        if (verify_cpu_cold) expert_executor_.StageResidentInput(x_base, count);
+
         for (int t = 0; t < count; ++t) {
             const int* t_ids = router_host_ids_ + t * top_k;
             const float* t_weights = router_host_weights_ + t * top_k;
@@ -1308,6 +1363,13 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // overlap the already submitted shared expert and resident kernels.
             if (d1_stash_valid && d1_stash_layer != layer) d1_stash_valid=false;
             int cpu_count=0;
+            // The multi-row gate falls back to the unchanged all-GPU staging
+            // path whenever a routed miss has no native RAM owner, mirroring
+            // the per-rank ownership the count==1 branch would have required.
+            bool cpu_cold_ok = true;
+            if (verify_cpu_cold && count > 1)
+                for (int c = 0; c < miss_count && cpu_cold_ok; ++c)
+                    cpu_cold_ok = host_arena_.GetExpertPointer(layer, miss_experts[c]) != nullptr;
             if (d1_stash_valid && d1_stash_layer == layer) {
                 // D1: the CPU batch was already started at the router wait.
                 // It must have taken exactly this miss prefix; otherwise the
@@ -1320,8 +1382,13 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     if (d1_stash_ids[c]!=miss_experts[c] || d1_stash_ranks[c]!=miss_ranks[c])
                         throw std::logic_error("Qwen4Exp: early CPU route classification changed");
                 d1_stash_valid=false;
-            } else if (count==1 && expert_executor_.cpu_overlap_enabled()) {
-                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_t);
+            } else if (expert_executor_.cpu_overlap_enabled() &&
+                       (count==1 || (verify_cpu_cold && cpu_cold_ok))) {
+                // x_base equals x_t for count==1, so the single-row call is
+                // byte-for-byte the T1 call; multi-row calls index the row
+                // staged by StageResidentInput above.
+                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_base,
+                    t, count);
             }
             cpu_work.active=cpu_count>0;
             const int gpu_cold_count=miss_count-cpu_count;
@@ -1490,8 +1557,26 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
         }
     }
     const int hits=int(prefill_unique_.size());
-    for (int e=0;e<cfg_.num_experts;++e)
-        if (prefill_expert_uses_[e] && adaptive_cache_.GetSlot(layer,e)<0) prefill_unique_.push_back(e);
+    // V3 (G3): the layer arena already holds this layer's nonresident set, so
+    // its routed members are consumed first and never touch the staging banks.
+    // The arena map can only miss an entry through a swap that made an expert
+    // cold after Begin, so the bank pump below still covers every remaining
+    // route entry (including the truncated tail of an oversized cold list).
+    int staged_count=0;
+    if (layer_stage_epoch_) {
+        for (int e : layer_stage_ids_) {
+            if (!prefill_expert_uses_[e]) continue;
+            if (layer_stage_.SlotOf(layer_stage_epoch_,e)<0) continue;
+            prefill_unique_.push_back(e);
+            adaptive_prefill_slots_[e]=layer_stage_.GetSlotDev(layer_stage_epoch_,e,&metadata);
+        }
+        staged_count=int(prefill_unique_.size())-hits;
+    }
+    for (int e=0;e<cfg_.num_experts;++e) {
+        if (!prefill_expert_uses_[e] || adaptive_cache_.GetSlot(layer,e)>=0) continue;
+        if (layer_stage_epoch_ && layer_stage_.SlotOf(layer_stage_epoch_,e)>=0) continue;
+        prefill_unique_.push_back(e);
+    }
     static const int xmx_rows=aila::env::read_int("AILA_Q4E_GROUPED_XMX_MIN_ROWS",0);
     const int threshold=grouped_xmx_min_rows_override_>=0 ? grouped_xmx_min_rows_override_ : xmx_rows;
     const int min_rows=grouped_xmx_supported_ && threshold>0 ? threshold : std::numeric_limits<int>::max();
@@ -1501,6 +1586,13 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
         const auto* ready=adaptive_cache_.ResidentReady();
         last=RunGroupedExperts(ctx,layer,count,0,hits,act_start,tile_start,min_rows,ready ? *ready : sycl::event{});
         adaptive_cache_.RecordResidentConsumer(last);
+    }
+    if (staged_count) {
+        // V3 (G3): one microlaunch set over the arena residents. The kernels
+        // depend on the epoch's last H2D (v1 also host-waited before entry,
+        // E7 R2); the ops guard an empty dependency event.
+        last=RunGroupedExperts(ctx,layer,count,hits,staged_count,act_start,tile_start,min_rows,
+                               layer_stage_.ReadyEvent(layer_stage_epoch_));
     }
     // A cold expert is uploaded once per layer/window, regardless of its row
     // count. Keep the original W4/G3/XMX math and rank-ordered accumulation.
@@ -1520,9 +1612,10 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     }();
     (void)staging_pump_logged;
     const int total_unique=int(prefill_unique_.size());
-    const int num_chunks=total_unique>hits ? (total_unique-hits+slots_per_chunk-1)/slots_per_chunk : 0;
+    const int bank_first=hits+staged_count;
+    const int num_chunks=total_unique>bank_first ? (total_unique-bank_first+slots_per_chunk-1)/slots_per_chunk : 0;
     std::array<StagingBatch,aila::AdaptiveCacheConfig::kMaxStagingBanks> staged_window{};
-    auto chunk_begin=[&](int c){ return hits+c*slots_per_chunk; };
+    auto chunk_begin=[&](int c){ return bank_first+c*slots_per_chunk; };
     auto chunk_count=[&](int c){ return std::min(slots_per_chunk,total_unique-chunk_begin(c)); };
     auto stage_chunk=[&](int c){
         const int s=chunk_begin(c),n=chunk_count(c);
@@ -2272,6 +2365,28 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
         dev_mark(layer.is_linear ? kDevLinear : kDevFull);
 
+        // V3 (G3): stage this layer's nonresident expert weights into the layer
+        // arena while the attention window runs. Expert weights are routing
+        // independent (E7 section 1.2), so the copy is legal before the router
+        // returns; RunAdaptivePrefill consumes the arena below and the recorded
+        // consumer gates the next layer's first H2D (arena reuse, E7 R3).
+        layer_stage_epoch_ = 0;
+        static const bool s_layer_stage_enabled =
+            aila::env::read_flag("AILA_Q4E_LAYER_STAGE", false);
+        if (s_layer_stage_enabled && is_prefill && count > 4 && copy_q_ &&
+            layer_stage_.IsAllocated() && adaptive_cache_.IsAllocated()) {
+            // The previous epoch is always waited before its consume; this
+            // only covers the cancellation path, where a stale epoch would
+            // otherwise make Begin throw.
+            layer_stage_.WaitIdle();
+            layer_stage_ids_ = aila::Qwen4ExpLayerStage::ColdExperts(adaptive_cache_, L);
+            if (static_cast<int>(layer_stage_ids_.size()) > layer_stage_.MaxSlots())
+                layer_stage_ids_.resize(static_cast<size_t>(layer_stage_.MaxSlots()));
+            if (!layer_stage_ids_.empty())
+                layer_stage_epoch_ =
+                    layer_stage_.BeginFromArena(L, layer_stage_ids_, host_arena_, *copy_q_);
+        }
+
         // 2.3. Attn Residual Add & 2.4. MLP Hyper-Connection (P1 Fused)
         static const bool s_fuse_attn_mlp_gr = aila::env::read_flag("AILA_Q4E_FUSE_ATTN_MLP_GR", true);
         if (s_fuse_attn_mlp_gr) {
@@ -2577,8 +2692,18 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStageRouter);
         // Unified Prefill and Decode via Qwen4ExpAdaptiveCache + Qwen4ExpHostArena
         if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated()) {
-            if (count>4) RunAdaptivePrefill(ctx,L,s_fuse_shared,count);
-            else RunResidentDecode(ctx,L,s_fuse_shared,count, options.decode_verification);
+            if (count>4) {
+                // V3 (G3): the layer arena is complete before the MoE kernels
+                // are submitted (v1 waits the staging tail, E7 R2). The
+                // returned event is the layer's last arena consumer; it gates
+                // the next epoch's first H2D (arena reuse).
+                if (layer_stage_epoch_) layer_stage_.WaitReady(layer_stage_epoch_);
+                sycl::event moe_last = RunAdaptivePrefill(ctx,L,s_fuse_shared,count);
+                if (layer_stage_epoch_) {
+                    layer_stage_.RecordArenaConsumer(layer_stage_epoch_, moe_last);
+                    layer_stage_epoch_ = 0;
+                }
+            } else RunResidentDecode(ctx,L,s_fuse_shared,count, options.decode_verification);
         } else {
             throw std::runtime_error("Qwen4Exp: legacy expert_cache pipeline has been removed; please enable adaptive pipeline.");
         }

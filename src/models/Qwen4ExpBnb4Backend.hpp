@@ -12,6 +12,7 @@
 #include "Qwen4ExpExpertExecutor.hpp"
 #include "Qwen4ExpHostArena.hpp"
 #include "Qwen4ExpAdaptiveCache.hpp"
+#include "Qwen4ExpLayerStage.hpp"
 #include "Qwen4ExpPle.hpp"
 #include "Qwen4ExpHotsetPolicy.hpp"
 #include "engine/Types.hpp"
@@ -525,6 +526,12 @@ private:
     aila::Qwen4ExpHostArena host_arena_;
     aila::Qwen4ExpAdaptiveCache adaptive_cache_;
     std::unique_ptr<sycl::queue> copy_q_;
+    // V3 whole-layer staging (role G3, 2026-10-15): one device arena holding
+    // whole-layer nonresident experts, filled during the attention window.
+    // Allocated only when AILA_Q4E_LAYER_STAGE=1; empty otherwise.
+    aila::Qwen4ExpLayerStage layer_stage_;
+    std::vector<int> layer_stage_ids_;
+    uint64_t layer_stage_epoch_ = 0;
     const bool use_adaptive_pipeline_ = true;
     int ping_pong_index_ = 0;
     void* resident_embedding_ = nullptr;

@@ -11,11 +11,12 @@
 // movement: slot payloads are copied verbatim, so consumers see bit-identical
 // bytes to the bank path.
 //
-// Not wired into production. The integration draft (speculation window, arena
-// VRAM options A/B/C, per-chunk gating) lives in
-// docs/plans/qwen38-r1-layer-stage-2026-10-15.md; default-off until the
-// overlap bench (perf/qwen4exp/q4e_layer_stage_bench.cpp) and the A/B/B/A GPU
-// arms pass their gates.
+// Wired into the prefill layer loop behind AILA_Q4E_LAYER_STAGE (default 0;
+// see docs/plans/qwen38-r1-layer-stage-2026-10-15.md sections 2 and 5). The
+// host fill runs on a small persistent pool (config.fill_threads, env
+// AILA_Q4E_LAYER_STAGE_THREADS) because the single-threaded memcpy was the
+// measured stage bottleneck (178 ms of a 184 ms pass, 2026-10-15). The pool
+// copies disjoint slots, so the staged bytes stay bit-identical.
 
 #include "core/Context.hpp"
 #include "models/Qwen4ExpAdaptiveCache.hpp"
@@ -39,6 +40,8 @@ struct LayerStageConfig {
     int max_slots = 512;      // arena capacity in expert slots
     int chunk_slots = 16;     // slots per host fill chunk / H2D batch
     int fill_banks = 2;       // host fill banks (2..8)
+    int fill_threads = 0;     // 0 = env auto (AILA_Q4E_LAYER_STAGE_THREADS, 6);
+                              // 1 = inline serial fill (the pre-pool behavior)
 };
 
 struct LayerStageStats {
@@ -79,6 +82,7 @@ public:
     int MaxSlots() const noexcept { return config_.max_slots; }
     int ChunkSlots() const noexcept { return config_.chunk_slots; }
     int FillBanks() const noexcept { return config_.fill_banks; }
+    int FillThreads() const noexcept { return config_.fill_threads; }
     size_t ArenaBytes() const noexcept { return arena_bytes_; }
     size_t HostBytes() const noexcept { return host_bytes_; }
 
@@ -140,6 +144,15 @@ private:
     void FailJob(uint64_t epoch, const std::string& message);
     ops::MoeExpertSlotDev MakeSlot(const uint8_t* base, int expert,
                                    const LayerNestedMetadata* nested) const;
+    // Parallel host fill pool (fill_threads > 1). Helpers block on cv_fill_;
+    // the staging worker publishes one chunk at a time under mu_fill_ and
+    // copies share 0 itself, then waits cv_fill_done_ until every share is
+    // memcpy'd. Shares are disjoint slot ranges, so the result is the same
+    // bytes as the serial loop regardless of the thread count.
+    void FillLoop(int index);
+    static void FillChunkShare(int index, int threads, uint8_t* bank,
+                               const uint8_t* const* sources, int count,
+                               size_t slot_bytes);
 
     LayerStageConfig config_{};
     Context* ctx_ = nullptr;
@@ -186,6 +199,18 @@ private:
     std::vector<bool> bank_event_valid_;
     bool arena_read_ = false;                  // consumer recorded for current
     sycl::event arena_reader_{};
+
+    // Parallel fill pool state (idle when fill_workers_ is empty).
+    std::vector<std::thread> fill_workers_;
+    mutable std::mutex mu_fill_;
+    std::condition_variable cv_fill_;
+    std::condition_variable cv_fill_done_;
+    std::atomic<uint64_t> fill_gen_{0};
+    std::atomic<int> fill_remaining_{0};
+    std::atomic<bool> fill_quit_{false};
+    uint8_t* fill_bank_ = nullptr;
+    const uint8_t* const* fill_sources_ = nullptr;
+    int fill_count_ = 0;
 };
 
 } // namespace aila
