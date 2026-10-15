@@ -2039,6 +2039,53 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage_t = now;
     };
 
+    // --- R1 instrumentation (B6) ------------------------------------------------
+    // (a) Host-side submit intervals for the sub-steps that previously only
+    //     existed inside the unprinted "MoE-front/shared" residual. Pure
+    //     steady_clock deltas around submission blocks; no queue interaction.
+    const bool host_split = s_work_summary;
+    double host_moe_front_ms = 0.0;
+    double host_topk_submit_ms = 0.0;
+    double host_shared_submit_ms = 0.0;
+    double host_shared_add_ms = 0.0;
+    double host_hc_inject_ms = 0.0;
+    auto hsplit_begin = [&]() { return host_split ? prof_clock::now() : prof_clock::time_point{}; };
+    auto hsplit_add = [&](double& acc, prof_clock::time_point t0) {
+        if (host_split) acc += prof_ms(t0, prof_clock::now());
+    };
+    // (b) Optional queue-span device timing. The gate adds one in-order barrier
+    //     per phase boundary and a single wait at the end of Forward, so it must
+    //     stay off (default) for any throughput receipt. It is only usable when
+    //     the queue was created with sycl::property::queue::enable_profiling
+    //     (Context.hpp:32-35, engine gate AILA_PROFILE_Q4E_COLD_DEVICE); the
+    //     shared-model worker owns a non-profiling Context (inference/Model.cpp
+    //     DeviceState), so there the fields print 0 after a one-time warning.
+    static const bool s_decode_stage_events = aila::env::read_flag("AILA_Q4E_DECODE_STAGE_EVENTS", false);
+    const bool dev_trace_wanted = s_decode_stage_events && s_work_summary;
+    bool dev_trace = false;
+    if (dev_trace_wanted) {
+        dev_trace = ctx.queue().has_property<sycl::property::queue::enable_profiling>();
+        if (!dev_trace) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                AILA_LOG_WARN("[Q4E DecodeStageEvents] gate on but queue profiling is off; "
+                              "dev_*_ms stay 0 (queue property fixed in Context.hpp:32-35)");
+            }
+        }
+    }
+    enum { kDevMisc, kDevHc, kDevLinear, kDevFull, kDevRouter, kDevShared,
+           kDevExperts, kDevResid, kDevHead, kDevCount };
+    double dev_ms[kDevCount] = {};
+    struct DevMark { sycl::event ev; int bucket; };
+    std::vector<DevMark> dev_marks;
+    auto dev_mark = [&](int bucket) {
+        if (!dev_trace) return;
+        dev_marks.push_back(DevMark{ctx.queue().ext_oneapi_submit_barrier(), bucket});
+    };
+    dev_mark(kDevMisc);
+    // ----------------------------------------------------------------------------
+
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
@@ -2060,6 +2107,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         stage(kStagePle);
+        dev_mark(kDevMisc);
 
         // 2.1. Attn Hyper-Connection
         if (verification_hidden_in_for_test_ &&
@@ -2078,6 +2126,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));
         }
         stage(kStageHc);
+        dev_mark(kDevHc);
 
         // Attention tiles advance this layer's state before routing the whole window.
         RunAttentionWindow(ctx, session, L, count, start_pos, interior, checkpoint_after, !is_prefill);
@@ -2093,6 +2142,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         stage(layer.is_linear ? kStageLinearAttn : kStageFullAttn);
+        dev_mark(layer.is_linear ? kDevLinear : kDevFull);
 
         // 2.3. Attn Residual Add & 2.4. MLP Hyper-Connection (P1 Fused)
         static const bool s_fuse_attn_mlp_gr = aila::env::read_flag("AILA_Q4E_FUSE_ATTN_MLP_GR", true);
@@ -2108,6 +2158,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             RunHyperConnection(ctx, layer.mlp_hc, count, true);
         }
         stage(kStageHc);
+        dev_mark(kDevHc);
 
         // 2.5. MoE Computation
         static const int s_verify_cpu_rows = aila::env::read_int("AILA_Q4E_VERIFY_CPU_ROWS", 0);
@@ -2140,6 +2191,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             layer.router_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.shared_expert_gate_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.router_w->numel() == int64_t(512) * hidden_size_ && layer.shared_expert_gate_w->numel() == hidden_size_;
+        dev_mark(kDevMisc);
+        const auto t_moe_front = hsplit_begin();
         if (moe_front_fused) {
             ops::bf16_moe_front_fused(ctx, layer.router_w->data_as<bf16>(), layer.shared_expert_gate_w->data_as<bf16>(),
                 buf_.x.data_as<bf16>(), buf_.router_scores.data_as<bf16>(), buf_.shared_gate_buf.data_as<bf16>(),
@@ -2154,6 +2207,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             dense_rows(layer.router_gate, layer.router_w, buf_.x, buf_.router_scores,
                        cfg_.num_experts, hidden_size_);
         }
+        hsplit_add(host_moe_front_ms, t_moe_front);
         if (verification_router_inputs_for_test_ && options.decode_verification && count == 2)
             ctx.queue().memcpy(verification_router_inputs_for_test_ + size_t(L) * 2 * hidden_size_,
                 buf_.x.data(), size_t(2) * hidden_size_ * sizeof(bf16));
@@ -2163,6 +2217,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 buf_.x.data(), size_t(count) * hidden_size_ * sizeof(bf16));
         }
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
+        const auto t_topk = hsplit_begin();
         sycl::event actual_route_event;
         if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512) {
             actual_route_event = ops::router_softmax_topk_resident(
@@ -2183,6 +2238,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                     resident_selected_host_, top_k, cfg_.num_experts);
             }
         }
+        hsplit_add(host_topk_submit_ms, t_topk);
+        dev_mark(kDevRouter);
         auto bind_actual_route = [&] {
             if (!use_adaptive_pipeline_ && cold_epoch_enabled_) expert_cache_.ObserveHotsetRoute(L, router_host_ids_, count, top_k);
             if (resident_epoch)
@@ -2271,6 +2328,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
         // concurrently while the host fills missed routed experts and sets up dispatch.
+        const auto t_shared = hsplit_begin();
         if (!moe_front_fused)
             dense_rows(layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
                        1, hidden_size_);
@@ -2308,6 +2366,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                            static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
             project_prefill(layer.shared_down_proj, buf_.shared_inter_buf, buf_.shared_out_buf);
         }
+        hsplit_add(host_shared_submit_ms, t_shared);
+        dev_mark(kDevShared);
 
         auto ensure_prediction_ready = [&]() {
             if (prediction_event != sycl::event{}) {
@@ -2351,6 +2411,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         ensure_prediction_ready();
         stage(kStageExperts);
+        dev_mark(kDevExperts);
 
         const uint64_t misses_after_moe = use_adaptive_pipeline_
             ? static_cast<uint64_t>(adaptive_cache_.Stats().cache_misses)
@@ -2361,12 +2422,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             session.consecutive_no_miss_layers_++;
         }
 
+        const auto t_shared_add = hsplit_begin();
         if (!s_fuse_shared) {
             add_shared_expert_to_y(ctx, buf_.y, buf_.shared_out_buf, buf_.shared_gate_buf,
                                    count, hidden_size_);
         }
+        hsplit_add(host_shared_add_ms, t_shared_add);
 
         // 2.6. MLP Residual Add
+        const auto t_hc_inject = hsplit_begin();
         if (decode_pending_mlp) {
             pending_mlp.Defer();
             // Per-layer observers and serial stage profiling require a complete
@@ -2378,7 +2442,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                static_cast<const float*>(buf_.hc_inject_f32.data()),
                                count, hidden_size_, 4);
         }
+        hsplit_add(host_hc_inject_ms, t_hc_inject);
         stage(kStageShared);
+        dev_mark(kDevResid);
 
         if (!s_dump_dir.empty()) {
             std::string dump_path = s_dump_dir + "/layer_" + std::to_string(L) + ".bin";
@@ -2448,6 +2514,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         stage(kStageHead);
+        dev_mark(kDevHead);
 
         if (!s_dump_dir.empty()) {
             std::string logits_path = s_dump_dir + "/logits.bin";
@@ -2510,16 +2577,38 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         AILA_LOG_INFO("[Q4E GroupedXMX] cumulative tiles=%llu acts=%llu",
             static_cast<unsigned long long>(grouped_xmx_tiles_), static_cast<unsigned long long>(grouped_xmx_acts_));
     }
+    // B6: read back the gated device spans. The single wait on the last marker
+    // replaces nothing and exists only in the AILA_Q4E_DECODE_STAGE_EVENTS arm.
+    if (dev_trace && !dev_marks.empty()) {
+        dev_marks.back().ev.wait_and_throw();
+        for (size_t i = 1; i < dev_marks.size(); ++i) {
+            const auto t_prev = dev_marks[i - 1].ev.get_profiling_info<sycl::info::event_profiling::command_end>();
+            const auto t_cur = dev_marks[i].ev.get_profiling_info<sycl::info::event_profiling::command_start>();
+            if (t_cur > t_prev) dev_ms[dev_marks[i].bucket] += static_cast<double>(t_cur - t_prev) * 1e-6;
+        }
+    }
     if (use_adaptive_pipeline_ && s_work_summary) {
         const auto& a = adaptive_cache_.Stats();
         const auto& c = expert_executor_.stats();
         // These are coordinator/CPU intervals, never an additive GPU profile.
-        // No new queue wait or barrier is introduced by this summary.
+        // This summary itself adds no queue wait; the dev_events arm above is
+        // the only gated synchronization.
+        const double submitted_ms_now = prof_ms(prof_t0, prof_clock::now());
+        const double stage_sum_ms = stage_ms[kStagePle] + stage_ms[kStageHc] + stage_ms[kStageLinearAttn] +
+            stage_ms[kStageFullAttn] + stage_ms[kStageRouter] + stage_ms[kStageExperts] +
+            stage_ms[kStageShared] + stage_ms[kStageHead];
+        const double router_other_ms = std::max(0.0, stage_ms[kStageRouter] - prof_router_sync_ms -
+            host_moe_front_ms - host_topk_submit_ms - host_shared_submit_ms);
+        const double shared_other_ms = std::max(0.0, stage_ms[kStageShared] - host_shared_add_ms - host_hc_inject_ms);
         AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d submitted_ms=%.3f router_wait_ms=%.3f "
             "ple_host_ms=%.3f hc_host_ms=%.3f linear_host_ms=%.3f full_host_ms=%.3f "
             "experts_host_ms=%.3f head_host_ms=%.3f fill_ms=%.3f bank_wait_ms=%.3f swap_ms=%.3f "
-            "cpu_compute_ms=%.3f cpu_join_ms=%.3f cpu_tasks=%llu hits=%llu misses=%llu staged=%llu h2d_mb=%.3f",
-            start_pos,count,int(reuse_ple),prof_ms(prof_t0,prof_clock::now()),prof_router_sync_ms,
+            "cpu_compute_ms=%.3f cpu_join_ms=%.3f cpu_tasks=%llu hits=%llu misses=%llu staged=%llu h2d_mb=%.3f "
+            "moe_front_ms=%.3f topk_submit_ms=%.3f shared_submit_ms=%.3f shared_add_ms=%.3f hc_inject_ms=%.3f "
+            "router_other_ms=%.3f shared_other_ms=%.3f tail_ms=%.3f dev_events=%d "
+            "misc_dev_ms=%.3f hc_dev_ms=%.3f linear_dev_ms=%.3f full_dev_ms=%.3f router_dev_ms=%.3f "
+            "shared_dev_ms=%.3f experts_dev_ms=%.3f resid_dev_ms=%.3f head_dev_ms=%.3f",
+            start_pos,count,int(reuse_ple),submitted_ms_now,prof_router_sync_ms,
             stage_ms[kStagePle],stage_ms[kStageHc],stage_ms[kStageLinearAttn],stage_ms[kStageFullAttn],
             stage_ms[kStageExperts],stage_ms[kStageHead],
             (a.staging_fill_ns-adaptive_stats0.staging_fill_ns)*1e-6,
@@ -2531,7 +2620,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             (unsigned long long)(a.cache_hits-adaptive_stats0.cache_hits),
             (unsigned long long)(a.cache_misses-adaptive_stats0.cache_misses),
             (unsigned long long)(a.cold_experts_staged-adaptive_stats0.cold_experts_staged),
-            (a.cold_bytes_transferred-adaptive_stats0.cold_bytes_transferred)/1048576.0);
+            (a.cold_bytes_transferred-adaptive_stats0.cold_bytes_transferred)/1048576.0,
+            host_moe_front_ms, host_topk_submit_ms, host_shared_submit_ms, host_shared_add_ms, host_hc_inject_ms,
+            router_other_ms, shared_other_ms, submitted_ms_now - stage_sum_ms, int(dev_trace),
+            dev_ms[kDevMisc], dev_ms[kDevHc], dev_ms[kDevLinear], dev_ms[kDevFull], dev_ms[kDevRouter],
+            dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead]);
     }
     if (!use_adaptive_pipeline_ && s_work_summary) {
         const auto& supply = expert_cache_.stats();

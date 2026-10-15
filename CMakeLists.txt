@@ -173,6 +173,7 @@ set(LIB_SOURCES
     src/ops/ConvOps.cpp
     src/ops/GatedDeltaNetOps.cpp
     src/ops/GdnChunkOps.cpp
+    src/ops/GdnPrefillVariant.cpp
     src/ops/HyperConnectionOps.cpp
     src/ops/MoeExpertOps.cpp
     src/ops/MoeGroupedXmx.cpp
@@ -735,6 +736,18 @@ target_include_directories(AilaQwen4ExpMoeBench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaQwen4ExpMoeBench PRIVATE AilaLib)
+
+add_executable(AilaQwen4ExpGdnBench
+    perf/qwen4exp/q4e_gdn_bench.cpp
+    src/core/ExecutionTrace.cpp
+)
+target_compile_definitions(AilaQwen4ExpGdnBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpGdnBench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQwen4ExpGdnBench PRIVATE AilaLib)
 
 add_executable(AilaQwen4ExpPrefillSupplyBench perf/qwen4exp/q4e_prefill_supply_bench.cpp)
 target_compile_definitions(AilaQwen4ExpPrefillSupplyBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)

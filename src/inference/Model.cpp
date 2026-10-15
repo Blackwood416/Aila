@@ -37,7 +37,9 @@ namespace detail {
 struct DeviceState {
     // First member dies last: trace_close follows native queue/stream teardown.
     std::unique_ptr<ExecutionTrace> trace = ExecutionTrace::FromEnvironment();
-    Context context{trace.get()};
+    // Device-side stage timing (AILA_Q4E_DECODE_STAGE_EVENTS) needs a
+    // profiling-enabled queue; the worker otherwise runs without profiling.
+    Context context{trace.get(), aila::env::read_flag("AILA_Q4E_DECODE_STAGE_EVENTS", false)};
     mutable std::mutex mutex;
     RuntimeFaultRecord fault;
     size_t loadedModels = 0;
