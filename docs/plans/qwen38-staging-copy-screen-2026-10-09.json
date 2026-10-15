@@ -1,0 +1,856 @@
+{
+  "schema_version": 1,
+  "report_status": "paired screen plus explicit post-screen retention disposition",
+  "parent_commit": "c5d5805ef788802929b857a11a62f194dc635daf",
+  "measured_candidate_pairs": [
+    {
+      "baseline": "stage-a1",
+      "candidate": "stage-b1",
+      "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+      "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+      "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+      "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+      "gates_passed": true
+    },
+    {
+      "baseline": "stage-a2",
+      "candidate": "stage-b2",
+      "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+      "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+      "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+      "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+      "gates_passed": true
+    }
+  ],
+  "formal_retained_pair_archive": {
+    "archive_type": "official post-commit retained/pair.json build identity",
+    "path": "tmp/q4e-stage-copy-screen-20261009/retained/pair.json",
+    "sha256": "cb781d16511a21d6090860de64e062a6dd8ddef907a779568c3da33c5e8701a0",
+    "worker": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+      "sha256": "18cea21c4ba83ec858d04ebb2f96df40ba3efb2a535786539d56c8b96e647e8a",
+      "build_id": "aila-0.2.0-abi1-39625195bdadb996a77248b0d0136d01bcc3c849"
+    },
+    "server": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+      "sha256": "ab04ae7de51de8e7982be0f8a5a6c3e7d0b03b64ca79501e2267f60e7b46bfd5",
+      "build_id": "aila-0.2.0-abi1-39625195bdadb996a77248b0d0136d01bcc3c849"
+    },
+    "worker_server_build_ids_equal": true,
+    "archived_build_commit": "39625195bdadb996a77248b0d0136d01bcc3c849",
+    "decision_commit_matches_archive": true,
+    "measurement_pair": false,
+    "timing_role": "identity archive only; excluded from the A1/B1 and A2/B2 timing aggregates"
+  },
+  "retention_disposition": {
+    "decision": "retain",
+    "decision_source": "explicit --retention-decision argument; not inferred from timing results",
+    "decision_commit": "39625195bdadb996a77248b0d0136d01bcc3c849",
+    "official_build_archive_pair": {
+      "archive_type": "official post-commit retained/pair.json build identity",
+      "path": "tmp/q4e-stage-copy-screen-20261009/retained/pair.json",
+      "sha256": "cb781d16511a21d6090860de64e062a6dd8ddef907a779568c3da33c5e8701a0",
+      "worker": {
+        "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+        "sha256": "18cea21c4ba83ec858d04ebb2f96df40ba3efb2a535786539d56c8b96e647e8a",
+        "build_id": "aila-0.2.0-abi1-39625195bdadb996a77248b0d0136d01bcc3c849"
+      },
+      "server": {
+        "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+        "sha256": "ab04ae7de51de8e7982be0f8a5a6c3e7d0b03b64ca79501e2267f60e7b46bfd5",
+        "build_id": "aila-0.2.0-abi1-39625195bdadb996a77248b0d0136d01bcc3c849"
+      },
+      "worker_server_build_ids_equal": true,
+      "archived_build_commit": "39625195bdadb996a77248b0d0136d01bcc3c849",
+      "decision_commit_matches_archive": true,
+      "measurement_pair": false,
+      "timing_role": "identity archive only; excluded from the A1/B1 and A2/B2 timing aggregates"
+    },
+    "check_logs": [
+      {
+        "name": "build-worker",
+        "path": "tmp/q4e-stage-copy-screen-20261009/build-worker.log",
+        "sha256": "eaceb48205713a1440fbc991f6c2e52566a2eddbd87fd33e4139635569748968",
+        "size_bytes": 34868,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      },
+      {
+        "name": "build-server",
+        "path": "tmp/q4e-stage-copy-screen-20261009/build-server.log",
+        "sha256": "211bd011969bfc21eb29b955c6a9ac376d86f5fc1809d2979bed75edc8406bac",
+        "size_bytes": 775,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      },
+      {
+        "name": "cache-formal-test",
+        "path": "tmp/q4e-stage-copy-screen-20261009/cache-formal-test.log",
+        "sha256": "d2c4123967140bc020e0297ffc027330912aad75b80fb9bd18260f4899e9b217",
+        "size_bytes": 241,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      },
+      {
+        "name": "ctest-cpu-abi",
+        "path": "tmp/q4e-stage-copy-screen-20261009/ctest-cpu-abi.log",
+        "sha256": "e15f9fd403b978d5c83eb6442bf24710546f1f2e41c954aecff31cfed8622da2",
+        "size_bytes": 32402,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      },
+      {
+        "name": "ctest-server",
+        "path": "tmp/q4e-stage-copy-screen-20261009/ctest-server.log",
+        "sha256": "eb9da67b68809f5e08cceb477eb48c69a602e45508aecdbb1d4dd8098268ca63",
+        "size_bytes": 10714,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      },
+      {
+        "name": "verification",
+        "path": "tmp/q4e-stage-copy-screen-20261009/verification.json",
+        "sha256": "51026657b175bd508148de89fc0db665834ed97aef6624a37389a2046e734d4a",
+        "size_bytes": 623,
+        "status": "operator-recorded check evidence; contents are not interpreted by this report script"
+      }
+    ],
+    "measurement_pair_distinction": "A1/B1 and A2/B2 are the only timed pairs. retained/pair.json is the post-commit official build identity archive, not another timed pair.",
+    "additional_production_pair_required": false,
+    "reason": "Continuation total improved 9.18% and 10.10% in the two pairs; median TTFT improved 23.22%. 14K total regressed about 0.35%; no long-prefill improvement is claimed."
+  },
+  "deployment": {
+    "runtime_default": false,
+    "launcher": "tools/server/start-qwen38.ps1",
+    "launcher_default": "1 when the caller has not set the staging flag; explicit 0 is preserved",
+    "measured_source_files": 6,
+    "retained_commit_files": 7,
+    "extra_commit_file": "The launcher enables the already measured flag=1 path; it adds no runtime algorithm change."
+  },
+  "official_verification": {
+    "commit": "39625195bdadb996a77248b0d0136d01bcc3c849",
+    "worker_build": {
+      "exit_code": 0,
+      "log": "build-worker.log"
+    },
+    "server_build": {
+      "exit_code": 0,
+      "log": "build-server.log"
+    },
+    "cache_test": {
+      "exit_code": 0,
+      "log": "cache-formal-test.log"
+    },
+    "cpu_abi": {
+      "exit_code": 0,
+      "passed": 18,
+      "skipped": 1,
+      "failed": 0,
+      "seconds": 176.41,
+      "log": "ctest-cpu-abi.log"
+    },
+    "server_ctest": {
+      "exit_code": 0,
+      "passed": 4,
+      "failed": 0,
+      "seconds": 24.74,
+      "log": "ctest-server.log"
+    },
+    "launcher_syntax": "PASS"
+  },
+  "source_patch": {
+    "path": "tmp/q4e-stage-copy-screen-20261009/candidate-source.patch",
+    "sha256": "ae7ed72b0f31722580cf3457cde171bf8314d66fe4029c66b427d4d292e91028",
+    "changed_file_count": 6,
+    "changed_files": [
+      "src/models/Qwen4ExpAdaptiveCache.cpp",
+      "src/models/Qwen4ExpAdaptiveCache.hpp",
+      "src/models/Qwen4ExpBnb4Backend.cpp",
+      "src/models/Qwen4ExpExpertExecutor.cpp",
+      "src/models/Qwen4ExpExpertExecutor.hpp",
+      "tests/models/Qwen4ExpAdaptiveCacheTests.cpp"
+    ]
+  },
+  "fixed_variable_contract": {
+    "only_worker_flag_changed": "AILA_Q4E_STAGE_COPY_PARALLEL",
+    "baseline_value": "0",
+    "candidate_value": "1",
+    "h4_profile_placement_swap_budget_frequency_route_and_cpu_gpu_math_unchanged": true,
+    "all_four_environment_gate": true,
+    "ring": "2x16 staging banks unchanged",
+    "host_copy_order": "expert i copies to disjoint staging slot i; one existing batch H2D follows completion",
+    "other_variables_gate": "same_environment and cross_four_run_checks.same_environment_except_copy_flag_all_four"
+  },
+  "work_signature_fields": [
+    "payload_sha256",
+    "input_sha256",
+    "output_sha256",
+    "content_sha256",
+    "reasoning_sha256",
+    "tool_calls_sha256",
+    "usage",
+    "cached",
+    "finish_reason",
+    "errors"
+  ],
+  "pi_gate_fields": [
+    "pi_prompt_sha256",
+    "pi_output_sha256",
+    "pi_answer",
+    "pi_calls",
+    "pi_usage",
+    "pi_event_output_count"
+  ],
+  "screening_pairs": [
+    {
+      "comparison_json": "tmp/q4e-stage-copy-screen-20261009/compare-stage-a1-stage-b1.json",
+      "comparison_json_sha256": "b8269f468cdfd20fead3295685fdffb9802d00404cdf090492fbe01054df1501",
+      "baseline_label": "stage-a1",
+      "candidate_label": "stage-b1",
+      "candidate_change_convention": "100*(candidate/baseline-1); negative elapsed-time delta is faster",
+      "binary_identity": {
+        "baseline": {
+          "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+          "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+          "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+          "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf"
+        },
+        "candidate": {
+          "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+          "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+          "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+          "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf"
+        },
+        "same_binary_pair": true
+      },
+      "gates": {
+        "identity": true,
+        "completed": true,
+        "cleanup": true,
+        "cancel_recover": true,
+        "same_environment": true,
+        "stage_copy_flag_only_0_to_1": true,
+        "same_binary_pair": true,
+        "same_socket_harness": true,
+        "same_fixture": true,
+        "production_timing": true,
+        "pi_equal_input_output_usage": true,
+        "after-cancel/equal_input_output_usage": true,
+        "after-cancel/same_input_settings_usage": true,
+        "context-14000/equal_input_output_usage": true,
+        "context-14000/same_input_settings_usage": true,
+        "context-14000-continue/equal_input_output_usage": true,
+        "context-14000-continue/same_input_settings_usage": true
+      },
+      "run_status": {
+        "baseline_passed": true,
+        "candidate_passed": true,
+        "identity": true,
+        "completed_and_cleaned": true,
+        "cancel_recover": true,
+        "pi_equal_input_output_usage": true,
+        "all_pair_checks_passed": true
+      },
+      "stage_flag": {
+        "baseline": "0",
+        "candidate": "1",
+        "only_variable_changed": true,
+        "all_other_worker_environment_equal": true
+      },
+      "fixed_h4_environment": {
+        "AILA_Q4E_COLD_BUDGET_US": {
+          "baseline": "1000",
+          "candidate": "1000",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_MODE": {
+          "baseline": "2",
+          "candidate": "2",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_PCIE_NUM": {
+          "baseline": "141",
+          "candidate": "141",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_POLICY": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": {
+          "baseline": "4096",
+          "candidate": "4096",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_ADOPT_READY": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_BORROW": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_COLD_QUEUE": {
+          "baseline": "2",
+          "candidate": "2",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_INTERVAL": {
+          "baseline": "4",
+          "candidate": "4",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROFILE": {
+          "baseline": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+          "candidate": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": {
+          "baseline": "0",
+          "candidate": "0",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": {
+          "baseline": "512",
+          "candidate": "512",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_SWAPS": {
+          "baseline": "0",
+          "candidate": "0",
+          "equal": true
+        },
+        "AILA_Q4E_VRAM_RESERVE_MB": {
+          "baseline": "3584",
+          "candidate": "3584",
+          "equal": true
+        }
+      },
+      "requests": {
+        "context-14000": {
+          "baseline": {
+            "ttft": 70.32384159999856,
+            "total": 72.62744949999978,
+            "rate": 13.457151279948082
+          },
+          "candidate": {
+            "ttft": 70.60808200000065,
+            "total": 72.8631977999994,
+            "rate": 13.746522462401801
+          },
+          "candidate_change_percent": {
+            "ttft": 0.404187816727708,
+            "total": 0.32459944776059846,
+            "rate": 2.150315296558336
+          },
+          "equal_input_output_usage_cache_gate": true,
+          "same_input_settings_usage_gate": true
+        },
+        "context-14000-continue": {
+          "baseline": {
+            "ttft": 1.4687727999989875,
+            "total": 3.628767099999095,
+            "rate": 14.351889724893466
+          },
+          "candidate": {
+            "ttft": 1.1336657000010746,
+            "total": 3.295732399999906,
+            "rate": 14.338133046504417
+          },
+          "candidate_change_percent": {
+            "ttft": -22.81544837963665,
+            "total": -9.177626748194223,
+            "rate": -0.09585273195896749
+          },
+          "equal_input_output_usage_cache_gate": true,
+          "same_input_settings_usage_gate": true
+        }
+      },
+      "pi_seconds": {
+        "baseline": 79.01888920000056,
+        "candidate": 78.3864455999992
+      },
+      "pi_usage": {
+        "baseline": [
+          {
+            "input": 6931,
+            "output": 26,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 6957,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          {
+            "input": 32,
+            "output": 14,
+            "cacheRead": 6957,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 7003,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          }
+        ],
+        "candidate": [
+          {
+            "input": 6931,
+            "output": 26,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 6957,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          {
+            "input": 32,
+            "output": 14,
+            "cacheRead": 6957,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 7003,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "comparison_json": "tmp/q4e-stage-copy-screen-20261009/compare-stage-a2-stage-b2.json",
+      "comparison_json_sha256": "fcebd35695bf989a3248b2331666668aec44280515635461b793626c2a900f5e",
+      "baseline_label": "stage-a2",
+      "candidate_label": "stage-b2",
+      "candidate_change_convention": "100*(candidate/baseline-1); negative elapsed-time delta is faster",
+      "binary_identity": {
+        "baseline": {
+          "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+          "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+          "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+          "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf"
+        },
+        "candidate": {
+          "worker_sha256": "e93be7e2b3623dc150ff4429cd0d5922fac9fcee4b4394199d093f0f392c1530",
+          "server_sha256": "5b08f3937e948197a2d97cd3533781e58538111d50f459f22f7920dd5da877da",
+          "worker_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf",
+          "server_build_id": "aila-0.2.0-abi1-c5d5805ef788802929b857a11a62f194dc635daf"
+        },
+        "same_binary_pair": true
+      },
+      "gates": {
+        "identity": true,
+        "completed": true,
+        "cleanup": true,
+        "cancel_recover": true,
+        "same_environment": true,
+        "stage_copy_flag_only_0_to_1": true,
+        "same_binary_pair": true,
+        "same_socket_harness": true,
+        "same_fixture": true,
+        "production_timing": true,
+        "pi_equal_input_output_usage": true,
+        "after-cancel/equal_input_output_usage": true,
+        "after-cancel/same_input_settings_usage": true,
+        "context-14000/equal_input_output_usage": true,
+        "context-14000/same_input_settings_usage": true,
+        "context-14000-continue/equal_input_output_usage": true,
+        "context-14000-continue/same_input_settings_usage": true
+      },
+      "run_status": {
+        "baseline_passed": true,
+        "candidate_passed": true,
+        "identity": true,
+        "completed_and_cleaned": true,
+        "cancel_recover": true,
+        "pi_equal_input_output_usage": true,
+        "all_pair_checks_passed": true
+      },
+      "stage_flag": {
+        "baseline": "0",
+        "candidate": "1",
+        "only_variable_changed": true,
+        "all_other_worker_environment_equal": true
+      },
+      "fixed_h4_environment": {
+        "AILA_Q4E_COLD_BUDGET_US": {
+          "baseline": "1000",
+          "candidate": "1000",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_MODE": {
+          "baseline": "2",
+          "candidate": "2",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_PCIE_NUM": {
+          "baseline": "141",
+          "candidate": "141",
+          "equal": true
+        },
+        "AILA_Q4E_COLD_POLICY": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": {
+          "baseline": "4096",
+          "candidate": "4096",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_ADOPT_READY": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_BORROW": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_COLD_QUEUE": {
+          "baseline": "2",
+          "candidate": "2",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_INTERVAL": {
+          "baseline": "4",
+          "candidate": "4",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROFILE": {
+          "baseline": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+          "candidate": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT": {
+          "baseline": "1",
+          "candidate": "1",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": {
+          "baseline": "0",
+          "candidate": "0",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": {
+          "baseline": "512",
+          "candidate": "512",
+          "equal": true
+        },
+        "AILA_Q4E_HOTSET_SWAPS": {
+          "baseline": "0",
+          "candidate": "0",
+          "equal": true
+        },
+        "AILA_Q4E_VRAM_RESERVE_MB": {
+          "baseline": "3584",
+          "candidate": "3584",
+          "equal": true
+        }
+      },
+      "requests": {
+        "context-14000": {
+          "baseline": {
+            "ttft": 70.33705340000051,
+            "total": 72.61052299999938,
+            "rate": 13.63554630333105
+          },
+          "candidate": {
+            "ttft": 70.58926939999947,
+            "total": 72.87576279999848,
+            "rate": 13.557878627602129
+          },
+          "candidate_change_percent": {
+            "ttft": 0.3585819817680136,
+            "total": 0.36529113004613034,
+            "rate": -0.5695970957170116
+          },
+          "equal_input_output_usage_cache_gate": true,
+          "same_input_settings_usage_gate": true
+        },
+        "context-14000-continue": {
+          "baseline": {
+            "ttft": 1.4653114000011556,
+            "total": 3.6554563000008784,
+            "rate": 14.154314630052069
+          },
+          "candidate": {
+            "ttft": 1.1192214999991847,
+            "total": 3.2860805000000255,
+            "rate": 14.30642233758079
+          },
+          "candidate_change_percent": {
+            "ttft": -23.618863539975045,
+            "total": -10.104779531922304,
+            "rate": 1.0746384512731577
+          },
+          "equal_input_output_usage_cache_gate": true,
+          "same_input_settings_usage_gate": true
+        }
+      },
+      "pi_seconds": {
+        "baseline": 79.94918929999949,
+        "candidate": 78.57052490000024
+      },
+      "pi_usage": {
+        "baseline": [
+          {
+            "input": 6931,
+            "output": 26,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 6957,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          {
+            "input": 32,
+            "output": 14,
+            "cacheRead": 6957,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 7003,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          }
+        ],
+        "candidate": [
+          {
+            "input": 6931,
+            "output": 26,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 6957,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          {
+            "input": 32,
+            "output": 14,
+            "cacheRead": 6957,
+            "cacheWrite": 0,
+            "reasoning": 0,
+            "totalTokens": 7003,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "aggregate_scope": {
+    "reported_scope": "Two same-binary A/B screens of the opt-in Q4E staging host-copy schedule; H4 profile/placement, expert math, 2x16 ring, and swap policy are fixed.",
+    "scope_override_reason": "The measurements toggle only the staging host-copy flag; this is not a placement-policy comparison."
+  },
+  "cross_four_run_checks": {
+    "four_distinct_runs": true,
+    "both_pair_gate_sets_pass": true,
+    "same_environment_except_copy_flag_all_four": true,
+    "same_fixture_all_four": true,
+    "same_socket_harness_all_four": true,
+    "production_timing_all_four": true,
+    "same_baseline_pair_across_runs": true,
+    "same_candidate_pair_across_runs": true,
+    "baseline_candidate_pair_identical": true
+  },
+  "cross_four_run_requests": {
+    "context-14000": {
+      "same_work_and_output_across_four_runs": true,
+      "metrics": {
+        "ttft": {
+          "baseline_median": 70.33044749999954,
+          "candidate_median": 70.59867570000006,
+          "candidate_change_percent": 0.38138275744730166,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": -0.38138275744730166,
+          "benefit_direction": "positive means lower latency"
+        },
+        "total": {
+          "baseline_median": 72.61898624999958,
+          "candidate_median": 72.86948029999894,
+          "candidate_change_percent": 0.34494291773365937,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": -0.34494291773365937,
+          "benefit_direction": "positive means lower latency"
+        },
+        "rate": {
+          "baseline_median": 13.546348791639566,
+          "candidate_median": 13.652200545001964,
+          "candidate_change_percent": 0.7814043104199975,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": 0.7814043104199975,
+          "benefit_direction": "positive means higher tokens/second"
+        }
+      }
+    },
+    "context-14000-continue": {
+      "same_work_and_output_across_four_runs": true,
+      "metrics": {
+        "ttft": {
+          "baseline_median": 1.4670421000000715,
+          "candidate_median": 1.1264436000001297,
+          "candidate_change_percent": -23.21668205704016,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": 23.21668205704016,
+          "benefit_direction": "positive means lower latency"
+        },
+        "total": {
+          "baseline_median": 3.6421116999999867,
+          "candidate_median": 3.290906449999966,
+          "candidate_change_percent": -9.642901671577564,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": 9.642901671577564,
+          "benefit_direction": "positive means lower latency"
+        },
+        "rate": {
+          "baseline_median": 14.253102177472767,
+          "candidate_median": 14.322277692042604,
+          "candidate_change_percent": 0.4853365513591168,
+          "strict_fixed_work_qualified": true,
+          "qualification_reason": "all pair/setup gates and four work signatures match",
+          "benefit_percent": 0.4853365513591168,
+          "benefit_direction": "positive means higher tokens/second"
+        }
+      }
+    }
+  },
+  "aggregate_json": {
+    "path": "tmp/q4e-stage-copy-screen-20261009/aggregate.json",
+    "sha256": "c7a4033d1b0601d4c581337b7f9385dc936a628ff916c81efc796ed0e3649fdd"
+  },
+  "run_artifacts": [
+    {
+      "label": "stage-a1",
+      "result_json": "tmp/q4e-resident-speed-20261009/stage-a1/result.json",
+      "result_json_sha256": "15a583bdc963f99349d003e9ab8219f708d2803ce5c592b033a9ab82dceea73c",
+      "monitor_json": "tmp/q4e-resident-speed-20261009/stage-a1-monitor.json",
+      "monitor_json_sha256": "86d9e4ed093871b4a018cebb1364f734da4810e89e9457946bd56716622e6f08",
+      "monitor_seconds": 298.0795921000008,
+      "pair_manifest_json": "tmp/q4e-stage-copy-screen-20261009/stage-a1-pair.json",
+      "pair_manifest_sha256": "21faae5d3f57759ad9a2229ad27e16785707804c3ddceee2d7e611454a2475e8"
+    },
+    {
+      "label": "stage-b1",
+      "result_json": "tmp/q4e-resident-speed-20261009/stage-b1/result.json",
+      "result_json_sha256": "7e4af93014ee4447866b21335ef3984908f2d301a953645a3e7e1d2a57eac40e",
+      "monitor_json": "tmp/q4e-resident-speed-20261009/stage-b1-monitor.json",
+      "monitor_json_sha256": "c03dfa5a2993adc896959a071adc1dbf8326c657f101b3b375ff2ed0bd8d3026",
+      "monitor_seconds": 294.0815256999995,
+      "pair_manifest_json": "tmp/q4e-stage-copy-screen-20261009/stage-b1-pair.json",
+      "pair_manifest_sha256": "21faae5d3f57759ad9a2229ad27e16785707804c3ddceee2d7e611454a2475e8"
+    },
+    {
+      "label": "stage-a2",
+      "result_json": "tmp/q4e-resident-speed-20261009/stage-a2/result.json",
+      "result_json_sha256": "e177ff58e99fa369ea4fc0fd233599c19a78ff2dbd06e26f9b125dd35b693dff",
+      "monitor_json": "tmp/q4e-resident-speed-20261009/stage-a2-monitor.json",
+      "monitor_json_sha256": "6d3c5d30a767633f7a9e7e68f2125bb269cc50e34d4eecc0864555322b757e4b",
+      "monitor_seconds": 296.07803650000096,
+      "pair_manifest_json": "tmp/q4e-stage-copy-screen-20261009/stage-a2-pair.json",
+      "pair_manifest_sha256": "21faae5d3f57759ad9a2229ad27e16785707804c3ddceee2d7e611454a2475e8"
+    },
+    {
+      "label": "stage-b2",
+      "result_json": "tmp/q4e-resident-speed-20261009/stage-b2/result.json",
+      "result_json_sha256": "f3b9ce8e91f006223d82bf70d60c1aa837fb2141a328f8c5395c15d0ef6f421d",
+      "monitor_json": "tmp/q4e-resident-speed-20261009/stage-b2-monitor.json",
+      "monitor_json_sha256": "fd53ea1e59ae474759fdd7d94ea6e2d455b1a190e4cf5f2574e1ddfb5095032c",
+      "monitor_seconds": 296.0809012999998,
+      "pair_manifest_json": "tmp/q4e-stage-copy-screen-20261009/stage-b2-pair.json",
+      "pair_manifest_sha256": "21faae5d3f57759ad9a2229ad27e16785707804c3ddceee2d7e611454a2475e8"
+    }
+  ],
+  "host_copy_microbenchmark": {
+    "source_log": "tmp/q4e-staging-parallel-20261009/microbench.log",
+    "geometry": "2560x640",
+    "slot_bytes": 2534400,
+    "experts": 16,
+    "bytes_per_batch": 40550400,
+    "source": "native-large-page",
+    "destination": "HostUSM",
+    "interleaved_pairs": 20,
+    "samples_per_mode": 20,
+    "individual_sample_values_available": false,
+    "individual_samples_note": "The retained log records count and percentiles only; it does not contain the 20 individual timings.",
+    "serial_ms": {
+      "median_ms": 5.73105,
+      "p10_ms": 5.6887,
+      "p90_ms": 5.7712
+    },
+    "parallel_ms": {
+      "median_ms": 1.57525,
+      "p10_ms": 1.5343,
+      "p90_ms": 1.6186
+    },
+    "copy_only_median_speedup": 3.6381844151721947,
+    "normal_gpu_consume_test": {
+      "log": "tmp/q4e-staging-parallel-20261009/cache-test.log",
+      "pass_line_present": true
+    },
+    "interpretation_limit": "Copy-only result; do not extrapolate its ratio to prefill or full-request latency."
+  },
+  "scope": {
+    "done": [
+      "one-variable A1/B1 screen and repeated A2/B2 screen",
+      "full payload/output/usage/cache and PI gates recorded per pair and across four runs",
+      "copy-only microbenchmark plus normal adaptive-cache GPU-consumer test log preserved",
+      "explicit retention disposition, commit hash, check-log paths, and optional official archive identity recorded"
+    ],
+    "not_done": [
+      "broad stability claim beyond two paired screens",
+      "operator arithmetic equivalence claim"
+    ],
+    "copy_only_ratio_must_not_be_extrapolated_to_prefill": true
+  }
+}

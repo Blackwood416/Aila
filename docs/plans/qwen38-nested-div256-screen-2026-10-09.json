@@ -1,0 +1,1840 @@
+{
+  "schemaVersion": 2,
+  "purpose": "q4e-nested-fixed256-server-screen-and-reverse",
+  "sequence": [
+    "nested-a1",
+    "nested-b1",
+    "nested-b2",
+    "nested-a2"
+  ],
+  "decision": "User requested retaining candidate and one reverse-order verification; verification completed, five source files committed, and official Worker/Server builds synchronized.",
+  "screen": {
+    "baseline": {
+      "label": "nested-a1",
+      "passed": true,
+      "monitor_exit": 0,
+      "socket_harness_sha256": "ff883b3a29da30f3fcbed2eece3604cb0d1898fcfd05a83d47b5610bb3b8a877",
+      "timeout": false,
+      "identity_ok": true,
+      "pair": {
+        "worker": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+          "sha256": "8ce1efd990cb64332ebde8421989160e18a86810e916d88eed005c530d2a653d",
+          "build_id": "aila-0.2.0-abi1-a83cd80a421fbe3d3dc789bcd6fe911445a9b9d5"
+        },
+        "server": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+          "sha256": "020c8a89cef7146999d1bb5de2e680f84b8a74bf4f891bf3f30b4835e48662e9",
+          "build_id": "aila-0.2.0-abi1-a83cd80a421fbe3d3dc789bcd6fe911445a9b9d5"
+        }
+      },
+      "startup": 126.58196229999999,
+      "pi": 79.09870319999993,
+      "startup_plus_pi": 205.68066549999992,
+      "pi_answer": "AILA_FIXED_AGENT_READ_20261007",
+      "pi_calls": [
+        {
+          "type": "tool_execution_start",
+          "toolName": "read",
+          "args": {
+            "path": "smoke-marker.txt"
+          }
+        }
+      ],
+      "pi_usage": [
+        {
+          "input": 6931,
+          "output": 26,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 6957,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        {
+          "input": 32,
+          "output": 14,
+          "cacheRead": 6957,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7003,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        }
+      ],
+      "pi_prompt_sha256": "99d75d40b0c1de254e63a5b0747a076e635393834072a6b559874d4339e2eb9c",
+      "pi_output_sha256": "4351142b67068450e80ee18d4ec95cc4b05eeba481bb3e2ae853163d0702b2d0",
+      "pi_event_output_count": 2,
+      "fixture_sha256": "ea960fd32758828c825e30f679545b28bd0c865814e2b07aa0555cef96bcf706",
+      "worker_environment": {
+        "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+        "AILA_KV_QUANT": "0",
+        "AILA_Q35_PREFILL_CHUNK": "4096",
+        "AILA_Q4E_ATTN_NF4_Q8": "0",
+        "AILA_Q4E_COLD_BUDGET_US": "1000",
+        "AILA_Q4E_COLD_MODE": "2",
+        "AILA_Q4E_COLD_PCIE_NUM": "141",
+        "AILA_Q4E_COLD_POLICY": "1",
+        "AILA_Q4E_CPU_A64_ROW2": "1",
+        "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+        "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+        "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+        "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+        "AILA_Q4E_CPU_EARLY_START": "0",
+        "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+        "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+        "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+        "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+        "AILA_Q4E_CPU_MMAP_COLD": "1",
+        "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+        "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+        "AILA_Q4E_CPU_NF4_Q8": "1",
+        "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+        "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+        "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+        "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+        "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+        "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+        "AILA_Q4E_CPU_RESULT_PACKET": "0",
+        "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+        "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+        "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+        "AILA_Q4E_CPU_THREADS": "18",
+        "AILA_Q4E_CPU_TILE_POOL": "0",
+        "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+        "AILA_Q4E_DECODE_TRIM_CAP": "0",
+        "AILA_Q4E_DEMAND_MICROBATCH": "32",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_FILL_PARTS": "8",
+        "AILA_Q4E_FILL_SHORT_PARTS": "1",
+        "AILA_Q4E_FILL_THREADS": "8",
+        "AILA_Q4E_GDN_CHUNK_MODE": "0",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_GPU_MMAP_DMA": "0",
+        "AILA_Q4E_GPU_NF4_Q8": "0",
+        "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+        "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+        "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+        "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+        "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+        "AILA_Q4E_HOST_COMPLEMENT": "0",
+        "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+        "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+        "AILA_Q4E_HOTSET_BORROW": "1",
+        "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+        "AILA_Q4E_HOTSET_INTERVAL": "4",
+        "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+        "AILA_Q4E_HOTSET_PROMPT": "1",
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+        "AILA_Q4E_HOTSET_SWAPS": "0",
+        "AILA_Q4E_HOT_RAM_MB": "0",
+        "AILA_Q4E_INLINE_CHECKPOINT": "1",
+        "AILA_Q4E_LM_HEAD_Q8": "0",
+        "AILA_Q4E_MOE_FRONT_FUSED": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+        "AILA_Q4E_PHASE_SCRATCH": "1",
+        "AILA_Q4E_PREFETCH_DECODE": "0",
+        "AILA_Q4E_PREFETCH_PREFILL": "0",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_RESIDENT_PREFILL": "1",
+        "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+        "AILA_Q4E_SERVER_MTP": "0",
+        "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+        "AILA_Q4E_SMALL_ROWS_HC": "1",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_VERIFY_ATTN_PAIR": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3584",
+        "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+        "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+        "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+        "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+        "UR_L0_BATCH_SIZE": "0",
+        "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+        "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0"
+      },
+      "production_timing": true,
+      "cleared_diagnostics": [
+        "AILA_PROFILE_Q4E_DECODE",
+        "AILA_Q4E_PROFILE_COMPONENTS"
+      ],
+      "min_available_gib": 1.26922607421875,
+      "requests": {
+        "after-cancel": {
+          "payload_sha256": "e0b6e772035f26771a5bb3b07c273a70b71c1053e031164d5e18f5a95c6ca23c",
+          "input_sha256": "ea7595fb0b8e83fa43d8df02a7a544e448b62a7138f631b49d0301774406e9ac",
+          "output_sha256": "3fc12343159751a54bab012c700c4691ab744d8239c2a342bb008f06ff91296c",
+          "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 1,
+            "prompt_tokens": 17,
+            "total_tokens": 18
+          },
+          "cached": 0,
+          "finish_reason": "stop",
+          "errors": [],
+          "ttft": 1.5937892000000602,
+          "total": 1.6992175000000316,
+          "rate": 0.0
+        },
+        "context-14000": {
+          "payload_sha256": "a4f6f0d1abcc0d6052d216abebe9a4c12ebc695972b42ad894de207fa277b2cc",
+          "input_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "40c0b64f40b432a34f150688835ce8659c8d5bf4d395e525c69a2e82387fa856",
+          "content_sha256": "bb919978900b050f2292ec71c8ce4a114a1a3364b0de0b121e25724d01f7defb",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 13979,
+            "total_tokens": 14011
+          },
+          "cached": 0,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 72.75245289999998,
+          "total": 75.2861163,
+          "rate": 12.235247981243175
+        },
+        "context-14000-continue": {
+          "payload_sha256": "e163efbb1cc5b1ceb323fd58cc651f7a97e27823b06f7faafe8846cdf8cc4fd4",
+          "input_sha256": "735388106135ebcd7939ec7f8dc041472b141dfb14acb59829dea4b01dfa470e",
+          "output_sha256": "abcec54d33e887bf2599f4945eddb6310624c2bb09d1ea1b3b9f5f2bc2d2fb13",
+          "content_sha256": "795ea167d85a5cc60472ccbd595bc10a511d0c0a2bea45e8d874f8fbdc3f1a5d",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 14035,
+            "prompt_tokens_details": {
+              "cached_tokens": 14011
+            },
+            "total_tokens": 14067
+          },
+          "cached": 14011,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 1.739034800000013,
+          "total": 4.314855400000056,
+          "rate": 12.034999642443843
+        }
+      },
+      "cancel_recover": true,
+      "cleanup": {
+        "exit_code": 0,
+        "forced_kill": false
+      }
+    },
+    "candidate": {
+      "label": "nested-b1",
+      "passed": true,
+      "monitor_exit": 0,
+      "socket_harness_sha256": "ff883b3a29da30f3fcbed2eece3604cb0d1898fcfd05a83d47b5610bb3b8a877",
+      "timeout": false,
+      "identity_ok": true,
+      "pair": {
+        "worker": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+          "sha256": "421d6a5cb3cc698406d56738b305d85fb40e3c1773dcd431980c3e8bbc988063",
+          "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+        },
+        "server": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+          "sha256": "d09e1f197833a77b47db5f1cba10864ee58ab5b1ca7ca4f6dd16a428ed5ae7e2",
+          "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+        }
+      },
+      "startup": 128.11050449999993,
+      "pi": 79.63600040000006,
+      "startup_plus_pi": 207.7465049,
+      "pi_answer": "AILA_FIXED_AGENT_READ_20261007",
+      "pi_calls": [
+        {
+          "type": "tool_execution_start",
+          "toolName": "read",
+          "args": {
+            "path": "smoke-marker.txt"
+          }
+        }
+      ],
+      "pi_usage": [
+        {
+          "input": 6931,
+          "output": 26,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 6957,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        {
+          "input": 32,
+          "output": 14,
+          "cacheRead": 6957,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7003,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        }
+      ],
+      "pi_prompt_sha256": "99d75d40b0c1de254e63a5b0747a076e635393834072a6b559874d4339e2eb9c",
+      "pi_output_sha256": "4351142b67068450e80ee18d4ec95cc4b05eeba481bb3e2ae853163d0702b2d0",
+      "pi_event_output_count": 2,
+      "fixture_sha256": "ea960fd32758828c825e30f679545b28bd0c865814e2b07aa0555cef96bcf706",
+      "worker_environment": {
+        "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+        "AILA_KV_QUANT": "0",
+        "AILA_Q35_PREFILL_CHUNK": "4096",
+        "AILA_Q4E_ATTN_NF4_Q8": "0",
+        "AILA_Q4E_COLD_BUDGET_US": "1000",
+        "AILA_Q4E_COLD_MODE": "2",
+        "AILA_Q4E_COLD_PCIE_NUM": "141",
+        "AILA_Q4E_COLD_POLICY": "1",
+        "AILA_Q4E_CPU_A64_ROW2": "1",
+        "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+        "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+        "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+        "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+        "AILA_Q4E_CPU_EARLY_START": "0",
+        "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+        "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+        "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+        "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+        "AILA_Q4E_CPU_MMAP_COLD": "1",
+        "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+        "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+        "AILA_Q4E_CPU_NF4_Q8": "1",
+        "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+        "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+        "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+        "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+        "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+        "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+        "AILA_Q4E_CPU_RESULT_PACKET": "0",
+        "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+        "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+        "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+        "AILA_Q4E_CPU_THREADS": "18",
+        "AILA_Q4E_CPU_TILE_POOL": "0",
+        "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+        "AILA_Q4E_DECODE_TRIM_CAP": "0",
+        "AILA_Q4E_DEMAND_MICROBATCH": "32",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_FILL_PARTS": "8",
+        "AILA_Q4E_FILL_SHORT_PARTS": "1",
+        "AILA_Q4E_FILL_THREADS": "8",
+        "AILA_Q4E_GDN_CHUNK_MODE": "0",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_GPU_MMAP_DMA": "0",
+        "AILA_Q4E_GPU_NF4_Q8": "0",
+        "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+        "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+        "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+        "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+        "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+        "AILA_Q4E_HOST_COMPLEMENT": "0",
+        "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+        "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+        "AILA_Q4E_HOTSET_BORROW": "1",
+        "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+        "AILA_Q4E_HOTSET_INTERVAL": "4",
+        "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+        "AILA_Q4E_HOTSET_PROMPT": "1",
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+        "AILA_Q4E_HOTSET_SWAPS": "0",
+        "AILA_Q4E_HOT_RAM_MB": "0",
+        "AILA_Q4E_INLINE_CHECKPOINT": "1",
+        "AILA_Q4E_LM_HEAD_Q8": "0",
+        "AILA_Q4E_MOE_FRONT_FUSED": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+        "AILA_Q4E_PHASE_SCRATCH": "1",
+        "AILA_Q4E_PREFETCH_DECODE": "0",
+        "AILA_Q4E_PREFETCH_PREFILL": "0",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_RESIDENT_PREFILL": "1",
+        "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+        "AILA_Q4E_SERVER_MTP": "0",
+        "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+        "AILA_Q4E_SMALL_ROWS_HC": "1",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_VERIFY_ATTN_PAIR": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3584",
+        "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+        "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+        "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+        "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+        "UR_L0_BATCH_SIZE": "0",
+        "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+        "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0"
+      },
+      "production_timing": true,
+      "cleared_diagnostics": [
+        "AILA_PROFILE_Q4E_DECODE",
+        "AILA_Q4E_PROFILE_COMPONENTS"
+      ],
+      "min_available_gib": 2.4364166259765625,
+      "requests": {
+        "after-cancel": {
+          "payload_sha256": "e0b6e772035f26771a5bb3b07c273a70b71c1053e031164d5e18f5a95c6ca23c",
+          "input_sha256": "ea7595fb0b8e83fa43d8df02a7a544e448b62a7138f631b49d0301774406e9ac",
+          "output_sha256": "3fc12343159751a54bab012c700c4691ab744d8239c2a342bb008f06ff91296c",
+          "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 1,
+            "prompt_tokens": 17,
+            "total_tokens": 18
+          },
+          "cached": 0,
+          "finish_reason": "stop",
+          "errors": [],
+          "ttft": 1.6119308999998339,
+          "total": 1.697864399999844,
+          "rate": 0.0
+        },
+        "context-14000": {
+          "payload_sha256": "a4f6f0d1abcc0d6052d216abebe9a4c12ebc695972b42ad894de207fa277b2cc",
+          "input_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "40c0b64f40b432a34f150688835ce8659c8d5bf4d395e525c69a2e82387fa856",
+          "content_sha256": "bb919978900b050f2292ec71c8ce4a114a1a3364b0de0b121e25724d01f7defb",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 13979,
+            "total_tokens": 14011
+          },
+          "cached": 0,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 70.7610095,
+          "total": 73.31469820000007,
+          "rate": 12.139302648752448
+        },
+        "context-14000-continue": {
+          "payload_sha256": "e163efbb1cc5b1ceb323fd58cc651f7a97e27823b06f7faafe8846cdf8cc4fd4",
+          "input_sha256": "735388106135ebcd7939ec7f8dc041472b141dfb14acb59829dea4b01dfa470e",
+          "output_sha256": "abcec54d33e887bf2599f4945eddb6310624c2bb09d1ea1b3b9f5f2bc2d2fb13",
+          "content_sha256": "795ea167d85a5cc60472ccbd595bc10a511d0c0a2bea45e8d874f8fbdc3f1a5d",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 14035,
+            "prompt_tokens_details": {
+              "cached_tokens": 14011
+            },
+            "total_tokens": 14067
+          },
+          "cached": 14011,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 1.7291534999999385,
+          "total": 4.184779400000025,
+          "rate": 12.624072746585263
+        }
+      },
+      "cancel_recover": true,
+      "cleanup": {
+        "exit_code": 0,
+        "forced_kill": false
+      }
+    },
+    "checks": {
+      "identity": true,
+      "completed": true,
+      "cleanup": true,
+      "cancel_recover": true,
+      "same_environment": true,
+      "same_socket_harness": true,
+      "same_fixture": true,
+      "production_timing": true,
+      "pi_equal_input_output_usage": true,
+      "after-cancel/equal_input_output_usage": true,
+      "context-14000/equal_input_output_usage": true,
+      "context-14000-continue/equal_input_output_usage": true
+    },
+    "metrics": {
+      "startup": {
+        "baseline": 126.58196229999999,
+        "candidate": 128.11050449999993,
+        "reduction_percent": -1.207551354257963,
+        "fixed_work_qualified": true
+      },
+      "pi": {
+        "baseline": 79.09870319999993,
+        "candidate": 79.63600040000006,
+        "reduction_percent": -0.6792743474461016,
+        "fixed_work_qualified": true
+      },
+      "startup_plus_pi": {
+        "baseline": 205.68066549999992,
+        "candidate": 207.7465049,
+        "reduction_percent": -1.0043916354403715,
+        "fixed_work_qualified": true
+      },
+      "context-14000/ttft": {
+        "baseline": 72.75245289999998,
+        "candidate": 70.7610095,
+        "reduction_percent": 2.7372869513241915,
+        "fixed_work_qualified": true
+      },
+      "context-14000/total": {
+        "baseline": 75.2861163,
+        "candidate": 73.31469820000007,
+        "reduction_percent": 2.618567933753191,
+        "fixed_work_qualified": true
+      },
+      "context-14000/rate": {
+        "baseline": 12.235247981243175,
+        "candidate": 12.139302648752448,
+        "reduction_percent": 0.7841715397825411,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/ttft": {
+        "baseline": 1.739034800000013,
+        "candidate": 1.7291534999999385,
+        "reduction_percent": 0.5682059956519825,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/total": {
+        "baseline": 4.314855400000056,
+        "candidate": 4.184779400000025,
+        "reduction_percent": 3.014608554437981,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/rate": {
+        "baseline": 12.034999642443843,
+        "candidate": 12.624072746585263,
+        "reduction_percent": -4.894666569527217,
+        "fixed_work_qualified": true
+      }
+    },
+    "scope": "One screening pair; no stability or broad performance claim."
+  },
+  "reverse": {
+    "baseline": {
+      "label": "nested-a2",
+      "passed": true,
+      "monitor_exit": 0,
+      "socket_harness_sha256": "ff883b3a29da30f3fcbed2eece3604cb0d1898fcfd05a83d47b5610bb3b8a877",
+      "timeout": false,
+      "identity_ok": true,
+      "pair": {
+        "worker": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+          "sha256": "8ce1efd990cb64332ebde8421989160e18a86810e916d88eed005c530d2a653d",
+          "build_id": "aila-0.2.0-abi1-a83cd80a421fbe3d3dc789bcd6fe911445a9b9d5"
+        },
+        "server": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+          "sha256": "020c8a89cef7146999d1bb5de2e680f84b8a74bf4f891bf3f30b4835e48662e9",
+          "build_id": "aila-0.2.0-abi1-a83cd80a421fbe3d3dc789bcd6fe911445a9b9d5"
+        }
+      },
+      "startup": 128.17931759999988,
+      "pi": 80.44391380000002,
+      "startup_plus_pi": 208.6232313999999,
+      "pi_answer": "AILA_FIXED_AGENT_READ_20261007",
+      "pi_calls": [
+        {
+          "type": "tool_execution_start",
+          "toolName": "read",
+          "args": {
+            "path": "smoke-marker.txt"
+          }
+        }
+      ],
+      "pi_usage": [
+        {
+          "input": 6931,
+          "output": 26,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 6957,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        {
+          "input": 32,
+          "output": 14,
+          "cacheRead": 6957,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7003,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        }
+      ],
+      "pi_prompt_sha256": "99d75d40b0c1de254e63a5b0747a076e635393834072a6b559874d4339e2eb9c",
+      "pi_output_sha256": "4351142b67068450e80ee18d4ec95cc4b05eeba481bb3e2ae853163d0702b2d0",
+      "pi_event_output_count": 2,
+      "fixture_sha256": "ea960fd32758828c825e30f679545b28bd0c865814e2b07aa0555cef96bcf706",
+      "worker_environment": {
+        "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+        "AILA_KV_QUANT": "0",
+        "AILA_Q35_PREFILL_CHUNK": "4096",
+        "AILA_Q4E_ATTN_NF4_Q8": "0",
+        "AILA_Q4E_COLD_BUDGET_US": "1000",
+        "AILA_Q4E_COLD_MODE": "2",
+        "AILA_Q4E_COLD_PCIE_NUM": "141",
+        "AILA_Q4E_COLD_POLICY": "1",
+        "AILA_Q4E_CPU_A64_ROW2": "1",
+        "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+        "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+        "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+        "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+        "AILA_Q4E_CPU_EARLY_START": "0",
+        "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+        "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+        "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+        "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+        "AILA_Q4E_CPU_MMAP_COLD": "1",
+        "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+        "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+        "AILA_Q4E_CPU_NF4_Q8": "1",
+        "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+        "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+        "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+        "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+        "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+        "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+        "AILA_Q4E_CPU_RESULT_PACKET": "0",
+        "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+        "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+        "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+        "AILA_Q4E_CPU_THREADS": "18",
+        "AILA_Q4E_CPU_TILE_POOL": "0",
+        "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+        "AILA_Q4E_DECODE_TRIM_CAP": "0",
+        "AILA_Q4E_DEMAND_MICROBATCH": "32",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_FILL_PARTS": "8",
+        "AILA_Q4E_FILL_SHORT_PARTS": "1",
+        "AILA_Q4E_FILL_THREADS": "8",
+        "AILA_Q4E_GDN_CHUNK_MODE": "0",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_GPU_MMAP_DMA": "0",
+        "AILA_Q4E_GPU_NF4_Q8": "0",
+        "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+        "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+        "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+        "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+        "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+        "AILA_Q4E_HOST_COMPLEMENT": "0",
+        "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+        "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+        "AILA_Q4E_HOTSET_BORROW": "1",
+        "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+        "AILA_Q4E_HOTSET_INTERVAL": "4",
+        "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+        "AILA_Q4E_HOTSET_PROMPT": "1",
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+        "AILA_Q4E_HOTSET_SWAPS": "0",
+        "AILA_Q4E_HOT_RAM_MB": "0",
+        "AILA_Q4E_INLINE_CHECKPOINT": "1",
+        "AILA_Q4E_LM_HEAD_Q8": "0",
+        "AILA_Q4E_MOE_FRONT_FUSED": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+        "AILA_Q4E_PHASE_SCRATCH": "1",
+        "AILA_Q4E_PREFETCH_DECODE": "0",
+        "AILA_Q4E_PREFETCH_PREFILL": "0",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_RESIDENT_PREFILL": "1",
+        "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+        "AILA_Q4E_SERVER_MTP": "0",
+        "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+        "AILA_Q4E_SMALL_ROWS_HC": "1",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_VERIFY_ATTN_PAIR": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3584",
+        "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+        "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+        "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+        "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+        "UR_L0_BATCH_SIZE": "0",
+        "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+        "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0"
+      },
+      "production_timing": true,
+      "cleared_diagnostics": [
+        "AILA_PROFILE_Q4E_DECODE",
+        "AILA_Q4E_PROFILE_COMPONENTS"
+      ],
+      "min_available_gib": 2.063213348388672,
+      "requests": {
+        "after-cancel": {
+          "payload_sha256": "e0b6e772035f26771a5bb3b07c273a70b71c1053e031164d5e18f5a95c6ca23c",
+          "input_sha256": "ea7595fb0b8e83fa43d8df02a7a544e448b62a7138f631b49d0301774406e9ac",
+          "output_sha256": "3fc12343159751a54bab012c700c4691ab744d8239c2a342bb008f06ff91296c",
+          "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 1,
+            "prompt_tokens": 17,
+            "total_tokens": 18
+          },
+          "cached": 0,
+          "finish_reason": "stop",
+          "errors": [],
+          "ttft": 1.6268713000001753,
+          "total": 1.722942699999976,
+          "rate": 0.0
+        },
+        "context-14000": {
+          "payload_sha256": "a4f6f0d1abcc0d6052d216abebe9a4c12ebc695972b42ad894de207fa277b2cc",
+          "input_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "40c0b64f40b432a34f150688835ce8659c8d5bf4d395e525c69a2e82387fa856",
+          "content_sha256": "bb919978900b050f2292ec71c8ce4a114a1a3364b0de0b121e25724d01f7defb",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 13979,
+            "total_tokens": 14011
+          },
+          "cached": 0,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 72.7866947,
+          "total": 75.302997,
+          "rate": 12.319664453670736
+        },
+        "context-14000-continue": {
+          "payload_sha256": "e163efbb1cc5b1ceb323fd58cc651f7a97e27823b06f7faafe8846cdf8cc4fd4",
+          "input_sha256": "735388106135ebcd7939ec7f8dc041472b141dfb14acb59829dea4b01dfa470e",
+          "output_sha256": "abcec54d33e887bf2599f4945eddb6310624c2bb09d1ea1b3b9f5f2bc2d2fb13",
+          "content_sha256": "795ea167d85a5cc60472ccbd595bc10a511d0c0a2bea45e8d874f8fbdc3f1a5d",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 14035,
+            "prompt_tokens_details": {
+              "cached_tokens": 14011
+            },
+            "total_tokens": 14067
+          },
+          "cached": 14011,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 1.7169402999998056,
+          "total": 4.138079800000014,
+          "rate": 12.803888417002543
+        }
+      },
+      "cancel_recover": true,
+      "cleanup": {
+        "exit_code": 0,
+        "forced_kill": false
+      }
+    },
+    "candidate": {
+      "label": "nested-b2",
+      "passed": true,
+      "monitor_exit": 0,
+      "socket_harness_sha256": "ff883b3a29da30f3fcbed2eece3604cb0d1898fcfd05a83d47b5610bb3b8a877",
+      "timeout": false,
+      "identity_ok": true,
+      "pair": {
+        "worker": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+          "sha256": "421d6a5cb3cc698406d56738b305d85fb40e3c1773dcd431980c3e8bbc988063",
+          "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+        },
+        "server": {
+          "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+          "sha256": "d09e1f197833a77b47db5f1cba10864ee58ab5b1ca7ca4f6dd16a428ed5ae7e2",
+          "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+        }
+      },
+      "startup": 123.87618459999999,
+      "pi": 79.17248359999985,
+      "startup_plus_pi": 203.04866819999984,
+      "pi_answer": "AILA_FIXED_AGENT_READ_20261007",
+      "pi_calls": [
+        {
+          "type": "tool_execution_start",
+          "toolName": "read",
+          "args": {
+            "path": "smoke-marker.txt"
+          }
+        }
+      ],
+      "pi_usage": [
+        {
+          "input": 6931,
+          "output": 26,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 6957,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        {
+          "input": 32,
+          "output": 14,
+          "cacheRead": 6957,
+          "cacheWrite": 0,
+          "reasoning": 0,
+          "totalTokens": 7003,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        }
+      ],
+      "pi_prompt_sha256": "99d75d40b0c1de254e63a5b0747a076e635393834072a6b559874d4339e2eb9c",
+      "pi_output_sha256": "4351142b67068450e80ee18d4ec95cc4b05eeba481bb3e2ae853163d0702b2d0",
+      "pi_event_output_count": 2,
+      "fixture_sha256": "ea960fd32758828c825e30f679545b28bd0c865814e2b07aa0555cef96bcf706",
+      "worker_environment": {
+        "AILA_BNB4_GEMV_INPUT_PREFETCH_OFF": "0",
+        "AILA_KV_QUANT": "0",
+        "AILA_Q35_PREFILL_CHUNK": "4096",
+        "AILA_Q4E_ATTN_NF4_Q8": "0",
+        "AILA_Q4E_COLD_BUDGET_US": "1000",
+        "AILA_Q4E_COLD_MODE": "2",
+        "AILA_Q4E_COLD_PCIE_NUM": "141",
+        "AILA_Q4E_COLD_POLICY": "1",
+        "AILA_Q4E_CPU_A64_ROW2": "1",
+        "AILA_Q4E_CPU_A64_SPECIALIZE": "1",
+        "AILA_Q4E_CPU_ASYNC_ROUTE": "1",
+        "AILA_Q4E_CPU_BYTE_SHUFFLE": "0",
+        "AILA_Q4E_CPU_DEFER_ARENA_WAIT": "0",
+        "AILA_Q4E_CPU_EARLY_START": "0",
+        "AILA_Q4E_CPU_EXPERT_DISPATCH": "0",
+        "AILA_Q4E_CPU_HANDOFF_SPIN_US": "0",
+        "AILA_Q4E_CPU_LIGHT_ROUTE": "1",
+        "AILA_Q4E_CPU_MAX_EXPERTS": "10",
+        "AILA_Q4E_CPU_MMAP_COLD": "1",
+        "AILA_Q4E_CPU_MMAP_PREFETCH": "0",
+        "AILA_Q4E_CPU_MMAP_TOUCH": "0",
+        "AILA_Q4E_CPU_NF4_Q8": "1",
+        "AILA_Q4E_CPU_NF4_Q8_BLOCK64": "0",
+        "AILA_Q4E_CPU_NF4_Q8_ROW4": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_MB": "0",
+        "AILA_Q4E_CPU_PACKED_CACHE_PROMPT": "0",
+        "AILA_Q4E_CPU_PER_EXPERT_DAG": "0",
+        "AILA_Q4E_CPU_Q8_ACTIVATION64": "1",
+        "AILA_Q4E_CPU_Q8_CHUNKS": "0",
+        "AILA_Q4E_CPU_RESULT_HOST_READ": "0",
+        "AILA_Q4E_CPU_RESULT_PACKET": "0",
+        "AILA_Q4E_CPU_SCALE_CACHE_MB": "0",
+        "AILA_Q4E_CPU_SCALE_REGISTER": "0",
+        "AILA_Q4E_CPU_SCALE_SHIFT": "1",
+        "AILA_Q4E_CPU_THREADS": "18",
+        "AILA_Q4E_CPU_TILE_POOL": "0",
+        "AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL": "1",
+        "AILA_Q4E_DECODE_TRIM_CAP": "0",
+        "AILA_Q4E_DEMAND_MICROBATCH": "32",
+        "AILA_Q4E_EXPERT_READER": "readfile",
+        "AILA_Q4E_FILL_PARTS": "8",
+        "AILA_Q4E_FILL_SHORT_PARTS": "1",
+        "AILA_Q4E_FILL_THREADS": "8",
+        "AILA_Q4E_GDN_CHUNK_MODE": "0",
+        "AILA_Q4E_GDN_HISTORY_FUSED": "1",
+        "AILA_Q4E_GPU_MMAP_DMA": "0",
+        "AILA_Q4E_GPU_NF4_Q8": "0",
+        "AILA_Q4E_GPU_Q8_FAST_RTE": "1",
+        "AILA_Q4E_GROUPED_XMX_MIN_ROWS": "0",
+        "AILA_Q4E_HC_DECODE_DOWN_WG": "256",
+        "AILA_Q4E_HC_DECODE_UP_STREAMS": "0",
+        "AILA_Q4E_HC_REUSE_ACTIVATION": "0",
+        "AILA_Q4E_HOST_COMPLEMENT": "0",
+        "AILA_Q4E_HOST_COMPLEMENT_SCAN": "512",
+        "AILA_Q4E_HOTSET_ADOPT_LIMIT": "4096",
+        "AILA_Q4E_HOTSET_ADOPT_READY": "1",
+        "AILA_Q4E_HOTSET_BORROW": "1",
+        "AILA_Q4E_HOTSET_COLD_QUEUE": "2",
+        "AILA_Q4E_HOTSET_INTERVAL": "4",
+        "AILA_Q4E_HOTSET_PROFILE": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-h4-v1.profile",
+        "AILA_Q4E_HOTSET_PROMPT": "1",
+        "AILA_Q4E_HOTSET_PROMPT_PREFILL": "0",
+        "AILA_Q4E_HOTSET_PROMPT_SWAPS": "512",
+        "AILA_Q4E_HOTSET_SWAPS": "0",
+        "AILA_Q4E_HOT_RAM_MB": "0",
+        "AILA_Q4E_INLINE_CHECKPOINT": "1",
+        "AILA_Q4E_LM_HEAD_Q8": "0",
+        "AILA_Q4E_MOE_FRONT_FUSED": "0",
+        "AILA_Q4E_MTP_HIDDEN_REUSE": "1",
+        "AILA_Q4E_PHASE_SCRATCH": "1",
+        "AILA_Q4E_PREFETCH_DECODE": "0",
+        "AILA_Q4E_PREFETCH_PREFILL": "0",
+        "AILA_Q4E_PREFILL_XMX": "1",
+        "AILA_Q4E_RESIDENT_PREFILL": "1",
+        "AILA_Q4E_ROUTER_RESIDENT_FUSED": "0",
+        "AILA_Q4E_SERVER_MTP": "0",
+        "AILA_Q4E_SMALL_ROWS_DECODE": "1",
+        "AILA_Q4E_SMALL_ROWS_HC": "1",
+        "AILA_Q4E_STATIC_PINNING": "0",
+        "AILA_Q4E_VERIFY_ASYNC_ROUTE": "1",
+        "AILA_Q4E_VERIFY_ATTN_PAIR": "1",
+        "AILA_Q4E_VERIFY_CPU_ROWS": "4",
+        "AILA_Q4E_VERIFY_DECODE_ATTN": "1",
+        "AILA_Q4E_VERIFY_DECODE_PREPARE": "1",
+        "AILA_Q4E_VERIFY_GDN_ORDER": "0",
+        "AILA_Q4E_VERIFY_GPU_REUSE": "4",
+        "AILA_Q4E_VERIFY_LINEAR_REUSE": "3",
+        "AILA_Q4E_VRAM_RESERVE_MB": "3584",
+        "SYCL_PI_LEVEL_ZERO_BATCH_SIZE": "0",
+        "SYCL_PI_LEVEL_ZERO_DEVICE_SCOPE_EVENTS": "0",
+        "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": "0",
+        "SYCL_UR_USE_LEVEL_ZERO_V2": "0",
+        "UR_L0_BATCH_SIZE": "0",
+        "UR_L0_DEVICE_SCOPE_EVENTS": "0",
+        "UR_L0_USE_IMMEDIATE_COMMANDLISTS": "0"
+      },
+      "production_timing": true,
+      "cleared_diagnostics": [
+        "AILA_PROFILE_Q4E_DECODE",
+        "AILA_Q4E_PROFILE_COMPONENTS"
+      ],
+      "min_available_gib": 2.1488609313964844,
+      "requests": {
+        "after-cancel": {
+          "payload_sha256": "e0b6e772035f26771a5bb3b07c273a70b71c1053e031164d5e18f5a95c6ca23c",
+          "input_sha256": "ea7595fb0b8e83fa43d8df02a7a544e448b62a7138f631b49d0301774406e9ac",
+          "output_sha256": "3fc12343159751a54bab012c700c4691ab744d8239c2a342bb008f06ff91296c",
+          "content_sha256": "c2e3ac47f4a325469c1a2d5f117e463ec943c721986d5d9f09ac4540b7d80526",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 1,
+            "prompt_tokens": 17,
+            "total_tokens": 18
+          },
+          "cached": 0,
+          "finish_reason": "stop",
+          "errors": [],
+          "ttft": 1.6170739000001504,
+          "total": 1.7045795000001362,
+          "rate": 0.0
+        },
+        "context-14000": {
+          "payload_sha256": "a4f6f0d1abcc0d6052d216abebe9a4c12ebc695972b42ad894de207fa277b2cc",
+          "input_sha256": "494b92176974b832a75cc3794306b762dca97507c8e2193d35b37df183615f84",
+          "output_sha256": "40c0b64f40b432a34f150688835ce8659c8d5bf4d395e525c69a2e82387fa856",
+          "content_sha256": "bb919978900b050f2292ec71c8ce4a114a1a3364b0de0b121e25724d01f7defb",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 13979,
+            "total_tokens": 14011
+          },
+          "cached": 0,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 70.98981400000002,
+          "total": 73.65767619999997,
+          "rate": 11.619790557398593
+        },
+        "context-14000-continue": {
+          "payload_sha256": "e163efbb1cc5b1ceb323fd58cc651f7a97e27823b06f7faafe8846cdf8cc4fd4",
+          "input_sha256": "735388106135ebcd7939ec7f8dc041472b141dfb14acb59829dea4b01dfa470e",
+          "output_sha256": "abcec54d33e887bf2599f4945eddb6310624c2bb09d1ea1b3b9f5f2bc2d2fb13",
+          "content_sha256": "795ea167d85a5cc60472ccbd595bc10a511d0c0a2bea45e8d874f8fbdc3f1a5d",
+          "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "tool_calls_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "usage": {
+            "completion_tokens": 32,
+            "prompt_tokens": 14035,
+            "prompt_tokens_details": {
+              "cached_tokens": 14011
+            },
+            "total_tokens": 14067
+          },
+          "cached": 14011,
+          "finish_reason": "length",
+          "errors": [],
+          "ttft": 1.7280283999998574,
+          "total": 4.238116199999922,
+          "rate": 12.350165599784678
+        }
+      },
+      "cancel_recover": true,
+      "cleanup": {
+        "exit_code": 0,
+        "forced_kill": false
+      }
+    },
+    "checks": {
+      "identity": true,
+      "completed": true,
+      "cleanup": true,
+      "cancel_recover": true,
+      "same_environment": true,
+      "same_socket_harness": true,
+      "same_fixture": true,
+      "production_timing": true,
+      "pi_equal_input_output_usage": true,
+      "after-cancel/equal_input_output_usage": true,
+      "context-14000/equal_input_output_usage": true,
+      "context-14000-continue/equal_input_output_usage": true
+    },
+    "metrics": {
+      "startup": {
+        "baseline": 128.17931759999988,
+        "candidate": 123.87618459999999,
+        "reduction_percent": 3.357119604450054,
+        "fixed_work_qualified": true
+      },
+      "pi": {
+        "baseline": 80.44391380000002,
+        "candidate": 79.17248359999985,
+        "reduction_percent": 1.5805175804364802,
+        "fixed_work_qualified": true
+      },
+      "startup_plus_pi": {
+        "baseline": 208.6232313999999,
+        "candidate": 203.04866819999984,
+        "reduction_percent": 2.6720721190018226,
+        "fixed_work_qualified": true
+      },
+      "context-14000/ttft": {
+        "baseline": 72.7866947,
+        "candidate": 70.98981400000002,
+        "reduction_percent": 2.468693910894093,
+        "fixed_work_qualified": true
+      },
+      "context-14000/total": {
+        "baseline": 75.302997,
+        "candidate": 73.65767619999997,
+        "reduction_percent": 2.1849340206207657,
+        "fixed_work_qualified": true
+      },
+      "context-14000/rate": {
+        "baseline": 12.319664453670736,
+        "candidate": 11.619790557398593,
+        "reduction_percent": 5.680949338385677,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/ttft": {
+        "baseline": 1.7169402999998056,
+        "candidate": 1.7280283999998574,
+        "reduction_percent": -0.6458057976770126,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/total": {
+        "baseline": 4.138079800000014,
+        "candidate": 4.238116199999922,
+        "reduction_percent": -2.4174594216358036,
+        "fixed_work_qualified": true
+      },
+      "context-14000-continue/rate": {
+        "baseline": 12.803888417002543,
+        "candidate": 12.350165599784678,
+        "reduction_percent": 3.5436330155404816,
+        "fixed_work_qualified": true
+      }
+    },
+    "scope": "One screening pair; no stability or broad performance claim."
+  },
+  "aggregate": {
+    "pairs": [
+      {
+        "pair": "nested-a1→nested-b1",
+        "gates": {
+          "passed": true,
+          "missing_or_false": []
+        },
+        "requests": {
+          "after-cancel": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 1.5937892000000602,
+              "candidate": 1.6119308999998339,
+              "candidate_change_percent": 1.1382747479888211,
+              "latency_reduction_percent": -1.1382747479888211
+            },
+            "total": {
+              "baseline": 1.6992175000000316,
+              "candidate": 1.697864399999844,
+              "candidate_change_percent": -0.07963077123367412,
+              "latency_reduction_percent": 0.07963077123367412
+            },
+            "rate": {
+              "baseline": 0.0,
+              "candidate": 0.0,
+              "candidate_change_percent": null
+            }
+          },
+          "context-14000": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 72.75245289999998,
+              "candidate": 70.7610095,
+              "candidate_change_percent": -2.7372869513241915,
+              "latency_reduction_percent": 2.7372869513241915
+            },
+            "total": {
+              "baseline": 75.2861163,
+              "candidate": 73.31469820000007,
+              "candidate_change_percent": -2.618567933753191,
+              "latency_reduction_percent": 2.618567933753191
+            },
+            "rate": {
+              "baseline": 12.235247981243175,
+              "candidate": 12.139302648752448,
+              "candidate_change_percent": -0.7841715397825411
+            }
+          },
+          "context-14000-continue": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 1.739034800000013,
+              "candidate": 1.7291534999999385,
+              "candidate_change_percent": -0.5682059956519825,
+              "latency_reduction_percent": 0.5682059956519825
+            },
+            "total": {
+              "baseline": 4.314855400000056,
+              "candidate": 4.184779400000025,
+              "candidate_change_percent": -3.014608554437981,
+              "latency_reduction_percent": 3.014608554437981
+            },
+            "rate": {
+              "baseline": 12.034999642443843,
+              "candidate": 12.624072746585263,
+              "candidate_change_percent": 4.894666569527217
+            }
+          }
+        },
+        "pi": {
+          "pair_gate": true,
+          "same_input_output_usage": true,
+          "baseline_seconds": 79.09870319999993,
+          "candidate_seconds": 79.63600040000006,
+          "candidate_change_percent": 0.6792743474461016,
+          "startup_plus_pi_baseline_seconds": 205.68066549999992,
+          "startup_plus_pi_candidate_seconds": 207.7465049,
+          "baseline_usage": [
+            {
+              "input": 6931,
+              "output": 26,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 6957,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            {
+              "input": 32,
+              "output": 14,
+              "cacheRead": 6957,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 7003,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            }
+          ],
+          "candidate_usage": [
+            {
+              "input": 6931,
+              "output": 26,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 6957,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            {
+              "input": 32,
+              "output": 14,
+              "cacheRead": 6957,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 7003,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            }
+          ]
+        },
+        "runner_wall_seconds": {
+          "baseline": 294.07132949999993,
+          "candidate": 294.0758687
+        }
+      },
+      {
+        "pair": "nested-a2→nested-b2",
+        "gates": {
+          "passed": true,
+          "missing_or_false": []
+        },
+        "requests": {
+          "after-cancel": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 1.6268713000001753,
+              "candidate": 1.6170739000001504,
+              "candidate_change_percent": -0.6022234211165878,
+              "latency_reduction_percent": 0.6022234211165878
+            },
+            "total": {
+              "baseline": 1.722942699999976,
+              "candidate": 1.7045795000001362,
+              "candidate_change_percent": -1.0658044518741083,
+              "latency_reduction_percent": 1.0658044518741083
+            },
+            "rate": {
+              "baseline": 0.0,
+              "candidate": 0.0,
+              "candidate_change_percent": null
+            }
+          },
+          "context-14000": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 72.7866947,
+              "candidate": 70.98981400000002,
+              "candidate_change_percent": -2.468693910894093,
+              "latency_reduction_percent": 2.468693910894093
+            },
+            "total": {
+              "baseline": 75.302997,
+              "candidate": 73.65767619999997,
+              "candidate_change_percent": -2.1849340206207657,
+              "latency_reduction_percent": 2.1849340206207657
+            },
+            "rate": {
+              "baseline": 12.319664453670736,
+              "candidate": 11.619790557398593,
+              "candidate_change_percent": -5.680949338385677
+            }
+          },
+          "context-14000-continue": {
+            "pair_gate": true,
+            "same_work_and_output": true,
+            "ttft": {
+              "baseline": 1.7169402999998056,
+              "candidate": 1.7280283999998574,
+              "candidate_change_percent": 0.6458057976770126,
+              "latency_reduction_percent": -0.6458057976770126
+            },
+            "total": {
+              "baseline": 4.138079800000014,
+              "candidate": 4.238116199999922,
+              "candidate_change_percent": 2.4174594216358036,
+              "latency_reduction_percent": -2.4174594216358036
+            },
+            "rate": {
+              "baseline": 12.803888417002543,
+              "candidate": 12.350165599784678,
+              "candidate_change_percent": -3.5436330155404816
+            }
+          }
+        },
+        "pi": {
+          "pair_gate": true,
+          "same_input_output_usage": true,
+          "baseline_seconds": 80.44391380000002,
+          "candidate_seconds": 79.17248359999985,
+          "candidate_change_percent": -1.5805175804364802,
+          "startup_plus_pi_baseline_seconds": 208.6232313999999,
+          "startup_plus_pi_candidate_seconds": 203.04866819999984,
+          "baseline_usage": [
+            {
+              "input": 6931,
+              "output": 26,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 6957,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            {
+              "input": 32,
+              "output": 14,
+              "cacheRead": 6957,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 7003,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            }
+          ],
+          "candidate_usage": [
+            {
+              "input": 6931,
+              "output": 26,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 6957,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            {
+              "input": 32,
+              "output": 14,
+              "cacheRead": 6957,
+              "cacheWrite": 0,
+              "reasoning": 0,
+              "totalTokens": 7003,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            }
+          ]
+        },
+        "runner_wall_seconds": {
+          "baseline": 298.0775658,
+          "candidate": 290.0697989
+        }
+      }
+    ],
+    "cross_four_run_checks": {
+      "four_distinct_runs": true,
+      "both_pair_gate_sets_pass": true,
+      "same_environment_all_four": true,
+      "same_fixture_all_four": true,
+      "same_socket_harness_all_four": true,
+      "production_timing_all_four": true,
+      "same_baseline_pair_across_runs": true,
+      "same_candidate_pair_across_runs": true,
+      "baseline_candidate_pairs_differ": true
+    },
+    "four_run_table": [
+      {
+        "pair": "nested-a1→nested-b1",
+        "role": "baseline",
+        "label": "nested-a1",
+        "worker_sha256": "8ce1efd990cb64332ebde8421989160e18a86810e916d88eed005c530d2a653d",
+        "server_sha256": "020c8a89cef7146999d1bb5de2e680f84b8a74bf4f891bf3f30b4835e48662e9",
+        "startup_seconds": 126.58196229999999,
+        "pi_seconds": 79.09870319999993,
+        "startup_plus_pi_seconds": 205.68066549999992,
+        "runner_wall_seconds": 294.07132949999993,
+        "min_available_gib": 1.26922607421875,
+        "14k_ttft_seconds": 72.75245289999998,
+        "14k_total_seconds": 75.2861163,
+        "14k_tokens_per_second": 12.235247981243175,
+        "continuation_ttft_seconds": 1.739034800000013,
+        "continuation_total_seconds": 4.314855400000056,
+        "continuation_tokens_per_second": 12.034999642443843
+      },
+      {
+        "pair": "nested-a1→nested-b1",
+        "role": "candidate",
+        "label": "nested-b1",
+        "worker_sha256": "421d6a5cb3cc698406d56738b305d85fb40e3c1773dcd431980c3e8bbc988063",
+        "server_sha256": "d09e1f197833a77b47db5f1cba10864ee58ab5b1ca7ca4f6dd16a428ed5ae7e2",
+        "startup_seconds": 128.11050449999993,
+        "pi_seconds": 79.63600040000006,
+        "startup_plus_pi_seconds": 207.7465049,
+        "runner_wall_seconds": 294.0758687,
+        "min_available_gib": 2.4364166259765625,
+        "14k_ttft_seconds": 70.7610095,
+        "14k_total_seconds": 73.31469820000007,
+        "14k_tokens_per_second": 12.139302648752448,
+        "continuation_ttft_seconds": 1.7291534999999385,
+        "continuation_total_seconds": 4.184779400000025,
+        "continuation_tokens_per_second": 12.624072746585263
+      },
+      {
+        "pair": "nested-a2→nested-b2",
+        "role": "baseline",
+        "label": "nested-a2",
+        "worker_sha256": "8ce1efd990cb64332ebde8421989160e18a86810e916d88eed005c530d2a653d",
+        "server_sha256": "020c8a89cef7146999d1bb5de2e680f84b8a74bf4f891bf3f30b4835e48662e9",
+        "startup_seconds": 128.17931759999988,
+        "pi_seconds": 80.44391380000002,
+        "startup_plus_pi_seconds": 208.6232313999999,
+        "runner_wall_seconds": 298.0775658,
+        "min_available_gib": 2.063213348388672,
+        "14k_ttft_seconds": 72.7866947,
+        "14k_total_seconds": 75.302997,
+        "14k_tokens_per_second": 12.319664453670736,
+        "continuation_ttft_seconds": 1.7169402999998056,
+        "continuation_total_seconds": 4.138079800000014,
+        "continuation_tokens_per_second": 12.803888417002543
+      },
+      {
+        "pair": "nested-a2→nested-b2",
+        "role": "candidate",
+        "label": "nested-b2",
+        "worker_sha256": "421d6a5cb3cc698406d56738b305d85fb40e3c1773dcd431980c3e8bbc988063",
+        "server_sha256": "d09e1f197833a77b47db5f1cba10864ee58ab5b1ca7ca4f6dd16a428ed5ae7e2",
+        "startup_seconds": 123.87618459999999,
+        "pi_seconds": 79.17248359999985,
+        "startup_plus_pi_seconds": 203.04866819999984,
+        "runner_wall_seconds": 290.0697989,
+        "min_available_gib": 2.1488609313964844,
+        "14k_ttft_seconds": 70.98981400000002,
+        "14k_total_seconds": 73.65767619999997,
+        "14k_tokens_per_second": 11.619790557398593,
+        "continuation_ttft_seconds": 1.7280283999998574,
+        "continuation_total_seconds": 4.238116199999922,
+        "continuation_tokens_per_second": 12.350165599784678
+      }
+    ],
+    "aggregates": {
+      "startup": {
+        "baseline_median": 127.38063994999993,
+        "candidate_median": 125.99334454999996,
+        "candidate_change_percent": -1.0890943871411873,
+        "strict_fixed_work_qualified": null,
+        "qualification_reason": "Descriptive startup median; no inference output workload applies."
+      },
+      "pi": {
+        "pooled_median_reported": false,
+        "reason": "Retain PI time and token usage per pair; do not pool potentially different PI outputs/workloads.",
+        "per_pair": {
+          "nested-a1→nested-b1": {
+            "pair_gate": true,
+            "same_input_output_usage": true,
+            "baseline_seconds": 79.09870319999993,
+            "candidate_seconds": 79.63600040000006,
+            "candidate_change_percent": 0.6792743474461016,
+            "startup_plus_pi_baseline_seconds": 205.68066549999992,
+            "startup_plus_pi_candidate_seconds": 207.7465049,
+            "baseline_usage": [
+              {
+                "input": 6931,
+                "output": 26,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 6957,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              },
+              {
+                "input": 32,
+                "output": 14,
+                "cacheRead": 6957,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 7003,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              }
+            ],
+            "candidate_usage": [
+              {
+                "input": 6931,
+                "output": 26,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 6957,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              },
+              {
+                "input": 32,
+                "output": 14,
+                "cacheRead": 6957,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 7003,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              }
+            ]
+          },
+          "nested-a2→nested-b2": {
+            "pair_gate": true,
+            "same_input_output_usage": true,
+            "baseline_seconds": 80.44391380000002,
+            "candidate_seconds": 79.17248359999985,
+            "candidate_change_percent": -1.5805175804364802,
+            "startup_plus_pi_baseline_seconds": 208.6232313999999,
+            "startup_plus_pi_candidate_seconds": 203.04866819999984,
+            "baseline_usage": [
+              {
+                "input": 6931,
+                "output": 26,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 6957,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              },
+              {
+                "input": 32,
+                "output": 14,
+                "cacheRead": 6957,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 7003,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              }
+            ],
+            "candidate_usage": [
+              {
+                "input": 6931,
+                "output": 26,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 6957,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              },
+              {
+                "input": 32,
+                "output": 14,
+                "cacheRead": 6957,
+                "cacheWrite": 0,
+                "reasoning": 0,
+                "totalTokens": 7003,
+                "cost": {
+                  "input": 0,
+                  "output": 0,
+                  "cacheRead": 0,
+                  "cacheWrite": 0,
+                  "total": 0
+                }
+              }
+            ]
+          }
+        }
+      },
+      "startup_plus_pi": {
+        "baseline_median": 207.1519484499999,
+        "candidate_median": 205.39758654999991,
+        "candidate_change_percent": -0.8468961615504367,
+        "strict_fixed_work_qualified": true,
+        "qualification_reason": "All gates and PI work match across four runs."
+      },
+      "runner_wall": {
+        "baseline_median": 296.07444764999997,
+        "candidate_median": 292.0728338,
+        "candidate_change_percent": -1.3515566377853783,
+        "strict_fixed_work_qualified": true,
+        "qualification_reason": "All setup, PI, and request work signatures match across four runs."
+      },
+      "requests": {
+        "context-14000": {
+          "same_work_and_output_across_four_runs": true,
+          "metrics": {
+            "ttft": {
+              "baseline_median": 72.76957379999999,
+              "candidate_median": 70.87541175000001,
+              "candidate_change_percent": -2.6029588344242516,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": 2.6029588344242516,
+              "benefit_direction": "positive means lower latency"
+            },
+            "total": {
+              "baseline_median": 75.29455665,
+              "candidate_median": 73.48618720000002,
+              "candidate_change_percent": -2.401726672495108,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": 2.401726672495108,
+              "benefit_direction": "positive means lower latency"
+            },
+            "rate": {
+              "baseline_median": 12.277456217456955,
+              "candidate_median": 11.879546603075521,
+              "candidate_change_percent": -3.2409776694268033,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": -3.2409776694268033,
+              "benefit_direction": "positive means higher tokens/second"
+            }
+          }
+        },
+        "context-14000-continue": {
+          "same_work_and_output_across_four_runs": true,
+          "metrics": {
+            "ttft": {
+              "baseline_median": 1.7279875499999093,
+              "candidate_median": 1.728590949999898,
+              "candidate_change_percent": 0.034919233069041766,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": -0.034919233069041766,
+              "benefit_direction": "positive means lower latency"
+            },
+            "total": {
+              "baseline_median": 4.226467600000035,
+              "candidate_median": 4.2114477999999735,
+              "candidate_change_percent": -0.35537478153295776,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": 0.35537478153295776,
+              "benefit_direction": "positive means lower latency"
+            },
+            "rate": {
+              "baseline_median": 12.419444029723193,
+              "candidate_median": 12.48711917318497,
+              "candidate_change_percent": 0.5449128262087433,
+              "strict_fixed_work_qualified": true,
+              "qualification_reason": "all pair/setup gates and four work signatures match",
+              "benefit_percent": 0.5449128262087433,
+              "benefit_direction": "positive means higher tokens/second"
+            }
+          }
+        }
+      }
+    },
+    "scope": "Two screening pairs. Request medians are strict fixed-work comparisons only when all four payload/output/usage signatures and setup gates match. PI remains paired. No stability claim."
+  },
+  "measuredCandidatePair": {
+    "worker": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+      "sha256": "421d6a5cb3cc698406d56738b305d85fb40e3c1773dcd431980c3e8bbc988063",
+      "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+    },
+    "server": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+      "sha256": "d09e1f197833a77b47db5f1cba10864ee58ab5b1ca7ca4f6dd16a428ed5ae7e2",
+      "build_id": "aila-0.2.0-abi1-88be93cf79cc95e4efec1ed95ba0853000d23d48"
+    }
+  },
+  "deployedPair": {
+    "worker": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+      "sha256": "06e37b91d644325d7ddefa192644af9918ecc42b352ca85961fa8c55db31597c",
+      "build_id": "aila-0.2.0-abi1-98cc037f865a4f9cc3ff5d1f88a764f73a2fdf12"
+    },
+    "server": {
+      "path": "E:\\RiderProjects\\Aila\\build-refactor-server\\AilaServer.exe",
+      "sha256": "ef19c505a19833af7936203fcc5c84509a5be7b6ddeb3327962c01f8b656ad68",
+      "build_id": "aila-0.2.0-abi1-98cc037f865a4f9cc3ff5d1f88a764f73a2fdf12"
+    }
+  },
+  "sourceCommit": "98cc037f865a4f9cc3ff5d1f88a764f73a2fdf12",
+  "measurementBaseCommit": "88be93cf79cc95e4efec1ed95ba0853000d23d48",
+  "sourceNote": "Candidate was measured before commit on 88be93c. Commit 98cc037 contains the five candidate files and API precondition comments added after timing. No behavior change after timing; official builds update identity.",
+  "postCommitBuild": {
+    "workerInfo": {
+      "schemaVersion": 2,
+      "generatedAtUtc": "2026-10-09T11:34:36.4894404Z",
+      "git": {
+        "shortCommit": "98cc037",
+        "fullCommit": "98cc037f865a4f9cc3ff5d1f88a764f73a2fdf12",
+        "branch": "main"
+      },
+      "build": {
+        "buildDir": "E:\\RiderProjects\\Aila\\build-refactor",
+        "buildType": "Release",
+        "compiler": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "generator": "Ninja"
+      },
+      "oneApi": {
+        "name": "oneapi-2026.1",
+        "role": "candidate",
+        "compilerPath": "C:\\Program Files (x86)\\Intel\\oneAPI\\compiler\\2026.1\\bin\\icx-cl.exe",
+        "compilerVersion": "2026.1.0",
+        "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.0",
+        "dnnlVersion": "3.11.2",
+        "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.1",
+        "tbbVersion": "2023.1",
+        "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.1",
+        "expectedSyclDll": "sycl9.dll",
+        "allowLegacyCompiler": false
+      }
+    },
+    "serverInfo": {
+      "schemaVersion": 1,
+      "purpose": "aila-server-build",
+      "generatedAtUtc": "2026-10-09T11:35:40.2923867Z",
+      "sourceDirectory": "E:\\RiderProjects\\Aila\\tools\\server",
+      "buildDirectory": "E:\\RiderProjects\\Aila\\build-refactor-server",
+      "compiler": "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\MSVC\\14.50.35717\\bin\\Hostx64\\x64\\cl.exe",
+      "compilerDependencies": {
+        "format": "msvc-showIncludes",
+        "prefixSha256": "55aafe1b7330e84eed24cfeeaaa5964efa8323a181498da176ef82bde1aa38d0",
+        "prefixHex": "e6b3a8e6848f3a20e58c85e590abe69687e4bbb63a2020",
+        "verifiedObjects": 32,
+        "probeDirectory": "E:\\RiderProjects\\Aila\\build-refactor-server\\CMakeFiles\\AilaShowIncludes"
+      },
+      "cxxStandard": 17,
+      "msvcRuntime": "MultiThreadedDLL",
+      "worker": {
+        "buildId": "aila-0.2.0-abi1-98cc037f865a4f9cc3ff5d1f88a764f73a2fdf12",
+        "buildInfo": "E:\\RiderProjects\\Aila\\build-refactor\\build_info.json",
+        "executable": "E:\\RiderProjects\\Aila\\build-refactor\\AilaWorker.exe",
+        "executableSha256": "06e37b91d644325d7ddefa192644af9918ecc42b352ca85961fa8c55db31597c",
+        "fakeExecutable": "E:\\RiderProjects\\Aila\\build-refactor\\AilaFakeInferenceWorker.exe",
+        "fakeExecutableSha256": "533a43d600b3fd95bb6d184f994e00f385d3983479425ca11d6a971b3a5c0dd7"
+      },
+      "dependencies": {
+        "lock": "E:\\RiderProjects\\Aila\\build-refactor-server-deps\\dependency-lock.json",
+        "lockSha256": "80f8bd3603c4c702666cdfcda70b2e1ffc4f193224b4e5ba0364c985cb9bdc25",
+        "prefix": "E:\\RiderProjects\\Aila\\build-refactor-server-deps\\prefix",
+        "vcpkgPrefix": "E:\\RiderProjects\\Aila\\build-refactor-server-deps\\vcpkg_installed\\x64-windows-static-md"
+      }
+    },
+    "validation": {
+      "cpuAbiPassed": 18,
+      "cpuAbiSkipped": [
+        "AilaInferenceCApiGpuTests"
+      ],
+      "serverPassed": 4,
+      "failed": 0,
+      "performanceRepeatedAfterCommit": false
+    }
+  },
+  "scope": "Two fixed-work A/B and B/A screening pairs on this model/stack. No general stability, decode acceleration, or broader context claim."
+}
