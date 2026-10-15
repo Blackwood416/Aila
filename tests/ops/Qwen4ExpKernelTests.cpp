@@ -5106,6 +5106,196 @@ void run_qsa_route_cost_probe(Context& ctx) {
     }
 }
 
+// R1 decode-attention K/V re-read bench (2026-10-15, role K3). Times the
+// production decode-attention entry point (ops::attention_decode_rows, which
+// dispatches to the D=256 exact-partial-merge kernels at these lengths) on the
+// audit shape Hq24/Hkv2/D256/bf16 KV for lengths {4096, 8192, 14336} and rows
+// {1, 2}. Both rows read one shared K/V cache image, which is the retained
+// pair-arm semantics; the per-row K/V traffic -- not the per-session
+// footprint -- is the quantity under test. Emits one parseable
+// [DECODE ATTN COST] JSON row per (length, rows) with warm_ms and per-row
+// microsecond median/min/max, so a K/V-sharing phase-1 kernel can be A/B'd
+// against the pre-change binary (adoption gate: >= 2x on median_us_per_row).
+// Every GPU phase prints a flushed [DECODE ATTN] breadcrumb before it runs
+// (same hardening as the QSA probe) so a stall names its stage instead of
+// looking like a silent exit.
+void run_decode_attn_bench(Context& ctx) {
+    std::cout << std::unitbuf;
+    struct TerminateGuard {
+        std::terminate_handler previous = std::get_terminate();
+        TerminateGuard() {
+            std::set_terminate([] {
+                std::cout << "[DECODE ATTN TERMINATE] unhandled termination inside the decode-attn bench; "
+                             "last [DECODE ATTN] breadcrumb above names the stalled stage\n";
+                std::abort();
+            });
+        }
+        ~TerminateGuard() { std::set_terminate(previous); }
+    } terminate_guard;
+
+    constexpr int heads = 24;
+    constexpr int kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int tile = 128;
+    constexpr int partial_stride = 272;
+    constexpr int max_len = 14336;
+    constexpr int max_rows = 2;
+    constexpr int reps = 20;
+    const int max_tiles = (max_len + tile - 1) / tile;
+    const int q_row_stride = heads * head_dim;
+    const int row_bytes = q_row_stride * static_cast<int>(sizeof(bf16));
+
+    const char* stage = "host_fill";
+    int length = 0;
+    int rows_now = 0;
+    try {
+        std::cout << "[DECODE ATTN] stage=host_fill lengths=4096,8192,14336 heads=24 kv_heads=2 "
+                     "head_dim=256 dtype=bf16 rows=1,2 reps=" << reps << " seed=20261015 shared_kv_cache=1\n";
+        std::mt19937 rng(20261015);
+        std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+        std::vector<bf16> q_h(static_cast<size_t>(max_rows) * q_row_stride);
+        std::vector<bf16> k_h(static_cast<size_t>(kv_heads) * max_len * head_dim);
+        std::vector<bf16> v_h(k_h.size());
+        for (auto* values : {&q_h, &k_h, &v_h})
+            for (auto& x : *values) x = bf16(dist(rng));
+        // Row 1 is an exact copy of row 0, so the rows=2 arm is a duplicate
+        // row: any row-mapping bug shows up as a bitwise mismatch, not as a
+        // timing artifact.
+        for (int i = 0; i < q_row_stride; ++i) q_h[q_row_stride + i] = q_h[i];
+        std::cout << "[DECODE ATTN] stage=host_fill_done\n";
+
+        stage = "allocate";
+        Tensor q = Tensor::allocate(ctx, {max_rows, q_row_stride}, dnnl::memory::data_type::bf16);
+        Tensor k = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor v = Tensor::allocate(ctx, {kv_heads, max_len, head_dim}, dnnl::memory::data_type::bf16);
+        Tensor out = Tensor::allocate(ctx, {max_rows, q_row_stride}, dnnl::memory::data_type::bf16);
+        Tensor scores = Tensor::allocate(ctx, {heads, max_len}, dnnl::memory::data_type::f32);
+        // [row, head, tile, stride] so the multi-row dispatcher takes its
+        // private-partials-region path for rows=2, while the per-row path
+        // slices a 3-D region out of the same buffer for rows=1.
+        Tensor partials = Tensor::allocate(ctx, {max_rows, heads, max_tiles, partial_stride},
+                                           dnnl::memory::data_type::f32);
+        const auto live = ctx.device_allocation_count();
+        std::cout << "[DECODE ATTN] stage=allocate_done partials_bytes="
+                  << partials.numel() * static_cast<int>(sizeof(float)) << "\n";
+
+        stage = "upload";
+        ctx.memcpy_h2d(q.data(), q_h.data(), q_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k.data(), k_h.data(), k_h.size() * sizeof(bf16));
+        ctx.memcpy_h2d(v.data(), v_h.data(), v_h.size() * sizeof(bf16));
+        ctx.synchronize();
+        std::cout << "[DECODE ATTN] stage=upload_done\n";
+
+        auto now = [] { return std::chrono::steady_clock::now(); };
+        auto elapsed_ms = [&](std::chrono::steady_clock::time_point t0) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+
+        ops::DecodeRowGeometry rows[max_rows];
+        auto run_rows = [&](int cached_len, int row_count) {
+            for (int r = 0; r < row_count; ++r) {
+                rows[r].k_cache = &k;
+                rows[r].v_cache = &v;
+                rows[r].cached_len = cached_len;
+            }
+            ops::attention_decode_rows(ctx, q, q_row_stride, out, scores, rows, row_count,
+                                       heads, kv_heads, head_dim, cached_len, &partials);
+        };
+
+        // CPU f64 reference over two heads (0 and 12, one per kv head) plus
+        // finite checks over every output. This is a coarse garbage guard; the
+        // strict bit-equality evidence stays with the pair and rows suites.
+        auto verify_output = [&](int cached_len) {
+            stage = "verify";
+            std::cout << "[DECODE ATTN] stage=verify length=" << cached_len << " rows=" << rows_now << "\n";
+            ctx.synchronize();
+            std::vector<bf16> got(out.numel());
+            ctx.memcpy_d2h(got.data(), out.data(), got.size() * sizeof(bf16));
+            for (auto x : got)
+                if (!std::isfinite(static_cast<float>(x)))
+                    throw std::runtime_error("decode-attn bench: non-finite attention output at length " +
+                                             std::to_string(cached_len));
+            if (rows_now == 2 &&
+                std::memcmp(got.data(), got.data() + q_row_stride, static_cast<size_t>(row_bytes)) != 0)
+                throw std::runtime_error("decode-attn bench: duplicate rows differ at length " +
+                                         std::to_string(cached_len));
+            double max_err = 0.0;
+            for (int h : {0, 12}) {
+                const int kv = h / (heads / kv_heads);
+                std::vector<double> logits(cached_len);
+                double mx = -1e100, sum = 0.0;
+                for (int t = 0; t < cached_len; ++t) {
+                    double dot = 0.0;
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += double(q_h[h * head_dim + d]) *
+                               double(k_h[(size_t(kv) * max_len + t) * head_dim + d]);
+                    logits[t] = dot / 16.0;
+                    mx = std::max(mx, logits[t]);
+                }
+                for (auto& x : logits) { x = std::exp(x - mx); sum += x; }
+                for (int d = 0; d < head_dim; ++d) {
+                    double value = 0.0;
+                    for (int t = 0; t < cached_len; ++t)
+                        value += logits[t] * double(v_h[(size_t(kv) * max_len + t) * head_dim + d]);
+                    max_err = std::max(max_err, std::abs(double(got[h * head_dim + d]) - value / sum));
+                }
+            }
+            if (max_err > 2e-4)
+                throw std::runtime_error("decode-attn bench: CPU f64 reference mismatch at length " +
+                                         std::to_string(cached_len) + " max_abs=" + std::to_string(max_err));
+            std::cout << "[DECODE ATTN CHECK] length=" << cached_len << " rows=" << rows_now
+                      << " max_abs=" << max_err << " reference_heads=2 duplicate_rows="
+                      << (rows_now == 2 ? 1 : 0) << "\n";
+        };
+
+        for (int cached_len : {4096, 8192, 14336}) {
+            length = cached_len;
+            for (int row_count : {1, 2}) {
+                rows_now = row_count;
+                stage = "warm";
+                std::cout << "[DECODE ATTN] stage=warm length=" << cached_len << " rows=" << row_count << "\n";
+                const auto t_warm = now();
+                for (int i = 0; i < 3; ++i) run_rows(cached_len, row_count);
+                ctx.synchronize();
+                const double warm_ms = elapsed_ms(t_warm);
+                std::cout << "[DECODE ATTN] stage=warm_done length=" << cached_len << " rows=" << row_count
+                          << " warm_ms=" << warm_ms << "\n";
+                verify_output(cached_len);
+
+                stage = "measure";
+                std::vector<double> us_per_row;
+                us_per_row.reserve(reps);
+                for (int i = 0; i < reps; ++i) {
+                    const auto t0 = now();
+                    run_rows(cached_len, row_count);
+                    ctx.synchronize();
+                    us_per_row.push_back(
+                        std::chrono::duration<double, std::micro>(now() - t0).count() / row_count);
+                }
+                std::sort(us_per_row.begin(), us_per_row.end());
+                const double median_us_per_row = us_per_row[reps / 2];
+                std::cout << "[DECODE ATTN COST] {\"length\":" << cached_len
+                          << ",\"rows\":" << row_count
+                          << ",\"reps\":" << reps
+                          << ",\"hq\":24,\"hkv\":2,\"head_dim\":256,\"dtype\":\"bf16\""
+                          << ",\"warm_ms\":" << warm_ms
+                          << ",\"median_ms_total\":" << median_us_per_row * row_count / 1000.0
+                          << ",\"median_us_per_row\":" << median_us_per_row
+                          << ",\"min_us_per_row\":" << us_per_row.front()
+                          << ",\"max_us_per_row\":" << us_per_row.back()
+                          << "}\n";
+            }
+        }
+        if (ctx.device_allocation_count() != live)
+            throw std::runtime_error("decode-attn bench: live USM changed during the run");
+        std::cout << "[DECODE ATTN END] lengths=3 rows=2 reps=" << reps << " model_free=1\n";
+    } catch (const std::exception& e) {
+        std::cout << "[DECODE ATTN FAIL] stage=" << stage << " length=" << length
+                  << " rows=" << rows_now << " what=" << e.what() << "\n";
+        throw;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -5201,6 +5391,13 @@ int main(int argc, char** argv) {
             ctx.synchronize(); ctx.release_execution_resources();
             if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("QSA probe teardown USM leak");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--decode-attn-bench") {
+            run_decode_attn_bench(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if(ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Decode attention bench teardown USM leak");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--w4a8-only") {
