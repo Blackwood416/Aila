@@ -11,6 +11,7 @@
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #endif
 
 namespace {
@@ -42,6 +43,32 @@ void prefetch_source_range(const uint8_t* base, size_t bytes, size_t chunk_bytes
 }
 #else
 void prefetch_source_range(const uint8_t*, size_t, size_t) {}
+#endif
+
+#ifdef _WIN32
+// R1 round 3 trim audit (AILA_Q4E_LOAD_TIMING only): read the process working
+// set, private commit and cumulative page-fault count. Read-only observation;
+// the default path never calls this. `valid == false` means the query failed
+// and the zeroed fields are printed as-is.
+struct ProcessMemorySample {
+    double working_set_mib = 0.0;
+    double private_mib = 0.0;
+    unsigned long page_faults = 0;
+    bool valid = false;
+};
+ProcessMemorySample sample_process_memory() {
+    ProcessMemorySample sample;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        sample.working_set_mib = double(counters.WorkingSetSize) / 1048576.0;
+        sample.private_mib = double(counters.PrivateUsage) / 1048576.0;
+        sample.page_faults = counters.PageFaultCount;
+        sample.valid = true;
+    }
+    return sample;
+}
 #endif
 } // namespace
 
@@ -198,6 +225,19 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
                                         const Bnb4BitHostWeightRef& dn) {
     if (!IsAllocated() || layer<0 || layer>=config_.num_layers)
         throw std::invalid_argument("Qwen4Exp arena layer is not allocated");
+    // R1 round 3 (see docs/plans/qwen38-r1-startup-arena-2026-10-15.md section
+    // 7): gate for the per-layer process-wide working-set trim. Default 1 keeps
+    // the historical 2026-10-08 behaviour (consumed mmap source pages become
+    // reclaimable after every layer); =0 skips the syscall so the audit can
+    // measure what the trim actually buys. The audit sampling below is read
+    // only and runs exclusively under AILA_Q4E_LOAD_TIMING.
+#ifdef _WIN32
+    static const bool s_working_set_trim =
+        aila::env::read_flag("AILA_Q4E_ARENA_WORKING_SET_TRIM", true);
+    static const bool s_trim_audit = aila::env::read_flag("AILA_Q4E_LOAD_TIMING", false);
+    ProcessMemorySample layer_entry_sample;
+    if (s_trim_audit) layer_entry_sample = sample_process_memory();
+#endif
     const size_t experts=config_.num_experts_per_layer;
     auto check=[&](const Bnb4BitHostWeightRef& r,size_t packed,size_t codes) {
         if (!r.packed_weight.valid() || r.packed_weight.bytes!=experts*packed ||
@@ -245,14 +285,29 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
         // The layer loop is serial (fill threads have joined above), so plain
         // statics are enough for this opt-in diagnostic.
         static double s_ram_copy_ms = 0.0;
+        static std::vector<double> s_fill_ms_by_layer;
         static int s_layers = 0;
-        s_ram_copy_ms +=
+        const double fill_ms =
             std::chrono::duration<double, std::milli>(ram_copy_done - copy_t0).count();
+        s_ram_copy_ms += fill_ms;
+        s_fill_ms_by_layer.push_back(fill_ms);
         ++s_layers;
         if (s_layers == config_.num_layers) {
             AILA_LOG_WARN("[Q4E LoadTiming] arena RAM copies: %.1f s total (%.1f ms/layer)",
                           s_ram_copy_ms / 1000.0,
                           s_ram_copy_ms / std::max(1, s_layers));
+            // R1 round 3: compact per-layer fill list so the trim audit can
+            // pair "trim at layer L" with "fill of layer L+1" (the fill right
+            // after that layer's trim) without extra log lines. %zu=layer.
+            std::string per_layer;
+            per_layer.reserve(size_t(config_.num_layers) * 12);
+            for (size_t i = 0; i < s_fill_ms_by_layer.size(); ++i) {
+                char cell[32];
+                std::snprintf(cell, sizeof(cell), "%s%zu=%.0f", i ? " " : "", i,
+                              s_fill_ms_by_layer[i]);
+                per_layer += cell;
+            }
+            AILA_LOG_WARN("[Q4E LoadTiming] fill ms/layer: %s", per_layer.c_str());
         }
     }
     // R1 round 2 residual attribution (AILA_Q4E_LOAD_TIMING only): split the
@@ -324,10 +379,18 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
 #ifdef _WIN32
     // Release consumed mmap source pages after each layer, before they compete
     // with the next layer. Native large pages are outside this working set.
+    // R1 round 3: gated by AILA_Q4E_ARENA_WORKING_SET_TRIM (default 1 = the
+    // 2026-10-08 behaviour); the samples around the trim point are the audit
+    // evidence and are only taken under AILA_Q4E_LOAD_TIMING.
+    ProcessMemorySample trim_before, trim_after;
+    if (s_trim_audit) trim_before = sample_process_memory();
     const auto trim_t0 = mark();
-    SetProcessWorkingSetSize(GetCurrentProcess(),SIZE_T(-1),SIZE_T(-1));
+    if (s_working_set_trim) {
+        SetProcessWorkingSetSize(GetCurrentProcess(),SIZE_T(-1),SIZE_T(-1));
+    }
     if (s_residual_timing) {
         trim_ms += std::chrono::duration<double, std::milli>(mark() - trim_t0).count();
+        trim_after = sample_process_memory();
     }
 #endif
     if (s_residual_timing) {
@@ -335,6 +398,11 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
         static double s_stage_wait_ms = 0.0, s_stage_memcpy_ms = 0.0, s_stage_enqueue_ms = 0.0;
         static double s_nested_ms = 0.0, s_drain_ms = 0.0, s_trim_ms = 0.0;
         static size_t s_stage_experts = 0, s_timing_layers = 0;
+#ifdef _WIN32
+        static double s_ws_before_mib = 0.0, s_ws_after_mib = 0.0;
+        static double s_ws_drop_min_mib = 1e18, s_ws_drop_max_mib = 0.0;
+        static double s_private_after_mib = 0.0, s_layer_faults = 0.0;
+#endif
         s_stage_wait_ms += stage_wait_ms;
         s_stage_memcpy_ms += stage_memcpy_ms;
         s_stage_enqueue_ms += stage_enqueue_ms;
@@ -342,12 +410,38 @@ void Qwen4ExpHostArena::LoadLayerDirect(int layer, const Bnb4BitHostWeightRef& g
         s_drain_ms += drain_ms;
         s_trim_ms += trim_ms;
         s_stage_experts += stage_experts;
+#ifdef _WIN32
+        s_ws_before_mib += trim_before.working_set_mib;
+        s_ws_after_mib += trim_after.working_set_mib;
+        s_private_after_mib += trim_after.private_mib;
+        const double ws_drop_mib = trim_before.working_set_mib - trim_after.working_set_mib;
+        s_ws_drop_min_mib = std::min(s_ws_drop_min_mib, ws_drop_mib);
+        s_ws_drop_max_mib = std::max(s_ws_drop_max_mib, ws_drop_mib);
+        // Page faults paid across this layer's fill + staging window (entry
+        // sample to the trim point), not just the trim syscall itself.
+        s_layer_faults += double(trim_after.page_faults - layer_entry_sample.page_faults);
+#endif
         ++s_timing_layers;
         if (s_timing_layers == static_cast<size_t>(config_.num_layers)) {
             AILA_LOG_WARN("[Q4E LoadTiming] arena residual split: stage memcpy %.1f s, stage wait %.1f s, stage enqueue %.1f s (%zu experts), nested+device %.1f s, device drain %.1f s, working-set trim %.1f s",
                           s_stage_memcpy_ms / 1000.0, s_stage_wait_ms / 1000.0,
                           s_stage_enqueue_ms / 1000.0, s_stage_experts,
                           s_nested_ms / 1000.0, s_drain_ms / 1000.0, s_trim_ms / 1000.0);
+#ifdef _WIN32
+            // R1 round 3 trim audit: what the per-layer trim reclaimed (ws_drop
+            // = before - after), the residual process working set and private
+            // commit after it, and the page-fault rate this layer paid. With
+            // AILA_Q4E_ARENA_WORKING_SET_TRIM=0 the same samples are printed,
+            // so the two arms can be compared field by field.
+            AILA_LOG_WARN("[Q4E LoadTiming] trim audit: trim_on=%d layers=%zu ws_before_avg=%.0f MiB ws_after_avg=%.0f MiB ws_drop_avg=%.0f MiB drop_min=%.0f MiB drop_max=%.0f MiB private_after_avg=%.0f MiB faults_avg=%.0f",
+                          s_working_set_trim ? 1 : 0, s_timing_layers,
+                          s_ws_before_mib / double(s_timing_layers),
+                          s_ws_after_mib / double(s_timing_layers),
+                          (s_ws_before_mib - s_ws_after_mib) / double(s_timing_layers),
+                          s_ws_drop_min_mib, s_ws_drop_max_mib,
+                          s_private_after_mib / double(s_timing_layers),
+                          s_layer_faults / double(s_timing_layers));
+#endif
         }
     }
 }
@@ -388,6 +482,13 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
         // 64 entries per PrefetchVirtualMemory call stays fixed (API limit).
         static const size_t s_prefetch_chunk_bytes = static_cast<size_t>(std::clamp(
             aila::env::read_int("AILA_Q4E_HOST_ARENA_PREFETCH_CHUNK_KB", 1024), 64, 16384)) * 1024;
+        // R1 round 3 variant (opt-in, default 1 keeps 58f7874 byte-identical):
+        // hint-window depth. 1 = the round-2 schedule (one helper reading layer
+        // L+1 while layer L is filled); 2 = two helper slots so L+1 and L+2 are
+        // both being read during layer L. Values <= 1 or unset keep the
+        // historical single-slot path; read_int maps 0 to the default.
+        static const int s_prefetch_lookahead = std::clamp(
+            aila::env::read_int("AILA_Q4E_HOST_ARENA_PREFETCH_LOOKAHEAD", 1), 1, 2);
         const bool async_prefetch =
             s_prefetch_async && s_host_arena_prefetch && s_read_threads == 0;
         const auto& shard_paths = weights.shard_paths();
@@ -451,27 +552,34 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             load(prefix+"gate_up_proj",gu,config_.hidden_size);
             load(prefix+"down_proj",dn,config_.moe_intermediate_size);
         };
-        std::thread pf_thread;
+        // Two hint slots exist so the opt-in lookahead=2 window can keep two
+        // layers in flight; with the default lookahead=1 only pf_thread is
+        // ever used and the call sequence matches 58f7874 exactly.
+        std::thread pf_thread, pf_thread2;
         Bnb4BitHostWeightRef pf_gu{}, pf_dn{};
+        int pf_target = -1, pf_target2 = -1; // layer each slot is reading
+        int pf_next_target = 1;              // next layer needing a hint
         // Exception-safe: a joinable helper must never reach ~thread.
         struct PfThreadGuard {
             std::thread& thread;
-            ~PfThreadGuard() { if (thread.joinable()) thread.join(); }
-        } pf_guard{pf_thread};
+            std::thread& thread2;
+            ~PfThreadGuard() {
+                if (thread.joinable()) thread.join();
+                if (thread2.joinable()) thread2.join();
+            }
+        } pf_guard{pf_thread, pf_thread2};
         double pf_inline_ms = 0.0, pf_issue_ms = 0.0, pf_join_ms = 0.0;
-        // Leftover wait for the lookahead issued during the previous layer.
-        // In sync mode this is always a no-op.
-        auto pf_join = [&]() {
-            if (!pf_thread.joinable()) return;
+        auto pf_join_thread = [&](std::thread& thread) {
+            if (!thread.joinable()) return;
             const auto join_t0 = load_timing ? std::chrono::steady_clock::now()
                                              : std::chrono::steady_clock::time_point{};
-            pf_thread.join();
+            thread.join();
             if (load_timing) {
                 pf_join_ms += std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - join_t0).count();
             }
         };
-        auto pf_launch = [&](const Bnb4BitHostWeightRef& gu_ref,
+        auto pf_launch = [&](std::thread& thread, const Bnb4BitHostWeightRef& gu_ref,
                              const Bnb4BitHostWeightRef& dn_ref) {
             const uint8_t* p0=gu_ref.packed_weight.ptr; const size_t n0=gu_ref.packed_weight.bytes;
             const uint8_t* p1=gu_ref.absmax.ptr;        const size_t n1=gu_ref.absmax.bytes;
@@ -480,7 +588,7 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             const size_t chunk=s_prefetch_chunk_bytes;
             const auto issue_t0 = load_timing ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
-            pf_thread=std::thread([p0,n0,p1,n1,p2,n2,p3,n3,chunk]{
+            thread=std::thread([p0,n0,p1,n1,p2,n2,p3,n3,chunk]{
                 prefetch_source_range(p0,n0,chunk);
                 prefetch_source_range(p1,n1,chunk);
                 prefetch_source_range(p2,n2,chunk);
@@ -497,8 +605,11 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             resolve_layer_refs(layer,gu,dn);
             const auto ref_done = std::chrono::steady_clock::now();
             // Close the lookahead window opened during the previous layer
-            // before this layer's sources are consumed. No-op in sync mode.
-            pf_join();
+            // before this layer's sources are consumed. Depth 1 has exactly
+            // one pending slot (historical behaviour); depth 2 keeps the other
+            // slot reading the next layer. No-op in sync mode.
+            if (pf_target == layer) { pf_join_thread(pf_thread); pf_target = -1; }
+            if (pf_target2 == layer) { pf_join_thread(pf_thread2); pf_target2 = -1; }
             Bnb4BitHostWeightRef gu_src = gu;
             Bnb4BitHostWeightRef dn_src = dn;
             // True while gu_src/dn_src still point at the SafeTensors mmap
@@ -593,12 +704,28 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
                             std::chrono::steady_clock::now() - pfv_t0).count();
                     }
                 }
-                // Queue layer L+1's hint on the helper thread; it runs during
-                // this layer's copies/staging and is joined at the top of the
-                // next iteration (pf_join above).
-                if (layer + 1 < config_.num_layers && mmap_sources) {
-                    resolve_layer_refs(layer + 1, pf_gu, pf_dn);
-                    pf_launch(pf_gu, pf_dn);
+                // Queue the L+1 (and, at lookahead 2, L+2) hint on the helper
+                // slots; each runs during the layers before its target and is
+                // joined at the top of the target layer's iteration. Depth 1
+                // launches exactly the historical single target; depth 2 keeps
+                // L+1..L+2 in flight on the two slots.
+                if (mmap_sources) {
+                    const int window_end = std::min(config_.num_layers - 1,
+                                                    layer + s_prefetch_lookahead);
+                    while (pf_next_target <= window_end) {
+                        if (pf_target < 0) {
+                            resolve_layer_refs(pf_next_target, pf_gu, pf_dn);
+                            pf_launch(pf_thread, pf_gu, pf_dn);
+                            pf_target = pf_next_target;
+                        } else if (pf_target2 < 0) {
+                            resolve_layer_refs(pf_next_target, pf_gu, pf_dn);
+                            pf_launch(pf_thread2, pf_gu, pf_dn);
+                            pf_target2 = pf_next_target;
+                        } else {
+                            break;
+                        }
+                        ++pf_next_target;
+                    }
                 }
             }
             // C7 deep dive: the RAM copies run at ~0.43 GB/s because every
@@ -659,11 +786,14 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
                               std::chrono::duration<double>(now - ref_done).count());
             }
         }
-        pf_join(); // no lookahead is pending after the last layer; symmetric guard
+        // No lookahead is pending after the last layer; symmetric guard.
+        pf_join_thread(pf_thread);
+        pf_join_thread(pf_thread2);
         if (load_timing && async_prefetch) {
-            AILA_LOG_WARN("[Q4E LoadTiming] host arena prefetch (PFV async chunk %zu KiB): inline %.1f s, issue %.1f s, join %.1f s total",
+            AILA_LOG_WARN("[Q4E LoadTiming] host arena prefetch (PFV async chunk %zu KiB): inline %.1f s, issue %.1f s, join %.1f s total, lookahead %d",
                           s_prefetch_chunk_bytes / 1024, pf_inline_ms / 1000.0,
-                          pf_issue_ms / 1000.0, pf_join_ms / 1000.0);
+                          pf_issue_ms / 1000.0, pf_join_ms / 1000.0,
+                          s_prefetch_lookahead);
         }
         Queue().wait_and_throw();
         initial_gpu_owners_.clear(); // no runtime file-reader or mmap fallback

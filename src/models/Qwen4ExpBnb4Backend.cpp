@@ -208,6 +208,20 @@ void dump_hidden_row(Context& ctx, const std::string& path, const Tensor& hidden
 
 } // namespace
 
+// D1 (opt-in, default off): decode layer-boundary experiments.
+// The adaptive decode CPU cold route can be classified and started as soon as
+// the router wait returns (instead of inside RunResidentDecode below), giving
+// the CPU worker the shared-expert submission block as extra lead time. The
+// stash is written in Forward and consumed once by RunResidentDecode for the
+// same layer; any mismatch fails closed instead of silently changing rows.
+namespace {
+static thread_local int d1_stash_layer = -1;
+static thread_local int d1_stash_cpu_count = -1;
+static thread_local bool d1_stash_valid = false;
+static thread_local std::array<int, 16> d1_stash_ids{};
+static thread_local std::array<int, 16> d1_stash_ranks{};
+}  // namespace
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -1291,8 +1305,23 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
             // Native CPU sources remain owned until Join below. CPU work can
             // overlap the already submitted shared expert and resident kernels.
-            const int cpu_count=count==1 && expert_executor_.cpu_overlap_enabled()
-                ? expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_t) : 0;
+            if (d1_stash_valid && d1_stash_layer != layer) d1_stash_valid=false;
+            int cpu_count=0;
+            if (d1_stash_valid && d1_stash_layer == layer) {
+                // D1: the CPU batch was already started at the router wait.
+                // It must have taken exactly this miss prefix; otherwise the
+                // early classification would silently change which rows the
+                // CPU computes, so fail closed instead.
+                cpu_count = d1_stash_cpu_count;
+                if (cpu_count<0 || cpu_count>miss_count)
+                    throw std::logic_error("Qwen4Exp: early CPU route prefix out of range");
+                for (int c=0;c<cpu_count;++c)
+                    if (d1_stash_ids[c]!=miss_experts[c] || d1_stash_ranks[c]!=miss_ranks[c])
+                        throw std::logic_error("Qwen4Exp: early CPU route classification changed");
+                d1_stash_valid=false;
+            } else if (count==1 && expert_executor_.cpu_overlap_enabled()) {
+                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_t);
+            }
             cpu_work.active=cpu_count>0;
             const int gpu_cold_count=miss_count-cpu_count;
             StagingBatch staging{};
@@ -2022,6 +2051,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_front_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
     static const bool s_cpu_early_start = aila::env::read_flag("AILA_Q4E_CPU_EARLY_START", false);
     static const bool s_cpu_async_route = aila::env::read_flag("AILA_Q4E_CPU_ASYNC_ROUTE", false);
+    // D1 layer-boundary experiments (see the file-scope stash above).
+    static const bool s_cpu_route_early = aila::env::read_flag("AILA_Q4E_CPU_ROUTE_EARLY", false);
+    static const bool s_stagein_hoist = aila::env::read_flag("AILA_Q4E_STAGEIN_HOIST", false);
     static const int s_hotset_swaps = aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS", 96);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
@@ -2092,6 +2124,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     };
     dev_mark(kDevMisc);  // pre-loop anchor (mark[0] is never credited)
     // ----------------------------------------------------------------------------
+
+    // D1: a stash from a previous forward call is never valid.
+    d1_stash_valid = false;
+    d1_stash_layer = -1;
+    d1_stash_cpu_count = -1;
 
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
@@ -2172,6 +2209,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         stage(kStageHc);
         dev_mark(kDevHc);
 
+        // D1 (opt-in): submit the resident-input D2H for the adaptive decode
+        // row right after the MLP-HC kernels, ahead of the lease/branch setup
+        // below. The copy only depends on the in-order queue position after
+        // those kernels, so the bytes and the executor state machine are
+        // unchanged; it just enters the queue earlier.
+        const bool stagein_hoisted = s_stagein_hoist && use_adaptive_pipeline_ && count == 1 &&
+            expert_executor_.cpu_overlap_enabled();
+        if (stagein_hoisted)
+            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+
         // 2.5. MoE Computation
         static const int s_verify_cpu_rows = aila::env::read_int("AILA_Q4E_VERIFY_CPU_ROWS", 0);
         const bool verify_cpu_rows = options.decode_verification && count <= s_verify_cpu_rows &&
@@ -2193,7 +2240,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // Place the activation copy ahead of the router so waiting for the
         // route also makes CPU input ready, before resident/shared GPU work.
         if (cpu_early_start || cpu_async_route || cpu_verify_async ||
-            (use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
+            (!stagein_hoisted && use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
             expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
         // Round 2: close the CPU input-staging window (lease/branch setup +
         // resident-input D2H on ctx.queue + the previous copy's host wait).
@@ -2403,6 +2450,38 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             expert_executor_.RetireAsyncResidentRoute(*resident_binding);
             early_cold.active=false;early_cold.completed=true;
         } else if (!cpu_early_start) wait_actual_route();
+        // D1 (opt-in): classify this layer's cold experts and start the CPU
+        // batch here, right after the route is known, instead of inside
+        // RunResidentDecode below. adaptive_cache_.ObserveRouting (called
+        // there) only updates usage counters, so the slot classification is
+        // identical; RunResidentDecode re-derives the same arrays and fails
+        // closed if they ever disagree.
+        if (s_cpu_route_early && use_adaptive_pipeline_ && count == 1 && !is_prefill &&
+            !options.decode_verification && !decodeHcReferenceForTest_ &&
+            cfg_.num_experts_per_tok <= 16 && expert_executor_.cpu_overlap_enabled() &&
+            adaptive_cache_.IsAllocated() && host_arena_.NumLayers() > 0) {
+            int miss_n = 0;
+            std::array<int, 16> miss_ids{}, miss_ranks{};
+            for (int k = 0; k < top_k; ++k) {
+                const int e = router_host_ids_[k];
+                if (adaptive_cache_.GetSlot(L, e) < 0) {
+                    miss_ids[miss_n] = e;
+                    miss_ranks[miss_n] = k;
+                    ++miss_n;
+                }
+            }
+            int cpu_n = 0;
+            if (miss_n > 0)
+                cpu_n = expert_executor_.StartArenaCold(host_arena_, L, miss_ids.data(),
+                    miss_ranks.data(), miss_n, buf_.x.data_as<bf16>());
+            d1_stash_layer = L;
+            d1_stash_cpu_count = cpu_n;
+            for (int c = 0; c < cpu_n; ++c) {
+                d1_stash_ids[c] = miss_ids[c];
+                d1_stash_ranks[c] = miss_ranks[c];
+            }
+            d1_stash_valid = true;
+        }
         if (!use_adaptive_pipeline_ && have_pred && s_predict_stats && count == 1) {
             for (int k = 0; k < top_k; ++k) {
                 const int e = router_host_ids_[k];
