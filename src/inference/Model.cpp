@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -34,12 +35,34 @@ using aila::diagnostics::ExecutionTrace;
 
 namespace detail {
 
+// Worker-path device queue. Profiling is opt-in and independent of the decode
+// stage-event gate: Qwen4ExpBnb4Backend can only read command_start/command_end
+// when the queue carries sycl::property::queue::enable_profiling, so the
+// enabler lives here and the default stays the plain in-order queue.
+Context MakeDeviceContext(ExecutionTrace* trace) {
+    static const bool s_queue_profiling =
+        aila::env::read_flag("AILA_Q4E_DEVICE_QUEUE_PROFILING", false);
+    if (!s_queue_profiling) return Context(trace);
+    try {
+        return Context(trace, true);
+    } catch (const std::exception& error) {
+        // Some backends reject the property at queue creation; keep the plain
+        // in-order queue instead of failing the model load (warn once).
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            AILA_LOG_WARN("[Q4E QueueProfiling] enable_profiling rejected (%s); "
+                          "falling back to the default in-order queue", error.what());
+        }
+        return Context(trace);
+    }
+}
+
 struct DeviceState {
     // First member dies last: trace_close follows native queue/stream teardown.
     std::unique_ptr<ExecutionTrace> trace = ExecutionTrace::FromEnvironment();
-    // Device-side stage timing (AILA_Q4E_DECODE_STAGE_EVENTS) needs a
-    // profiling-enabled queue; the worker otherwise runs without profiling.
-    Context context{trace.get(), aila::env::read_flag("AILA_Q4E_DECODE_STAGE_EVENTS", false)};
+    // Device spans need the opt-in profiling queue; see MakeDeviceContext.
+    Context context{MakeDeviceContext(trace.get())};
     mutable std::mutex mutex;
     RuntimeFaultRecord fault;
     size_t loadedModels = 0;
