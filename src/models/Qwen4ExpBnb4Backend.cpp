@@ -2074,8 +2074,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
         }
     }
+    // Round 2 (R1 C2): kDevMisc is kept as the "unclassified" slot but no
+    // marker credits it anymore; the former misc markers now land in
+    // kDevInter (layer boundary), kDevPle (PLE block) and kDevPreRouter
+    // (post StageResidentInput flag tail). kDevStageIn splits the
+    // MLP-HC -> pre-router window at the resident-input handoff.
+    // misc_dev_ms must print ~0: non-zero means a marker lost its bucket.
     enum { kDevMisc, kDevHc, kDevLinear, kDevFull, kDevRouter, kDevShared,
-           kDevExperts, kDevResid, kDevHead, kDevCount };
+           kDevExperts, kDevResid, kDevHead,
+           kDevInter, kDevPle, kDevStageIn, kDevPreRouter, kDevCount };
     double dev_ms[kDevCount] = {};
     struct DevMark { sycl::event ev; int bucket; };
     std::vector<DevMark> dev_marks;
@@ -2083,13 +2090,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (!dev_trace) return;
         dev_marks.push_back(DevMark{ctx.queue().ext_oneapi_submit_barrier(), bucket});
     };
-    dev_mark(kDevMisc);
+    dev_mark(kDevMisc);  // pre-loop anchor (mark[0] is never credited)
     // ----------------------------------------------------------------------------
 
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
+        // Round 2: layer boundary = queue idle from the previous layer's last
+        // marker through this loop header (dump checks, host bookkeeping).
+        dev_mark(kDevInter);
 
         // 2.0. PLE on Layer 1 (Epilogue Residual Fused via P0 PleTicket)
         if (L == 1) {
@@ -2107,7 +2117,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         stage(kStagePle);
-        dev_mark(kDevMisc);
+        // Round 2: PLE-only window (pending_mlp.Materialize + ple prepare/
+        // consume at L==1; ~empty on the other 47 layers).
+        dev_mark(kDevPle);
 
         // 2.1. Attn Hyper-Connection
         if (verification_hidden_in_for_test_ &&
@@ -2183,6 +2195,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (cpu_early_start || cpu_async_route || cpu_verify_async ||
             (use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
             expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+        // Round 2: close the CPU input-staging window (lease/branch setup +
+        // resident-input D2H on ctx.queue + the previous copy's host wait).
+        dev_mark(kDevStageIn);
         const bool gpu_nf4_q8 = resident_epoch && gpuNf4Q8Supported_ && !gpuNf4Q8ReferenceForTest_ &&
             !decodeHcReferenceForTest_ && count == 1 && !is_prefill && resident_decode_mode_ == 2;
         const bool moe_front_fused = s_moe_front_fused && s_front_native_gemv && moeFrontFusedGpu_ &&
@@ -2191,7 +2206,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             layer.router_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.shared_expert_gate_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.router_w->numel() == int64_t(512) * hidden_size_ && layer.shared_expert_gate_w->numel() == hidden_size_;
-        dev_mark(kDevMisc);
+        dev_mark(kDevPreRouter);
         const auto t_moe_front = hsplit_begin();
         if (moe_front_fused) {
             ops::bf16_moe_front_fused(ctx, layer.router_w->data_as<bf16>(), layer.shared_expert_gate_w->data_as<bf16>(),
@@ -2607,7 +2622,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             "moe_front_ms=%.3f topk_submit_ms=%.3f shared_submit_ms=%.3f shared_add_ms=%.3f hc_inject_ms=%.3f "
             "router_other_ms=%.3f shared_other_ms=%.3f tail_ms=%.3f dev_events=%d "
             "misc_dev_ms=%.3f hc_dev_ms=%.3f linear_dev_ms=%.3f full_dev_ms=%.3f router_dev_ms=%.3f "
-            "shared_dev_ms=%.3f experts_dev_ms=%.3f resid_dev_ms=%.3f head_dev_ms=%.3f",
+            "shared_dev_ms=%.3f experts_dev_ms=%.3f resid_dev_ms=%.3f head_dev_ms=%.3f "
+            "inter_dev_ms=%.3f ple_dev_ms=%.3f stagein_dev_ms=%.3f prerouter_dev_ms=%.3f",
             start_pos,count,int(reuse_ple),submitted_ms_now,prof_router_sync_ms,
             stage_ms[kStagePle],stage_ms[kStageHc],stage_ms[kStageLinearAttn],stage_ms[kStageFullAttn],
             stage_ms[kStageExperts],stage_ms[kStageHead],
@@ -2624,7 +2640,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             host_moe_front_ms, host_topk_submit_ms, host_shared_submit_ms, host_shared_add_ms, host_hc_inject_ms,
             router_other_ms, shared_other_ms, submitted_ms_now - stage_sum_ms, int(dev_trace),
             dev_ms[kDevMisc], dev_ms[kDevHc], dev_ms[kDevLinear], dev_ms[kDevFull], dev_ms[kDevRouter],
-            dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead]);
+            dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead],
+            dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter]);
     }
     if (!use_adaptive_pipeline_ && s_work_summary) {
         const auto& supply = expert_cache_.stats();
