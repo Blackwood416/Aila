@@ -13,6 +13,36 @@
 #include <windows.h>
 #endif
 
+namespace {
+#ifdef _WIN32
+// F1-style advisory prefetch (same pattern as Qwen4ExpPle::prefetch_gather_pages):
+// hand the cache manager the file-backed source ranges in bounded chunks so the
+// reads queue up with real depth instead of serializing as demand faults on a
+// single file section (C7 screen: ~0.5-0.66 GB/s regardless of fault threads).
+// PrefetchVirtualMemory accepts at most 64 entries per call. Failures are
+// ignored: the normal memcpy path still faults pages in.
+void prefetch_source_range(const uint8_t* base, size_t bytes) {
+    if (!base || !bytes) return;
+    constexpr size_t kChunkBytes = size_t(1) << 20;
+    constexpr size_t kBatch = 64;
+    WIN32_MEMORY_RANGE_ENTRY ranges[kBatch];
+    const HANDLE process = GetCurrentProcess();
+    size_t count = 0;
+    for (size_t off = 0; off < bytes; off += kChunkBytes) {
+        ranges[count].VirtualAddress = const_cast<uint8_t*>(base + off);
+        ranges[count].NumberOfBytes = std::min(kChunkBytes, bytes - off);
+        if (++count == kBatch) {
+            PrefetchVirtualMemory(process, count, ranges, 0);
+            count = 0;
+        }
+    }
+    if (count) PrefetchVirtualMemory(process, count, ranges, 0);
+}
+#else
+void prefetch_source_range(const uint8_t*, size_t) {}
+#endif
+} // namespace
+
 namespace aila {
 Qwen4ExpHostArena::~Qwen4ExpHostArena() { Release(); }
 Qwen4ExpHostArena::Qwen4ExpHostArena(Qwen4ExpHostArena&& other) noexcept { *this=std::move(other); }
@@ -281,6 +311,11 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
         // reads (116 s -> 64-83 s). Opt-in for cold starts only.
         static const int s_read_threads = std::clamp(
             aila::env::read_int("AILA_Q4E_ARENA_READ_THREADS", 0), 0, 32);
+        // F1-style advisory prefetch of the mmap source ranges (default ON).
+        // Cold starts fault ~58 GiB of file-backed pages from the fill loop;
+        // the hint is skipped whenever the explicit-read path owns the data.
+        static const bool s_host_arena_prefetch =
+            aila::env::read_flag("AILA_Q4E_HOST_ARENA_PREFETCH", true);
         const auto& shard_paths = weights.shard_paths();
         std::unique_ptr<uint8_t[]> bounce;
         size_t bounce_bytes = 0;
@@ -342,6 +377,9 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
             const auto ref_done = std::chrono::steady_clock::now();
             Bnb4BitHostWeightRef gu_src = gu;
             Bnb4BitHostWeightRef dn_src = dn;
+            // True while gu_src/dn_src still point at the SafeTensors mmap
+            // host_view (the F1 prefetch only makes sense for those pages).
+            bool mmap_sources = true;
             if (s_read_threads > 0) {
                 const size_t need = gu.packed_weight.bytes + gu.absmax.bytes +
                                     dn.packed_weight.bytes + dn.absmax.bytes;
@@ -375,13 +413,37 @@ bool Qwen4ExpHostArena::LoadFromModelWeights(const ModelWeights& weights, std::s
                         AILA_LOG_WARN("[Q4E ArenaRead] explicit read failed; falling back to mmap path");
                         read_fallback_logged = true;
                     }
-                } else if (load_timing) {
-                    static double s_read_ms = 0.0;
-                    s_read_ms += std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - ref_done).count();
+                } else {
+                    mmap_sources = false;
+                    if (load_timing) {
+                        static double s_read_ms = 0.0;
+                        s_read_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - ref_done).count();
+                        if (layer + 1 == config_.num_layers) {
+                            AILA_LOG_WARN("[Q4E LoadTiming] explicit reads: %.1f s total",
+                                          s_read_ms / 1000.0);
+                        }
+                    }
+                }
+            }
+            // F1-style advisory prefetch (default on; =0 restores the historical
+            // path). The four per-layer source ranges are contiguous mmap spans
+            // that the fill and the GPU-owned staging copies will read exactly
+            // once; queuing them up front lets the cache manager read with real
+            // depth instead of faulting serially inside the memcpy loop.
+            if (s_host_arena_prefetch && mmap_sources) {
+                const auto pfv_t0 = std::chrono::steady_clock::now();
+                prefetch_source_range(gu_src.packed_weight.ptr, gu_src.packed_weight.bytes);
+                prefetch_source_range(gu_src.absmax.ptr, gu_src.absmax.bytes);
+                prefetch_source_range(dn_src.packed_weight.ptr, dn_src.packed_weight.bytes);
+                prefetch_source_range(dn_src.absmax.ptr, dn_src.absmax.bytes);
+                if (load_timing) {
+                    static double s_pfv_ms = 0.0;
+                    s_pfv_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - pfv_t0).count();
                     if (layer + 1 == config_.num_layers) {
-                        AILA_LOG_WARN("[Q4E LoadTiming] explicit reads: %.1f s total",
-                                      s_read_ms / 1000.0);
+                        AILA_LOG_WARN("[Q4E LoadTiming] host arena prefetch (PFV): %.1f s total",
+                                      s_pfv_ms / 1000.0);
                     }
                 }
             }
