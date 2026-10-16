@@ -196,3 +196,50 @@ from ~20 us toward the 5-7 us batched regime?), then A/k3/A/k3 pairing.
   because the previous arm's ~52 GiB large-page arena is not yet back. Always
   gate on >=45 GiB available physical memory plus the 15 s pool drain before
   launching the next arm. `gap2-k3` succeeded when started ~15 s later.
+
+### The batch breaker, found: memcpy/wait/status-query between submits
+
+Gap buckets (gap4-a1) had already falsified the "batch closes on host idle"
+story: 190 of 286 HC submits sit <10 us from the previous HC submit yet still
+pay 23.1 us; bucket cost is flat (~22-26 us) across all gap sizes. A dedicated
+probe (`tmp/q4e-structural-20261016/probe_chain.cpp`, receipt
+`chain-probe3.log`) then isolated what actually breaks the batch:
+
+| per-iteration sequence (k=32 back-to-back submits, no waits) | us per submit |
+|---|---:|
+| plain, no dependencies | 5.5 |
+| explicit `depends_on(previous)` chain | 5.8 |
+| submit; host wait; submit; ... | 19.7 |
+| submit; event status query; submit; ... | 17.8 |
+| submit; 4 B H2D memcpy (stack source); ... | 78.3 |
+| submit; 4 B H2D memcpy (USM host source); ... | 22.2 |
+
+Conclusions:
+
+1. `depends_on` on an in-order queue is free (+0.3 us) - not the issue.
+2. **Any `queue.memcpy` on the compute queue is a synchronization point**:
+   even a 4-byte USM-host->device copy costs ~22 us of host time and closes
+   the L0 batch (a non-USM source degrades to a blocking copy at ~78 us).
+   Event status queries (17.8 us) and host waits (19.7 us) do the same.
+3. Production's per-layer pattern contains roughly 4-6 such flush events
+   (2 host waits + 1 status query in the executor + 1-2 compute-queue
+   memcpys: the 40 B top-k weight H2D at
+   `Qwen4ExpBnb4Backend.cpp:1583/:1654` and the 5 KB top-k D2H readback),
+   i.e. ~200-290 flushes/token - the same order as the 286 HC submits/token,
+   which is why *every* HC submit measures in the drained 20-28 us regime.
+   The audit itself had flagged these two memcpys as "not on copy_q_".
+
+### Next change (scoped, ready to implement)
+
+Route both per-layer copies off the compute queue:
+
+1. The 40 B top-k weight H2D (`RunResidentDecode`) and the 5 KB top-k D2H
+   readback -> `copy_q_` (already exists: in-order + copy engine, used by the
+   prefill staging path), chained with explicit events; the host wait for the
+   readback stays (it is the router dependency), but the compute queue's
+   batch no longer breaks.
+2. Gate the executor's per-layer status query (`Qwen4ExpExpertExecutor.cpp:2162`)
+   behind an env flag and measure.
+3. Expected effect: compute-queue submits drop from ~20-28 us toward the
+   5-8 us batched regime; if the whole submit ledger (~18.7 ms/token) follows,
+   decode moves from 16.2 toward 20+ tok/s.
