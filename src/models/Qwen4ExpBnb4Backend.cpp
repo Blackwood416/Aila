@@ -1252,6 +1252,13 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
         sycl::event last{};
         ResidentColdWork cpu_work{expert_executor_};
+        // P1 release gate. With the L0 v1 regular command list, submitted
+        // kernels stay in the batch until the next SYCL wait or event status
+        // query. Sampling the last event once before the CPU join lets the
+        // queued resident/cold kernels execute during the condvar wait
+        // (synthetic probe: 29.2 -> 25.4 ms/token; e2e gate pending).
+        static const bool s_join_release =
+            aila::env::read_int_raw("AILA_Q4E_JOIN_RELEASE", 0) != 0;
 
         // Opt-in multi-row CPU verification. The native host arena is the RAM
         // complement of the GPU hotset, so every routed miss can be served by
@@ -1497,6 +1504,14 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     nullptr, nullptr, &last, nested, nested_fixed256);
 
                 adaptive_cache_.RecordStagingConsumer(staging.ping_pong_index,last);
+            }
+
+            // P1: release the queued kernels before the host blocks on the CPU
+            // join (a condvar wait, not a SYCL wait), so the GPU executes the
+            // resident/cold expert kernels while the CPU finishes its rows.
+            if (s_join_release) {
+                try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
+                catch (...) {}
             }
 
             // G1b keeps one job outstanding for the whole window: the first
