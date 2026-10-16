@@ -174,3 +174,25 @@ Session drift is ~2% (the instrument-only arm moved +2.5% vs the A pair), so
 k1/k3 need paired confirmation against interleaved controls before any claim.
 Pending: k3 mechanism check (diag + HC timing: does the per-call cost drop
 from ~20 us toward the 5-7 us batched regime?), then A/k3/A/k3 pairing.
+
+### Pairing progress and two operational hazards
+
+- The k3 mechanism check ran (`gap2-k3`, diag + HC timing + reuse-discarded-
+  events): norm 46 calls, mean 18.4 us (min 15.0) vs baseline 47/20.3/16.2;
+  norm-fallback 48 calls, mean 26.2 (min 20.7) vs 24.8/13.6. Mixed, within
+  noise - no mechanism-level confirmation. The k3 e2e +4.7% is more likely
+  session drift than a real effect; k3 stays unadopted, pairing would need a
+  longer interleaved run.
+- Gap buckets still do not reach the log: the AdaptiveWork line truncates at
+  1025 chars right after `hc_submit_down_us=2550.100`, so `hc_gap_b0..b3` and
+  `hc_gap_max_us` are lost. Fix in flight (print the hc_* block as its own
+  line or move it to the front).
+- Worker/server identity: rebuilding only the worker makes every arm fail in
+  4 s with `Worker handshake identity/path isolation mismatch`
+  (receipts `gap-a1`, `gap-k3`). The server must be rebuilt in the same
+  window (`tools/server/build.ps1 -SkipDependencies`).
+- Host-memory race: back-to-back arms can fail model load with
+  `MEM_LARGE_PAGES ... host_avail=107-190 MiB` (receipts `ub8`, `gap2-a1`)
+  because the previous arm's ~52 GiB large-page arena is not yet back. Always
+  gate on >=45 GiB available physical memory plus the 15 s pool drain before
+  launching the next arm. `gap2-k3` succeeded when started ~15 s later.
