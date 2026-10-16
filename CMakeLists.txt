@@ -179,6 +179,7 @@ set(LIB_SOURCES
     src/ops/MoeExpertOps.cpp
     src/ops/MoeDecodeVariant.cpp
     src/ops/MoeGroupedXmx.cpp
+    src/ops/MoeExpertXmx.cpp
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
     src/memory/KVCache.cpp
@@ -902,6 +903,18 @@ add_test(NAME AilaQwen4ExpGpuQ8FastTests COMMAND AilaQwen4ExpGpuQ8Tests)
 set_tests_properties(AilaQwen4ExpGpuQ8FastTests PROPERTIES
     ENVIRONMENT "AILA_Q4E_GPU_Q8_FAST_RTE=1"
     LABELS "gpu;ops;qwen4exp;q8" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+add_executable(AilaMoeExpertXmxTests tests/ops/MoeExpertXmxTests.cpp)
+target_compile_definitions(AilaMoeExpertXmxTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaMoeExpertXmxTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaMoeExpertXmxTests PRIVATE AilaLib)
+add_test(NAME AilaMoeExpertXmxTests COMMAND AilaMoeExpertXmxTests)
+set_tests_properties(AilaMoeExpertXmxTests PROPERTIES
+    LABELS "gpu;ops;qwen4exp;prefill_xmx" RUN_SERIAL TRUE RESOURCE_LOCK aila_gpu TIMEOUT 120)
 
 add_executable(AilaQwen4ExpExpertReaderTests
     tests/models/Qwen4ExpExpertReaderTests.cpp
