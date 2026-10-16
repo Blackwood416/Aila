@@ -1913,6 +1913,12 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
     float* down_dev = buf_.moe_down_acc.data_as<float>();
     static const int rows_budget =
         std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 2048));
+    // Optional minimum pad band: (16,96)-shaped batched GEMMs are less
+    // efficient per weight byte than the probe's larger-M chunks, and padded A
+    // rows are nearly free while the GEMM is weight-bandwidth bound.
+    static const int min_band_env =
+        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 0));
+    const int min_band = min_band_env > 0 ? ((min_band_env + 15) & ~15) : 0;
     const int max_band_rows = xmx_scratch_.max_chunk_rows;
 
     // 1. Collect this segment's experts as (expert, slice offset, rows)
@@ -1951,14 +1957,14 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
         } else {
             while (mi < xmx_members_.size() && b_count < 16) {
                 const int n = xmx_members_[mi].rows;
-                const int m_try = (std::max(max_rows, n) + 15) & ~15;
+                const int m_try = std::max((std::max(max_rows, n) + 15) & ~15, min_band);
                 if (b_count > 0 && size_t(b_count + 1) * size_t(m_try) > size_t(rows_budget)) break;
                 max_rows = std::max(max_rows, n);
                 ++b_count;
                 ++mi;
             }
         }
-        const int rows_per_band = (max_rows + 15) & ~15;
+        const int rows_per_band = std::max((max_rows + 15) & ~15, min_band);
         if (size_t(b_count) * size_t(rows_per_band) > size_t(max_band_rows)) {
             throw std::runtime_error("Qwen4Exp: XMX chunk exceeds scratch capacity");
         }
