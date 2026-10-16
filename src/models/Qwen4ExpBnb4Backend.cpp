@@ -1223,10 +1223,11 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
                         hidden_size_, cfg_.moe_intermediate_size)) {
                     prefill_expert_xmx_ = true;
                     const int c1_f32 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", 0);
+                    const int w_f16 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_F16", 0);
                     AILA_LOG_INFO(
                         "[Q4E PrefillExpertXmx] enabled=1 max_chunk_rows=4096 channels=%d/%d "
-                        "plan_bytes=%d c1_f32=%d", hidden_size_, cfg_.moe_intermediate_size,
-                        xmx_plan_bytes_, c1_f32 != 0 ? 1 : 0);
+                        "plan_bytes=%d c1_f32=%d w_f16=%d", hidden_size_, cfg_.moe_intermediate_size,
+                        xmx_plan_bytes_, (c1_f32 != 0 || w_f16 != 0) ? 1 : 0, w_f16 != 0 ? 1 : 0);
                 } else {
                     AILA_LOG_WARN("[Q4E PrefillExpertXmx] unavailable (plan or scratch allocation "
                                   "failed); falling back to the ALU path");

@@ -1,14 +1,22 @@
 #pragma once
 
 // R1 prefill expert XMX path (docs/plans/qwen38-r1-prefill-expert-xmx-plan-2026-10-16.md,
-// workstream A): per chunk NF4 -> bf16 dequant, activation gather, batched bf16
-// oneDNN matmul (gate_up), SwiGLU, batched bf16 matmul (down), scatter.  The
-// kernel structure mirrors the measured probe
+// workstream A): per chunk NF4 dequant, activation gather, batched oneDNN
+// matmul (gate_up), SwiGLU, batched matmul (down), scatter.  The A/W storage
+// element type is bf16 by default and fp16 when
+// AILA_Q4E_PREFILL_EXPERT_XMX_W_F16 is set (fp16 keeps 11 mantissa bits in the
+// same 2 bytes/elem and the same XMX throughput class).  The kernel structure
+// mirrors the measured probe
 // tmp/q4e-bottleneck-audit-20261016/expert_shape_probe2.cpp.
 //
 // AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 (int, default 0): non-zero keeps the
 // gate_up destination (c1) in f32 instead of bf16, so SwiGLU reads the
-// unrounded GEMM output.  The down GEMM's A input (a2) stays bf16 either way.
+// unrounded GEMM output.  With the default bf16 storage the down GEMM's A
+// input (a2) stays bf16 either way.
+// AILA_Q4E_PREFILL_EXPERT_XMX_W_F16 (int, default 0): non-zero stores the
+// weight banks (wgu/wdn), the gathered a1 and the SwiGLU a2 as fp16 and forces
+// the gate_up dst (c1) to f32, so both GEMMs run f16 x f16 -> f32.  When both
+// flags are set W_F16 wins with c1 f32.
 //
 // Ownership: the caller owns the chunk plan (device USM), the input x, the
 // down_acc rank arena and every slot descriptor; this file owns the scratch,
@@ -42,11 +50,11 @@ struct MoeExpertXmxChunk {
 
 struct MoeExpertXmxScratch {
     // Two weight banks so chunk k+1's dequant can overlap chunk k's GEMMs.
-    void* wgu_bf16[2] = {};   // each 16 * 2 * I * H bf16
-    void* wdn_bf16[2] = {};   // each 16 * H * I bf16
-    void* a1 = {};            // [max_chunk_rows * H] bf16 (gather)
+    void* wgu_bf16[2] = {};   // each 16 * 2 * I * H bf16; fp16 when w_f16
+    void* wdn_bf16[2] = {};   // each 16 * H * I bf16; fp16 when w_f16
+    void* a1 = {};            // [max_chunk_rows * H] bf16 (gather); fp16 when w_f16
     void* c1 = {};            // [max_chunk_rows * 2I] bf16 (gate_up dst); f32 when c1_f32
-    void* a2 = {};            // [max_chunk_rows * I] bf16 (SwiGLU)
+    void* a2 = {};            // [max_chunk_rows * I] bf16 (SwiGLU); fp16 when w_f16
     void* c2 = {};            // [max_chunk_rows * H] f32 (down dst)
     // Device staging for per-chunk plan arrays, in int units: [0, 17) row bases,
     // then max_chunk_rows token ids, then max_chunk_rows ranks.  The pipeline
@@ -58,6 +66,10 @@ struct MoeExpertXmxScratch {
     // f32 gate_up results and SwiGLU reads f32.  Latched per scratch, so a
     // scratch's numeric mode never changes while work is queued.
     bool c1_f32 = false;
+    // Set at scratch_create from AILA_Q4E_PREFILL_EXPERT_XMX_W_F16: the weight
+    // banks, a1 and a2 hold fp16 (same 2 bytes/elem) and c1 is forced to f32
+    // (f16 x f16 -> f32 on both GEMMs).  Latched per scratch like c1_f32.
+    bool w_f16 = false;
 
     // Internal: geometry + primitive cache owner.  Do not copy this struct and
     // do not restore it by hand; only scratch_create/scratch_destroy manage it.
@@ -67,12 +79,13 @@ struct MoeExpertXmxScratch {
 };
 
 // Allocates the full flag-on footprint (375 MiB at 4096 rows / H=2560 / I=640,
-// +10 MiB more when AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 is set) through ctx, so
-// the device budget and the backend VRAM reserve see it.  The hidden/
-// intermediate parameters default to the gated production shape; a scratch must
-// be recreated if the model shape changes.  Returns false when the allocation
-// budget rejects the request (nothing is left allocated); throws
-// std::invalid_argument for non-positive dimensions.
+// +10 MiB more when the gate_up destination is f32, i.e.
+// AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 or _W_F16) through ctx, so the device
+// budget and the backend VRAM reserve see it.  The hidden/intermediate
+// parameters default to the gated production shape; a scratch must be recreated
+// if the model shape changes.  Returns false when the allocation budget rejects
+// the request (nothing is left allocated); throws std::invalid_argument for
+// non-positive dimensions.
 bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s,
                                    int max_chunk_rows = 4096, int hidden = 2560,
                                    int intermediate = 640);

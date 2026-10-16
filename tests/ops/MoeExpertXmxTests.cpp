@@ -2,7 +2,8 @@
 // Small synthetic shapes (H=256, I=64, bs=64) keep the run trivial; the checks
 // cover the two-bank dequant, the padded-band gather/scatter contract, the
 // nullable H2D ready gate, nested and flat NF4 scales, B=1 / B=2 batches, and
-// the AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 gate_up-destination mode.
+// the AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 gate_up-destination and
+// AILA_Q4E_PREFILL_EXPERT_XMX_W_F16 fp16-storage modes.
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
@@ -43,18 +44,27 @@ void expect(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error("MoeExpertXmxTests: " + message);
 }
 
-// The op latches AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 at scratch_create, so the
-// test can flip the mode by setting the variable and creating a new scratch.
-void set_c1_f32_env(const char* value) {
+// The op latches the AILA_Q4E_PREFILL_EXPERT_XMX_* numeric-mode variables at
+// scratch_create, so the test can flip a mode by setting the variable and
+// creating a new scratch.
+void set_env(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", value);
+    _putenv_s(name, value);
 #else
     if (value[0] == '\0') {
-        unsetenv("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32");
+        unsetenv(name);
     } else {
-        setenv("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", value, 1);
+        setenv(name, value, 1);
     }
 #endif
+}
+
+void set_c1_f32_env(const char* value) {
+    set_env("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", value);
+}
+
+void set_w_f16_env(const char* value) {
+    set_env("AILA_Q4E_PREFILL_EXPERT_XMX_W_F16", value);
 }
 
 struct HostProjection {
@@ -243,9 +253,10 @@ double check_chunk(const std::vector<float>& down_acc, const std::vector<int>& t
 void run_pipeline_test() {
     Context ctx;
     // Cases A/B/C pin the legacy bf16 c1 mode so they keep exercising it even
-    // on a machine that exports the flag; case D below creates its own scratch
-    // with the f32 c1 flag set.
+    // on a machine that exports the flags; cases D/E below create their own
+    // scratch with the c1_f32 / w_f16 flag set.
     set_c1_f32_env("0");
+    set_w_f16_env("0");
     std::array<ExpertFixture, Members> fixtures;
     fixtures[0].gate_up.init(2 * I, H, 101u, true);
     fixtures[0].down.init(H, I, 102u, true);
@@ -345,10 +356,13 @@ void run_pipeline_test() {
         Tensor::allocate(ctx, {static_cast<int64_t>(acc_elements)}, dnnl::memory::data_type::f32);
     Tensor acc_d_dev =
         Tensor::allocate(ctx, {static_cast<int64_t>(acc_elements)}, dnnl::memory::data_type::f32);
+    Tensor acc_e_dev =
+        Tensor::allocate(ctx, {static_cast<int64_t>(acc_elements)}, dnnl::memory::data_type::f32);
     ctx.memcpy_h2d(acc_a_dev.data(), acc_host.data(), acc_elements * sizeof(float));
     ctx.memcpy_h2d(acc_b_dev.data(), acc_host.data(), acc_elements * sizeof(float));
     ctx.memcpy_h2d(acc_c_dev.data(), acc_host.data(), acc_elements * sizeof(float));
     ctx.memcpy_h2d(acc_d_dev.data(), acc_host.data(), acc_elements * sizeof(float));
+    ctx.memcpy_h2d(acc_e_dev.data(), acc_host.data(), acc_elements * sizeof(float));
 
     ops::MoeExpertXmxScratch scratch;
     expect(ops::moe_expert_xmx_scratch_create(ctx, scratch, 32, H, I),
@@ -443,6 +457,37 @@ void run_pipeline_test() {
     expect(scratch_f32.c1_f32 == false && scratch_f32.impl == nullptr,
            "scratch_destroy left the c1_f32 state behind");
     set_c1_f32_env("");
+
+    // Case E: the storage-precision tightening
+    // (AILA_Q4E_PREFILL_EXPERT_XMX_W_F16=1).  The scratch must latch fp16
+    // weight banks / a1 / a2 plus the implied f32 c1 (both oneDNN GEMMs run
+    // f16 x f16 -> f32), and the same chunk_a plan must land tighter to the
+    // fp64 reference than the bf16-storage arm (case A).  The reference rounds
+    // a2 to bf16 like cases A-D, so it also puts a bf16 rounding floor under
+    // this arm; both arms are compared against it.
+    set_w_f16_env("1");
+    ops::MoeExpertXmxScratch scratch_f16;
+    expect(ops::moe_expert_xmx_scratch_create(ctx, scratch_f16, 32, H, I),
+           "moe_expert_xmx_scratch_create (w_f16) failed");
+    expect(scratch_f16.w_f16, "w_f16 was not latched from the environment");
+    expect(scratch_f16.c1_f32, "W_F16 must force the f32 gate_up destination");
+    ops::moe_expert_xmx_prefill_chunk(ctx, scratch_f16, chunk_a, 0, x_dev.data_as<bf16>(),
+                                      acc_e_dev.data_as<float>(), H, I, Block, nullptr);
+    ctx.synchronize();
+    std::vector<float> acc_e(acc_elements);
+    ctx.memcpy_d2h(acc_e.data(), acc_e_dev.data(), acc_elements * sizeof(float));
+    const double nrmse_e = check_chunk(
+        acc_e, tokens_a, ranks_a, counts_a,
+        reference_rows(fixtures, 0, counts_a, tokens_a, x_host), "caseE(w_f16)", 0.03);
+    expect(nrmse_e < nrmse_a,
+           "caseE: fp16-storage nrmse " + std::to_string(nrmse_e) +
+               " did not tighten against the bf16-storage nrmse " + std::to_string(nrmse_a));
+    std::cout << "caseE(w_f16) tightened nrmse from " << nrmse_a << " (bf16 storage) to "
+              << nrmse_e << " (fp16 storage)\n";
+    ops::moe_expert_xmx_scratch_destroy(ctx, scratch_f16);
+    expect(scratch_f16.w_f16 == false && scratch_f16.impl == nullptr,
+           "scratch_destroy left the w_f16 state behind");
+    set_w_f16_env("");
 }
 
 }  // namespace
