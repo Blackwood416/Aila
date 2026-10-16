@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include "utils/EnvUtils.hpp"
+
 namespace ops {
 namespace {
 
@@ -151,6 +153,34 @@ sycl::event submit_gather(Context& ctx, const MoeExpertXmxScratch& s,
     });
 }
 
+// f32 counterpart of moe_silu_gate_up_mul_flat (MoeExpertOps.cpp:5303): same
+// math, same launch shape and the same gate=[0, I) / up=[I, 2I) column split,
+// but the gate_up tile is the f32 c1 buffer, so the SwiGLU input keeps the XMX
+// accumulator's precision.  a2 stays bf16 (the down GEMM's A input does).
+sycl::event submit_swiglu_f32(Context& ctx, const float* gate_up, bf16* out,
+                              int total_rows, int intermediate) {
+    const size_t total_elements =
+        static_cast<size_t>(total_rows) * static_cast<size_t>(intermediate);
+    constexpr size_t wg = 256;
+    const size_t num_wgs = (total_elements + wg - 1) / wg;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t idx = item.get_global_id(0);
+                if (idx < total_elements) {
+                    const size_t t = idx / intermediate;
+                    const size_t i = idx % intermediate;
+                    const size_t row_stride = static_cast<size_t>(2) * intermediate;
+                    const float g_f = gate_up[t * row_stride + i];
+                    const float u_f = gate_up[t * row_stride + intermediate + i];
+                    const float silu_g = g_f / (1.0f + sycl::native::exp(-g_f));
+                    out[idx] = bf16(silu_g * u_f);
+                }
+            });
+    });
+}
+
 // Row b * M + m -> down_acc[(token * top_k + rank) * hidden]; padding rows are
 // skipped, every real row is written exactly once.
 sycl::event submit_scatter(Context& ctx, const MoeExpertXmxScratch& s,
@@ -188,7 +218,11 @@ sycl::event submit_scatter(Context& ctx, const MoeExpertXmxScratch& s,
 XmxPrim& ensure_xmx_prim(Context& ctx, MoeExpertXmxScratch& s, int num_experts, int rows_per_band,
                          int hidden, int intermediate) {
     XmxCache& cache = cache_of(s);
-    const uint64_t key = (uint64_t(static_cast<uint32_t>(num_experts)) << 32) |
+    // The c1 dtype is part of the key: an f32 gate_up dst descriptor must never
+    // be served to a bf16 c1 buffer (or the other way round).
+    const bool c1_f32 = s.c1_f32;
+    const uint64_t key = (uint64_t(c1_f32 ? 1u : 0u) << 63) |
+                         (uint64_t(static_cast<uint32_t>(num_experts)) << 32) |
                          uint64_t(static_cast<uint32_t>(rows_per_band));
     const auto found = cache.prims.find(key);
     if (found != cache.prims.end()) return found->second;
@@ -210,7 +244,8 @@ XmxPrim& ensure_xmx_prim(Context& ctx, MoeExpertXmxScratch& s, int num_experts, 
     // with W stored as the packed [N][K] linear buffer (K contiguous).
     prim.s1 = dnnl::memory::desc({b, m, h}, dt::bf16, {m * h, h, 1});
     prim.w1 = dnnl::memory::desc({b, h, two_i}, dt::bf16, {two_i * h, 1, h});
-    prim.d1 = dnnl::memory::desc({b, m, two_i}, dt::bf16, {m * two_i, two_i, 1});
+    prim.d1 = dnnl::memory::desc({b, m, two_i}, c1_f32 ? dt::f32 : dt::bf16,
+                                 {m * two_i, two_i, 1});
     prim.s2 = dnnl::memory::desc({b, m, i}, dt::bf16, {m * i, i, 1});
     prim.w2 = dnnl::memory::desc({b, i, h}, dt::bf16, {h * i, 1, i});
     prim.d2 = dnnl::memory::desc({b, m, h}, dt::f32, {m * h, h, 1});
@@ -240,6 +275,7 @@ void release_all(MoeExpertXmxScratch& s) {
     s.c2 = nullptr;
     s.d_plan = nullptr;
     s.max_chunk_rows = 0;
+    s.c1_f32 = false;
     s.hidden = 0;
     s.intermediate = 0;
 }
@@ -253,11 +289,20 @@ bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s, int max
         throw std::invalid_argument(
             "moe_expert_xmx_scratch_create: rows and dimensions must be positive");
     }
+    // AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 (int, default 0): non-zero keeps the
+    // gate_up destination in f32.  Read per create and latched into the
+    // scratch: the production backend creates the scratch once per model load,
+    // so this is a once-per-process decision in practice, while tests and
+    // scratch recreation can still select the mode per scratch.  The f32 c1
+    // also selects the f32-input SwiGLU in moe_expert_xmx_prefill_chunk.
+    const bool c1_f32 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", 0) != 0;
     const int rows = static_cast<int>((static_cast<int64_t>(max_chunk_rows) + 15) / 16 * 16);
     const size_t gu_bytes =
         size_t(kMaxExpertsPerChunk) * 2 * size_t(intermediate) * size_t(hidden) * sizeof(bf16);
     const size_t dn_bytes =
         size_t(kMaxExpertsPerChunk) * size_t(hidden) * size_t(intermediate) * sizeof(bf16);
+    const size_t c1_bytes = size_t(rows) * 2 * size_t(intermediate) *
+                            (c1_f32 ? sizeof(float) : sizeof(bf16));
     // Locals are owned by the rollback lambda until the scratch commits.
     void* wgu0 = nullptr;
     void* wgu1 = nullptr;
@@ -288,7 +333,7 @@ bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s, int max
         wdn0 = ctx.alloc_device(dn_bytes);
         wdn1 = ctx.alloc_device(dn_bytes);
         a1 = ctx.alloc_device(size_t(rows) * size_t(hidden) * sizeof(bf16));
-        c1 = ctx.alloc_device(size_t(rows) * 2 * size_t(intermediate) * sizeof(bf16));
+        c1 = ctx.alloc_device(c1_bytes);
         a2 = ctx.alloc_device(size_t(rows) * size_t(intermediate) * sizeof(bf16));
         c2 = ctx.alloc_device(size_t(rows) * size_t(hidden) * sizeof(float));
         d_plan = ctx.alloc_device((size_t(kPlanBaseSlots) + 2 * size_t(rows)) * sizeof(int));
@@ -308,6 +353,7 @@ bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s, int max
     s.d_plan = d_plan;
     s.impl = cache;
     s.max_chunk_rows = rows;
+    s.c1_f32 = c1_f32;
     s.hidden = hidden;
     s.intermediate = intermediate;
     return true;
@@ -385,11 +431,19 @@ sycl::event moe_expert_xmx_prefill_chunk(Context& ctx, MoeExpertXmxScratch& scra
     sycl::event last = submit_dequant(ctx, scratch, chunk, bank, hidden, intermediate, blocksize, ready);
     last = submit_gather(ctx, scratch, chunk, x, hidden, last);
     last = dnnl::sycl_interop::execute(prim.mm1, ctx.stream(), prim.args1[bank], {last});
-    // SwiGLU on every padded row (zero rows stay zero).  It carries no event, so
-    // the in-order queue is what orders it after mm1 and before mm2.
-    moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(scratch.c1),
-                              static_cast<bf16*>(scratch.a2), rows, intermediate);
-    last = dnnl::sycl_interop::execute(prim.mm2, ctx.stream(), prim.args2[bank], {});
+    if (scratch.c1_f32) {
+        // SwiGLU reads the unrounded f32 gate_up tile; a2 is still bf16.
+        last = submit_swiglu_f32(ctx, static_cast<const float*>(scratch.c1),
+                                 static_cast<bf16*>(scratch.a2), rows, intermediate);
+        last = dnnl::sycl_interop::execute(prim.mm2, ctx.stream(), prim.args2[bank], {last});
+    } else {
+        // SwiGLU on every padded row (zero rows stay zero).  It carries no
+        // event, so the in-order queue is what orders it after mm1 and before
+        // mm2.
+        moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(scratch.c1),
+                                  static_cast<bf16*>(scratch.a2), rows, intermediate);
+        last = dnnl::sycl_interop::execute(prim.mm2, ctx.stream(), prim.args2[bank], {});
+    }
     last = submit_scatter(ctx, scratch, chunk, down_acc, hidden, last);
     return last;
 }

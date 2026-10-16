@@ -6,6 +6,10 @@
 // kernel structure mirrors the measured probe
 // tmp/q4e-bottleneck-audit-20261016/expert_shape_probe2.cpp.
 //
+// AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 (int, default 0): non-zero keeps the
+// gate_up destination (c1) in f32 instead of bf16, so SwiGLU reads the
+// unrounded GEMM output.  The down GEMM's A input (a2) stays bf16 either way.
+//
 // Ownership: the caller owns the chunk plan (device USM), the input x, the
 // down_acc rank arena and every slot descriptor; this file owns the scratch,
 // its oneDNN primitives and the oneDNN memory handles that must outlive queued
@@ -41,7 +45,7 @@ struct MoeExpertXmxScratch {
     void* wgu_bf16[2] = {};   // each 16 * 2 * I * H bf16
     void* wdn_bf16[2] = {};   // each 16 * H * I bf16
     void* a1 = {};            // [max_chunk_rows * H] bf16 (gather)
-    void* c1 = {};            // [max_chunk_rows * 2I] bf16 (gate_up dst)
+    void* c1 = {};            // [max_chunk_rows * 2I] bf16 (gate_up dst); f32 when c1_f32
     void* a2 = {};            // [max_chunk_rows * I] bf16 (SwiGLU)
     void* c2 = {};            // [max_chunk_rows * H] f32 (down dst)
     // Device staging for per-chunk plan arrays, in int units: [0, 17) row bases,
@@ -50,6 +54,10 @@ struct MoeExpertXmxScratch {
     // build the plan on the host.
     void* d_plan = {};
     int max_chunk_rows = 0;   // total padded rows (B * M) per chunk; 4096 per the plan
+    // Set at scratch_create from AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32: c1 holds
+    // f32 gate_up results and SwiGLU reads f32.  Latched per scratch, so a
+    // scratch's numeric mode never changes while work is queued.
+    bool c1_f32 = false;
 
     // Internal: geometry + primitive cache owner.  Do not copy this struct and
     // do not restore it by hand; only scratch_create/scratch_destroy manage it.
@@ -58,11 +66,12 @@ struct MoeExpertXmxScratch {
     int intermediate = 0;
 };
 
-// Allocates the full flag-on footprint (375 MiB at 4096 rows / H=2560 / I=640)
-// through ctx, so the device budget and the backend VRAM reserve see it.  The
-// hidden/intermediate parameters default to the gated production shape; a
-// scratch must be recreated if the model shape changes.  Returns false when the
-// allocation budget rejects the request (nothing is left allocated); throws
+// Allocates the full flag-on footprint (375 MiB at 4096 rows / H=2560 / I=640,
+// +10 MiB more when AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32 is set) through ctx, so
+// the device budget and the backend VRAM reserve see it.  The hidden/
+// intermediate parameters default to the gated production shape; a scratch must
+// be recreated if the model shape changes.  Returns false when the allocation
+// budget rejects the request (nothing is left allocated); throws
 // std::invalid_argument for non-positive dimensions.
 bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s,
                                    int max_chunk_rows = 4096, int hidden = 2560,
@@ -78,9 +87,9 @@ void moe_expert_xmx_scratch_destroy(Context& ctx, MoeExpertXmxScratch& s);
 // completion event (nullable).  down_acc rows are (token*top_k + rank).
 //
 // The internal steps are chained through explicit SYCL events except the
-// SwiGLU step, which is ordered by the in-order queue (Context always submits
-// on an in-order queue).  Callers must not submit this chunk's pipeline to an
-// out-of-order queue.
+// bf16-input SwiGLU step (c1_f32 off), which is ordered by the in-order queue
+// (Context always submits on an in-order queue).  Callers must not submit this
+// chunk's pipeline to an out-of-order queue.
 sycl::event moe_expert_xmx_prefill_chunk(
     Context& ctx, MoeExpertXmxScratch& scratch, const MoeExpertXmxChunk& chunk, int bank,
     const bf16* x, float* down_acc, int hidden, int intermediate, int blocksize,
