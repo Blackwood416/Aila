@@ -1554,3 +1554,18 @@ accepts only the string `"pair2"`): the K5 receipt rejected it because of the
 be A/B'd end to end; rows=2 (the MTP verify shape) gains nothing either way.
 
 | L96 | Decode attention KV head grouping: G=2 gives -21.7% / -16.4% at 8192 / 14336 rows=1, G=4 (bench variant) is neutral -> E5's G=4 candidate falsified; the live item is the existing pair2 plus the `cached_len >= 2048` gate required by the K5 pre-registered reject | q4e_decode_attn_reuse_bench |
+
+**Decode residency/VRAM-reserve screen - catastrophic, keep the defaults.**
+Bundle config (`agent6k` + int8-KV + front-fused) admission accounting:
+`Total VRAM 15933 = Static Weights 4522.3 + Session State 622.2 + Reserve Headroom
+3584 + Expert Cache 7204 MB` (2842 slots). Raising residency therefore means
+lowering the reserve, so `rs-b1` ran the same bundle with
+`AILA_Q4E_VRAM_RESERVE_MB=2048 AILA_Q4E_MAX_GPU_SLOTS=3600` (GPU-only experts
+2800 -> 3584, native RAM complement 21,776 -> 20,992): the 14K continue rate
+**collapses to 7.363 tok/s** versus the 17.413 / 17.490 baseline. More slots is
+not better here - the admission/hotset policy and/or the reduced headroom
+degrade the pipeline badly. This also retroactively explains the earlier
+`rv-2048-3600-b1` reading of 10.95 tok/s, which I had wrongly written off as a
+generate=8 artifact. Defaults stay reserve 3584 / slots 2800.
+
+| L97 | Decode residency screen: reserve 2048 + slots 3600 (2800 -> 3584 GPU-only experts) collapses the 14K rate to 7.363 tok/s vs 17.413/17.490 -> keep reserve 3584 / slots 2800; more residency is not a decode lever | rs-b1 |
