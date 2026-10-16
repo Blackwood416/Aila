@@ -1536,3 +1536,21 @@ M-tiled variant (one work-group = 16 rows x M activations of the same expert,
 weights hoisted out of the M loop), which is role-P9 L2.
 
 | L95 | `AILA_Q4E_PREFILL_ACT_SLM` NO-GO: enabled=1 and bit-exact, but TTFT 70.1 vs 69.6 s and blocks +1.0% -> the activation re-reads were already L1/L2-served; the DRAM term is weight traffic, so L2 (M-tiling) is the live lever | slm-b1 |
+
+**Decode-attention KV head grouping measured - G=2 is the ceiling (E5's G=4 candidate falsified).**
+`AilaQwen4ExpKernelTests.exe --decode-attn-reuse-bench --json`, median us/row:
+
+| variant | 8192 r=1 | 14336 r=1 | 14336 r=2 |
+|---|---:|---:|---:|
+| off | 566.4 | 842.5 | 864.5 |
+| `AILA_ATTN_KVREUSE=pair2` | **443.7 (-21.7%)** | **704.2 (-16.4%)** | 866.5 (+0.2%) |
+| `pair4` (bench-only variant) | 565.0 (-0.2%) | 829.4 (-1.6%) | 863.25 (-0.1%) |
+
+So the E5 audit's "G=4 extrapolates to -30..-38%" is wrong: G=4 is neutral. The
+live item is the *existing* pair2 path (`AttentionOps.cpp:742-746`, production
+accepts only the string `"pair2"`): the K5 receipt rejected it because of the
++8.0% regression at 1834 rows, and the pre-registered condition was a
+`cached_len >= 2048` gate. Role-P10 is implementing that gate so the variant can
+be A/B'd end to end; rows=2 (the MTP verify shape) gains nothing either way.
+
+| L96 | Decode attention KV head grouping: G=2 gives -21.7% / -16.4% at 8192 / 14336 rows=1, G=4 (bench variant) is neutral -> E5's G=4 candidate falsified; the live item is the existing pair2 plus the `cached_len >= 2048` gate required by the K5 pre-registered reject | q4e_decode_attn_reuse_bench |
