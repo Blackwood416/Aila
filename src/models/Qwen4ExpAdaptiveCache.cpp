@@ -624,8 +624,12 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         sources[i]=arena.GetExpertPointer(layer,experts[i]);
         if (!sources[i]) throw std::logic_error("Cold expert is missing its RAM owner");
     }
+    // Adopted default-on 2026-10-16: with the expert-XMX path this cut the
+    // steady 4096-row block 17.0s -> 14.6s and the 14K TTFT 64.0s -> 54.1s
+    // (fill 7.4s -> 2.3s, bank_wait 9ms -> 2.1s); confirmed by xpb-b1/b2.
+    // AILA_Q4E_STAGE_COPY_PARALLEL=0 restores the serial host copy.
     static const bool parallel_host_copy =
-        aila::env::read_flag("AILA_Q4E_STAGE_COPY_PARALLEL", false);
+        aila::env::read_flag("AILA_Q4E_STAGE_COPY_PARALLEL", true);
     if (parallel_host_copy && count>1 && copy_executor) {
         // The executor's parallel host copy is bounded to 16 slots per call;
         // deeper staging banks (AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS) must split

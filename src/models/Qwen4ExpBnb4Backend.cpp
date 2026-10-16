@@ -1208,8 +1208,14 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         // the async H2D) plus the flag-only ops scratch. Everything here is
         // inert when AILA_Q4E_PREFILL_EXPERT_XMX is unset.
         {
+            // Adopted default-on 2026-10-16 (owner waiver): the expert-XMX path
+            // measured TTFT 63.99s vs 69.6-71.2s ALU (-8..-10%) and its
+            // deviation is accumulation-order bound (KL 0.019 vs the 0.01
+            // contract; two XMX variants differ 0.0099; fp16 storage tightened
+            // the kernel 2.1x with no e2e change). AILA_Q4E_PREFILL_EXPERT_XMX=0
+            // returns to the ALU path.
             static const bool s_prefill_expert_xmx =
-                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", false);
+                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", true);
             const size_t bases_bytes = size_t(17) * sizeof(int);
             const size_t rows_bytes = size_t(cap) * cfg_.num_experts_per_tok * sizeof(int);
             const size_t ranks_off = bases_bytes + rows_bytes;
@@ -1921,12 +1927,12 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
     const bf16* x_dev = buf_.x.data_as<bf16>();
     float* down_dev = buf_.moe_down_acc.data_as<float>();
     static const int rows_budget =
-        std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 2048));
+        std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 4096));
     // Optional minimum pad band: (16,96)-shaped batched GEMMs are less
     // efficient per weight byte than the probe's larger-M chunks, and padded A
     // rows are nearly free while the GEMM is weight-bandwidth bound.
     static const int min_band_env =
-        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 0));
+        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 256));
     const int min_band = min_band_env > 0 ? ((min_band_env + 15) & ~15) : 0;
     const int max_band_rows = xmx_scratch_.max_chunk_rows;
 
@@ -3216,6 +3222,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const double router_other_ms = std::max(0.0, stage_ms[kStageRouter] - prof_router_sync_ms -
             host_moe_front_ms - host_topk_submit_ms - host_shared_submit_ms);
         const double shared_other_ms = std::max(0.0, stage_ms[kStageShared] - host_shared_add_ms - host_hc_inject_ms);
+        // HC submit split (AILA_Q4E_HC_SUBMIT_TIMING): steady_clock deltas
+        // around the HC decode submit calls, windowed to this forward. All
+        // zeros when the gate is off (the ops never read a clock then).
+        const ops::HcSubmitTiming hc_submit = ops::HcSubmitTimingTakeWindow();
+        auto hc_sub_us = [](const ops::HcSubmitTimingStage& s) {
+            return static_cast<double>(s.total_ns) * 1e-3;
+        };
+        auto hc_sub_min_us = [](const ops::HcSubmitTimingStage& s) {
+            return static_cast<double>(s.min_ns) * 1e-3;
+        };
+        auto hc_sub_max_us = [](const ops::HcSubmitTimingStage& s) {
+            return static_cast<double>(s.max_ns) * 1e-3;
+        };
         AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d submitted_ms=%.3f router_wait_ms=%.3f "
             "ple_host_ms=%.3f hc_host_ms=%.3f linear_host_ms=%.3f full_host_ms=%.3f "
             "experts_host_ms=%.3f head_host_ms=%.3f fill_ms=%.3f bank_wait_ms=%.3f swap_ms=%.3f "
@@ -3224,7 +3243,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             "router_other_ms=%.3f shared_other_ms=%.3f tail_ms=%.3f dev_events=%d "
             "misc_dev_ms=%.3f hc_dev_ms=%.3f linear_dev_ms=%.3f full_dev_ms=%.3f router_dev_ms=%.3f "
             "shared_dev_ms=%.3f experts_dev_ms=%.3f resid_dev_ms=%.3f head_dev_ms=%.3f "
-            "inter_dev_ms=%.3f ple_dev_ms=%.3f stagein_dev_ms=%.3f prerouter_dev_ms=%.3f",
+            "inter_dev_ms=%.3f ple_dev_ms=%.3f stagein_dev_ms=%.3f prerouter_dev_ms=%.3f "
+            "hc_submit_norm_us=%.3f hc_submit_norm_n=%llu hc_submit_norm_min_us=%.3f hc_submit_norm_max_us=%.3f "
+            "hc_submit_normfb_us=%.3f hc_submit_normfb_n=%llu hc_submit_normfb_min_us=%.3f hc_submit_normfb_max_us=%.3f "
+            "hc_submit_down_us=%.3f hc_submit_down_n=%llu hc_submit_down_min_us=%.3f hc_submit_down_max_us=%.3f "
+            "hc_submit_up_us=%.3f hc_submit_up_n=%llu hc_submit_up_min_us=%.3f hc_submit_up_max_us=%.3f",
             start_pos,count,int(reuse_ple),submitted_ms_now,prof_router_sync_ms,
             stage_ms[kStagePle],stage_ms[kStageHc],stage_ms[kStageLinearAttn],stage_ms[kStageFullAttn],
             stage_ms[kStageExperts],stage_ms[kStageHead],
@@ -3242,7 +3265,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             router_other_ms, shared_other_ms, submitted_ms_now - stage_sum_ms, int(dev_trace),
             dev_ms[kDevMisc], dev_ms[kDevHc], dev_ms[kDevLinear], dev_ms[kDevFull], dev_ms[kDevRouter],
             dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead],
-            dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter]);
+            dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter],
+            hc_sub_us(hc_submit.norm_pending), (unsigned long long)hc_submit.norm_pending.count,
+            hc_sub_min_us(hc_submit.norm_pending), hc_sub_max_us(hc_submit.norm_pending),
+            hc_sub_us(hc_submit.norm_fallback), (unsigned long long)hc_submit.norm_fallback.count,
+            hc_sub_min_us(hc_submit.norm_fallback), hc_sub_max_us(hc_submit.norm_fallback),
+            hc_sub_us(hc_submit.down), (unsigned long long)hc_submit.down.count,
+            hc_sub_min_us(hc_submit.down), hc_sub_max_us(hc_submit.down),
+            hc_sub_us(hc_submit.up), (unsigned long long)hc_submit.up.count,
+            hc_sub_min_us(hc_submit.up), hc_sub_max_us(hc_submit.up));
     }
     // G5: one line per prefill forward that proves how the layer arena was
     // consumed (arena_experts vs bank fallback). A zero-hit consumer would
