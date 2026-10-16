@@ -15,6 +15,16 @@ constexpr int kBlockSize = 64;
 constexpr int kMaxExpertBatchTasks = 40;
 struct CpuExpertTask { MoeExpertSlotHost slot; int token = 0; };
 
+// One (layer, expert) weight source shared by several per-row tasks. `members`
+// of the same batch (indices into the CpuExpertTask array) name the tasks that
+// read this slot; every member keeps its own activation row, its own output row
+// and therefore its own bytes.
+struct CpuExpertGroup {
+    MoeExpertSlotHost slot; // same source as every member task's slot
+    int member_begin = 0;   // index into the flattened member list
+    int member_count = 0;   // 1..4 (2..4 rows of one verify window)
+};
+
 enum class CpuKernelBackend {
     Auto = 0,
     Scalar = 1,
@@ -60,6 +70,23 @@ void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
     std::optional<bool> a64_row2_override = std::nullopt,
     std::optional<bool> per_expert_dag_override = std::nullopt,
     const CpuExpertDagTestHooks* dag_test_hooks = nullptr);
+
+// Grouped variant of cpu_expert_batch_forward for window-level reuse of packed
+// weights. `tasks` keeps the ungrouped per-(row, expert) layout: task index c
+// owns both the activation row (tasks[c].token) and the output rows
+// (h + c*intermediate, out + c*hidden), so per-row rank-span publishing and the
+// observer feed are unchanged. `groups` lists the distinct weight sources;
+// members[group.member_begin .. +member_count) are indices into `tasks` and must
+// cover every task exactly once. Each member runs the exact same per-(task,
+// tile) body as the ungrouped call, only the packed weights of a (group, tile)
+// are streamed once for all its members, so results are bitwise identical to
+// cpu_expert_batch_forward for the same task list. Grouping executes on the
+// NF4-Q8 family; every other backend falls back to the ungrouped call.
+void cpu_expert_batch_forward_groups(const CpuExpertGroup* groups, int group_count,
+    const int* members, const CpuExpertTask* tasks, int pair_count,
+    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map = nullptr,
+    CpuKernelBackend backend = CpuKernelBackend::GpuOrderAvx2,
+    CpuExpertPhaseTimings* timings = nullptr, bool nf4_scale_shift = false);
 
 // Gate/Up SwiGLU:
 // Inputs:

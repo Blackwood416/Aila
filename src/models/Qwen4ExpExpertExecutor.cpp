@@ -80,6 +80,12 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         int route_top_k = 0, route_experts = 0;
         bool resident_prepared = false;
         std::array<bool, ops::cpu::kMaxExpertBatchTasks> mapped_tasks{};
+        // Optional grouped schedule (AILA_Q4E_VERIFY_CPU_MERGE): group g owns
+        // tasks group_members[groups[g].member_begin .. +member_count). An empty
+        // group_count keeps the exact ungrouped cpu_expert_batch_forward call.
+        std::array<ops::cpu::CpuExpertGroup, ops::cpu::kMaxExpertBatchTasks> groups{};
+        std::array<int, ops::cpu::kMaxExpertBatchTasks> group_members{};
+        int group_count = 0;
     };
     struct Result {
         uint64_t activation_ns = 0, begin_ns = 0, end_ns = 0;
@@ -485,11 +491,20 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                             AILA_LOG_INFO("[Q4E CpuScaleShiftEnabled] nested_block256=shift8 other_blocks=division");
                             scale_shift_logged = true;
                         }
-                        ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
-                            current.resident_prepared ? (nf4_q8 ? (nf4_q8_activation64 ? ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2 : nf4_q8_block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2 : nf4_q8_row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2 : ops::cpu::CpuKernelBackend::Nf4Q8Avx2) : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2) :
-                            gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
-                                      : ops::cpu::CpuKernelBackend::Avx2,
-                            diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
+                        const auto batch_backend = current.resident_prepared
+                            ? (nf4_q8 ? (nf4_q8_activation64 ? ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2 : nf4_q8_block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2 : nf4_q8_row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2 : ops::cpu::CpuKernelBackend::Nf4Q8Avx2)
+                                      : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2)
+                            : (gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
+                                         : ops::cpu::CpuKernelBackend::Avx2);
+                        if (current.group_count > 0) {
+                            ops::cpu::cpu_expert_batch_forward_groups(current.groups.data(), current.group_count,
+                                current.group_members.data(), current.tasks.data(), current.count,
+                                current.x, current.tokens, current.h, current.out, nullptr, batch_backend,
+                                diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
+                        } else {
+                            ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
+                                batch_backend, diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
+                        }
                         if (verify_q8 && current.resident_prepared && nf4_q8) {
                             ops::cpu::CpuTilePoolScope originalPool(nullptr);
                             const auto* reference = current.reference_tasks ? current.reference_tasks :
@@ -897,6 +912,17 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         row_token<0 || row_token>=tokens || cold_count_ || async_route_pending_ ||
         async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)
         throw std::logic_error("Invalid native arena CPU batch");
+    // The grouped schedule (AILA_Q4E_VERIFY_CPU_MERGE) lives in the window-wide
+    // job that StartArenaColdRows builds, which the caller only reaches under
+    // AILA_Q4E_VERIFY_CPU_BATCH. A multi-row per-row call therefore means the
+    // merge flag cannot act; report that once instead of silently no-oping.
+    if (tokens >= 2) {
+        static const bool s_merge = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE", false);
+        if (s_merge && !merge_inactive_logged_) {
+            AILA_LOG_INFO("[Q4E VerifyCpuMerge] inactive: window job requires AILA_Q4E_VERIFY_CPU_BATCH=1");
+            merge_inactive_logged_ = true;
+        }
+    }
     try {
         if (prev_cpu_h2d_ev_!=sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
         prev_cpu_h2d_ev_={}; cold_layer_=layer;
@@ -1103,6 +1129,60 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         }
         if (offset != task_count)
             throw std::logic_error("Multi-row CPU task spans are not a strict partition");
+        // Opt-in C1 grouped schedule (AILA_Q4E_VERIFY_CPU_MERGE): tasks are
+        // already a strict row-major partition of (row, expert) pairs, so the
+        // same expert selected by several rows can be expressed as one group
+        // whose members are those pair indices. Everything downstream (row
+        // spans, cold_ranks_, per-row rank-span upload, observer) keeps the
+        // pair layout; only the worker's tile loop is reordered.
+        if (task_count > 1) {
+            static const bool s_merge = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE", false);
+            if (s_merge) {
+                std::array<int, ops::cpu::kMaxExpertBatchTasks> pair_group{}, group_ids{}, group_counts{};
+                int groups = 0;
+                for (int i = 0; i < task_count; ++i) {
+                    int g = -1;
+                    for (int k = 0; k < groups; ++k)
+                        if (group_ids[k] == cold_ids_[i]) { g = k; break; }
+                    if (g < 0) { g = groups++; group_ids[g] = cold_ids_[i]; group_counts[g] = 0; }
+                    pair_group[i] = g; ++group_counts[g];
+                }
+                bool mergeable = groups < task_count;
+                for (int g = 0; g < groups && mergeable; ++g)
+                    mergeable = group_counts[g] <= 4;
+                if (mergeable) {
+                    // Flattened member lists keep each group's pair indices
+                    // contiguous; the pair table itself is untouched.
+                    std::array<int, ops::cpu::kMaxExpertBatchTasks> group_begin{};
+                    int cursor = 0;
+                    for (int g = 0; g < groups; ++g) { group_begin[g] = cursor; cursor += group_counts[g]; }
+                    std::array<int, ops::cpu::kMaxExpertBatchTasks> fill = group_begin;
+                    for (int i = 0; i < task_count; ++i) {
+                        const int g = pair_group[i];
+                        job.group_members[fill[g]++] = i;
+                    }
+                    for (int g = 0; g < groups; ++g) {
+                        job.groups[g].slot = cold_source_slots_[job.group_members[group_begin[g]]];
+                        job.groups[g].member_begin = group_begin[g];
+                        job.groups[g].member_count = group_counts[g];
+                    }
+                    job.group_count = groups;
+                }
+                merge_stat_pairs_ += static_cast<uint64_t>(task_count);
+                merge_stat_groups_ += static_cast<uint64_t>(groups);
+                ++merge_stat_builds_;
+                if (merge_stat_builds_ <= 4 || (merge_stat_builds_ % 48) == 0) {
+                    const double window_f = 1.0 - static_cast<double>(groups) / static_cast<double>(task_count);
+                    const double cum_f = merge_stat_pairs_ > 0
+                        ? 1.0 - static_cast<double>(merge_stat_groups_) / static_cast<double>(merge_stat_pairs_)
+                        : 0.0;
+                    AILA_LOG_INFO("[Q4E VerifyCpuMerge] build=%llu layer=%d pairs=%d groups=%d f=%.4f cum_pairs=%llu cum_groups=%llu cum_f=%.4f",
+                        static_cast<unsigned long long>(merge_stat_builds_), layer, task_count, groups, window_f,
+                        static_cast<unsigned long long>(merge_stat_pairs_),
+                        static_cast<unsigned long long>(merge_stat_groups_), cum_f);
+                }
+            }
+        }
         arena_cold_rows_ = rows; arena_cold_rows_next_row_ = 0;
         arena_cold_rows_joined_ = false; arena_cold_rows_pending_ = true;
         cold_submit_ns_ = steady_ns();

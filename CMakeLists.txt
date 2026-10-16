@@ -790,6 +790,11 @@ target_compile_definitions(AilaQwen4ExpCpuMoePrefillBench PRIVATE NOMINMAX WIN32
 target_include_directories(AilaQwen4ExpCpuMoePrefillBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(AilaQwen4ExpCpuMoePrefillBench PRIVATE AilaLib TBB::tbb)
 
+add_executable(AilaQwen4ExpHostReadBench perf/qwen4exp/q4e_hostread_bench.cpp)
+target_compile_definitions(AilaQwen4ExpHostReadBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
+target_include_directories(AilaQwen4ExpHostReadBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(AilaQwen4ExpHostReadBench PRIVATE AilaLib)
+
 add_executable(AilaQwen4ExpModuleTests
     tests/models/Qwen4ExpModuleTests.cpp
     src/core/ExecutionTrace.cpp

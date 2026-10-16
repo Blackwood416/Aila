@@ -6,6 +6,7 @@
 #include <cmath>
 #include <chrono>
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -906,7 +907,12 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
     const bf16* x, int tokens, bf16* h, float* out, const float* qmap, bool row4,
     bool block64, bool activation64, CpuExpertPhaseTimings* timings, bool nf4_scale_shift,
     bool a64_specialize, bool a64_row2, bool per_expert_dag,
-    const CpuExpertDagTestHooks* dag_test_hooks) {
+    const CpuExpertDagTestHooks* dag_test_hooks,
+    // Optional (AILA_Q4E_VERIFY_CPU_MERGE) grouped schedule: members of one
+    // group iterate the same tile body back to back, so the packed weights of
+    // that tile stay in L1/L2 across the group's tasks. Null keeps the exact
+    // ungrouped schedule. `groups` must be non-null when group_count > 0.
+    const CpuExpertGroup* groups = nullptr, const int* members = nullptr, int group_count = 0) {
     alignas(64) int8_t input[4 * kHiddenDim];
     alignas(64) float input_scales[4 * kHiddenDim / 32];
     alignas(64) int8_t intermediate[kMaxExpertBatchTasks * kIntermediateDim];
@@ -935,6 +941,14 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
         phase_begin = now;
     }
     if(per_expert_dag && activation64 && !timings && !currentTilePool) {
+        if (group_count > 0) {
+            // The per-expert DAG schedules one task at a time and cannot carry
+            // the group map; both switches are opt-in, so keep the exact
+            // ungrouped DAG bytes instead of silently rescheduling.
+            nf4_q8_batch_forward(tasks, count, x, tokens, h, out, qmap, row4, block64, activation64, timings,
+                nf4_scale_shift, a64_specialize, a64_row2, per_expert_dag, dag_test_hooks);
+            return;
+        }
         static std::atomic<bool> reported{false};
         if(!reported.exchange(true,std::memory_order_relaxed))
             std::fprintf(stderr,"[Q4E CpuExpertDagEnabled] actual=1 gate_tile=16 down_tile=32 expert_dependency=1\n");
@@ -943,11 +957,12 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
         return;
     }
     constexpr int gate_tile = 16, down_tile = 32;
-    const int gate_chunks = nf4_q8_parallel_tiles(count * (kIntermediateDim / gate_tile),
-        [&](const tbb::blocked_range<int>& range) {
-            for (int tile = range.begin(); tile < range.end(); ++tile) {
-                const int c = tile / (kIntermediateDim / gate_tile);
-                const int begin = tile % (kIntermediateDim / gate_tile) * gate_tile;
+    const int gate_tile_cols = kIntermediateDim / gate_tile;
+    // Single (task, tile) body shared by the ungrouped loop and the grouped
+    // (AILA_Q4E_VERIFY_CPU_MERGE) loop below. `c` owns both the activation row
+    // and the output row, so every call is byte-identical to the ungrouped
+    // body; only the interleaving across independent tasks changes.
+    auto nf4_q8_gate_tile_body = [&](int c, int begin) {
                 const auto& slot = tasks[c].slot;
                 const auto* values = input + tasks[c].token * kHiddenDim;
                 if (activation64 && (a64_specialize || a64_row2)) {
@@ -974,7 +989,7 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                             values, scales64, lut, lut_scale, nf4_scale_shift, output, a64_row2); break;
                     }
                     mark_a64_specialize_enabled(mode);
-                    continue;
+                    return;
                 }
                 const auto* scales = input_scales + tasks[c].token * (kHiddenDim / activation_block);
                 if (activation64) {
@@ -1031,6 +1046,17 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                     const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
                     h[c * kIntermediateDim + row] = bf16(silu * up);
                 }
+    };
+    const int gate_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * gate_tile_cols,
+        [&](const tbb::blocked_range<int>& range) {
+            for (int tile = range.begin(); tile < range.end(); ++tile) {
+                const int unit = tile / gate_tile_cols;
+                const int begin = tile % gate_tile_cols * gate_tile;
+                if (group_count <= 0) { nf4_q8_gate_tile_body(unit, begin); continue; }
+                const int member_begin = groups[unit].member_begin;
+                const int member_count = groups[unit].member_count;
+                for (int mi = 0; mi < member_count; ++mi)
+                    nf4_q8_gate_tile_body(members[member_begin + mi], begin);
             }
         });
     if (timings) {
@@ -1052,11 +1078,8 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
         timings->quantize_ns += now - phase_begin;
         phase_begin = now;
     }
-    const int down_chunks = nf4_q8_parallel_tiles(count * (kHiddenDim / down_tile),
-        [&](const tbb::blocked_range<int>& range) {
-            for (int tile = range.begin(); tile < range.end(); ++tile) {
-                const int c = tile / (kHiddenDim / down_tile);
-                const int begin = tile % (kHiddenDim / down_tile) * down_tile;
+    const int down_tile_cols = kHiddenDim / down_tile;
+    auto nf4_q8_down_tile_body = [&](int c, int begin) {
                 const auto& slot = tasks[c].slot;
                 if (activation64 && (a64_specialize || a64_row2)) {
                     const auto* values = intermediate + c * kIntermediateDim;
@@ -1083,7 +1106,7 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                             values, scales64, lut, lut_scale, nf4_scale_shift, output, a64_row2); break;
                     }
                     mark_a64_specialize_enabled(mode);
-                    continue;
+                    return;
                 }
                 if (activation64) {
                     for (int row = begin; row < begin + down_tile; ++row)
@@ -1105,6 +1128,17 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                     out[c * kHiddenDim + row] = nf4_q8_dot(slot.down_packed, slot.down_absmax, slot.down_nested,
                         row, intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32),
                         kIntermediateDim, lut, lut_scale, nf4_scale_shift);
+    };
+    const int down_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * down_tile_cols,
+        [&](const tbb::blocked_range<int>& range) {
+            for (int tile = range.begin(); tile < range.end(); ++tile) {
+                const int unit = tile / down_tile_cols;
+                const int begin = tile % down_tile_cols * down_tile;
+                if (group_count <= 0) { nf4_q8_down_tile_body(unit, begin); continue; }
+                const int member_begin = groups[unit].member_begin;
+                const int member_count = groups[unit].member_count;
+                for (int mi = 0; mi < member_count; ++mi)
+                    nf4_q8_down_tile_body(members[member_begin + mi], begin);
             }
         });
     if (timings) {
@@ -1654,6 +1688,61 @@ void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
                         : gpu_order_dot(slot.down_packed, slot.down_absmax, slot.down_nested, row, values, kIntermediateDim, qmap);
             }
         });
+#else
+    throw std::runtime_error("CPU expert batch requires AVX2/FMA");
+#endif
+}
+
+void cpu_expert_batch_forward_groups(const CpuExpertGroup* groups, int group_count,
+    const int* members, const CpuExpertTask* tasks, int pair_count,
+    const bf16* x, int tokens, bf16* h, float* out, const float* quant_map,
+    CpuKernelBackend backend, CpuExpertPhaseTimings* timings, bool nf4_scale_shift) {
+    if (timings) *timings = {};
+    if (!groups || !members || !tasks || !x || !h || !out)
+        throw std::invalid_argument("Null grouped CPU expert batch buffer");
+    if (group_count < 1 || group_count > kMaxExpertBatchTasks)
+        throw std::invalid_argument("Grouped CPU expert batch count out of range");
+    if (pair_count < group_count || pair_count > kMaxExpertBatchTasks)
+        throw std::invalid_argument("Grouped CPU expert pair count out of range");
+    if (tokens < 1 || tokens > 4)
+        throw std::invalid_argument("CPU expert batch exceeds m=4 capacity");
+    alignas(64) std::array<int, kMaxExpertBatchTasks> seen{};
+    int covered = 0;
+    for (int g = 0; g < group_count; ++g) {
+        const int member_begin = groups[g].member_begin, member_count = groups[g].member_count;
+        if (!groups[g].slot.gate_up_packed || !groups[g].slot.down_packed)
+            throw std::invalid_argument("Invalid grouped CPU expert slot");
+        if (member_begin < 0 || member_count < 1 || member_count > 4 || member_begin + member_count > pair_count)
+            throw std::invalid_argument("Invalid grouped CPU expert member span");
+        for (int mi = 0; mi < member_count; ++mi) {
+            const int p = members[member_begin + mi];
+            if (p < 0 || p >= pair_count || seen[p])
+                throw std::invalid_argument("Grouped CPU expert members must cover each pair exactly once");
+            seen[p] = 1; ++covered;
+            if (tasks[p].token < 0 || tasks[p].token >= tokens)
+                throw std::invalid_argument("Invalid grouped CPU expert task token");
+        }
+    }
+    if (covered != pair_count)
+        throw std::invalid_argument("Grouped CPU expert members must cover each pair exactly once");
+#if defined(__AVX2__)
+    const bool nf4_q8_family = backend == CpuKernelBackend::Nf4Q8Avx2 ||
+        backend == CpuKernelBackend::Nf4Q8Row4Avx2 ||
+        backend == CpuKernelBackend::Nf4Q8Block64Avx2 ||
+        backend == CpuKernelBackend::Nf4Q8Activation64Avx2;
+    if (!nf4_q8_family) {
+        // Grouping is implemented for the NF4-Q8 family (the production cold
+        // service). Every other backend keeps its exact ungrouped bytes.
+        cpu_expert_batch_forward(tasks, pair_count, x, tokens, h, out, quant_map, backend, timings, nf4_scale_shift);
+        return;
+    }
+    static const bool a64_specialize = aila::env::read_flag("AILA_Q4E_CPU_A64_SPECIALIZE", false);
+    static const bool a64_row2 = aila::env::read_flag("AILA_Q4E_CPU_A64_ROW2", false);
+    static const bool per_expert_dag = aila::env::read_flag("AILA_Q4E_CPU_PER_EXPERT_DAG", false);
+    nf4_q8_batch_forward(tasks, pair_count, x, tokens, h, out, resolve_quant_map(quant_map),
+        backend == CpuKernelBackend::Nf4Q8Row4Avx2, backend == CpuKernelBackend::Nf4Q8Block64Avx2,
+        backend == CpuKernelBackend::Nf4Q8Activation64Avx2, timings, nf4_scale_shift,
+        a64_specialize, a64_row2, per_expert_dag, nullptr, groups, members, group_count);
 #else
     throw std::runtime_error("CPU expert batch requires AVX2/FMA");
 #endif

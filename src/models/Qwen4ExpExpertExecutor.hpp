@@ -375,6 +375,14 @@ private:
     int arena_cold_rows_ = 0;
     int arena_cold_rows_next_row_ = 0;
     std::array<int, 4> arena_cold_row_begin_{}, arena_cold_row_count_{};
+
+    // Opt-in grouped cold service (AILA_Q4E_VERIFY_CPU_MERGE): the window job
+    // carries a (layer, expert) -> multi-row group map so one packed-weight
+    // stream serves every row that selected the expert. The counters below only
+    // feed the read-only [Q4E VerifyCpuMerge] diagnostic line; f is defined as
+    // 1 - merged tasks / original tasks, aggregated across builds.
+    uint64_t merge_stat_pairs_ = 0, merge_stat_groups_ = 0, merge_stat_builds_ = 0;
+    bool merge_inactive_logged_ = false;
 };
 
 } // namespace aila
