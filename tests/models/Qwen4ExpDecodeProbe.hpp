@@ -6,6 +6,11 @@ void test_decode_probe(const std::string& directory) {
     const int prompt_count = aila::env::read_int("AILA_Q4E_DECODE_PROBE_PROMPT", 30);
     const int rows = aila::env::read_int("AILA_Q4E_DECODE_PROBE_ROWS", 1);
     const int repeats = aila::env::read_int("AILA_Q4E_DECODE_PROBE_REPEATS", 4);
+    // The expert-XMX prefill path groups bf16 GEMMs by whichever cache source
+    // (resident/arena/staging) serves a routing, so replayed passes may differ
+    // in the last bits. Opt in to tolerate that drift instead of failing.
+    const bool allow_replay_drift =
+        aila::env::read_int("AILA_Q4E_DECODE_PROBE_ALLOW_REPLAY_DRIFT", 0) != 0;
     expect((prompt_count == 30 || prompt_count == 512) && (rows == 1 || rows == 2 || rows == 4) &&
            repeats >= 2 && repeats <= 8, "Invalid decode probe configuration");
     InferenceEngine engine;
@@ -78,6 +83,7 @@ void test_decode_probe(const std::string& directory) {
         std::vector<double> times; times.reserve(steps / rows);
         std::vector<uint64_t> hashes; hashes.reserve(steps);
         std::vector<int> top1; top1.reserve(steps);
+        int replay_drift = 0; // Replay row hashes that differ from pass 0.
         double core_ms = 0;
         const auto loop_start = std::chrono::steady_clock::now();
         for (int t = 0; t < steps; t += rows) {
@@ -100,7 +106,9 @@ void test_decode_probe(const std::string& directory) {
                     expected_hashes[t+r] = hash;
                     std::copy(row, row + vocabulary, reference.data() + size_t(t+r) * vocabulary);
                 } else {
-                    expect(hash == expected_hashes[t+r], "Identical continuation replay changed logits bits");
+                    const bool matches = hash == expected_hashes[t+r];
+                    expect(matches || allow_replay_drift, "Identical continuation replay changed logits bits");
+                    if (!matches) ++replay_drift;
                 }
                 hashes.push_back(hash); top1.push_back(best);
             }
@@ -134,7 +142,11 @@ void test_decode_probe(const std::string& directory) {
         for (size_t i=0;i<top1.size();++i) std::cout << (i ? "," : "") << top1[i];
         std::cout << "],\"forward_ms\":[";
         for (size_t i=0;i<times.size();++i) std::cout << (i ? "," : "") << times[i];
-        std::cout << "]}\n";
+        std::cout << "]";
+        if (allow_replay_drift) std::cout << ",\"replay_drift\":" << replay_drift;
+        std::cout << "}\n";
+        if (allow_replay_drift && pass > 0)
+            std::cout << "[DECODE REPLAY] drift=" << replay_drift << "/" << steps << '\n';
     }
     const auto path = aila::env::read_string("AILA_Q4E_DECODE_PROBE_LOGITS", "");
     if (!path.empty()) {
