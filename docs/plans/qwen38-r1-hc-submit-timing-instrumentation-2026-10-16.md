@@ -97,7 +97,25 @@ only observable difference is that the `[Q4E AdaptiveWork]` line carries the
 
 ## 6. Build verification
 
-Pending (waiting for the running GPU arm to exit before building).
+Both builds green on 2026-10-16 (Asia/Shanghai), no GPU test run from this
+change; the tree also carries the owner-approved default flips
+(`AILA_Q4E_PREFILL_EXPERT_XMX` on + MIN_M=256/ROWS=4096,
+`AILA_Q4E_STAGE_COPY_PARALLEL` on) in the backend file.
+
+- Runtime: `pwsh -NoProfile -File build.ps1 -BuildDir build-refactor` exit 0.
+  Race guard: `HyperConnectionOps.cpp.obj` 21:41:17 and
+  `Qwen4ExpBnb4Backend.cpp.obj` 21:41:38 are both later than every touched src
+  mtime (hpp 21:33:53, ops cpp 21:34:53, backend cpp 21:39:40), so the
+  artifacts below contain the instrumentation plus the default flips.
+- Artifacts: `build-refactor/AilaWorker.exe` **2026-10-16 21:43:00**
+  (12,633,600 bytes); `Aila.exe` 21:43:01; `AilaShared.dll` 21:41:43;
+  `AilaInference.dll` 21:41:38.
+- Server: `pwsh -NoProfile -File tools/server/build.ps1 -SkipDependencies`
+  exit 0; `build-refactor-server/AilaServer.exe` **2026-10-16 21:44:06**
+  (2,627,072 bytes; the server never links the SYCL ops, this is the
+  discipline build).
+- Instrumentation landed as commit `ffb2b08`; the 16 backend log fields rode
+  in `6f9a41e` together with the default flips.
 
 ## 7. Files changed
 
@@ -105,3 +123,95 @@ Pending (waiting for the running GPU arm to exit before building).
 - `src/ops/HyperConnectionOps.cpp` (read-once gate, counters, 4 submit sites)
 - `src/models/Qwen4ExpBnb4Backend.cpp` (window take + 16 appended log fields)
 - this file
+- `tmp/q4e-structural-20261016/probe_submit_shape.cpp` + `probe_submit_shape.exe`
+  + `run_shape_probe.ps1` (section 8; `tmp/` is not tracked)
+
+## 8. Structural submit-shape probe (2026-10-16)
+
+Follow-up for the 21-26 us/submit attribution. hct-a1 receipt: `hc_submit_norm`
+~21 us and `hc_submit_normfb` ~26 us per call in the production worker (min
+13.4-17.0, max 39-68 us) while the bare `submit_probe.cpp` measured ~6.5 us per
+submit in the same L0 environment. The probe re-measures that gap as a function
+of the CG shape alone and then repeats it under simulated CPU contention:
+`tmp/q4e-structural-20261016/probe_submit_shape.cpp` ->
+`probe_submit_shape.exe` (2026-10-16 21:57:11, 143,872 bytes). Compile + link
+verified; deliberately not executed here (GPU is scheduled by the main agent).
+
+| arm | shape |
+|---|---|
+| `A_plain` | `q.parallel_for(range<1>(1024), scalar body)`; the 6.5 us control |
+| `S_sync` | `q.single_task([] {})`; pure submit call with no CG work |
+| `B_slm_empty` | `submit` + `local_accessor<float,1>(256)` + `nd_range<1>(4*256,256)` + `[[reqd_sub_group_size(16)]]`, near-empty body |
+| `C_down_slm` | B's CG shape + the real down captures (~12 values) + the full `hc_decode_down_inject_impl` body, SLM kept |
+| `R_down_real` | exact production down CG: same captures and body, no SLM |
+
+Phases: `idle`, then (default; skipped by `--cg-only`) `loaded18` = 18
+in-process CPU threads each streaming a private 10 MB buffer read+write, the
+18-expert-thread / fill-thread contention model. `A->B->C/R` prices hypothesis
+(a) "the HC CG shape itself is expensive"; `idle->loaded18` prices hypothesis
+(b) "the loaded production machine is expensive".
+
+`--cg-only` adds two extra pieces: `cg_no_kernel` (the SLM + capture CG without
+`parallel_for`; prints `unsupported` if the runtime rejects zero-command command
+groups) and `cg_capture_host` (host-only closure construction with the same
+capture pack, pricing the capture copy the call site does before `submit`,
+which the arm intervals exclude by construction).
+
+Run (GPU; refuses to start when a worker/server holds the card):
+
+```
+pwsh -NoProfile -File tmp/q4e-structural-20261016/run_shape_probe.ps1 -Log tmp/q4e-structural-20261016/shape-L20.log
+tmp/q4e-structural-20261016/probe_submit_shape.exe --n 256 --warmup 64 --wait-every 32
+```
+
+Defaults `--n 256 --warmup 64 --wait-every 32` (bounded 32-deep in-flight
+window; `--wait-every 0` submits the whole arm before one wait); the runner sets
+the production L0 knobs (regular command lists, copy engine on, batch size 0,
+cache persistent off). `run_shape_probe.ps1 -Cpu` smoke-tests the harness on the
+CPU device; those numbers are not representative of the L0 submit path.
+Output: one `[SHAPE ARM] name=... phase=... n=... p10_us=... median_us=...
+p90_us=... mean_us=... min_us=... max_us=...` line per arm. Build (project build
+untouched):
+
+```
+pwsh -NoProfile -File tmp/q4e-bottleneck-audit-20261016/build_probe.ps1 -Source tmp/q4e-structural-20261016/probe_submit_shape.cpp -Output tmp/q4e-structural-20261016/probe_submit_shape.exe
+```
+
+## 9. Per-submit kernel metadata path at the HC sites (DPC++ 2026.1 audit)
+
+Source-level answer to "do `local_accessor` and `[[reqd_sub_group_size]]` trigger
+a per-submit kernel specialization or metadata lookup". Not a re-specialization
+of the device image, but `submit` does per-call template erasure and bookkeeping.
+Anchors in the installed headers
+(`.../oneAPI/compiler/2026.1/include/sycl/handler.hpp`):
+
+- `handler.hpp:632`, called at `:885`/`:917`: every `parallel_for` runs
+  `verifyUsedKernelBundleInternal(Info.Name)`. With no explicit kernel bundle set
+  (Aila never calls `use_kernel_bundle`), this is the documented fast path
+  ("Verifies the kernel bundle to be used if any is set"): a name check, no
+  device-image lookup - but it is executed once per HC submit.
+- `handler.hpp:893`/`:922`: `StoreLambda<...>(std::move(KernelFunc))` per submit -
+  "Stores lambda to the template-free object. Also initializes the kernel name
+  and prepares for arguments to be extracted from the lambda in
+  handler::finalize()". Per-submit side effects: `MHostKernel.reset(new
+  detail::HostKernel<...>)` (`handler.hpp:651`, one heap allocation) and
+  `setDeviceKernelInfo<KernelName>(...)` (`handler.hpp:695`).
+- `handler.hpp:700`/`:1027`: `getOrInsertHandlerKernelBundle(Insert=true)` per CG.
+- `handler.hpp:473`/`:478` + `:2641`: each `local_accessor` construction appends a
+  `shared_ptr<LocalAccessorImplHost>` to the handler's `MLocalAccStorage` (one
+  heap allocation per accessor per submit) - the two norm ops carry one each; the
+  down/up ops carry none.
+- `[[reqd_sub_group_size]]` is a kernel function attribute consumed when the
+  device image is built; it adds no per-submit specialization. The project build
+  already passes `-fsycl-default-sub-group-size=16`, so the attribute matches the
+  compile default.
+- `handler::finalize()` (runtime side, outside the headers) then resolves the
+  kernel in the per-context program/kernel cache (the first submit per kernel
+  pays JIT; later submits are cache hits - inference from DPC++ behaviour, not a
+  header anchor), marshals the ~12 captured arguments into UR launch parameters
+  and sets the dynamic local-memory size for the SLM kernels.
+
+So each HC submit pays: one bundle-name check, one `HostKernel` heap allocation,
+~10-12 captured-argument collection and cache lookups, all inside the measured
+interval; section 8's `A -> S -> B -> C/R` ladder prices exactly these
+increments against the 6.5 us control.
