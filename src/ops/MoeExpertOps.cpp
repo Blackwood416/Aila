@@ -5921,6 +5921,13 @@ sycl::event moe_expert_major_prefill_gate_up(
     sycl::event quad_ev{};
     sycl::event pair_ev{};
     sycl::event single_ev{};
+    // A default-constructed sycl::event compares unequal to another default
+    // event on this toolchain, so the returned fence must be selected by an
+    // explicit "was submitted" flag, never by an event comparison.
+    bool eight_submitted = false;
+    bool quad_submitted = false;
+    bool pair_submitted = false;
+    bool single_submitted = false;
 
     // Eights lead the layout (see RunGroupedExperts) so the descending-width
     // chain lets every down section depend on its own gate/up section.
@@ -5942,6 +5949,7 @@ sycl::event moe_expert_major_prefill_gate_up(
                     quant_map, x, h, clamped_eights, top_k,
                     in_features, intermediate_size, blocksize, dep_event);
             }
+            eight_submitted = true;
             const int eight_acts = 8 * clamped_eights;
             cur_offset += eight_acts;
             remaining_acts -= eight_acts;
@@ -5989,6 +5997,7 @@ sycl::event moe_expert_major_prefill_gate_up(
                     quant_map, x, h, clamped_quads, top_k,
                     in_features, intermediate_size, blocksize, dep_event);
             }
+            quad_submitted = true;
             const int quad_acts = 4 * clamped_quads;
             cur_offset += quad_acts;
             remaining_acts -= quad_acts;
@@ -6013,6 +6022,7 @@ sycl::event moe_expert_major_prefill_gate_up(
                     quant_map, x, h, clamped_pairs, top_k,
                     in_features, intermediate_size, blocksize, dep_event);
             }
+            pair_submitted = true;
             const int pair_acts = 2 * clamped_pairs;
             cur_offset += pair_acts;
             remaining_acts -= pair_acts;
@@ -6051,12 +6061,14 @@ sycl::event moe_expert_major_prefill_gate_up(
                 quant_map, x, h, remaining_acts, top_k,
                 in_features, intermediate_size, blocksize, dep_event);
         }
+        single_submitted = true;
     }
 
-    if (single_ev != sycl::event{}) return single_ev;
-    if (pair_ev != sycl::event{}) return pair_ev;
-    if (quad_ev != sycl::event{}) return quad_ev;
-    return eight_ev;
+    if (single_submitted) return single_ev;
+    if (pair_submitted) return pair_ev;
+    if (quad_submitted) return quad_ev;
+    if (eight_submitted) return eight_ev;
+    return {};
 }
 
 template <bool Compact>
@@ -6118,6 +6130,13 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
     sycl::event quad_ev{};
     sycl::event pair_ev{};
     sycl::event single_ev{};
+    // A default-constructed sycl::event compares unequal to another default
+    // event on this toolchain, so the returned fence must be selected by an
+    // explicit "was submitted" flag, never by an event comparison.
+    bool eight_submitted = false;
+    bool quad_submitted = false;
+    bool pair_submitted = false;
+    bool single_submitted = false;
 
     // Eights lead the layout (see RunGroupedExperts); publishing them first
     // keeps every down section behind its matching gate/up section.
@@ -6139,6 +6158,7 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_eights, top_k,
                     in_features, out_features, blocksize, dep_event);
             }
+            eight_submitted = true;
             const int eight_acts = 8 * clamped_eights;
             cur_offset += eight_acts;
             remaining_acts -= eight_acts;
@@ -6186,6 +6206,7 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
                     in_features, out_features, blocksize, dep_event);
             }
+            quad_submitted = true;
             const int quad_acts = 4 * clamped_quads;
             cur_offset += quad_acts;
             remaining_acts -= quad_acts;
@@ -6210,6 +6231,7 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_pairs, top_k,
                     in_features, out_features, blocksize, dep_event);
             }
+            pair_submitted = true;
             const int pair_acts = 2 * clamped_pairs;
             cur_offset += pair_acts;
             remaining_acts -= pair_acts;
@@ -6248,12 +6270,14 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
                 quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
                 in_features, out_features, blocksize, dep_event);
         }
+        single_submitted = true;
     }
 
-    if (single_ev != sycl::event{}) return single_ev;
-    if (pair_ev != sycl::event{}) return pair_ev;
-    if (quad_ev != sycl::event{}) return quad_ev;
-    return eight_ev;
+    if (single_submitted) return single_ev;
+    if (pair_submitted) return pair_ev;
+    if (quad_submitted) return quad_ev;
+    if (eight_submitted) return eight_ev;
+    return {};
 }
 
 sycl::event moe_expert_major_prefill_down(
