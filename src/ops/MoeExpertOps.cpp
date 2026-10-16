@@ -1580,7 +1580,42 @@ sycl::event launch_moe_prefill_down_rows(
     });
 }
 
-template <bool UseNested, bool FixedNested256 = false>
+// ---------------------------------------------------------------------------
+// P9 / AILA_Q4E_PREFILL_ACT_SLM: activation-row staging in SLM.
+//
+// Every expert-major prefill kernel below maps one 16-lane sub-group to one
+// output row, and the 16 sub-groups of a work-group walk 16 consecutive rows.
+// The per-activation row count (intermediate_size for gate/up, out_features
+// for down) is a multiple of 16 in every production shape, so all 16
+// sub-groups of a work-group belong to the same activation, yet each of them
+// re-reads that whole activation row from global/L1. With this flag the work
+// group stages its activation row(s) once in SLM and every sub-group then
+// reads the same element offsets from SLM.
+//
+// The staged bytes, every consumer index and every FMA/reduce order are
+// unchanged, so the kernels stay bit-exact; only the memory space of the
+// activation loads changes. Default 0 keeps the historical global reads.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kQ4eActSlmMaxBytes = 32 * 1024; // >32 KB/WG costs residency [A770]
+bool q4e_prefill_act_slm_enabled() {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_PREFILL_ACT_SLM", false);
+    return enabled;
+}
+// rows_per_group == wg_size / sub_group_size == 16 in all of these kernels.
+// The staging is only valid when one work-group serves one activation (or one
+// quad of activations), which needs features_per_act % rows_per_group == 0;
+// the cooperative vec8 copy needs in_features % 8 == 0.
+bool q4e_act_slm_shape_ok(int in_features, int features_per_act, int acts_per_wg) {
+    if (in_features <= 0 || features_per_act <= 0) return false;
+    if ((in_features % 8) != 0) return false;
+    if ((features_per_act % 16) != 0) return false;
+    const int tile_bytes = acts_per_wg * in_features * static_cast<int>(sizeof(bf16));
+    return tile_bytes <= kQ4eActSlmMaxBytes;
+}
+} // namespace
+
+template <bool UseNested, bool FixedNested256 = false, bool ActSlm = false>
 sycl::event launch_moe_expert_major_prefill_gate_up(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1608,6 +1643,9 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
             cgh.depends_on(*dep_event);
         }
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        // P9: this work-group's activation row, staged once for all 16 sub-groups.
+        sycl::local_accessor<bf16, 1> x_slm(
+            sycl::range<1>(ActSlm ? in_features : 1), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
@@ -1617,10 +1655,28 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
                 const int sg_id = lid / sub_group_size;
                 const int sg_lane = lid % sub_group_size;
                 const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const size_t wg_base_row = item.get_group(0) * rows_per_group; // uniform
+                const bool wg_active = wg_base_row < total_rows;               // uniform
                 const int stride = static_cast<int>(sub_group_size) * 4;
 
                 if (lid < 16) {
                     qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                bf16* const x_slm_ptr = x_slm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (ActSlm) {
+                    // Every lane of this work-group consumes act_idx =
+                    // wg_base_row / intermediate_size: the dispatcher only enables
+                    // this path when intermediate_size % rows_per_group == 0, so no
+                    // work-group straddles two activations.
+                    if (wg_active) {
+                        const int act_idx = static_cast<int>(wg_base_row / intermediate_size);
+                        const bf16* src = x + static_cast<size_t>(token_ids[act_idx]) * in_features;
+                        for (int e = lid * 8; e < in_features;
+                             e += static_cast<int>(wg_size) * 8) {
+                            *reinterpret_cast<vec8*>(x_slm_ptr + e) =
+                                *reinterpret_cast<const vec8*>(src + e);
+                        }
+                    }
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
@@ -1674,7 +1730,12 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
                             ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
-                        const vec8 in_v = *reinterpret_cast<const vec8*>(x_token + byte_offset * 2);
+                        vec8 in_v;
+                        if constexpr (ActSlm) {
+                            in_v = *reinterpret_cast<const vec8*>(x_slm_ptr + byte_offset * 2);
+                        } else {
+                            in_v = *reinterpret_cast<const vec8*>(x_token + byte_offset * 2);
+                        }
 
                         const uint8_t gb0 = static_cast<uint8_t>(g4);
                         const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
@@ -1721,7 +1782,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up(
     });
 }
 
-template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
+template <bool UseNested, bool Compact = false, bool FixedNested256 = false, bool ActSlm = false>
 sycl::event launch_moe_expert_major_prefill_down(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -1749,6 +1810,9 @@ sycl::event launch_moe_expert_major_prefill_down(
             cgh.depends_on(*dep_event);
         }
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        // P9: this work-group's h row, staged once for all 16 sub-groups.
+        sycl::local_accessor<bf16, 1> x_slm(
+            sycl::range<1>(ActSlm ? in_features : 1), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
@@ -1758,10 +1822,31 @@ sycl::event launch_moe_expert_major_prefill_down(
                 const int sg_id = lid / sub_group_size;
                 const int sg_lane = lid % sub_group_size;
                 const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const size_t wg_base_row = item.get_group(0) * rows_per_group; // uniform
+                const bool wg_active = wg_base_row < total_rows;               // uniform
                 const int stride = static_cast<int>(sub_group_size) * 4;
 
                 if (lid < 16) {
                     qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                bf16* const x_slm_ptr = x_slm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (ActSlm) {
+                    // Every lane of this work-group consumes act_idx =
+                    // wg_base_row / out_features: the dispatcher only enables this
+                    // path when out_features % rows_per_group == 0, so no work-group
+                    // straddles two activations.
+                    if (wg_active) {
+                        const int act_idx = static_cast<int>(wg_base_row / out_features);
+                        const int act_token = token_ids[act_idx];
+                        const int act_rank = ranks[act_idx];
+                        const bf16* src = h +
+                            (static_cast<size_t>(act_token) * top_k + act_rank) * in_features;
+                        for (int e = lid * 8; e < in_features;
+                             e += static_cast<int>(wg_size) * 8) {
+                            *reinterpret_cast<vec8*>(x_slm_ptr + e) =
+                                *reinterpret_cast<const vec8*>(src + e);
+                        }
+                    }
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
@@ -1798,7 +1883,12 @@ sycl::event launch_moe_expert_major_prefill_down(
                             da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
-                        const vec8 in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
+                        vec8 in_v;
+                        if constexpr (ActSlm) {
+                            in_v = *reinterpret_cast<const vec8*>(x_slm_ptr + byte_offset * 2);
+                        } else {
+                            in_v = *reinterpret_cast<const vec8*>(in_expert + byte_offset * 2);
+                        }
 
                         const uint8_t db0 = static_cast<uint8_t>(d4);
                         const uint8_t db1 = static_cast<uint8_t>(d4 >> 8);
@@ -2159,7 +2249,7 @@ sycl::event launch_moe_expert_major_prefill_down_2token(
     });
 }
 
-template <bool UseNested, bool FixedNested256 = false>
+template <bool UseNested, bool FixedNested256 = false, bool ActSlm = false>
 sycl::event launch_moe_expert_major_prefill_gate_up_4token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -2187,6 +2277,9 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
             cgh.depends_on(*dep_event);
         }
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        // P9: the quad's four activation rows, staged once for all 16 sub-groups.
+        sycl::local_accessor<bf16, 1> x_slm(
+            sycl::range<1>(ActSlm ? 4 * in_features : 1), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
@@ -2196,10 +2289,36 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
                 const int sg_id = lid / sub_group_size;
                 const int sg_lane = lid % sub_group_size;
                 const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const size_t wg_base_row = item.get_group(0) * rows_per_group; // uniform
+                const bool wg_active = wg_base_row < total_rows;               // uniform
                 const int stride = static_cast<int>(sub_group_size) * 4;
 
                 if (lid < 16) {
                     qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                bf16* const x_slm_ptr = x_slm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (ActSlm) {
+                    // quad_idx is work-group uniform: the dispatcher only enables
+                    // this path when intermediate_size % rows_per_group == 0.
+                    if (wg_active) {
+                        const int quad_idx = static_cast<int>(wg_base_row / intermediate_size);
+                        const int base = quad_idx * 4;
+                        const bf16* src0 = x + static_cast<size_t>(token_ids[base + 0]) * in_features;
+                        const bf16* src1 = x + static_cast<size_t>(token_ids[base + 1]) * in_features;
+                        const bf16* src2 = x + static_cast<size_t>(token_ids[base + 2]) * in_features;
+                        const bf16* src3 = x + static_cast<size_t>(token_ids[base + 3]) * in_features;
+                        for (int e = lid * 8; e < in_features;
+                             e += static_cast<int>(wg_size) * 8) {
+                            *reinterpret_cast<vec8*>(x_slm_ptr + e) =
+                                *reinterpret_cast<const vec8*>(src0 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + in_features + e) =
+                                *reinterpret_cast<const vec8*>(src1 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + 2 * in_features + e) =
+                                *reinterpret_cast<const vec8*>(src2 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + 3 * in_features + e) =
+                                *reinterpret_cast<const vec8*>(src3 + e);
+                        }
+                    }
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
@@ -2266,10 +2385,22 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token(
                             ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
-                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
-                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
-                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
-                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+                        vec8 in_v0;
+                        vec8 in_v1;
+                        vec8 in_v2;
+                        vec8 in_v3;
+                        if constexpr (ActSlm) {
+                            const int elem_offset = byte_offset * 2;
+                            in_v0 = *reinterpret_cast<const vec8*>(x_slm_ptr + elem_offset);
+                            in_v1 = *reinterpret_cast<const vec8*>(x_slm_ptr + in_features + elem_offset);
+                            in_v2 = *reinterpret_cast<const vec8*>(x_slm_ptr + 2 * in_features + elem_offset);
+                            in_v3 = *reinterpret_cast<const vec8*>(x_slm_ptr + 3 * in_features + elem_offset);
+                        } else {
+                            in_v0 = *reinterpret_cast<const vec8*>(x_token0 + byte_offset * 2);
+                            in_v1 = *reinterpret_cast<const vec8*>(x_token1 + byte_offset * 2);
+                            in_v2 = *reinterpret_cast<const vec8*>(x_token2 + byte_offset * 2);
+                            in_v3 = *reinterpret_cast<const vec8*>(x_token3 + byte_offset * 2);
+                        }
 
                         const uint8_t gb0 = static_cast<uint8_t>(g4);
                         const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
@@ -3666,7 +3797,7 @@ sycl::event launch_moe_expert_major_prefill_gate_up_4token_wgshare_nounpack(
 }
 
 
-template <bool UseNested, bool Compact = false, bool FixedNested256 = false>
+template <bool UseNested, bool Compact = false, bool FixedNested256 = false, bool ActSlm = false>
 sycl::event launch_moe_expert_major_prefill_down_4token(
     Context& ctx,
     const MoeExpertSlotDev* slots,
@@ -3694,6 +3825,9 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
             cgh.depends_on(*dep_event);
         }
         sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        // P9: the quad's four gate/up activation rows (h), staged once per WG.
+        sycl::local_accessor<bf16, 1> x_slm(
+            sycl::range<1>(ActSlm ? 4 * in_features : 1), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
@@ -3703,10 +3837,40 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
                 const int sg_id = lid / sub_group_size;
                 const int sg_lane = lid % sub_group_size;
                 const size_t global_row = item.get_group(0) * rows_per_group + sg_id;
+                const size_t wg_base_row = item.get_group(0) * rows_per_group; // uniform
+                const bool wg_active = wg_base_row < total_rows;               // uniform
                 const int stride = static_cast<int>(sub_group_size) * 4;
 
                 if (lid < 16) {
                     qmap[lid] = quant_map ? quant_map[lid] : kDefaultNf4QuantMap[lid];
+                }
+                bf16* const x_slm_ptr = x_slm.get_multi_ptr<sycl::access::decorated::no>().get();
+                if constexpr (ActSlm) {
+                    // quad_idx is work-group uniform: the dispatcher only enables
+                    // this path when out_features % rows_per_group == 0.
+                    if (wg_active) {
+                        const int quad_idx = static_cast<int>(wg_base_row / out_features);
+                        const int base = quad_idx * 4;
+                        const bf16* src0 = h + (static_cast<size_t>(token_ids[base + 0]) * top_k +
+                                                ranks[base + 0]) * in_features;
+                        const bf16* src1 = h + (static_cast<size_t>(token_ids[base + 1]) * top_k +
+                                                ranks[base + 1]) * in_features;
+                        const bf16* src2 = h + (static_cast<size_t>(token_ids[base + 2]) * top_k +
+                                                ranks[base + 2]) * in_features;
+                        const bf16* src3 = h + (static_cast<size_t>(token_ids[base + 3]) * top_k +
+                                                ranks[base + 3]) * in_features;
+                        for (int e = lid * 8; e < in_features;
+                             e += static_cast<int>(wg_size) * 8) {
+                            *reinterpret_cast<vec8*>(x_slm_ptr + e) =
+                                *reinterpret_cast<const vec8*>(src0 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + in_features + e) =
+                                *reinterpret_cast<const vec8*>(src1 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + 2 * in_features + e) =
+                                *reinterpret_cast<const vec8*>(src2 + e);
+                            *reinterpret_cast<vec8*>(x_slm_ptr + 3 * in_features + e) =
+                                *reinterpret_cast<const vec8*>(src3 + e);
+                        }
+                    }
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
@@ -3757,10 +3921,22 @@ sycl::event launch_moe_expert_major_prefill_down_4token(
                             da = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.down_absmax, slot.down_nested, scale_index);
                         }
-                        const vec8 in_v0 = *reinterpret_cast<const vec8*>(in_expert0 + byte_offset * 2);
-                        const vec8 in_v1 = *reinterpret_cast<const vec8*>(in_expert1 + byte_offset * 2);
-                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(in_expert2 + byte_offset * 2);
-                        const vec8 in_v3 = *reinterpret_cast<const vec8*>(in_expert3 + byte_offset * 2);
+                        vec8 in_v0;
+                        vec8 in_v1;
+                        vec8 in_v2;
+                        vec8 in_v3;
+                        if constexpr (ActSlm) {
+                            const int elem_offset = byte_offset * 2;
+                            in_v0 = *reinterpret_cast<const vec8*>(x_slm_ptr + elem_offset);
+                            in_v1 = *reinterpret_cast<const vec8*>(x_slm_ptr + in_features + elem_offset);
+                            in_v2 = *reinterpret_cast<const vec8*>(x_slm_ptr + 2 * in_features + elem_offset);
+                            in_v3 = *reinterpret_cast<const vec8*>(x_slm_ptr + 3 * in_features + elem_offset);
+                        } else {
+                            in_v0 = *reinterpret_cast<const vec8*>(in_expert0 + byte_offset * 2);
+                            in_v1 = *reinterpret_cast<const vec8*>(in_expert1 + byte_offset * 2);
+                            in_v2 = *reinterpret_cast<const vec8*>(in_expert2 + byte_offset * 2);
+                            in_v3 = *reinterpret_cast<const vec8*>(in_expert3 + byte_offset * 2);
+                        }
 
                         const uint8_t db0 = static_cast<uint8_t>(d4);
                         const uint8_t db1 = static_cast<uint8_t>(d4 >> 8);
@@ -5231,6 +5407,21 @@ sycl::event moe_expert_major_prefill_gate_up_4token(
     bool use_nested,
     bool nested_fixed256) {
     if (total_quads <= 0) return {};
+    const bool act_slm = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, intermediate_size, 4);
+    if (act_slm) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token<true, true, true>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_gate_up_4token<true, false, true>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_gate_up_4token<false, false, true>(
+            ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
+            in_features, intermediate_size, blocksize, dep_event);
+    }
     if (use_nested) {
         if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up_4token<true, true>(
             ctx, slots, token_ids, ranks, quant_map, x, h, total_quads, top_k,
@@ -5261,6 +5452,21 @@ sycl::event moe_expert_major_prefill_down_4token(
     bool use_nested,
     bool nested_fixed256) {
     if (total_quads <= 0) return {};
+    const bool act_slm = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, out_features, 4);
+    if (act_slm) {
+        if (use_nested) {
+            if (nested_fixed256) return launch_moe_expert_major_prefill_down_4token<true, false, true, true>(
+                ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
+                in_features, out_features, blocksize, dep_event);
+            return launch_moe_expert_major_prefill_down_4token<true, false, false, true>(
+                ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
+                in_features, out_features, blocksize, dep_event);
+        }
+        return launch_moe_expert_major_prefill_down_4token<false, false, false, true>(
+            ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
+            in_features, out_features, blocksize, dep_event);
+    }
     if (use_nested) {
         if (nested_fixed256) return launch_moe_expert_major_prefill_down_4token<true, false, true>(
             ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_quads, top_k,
@@ -5679,6 +5885,20 @@ sycl::event moe_expert_major_prefill_gate_up(
     bool nested_fixed256) {
     if (total_acts <= 0) return {};
     if (num_eights <= 0 && num_quads <= 0 && num_pairs <= 0) {
+        if (q4e_prefill_act_slm_enabled() &&
+            q4e_act_slm_shape_ok(in_features, intermediate_size, 1)) {
+            if (use_nested) {
+                if (nested_fixed256) return launch_moe_expert_major_prefill_gate_up<true, true, true>(
+                    ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+                return launch_moe_expert_major_prefill_gate_up<true, false, true>(
+                    ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+            }
+            return launch_moe_expert_major_prefill_gate_up<false, false, true>(
+                ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
+                in_features, intermediate_size, blocksize, dep_event);
+        }
         auto ev = use_nested ? (nested_fixed256 ? launch_moe_expert_major_prefill_gate_up<true, true>(
                 ctx, slots, token_ids, ranks, quant_map, x, h, total_acts, top_k,
                 in_features, intermediate_size, blocksize, dep_event)
@@ -5691,6 +5911,10 @@ sycl::event moe_expert_major_prefill_gate_up(
         return ev;
     }
 
+    const bool act_slm_quad = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, intermediate_size, 4);
+    const bool act_slm_single = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, intermediate_size, 1);
     int remaining_acts = total_acts;
     int cur_offset = 0;
     sycl::event eight_ev{};
@@ -5734,6 +5958,22 @@ sycl::event moe_expert_major_prefill_gate_up(
                     quant_map, x, h, clamped_quads, top_k,
                     in_features, intermediate_size, blocksize, dep_event,
                     use_nested, wgshare, nested_fixed256);
+            } else if (act_slm_quad) {
+                if (use_nested) {
+                    if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true, true, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, x, h, clamped_quads, top_k,
+                        in_features, intermediate_size, blocksize, dep_event);
+                    else quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true, false, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, x, h, clamped_quads, top_k,
+                        in_features, intermediate_size, blocksize, dep_event);
+                } else {
+                    quad_ev = launch_moe_expert_major_prefill_gate_up_4token<false, false, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, x, h, clamped_quads, top_k,
+                        in_features, intermediate_size, blocksize, dep_event);
+                }
             } else if (use_nested) {
                 if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_gate_up_4token<true, true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
@@ -5780,7 +6020,23 @@ sycl::event moe_expert_major_prefill_gate_up(
     }
 
     if (remaining_acts > 0) {
-        if (use_nested) {
+        if (act_slm_single) {
+            if (use_nested) {
+                if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_gate_up<true, true, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, x, h, remaining_acts, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+                else single_ev = launch_moe_expert_major_prefill_gate_up<true, false, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, x, h, remaining_acts, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+            } else {
+                single_ev = launch_moe_expert_major_prefill_gate_up<false, false, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, x, h, remaining_acts, top_k,
+                    in_features, intermediate_size, blocksize, dep_event);
+            }
+        } else if (use_nested) {
             if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_gate_up<true, true>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, x, h, remaining_acts, top_k,
@@ -5825,6 +6081,20 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
     bool nested_fixed256) {
     if (total_acts <= 0) return {};
     if (num_eights <= 0 && num_quads <= 0 && num_pairs <= 0) {
+        if (q4e_prefill_act_slm_enabled() &&
+            q4e_act_slm_shape_ok(in_features, out_features, 1)) {
+            if (use_nested) {
+                if (nested_fixed256) return launch_moe_expert_major_prefill_down<true, Compact, true, true>(
+                    ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
+                    in_features, out_features, blocksize, dep_event);
+                return launch_moe_expert_major_prefill_down<true, Compact, false, true>(
+                    ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
+                    in_features, out_features, blocksize, dep_event);
+            }
+            return launch_moe_expert_major_prefill_down<false, Compact, false, true>(
+                ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
+                in_features, out_features, blocksize, dep_event);
+        }
         if (use_nested) {
             if (nested_fixed256) return launch_moe_expert_major_prefill_down<true, Compact, true>(
                 ctx, slots, token_ids, ranks, quant_map, h, down_acc, total_acts, top_k,
@@ -5838,6 +6108,10 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
             in_features, out_features, blocksize, dep_event);
     }
 
+    const bool act_slm_quad = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, out_features, 4);
+    const bool act_slm_single = q4e_prefill_act_slm_enabled() &&
+        q4e_act_slm_shape_ok(in_features, out_features, 1);
     int remaining_acts = total_acts;
     int cur_offset = 0;
     sycl::event eight_ev{};
@@ -5881,6 +6155,22 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
                     quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
                     in_features, out_features, blocksize, dep_event,
                     use_nested, wgshare, nested_fixed256);
+            } else if (act_slm_quad) {
+                if (use_nested) {
+                    if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact, true, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
+                        in_features, out_features, blocksize, dep_event);
+                    else quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact, false, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
+                        in_features, out_features, blocksize, dep_event);
+                } else {
+                    quad_ev = launch_moe_expert_major_prefill_down_4token<false, Compact, false, true>(
+                        ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                        quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), clamped_quads, top_k,
+                        in_features, out_features, blocksize, dep_event);
+                }
             } else if (use_nested) {
                 if (nested_fixed256) quad_ev = launch_moe_expert_major_prefill_down_4token<true, Compact, true>(
                     ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
@@ -5927,7 +6217,23 @@ static sycl::event dispatch_moe_expert_major_prefill_down(
     }
 
     if (remaining_acts > 0) {
-        if (use_nested) {
+        if (act_slm_single) {
+            if (use_nested) {
+                if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_down<true, Compact, true, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
+                    in_features, out_features, blocksize, dep_event);
+                else single_ev = launch_moe_expert_major_prefill_down<true, Compact, false, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
+                    in_features, out_features, blocksize, dep_event);
+            } else {
+                single_ev = launch_moe_expert_major_prefill_down<false, Compact, false, true>(
+                    ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
+                    quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,
+                    in_features, out_features, blocksize, dep_event);
+            }
+        } else if (use_nested) {
             if (nested_fixed256) single_ev = launch_moe_expert_major_prefill_down<true, Compact, true>(
                 ctx, slots + cur_offset, token_ids + cur_offset, ranks + cur_offset,
                 quant_map, h, down_acc + (Compact ? size_t(cur_offset)*out_features : 0), remaining_acts, top_k,

@@ -1522,3 +1522,17 @@ tile loses in this regime as well, so the expert-kernel fix has to happen in the
 ALU path (role-P9 L1/L2 reuse), not by enabling this path.
 
 | L94 | Grouped-XMX re-test at 4096-token shapes: TTFT 93.3 vs 69.6 s, blocks 25.9-26.8 vs 19.1-19.9 s, bank_wait 3.7 -> 9.7 s, bit-exact -> stays default off; the expert-kernel fix must be ALU-side reuse | gx-b1 |
+
+**`AILA_Q4E_PREFILL_ACT_SLM` (role-P9 L1) measured - NO-GO, stays default off.**
+The work-group does cover 16 output rows of one activation, so staging that row in SLM
+is a faithful optimisation, but the activation re-reads it removes were already
+served by L1/L2. `slm-b1` (standard arm, `--prime --diag --generate=8`):
+`[Q4E PrefillActSlm] enabled=1 in_features=2560 intermediate_size=640
+gate_up_quad_tile_bytes=20480` in the log, SSE body byte-identical, TTFT 14000
+**70.1 s vs 69.6 / 69.6 s**, steady blocks **19.24 / 19.82 / 20.07 s vs
+19.05 / 19.64 / 19.89 s** (+1.0%). The DRAM-bound term is the *weight* traffic
+(54 GB/layer, each expert re-read once per activation), so the follow-up is the
+M-tiled variant (one work-group = 16 rows x M activations of the same expert,
+weights hoisted out of the M loop), which is role-P9 L2.
+
+| L95 | `AILA_Q4E_PREFILL_ACT_SLM` NO-GO: enabled=1 and bit-exact, but TTFT 70.1 vs 69.6 s and blocks +1.0% -> the activation re-reads were already L1/L2-served; the DRAM term is weight traffic, so L2 (M-tiling) is the live lever | slm-b1 |

@@ -1795,6 +1795,20 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     const bool nested = use_adaptive_pipeline_ || expert_cache_.uses_nested_codes();
     const bool nested_fixed256 = use_adaptive_pipeline_;
     if (alu) {
+        // P9: one-shot evidence that an AILA_Q4E_PREFILL_ACT_SLM arm really took
+        // the SLM-staged expert kernels. The ops layer owns the routing rule; this
+        // records the flag and the shapes so a run can prove which path it took
+        // (see docs/plans/qwen38-r1-moe-kernel-slmbound-2026-10-16.md).
+        static const bool act_slm_reported = [&] {
+            static const bool act_slm = aila::env::read_flag("AILA_Q4E_PREFILL_ACT_SLM", false);
+            AILA_LOG_INFO(
+                "[Q4E PrefillActSlm] enabled=%d in_features=%d intermediate_size=%d "
+                "gate_up_quad_tile_bytes=%d",
+                act_slm ? 1 : 0, hidden_size_, cfg_.moe_intermediate_size,
+                4 * hidden_size_ * static_cast<int>(sizeof(bf16)));
+            return true;
+        }();
+        (void)act_slm_reported;
         last = ops::moe_expert_major_prefill_gate_up(ctx, expert_map_slot_dev_ + actStart,
             expert_map_token_dev_ + actStart, expert_map_rank_dev_ + actStart, nullptr,
             x_dev, h_dev, alu, top_k,
