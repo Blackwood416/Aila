@@ -1015,6 +1015,12 @@ bool Qwen4ExpBnb4Backend::load(
 // ============================================================================
 
 void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
+    // Optional preallocation floor: pay the chunk-8192 phase-scratch growth and
+    // first-touch once (warmup/first call) instead of inside the first real
+    // request, where it costs ~55-90 s of host/alloc time on this machine.
+    static const int s_runtime_min_cap =
+        std::max(0, aila::env::read_int("AILA_Q4E_RUNTIME_MIN_CAP", 0));
+    if (s_runtime_min_cap > seq_len) seq_len = std::min(s_runtime_min_cap, max_seq_len_);
     if (seq_len <= runtime_seq_capacity_) return;
     int cap = std::max(seq_len, runtime_seq_capacity_ == 0 ? std::min(max_seq_len_, 64) : runtime_seq_capacity_ * 2);
     cap = std::min(cap, max_seq_len_);
