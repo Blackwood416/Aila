@@ -1,6 +1,88 @@
 #include "HyperConnectionOps.hpp"
+#include "utils/EnvUtils.hpp"
+
+#include <chrono>
 
 namespace ops {
+
+namespace {
+
+// HC submit timing (AILA_Q4E_HC_SUBMIT_TIMING, read once, default 0/off).
+// With the gate off these helpers only test a cached bool and never read a
+// clock, so the submit path stays byte-for-byte the production path. The
+// counters are updated on the submission thread (the worker's scheduler
+// thread, or the CLI thread) and read back on that same thread.
+enum HcSubmitStage : int {
+    kHcSubmitNormPending = 0,
+    kHcSubmitNormFallback = 1,
+    kHcSubmitDown = 2,
+    kHcSubmitUp = 3,
+    kHcSubmitStageCount = 4,
+};
+
+struct HcSubmitCounters {
+    uint64_t count[kHcSubmitStageCount] = {};
+    uint64_t total_ns[kHcSubmitStageCount] = {};
+    uint64_t min_ns[kHcSubmitStageCount] = {};
+    uint64_t max_ns[kHcSubmitStageCount] = {};
+};
+
+HcSubmitCounters g_hc_submit_totals; // process lifetime, never reset
+HcSubmitCounters g_hc_submit_window; // since the last TakeWindow call
+
+bool hc_submit_timing_enabled() {
+    static const bool s_enabled =
+        aila::env::read_int_raw("AILA_Q4E_HC_SUBMIT_TIMING", 0) != 0;
+    return s_enabled;
+}
+
+std::chrono::steady_clock::time_point hc_submit_begin() {
+    return hc_submit_timing_enabled() ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+}
+
+void hc_submit_record(HcSubmitCounters& c, int stage, uint64_t ns) {
+    if (c.count[stage] == 0 || ns < c.min_ns[stage]) c.min_ns[stage] = ns;
+    if (ns > c.max_ns[stage]) c.max_ns[stage] = ns;
+    c.count[stage] += 1;
+    c.total_ns[stage] += ns;
+}
+
+// Ends an interval opened by hc_submit_begin around one ctx.queue().submit()
+// call. No-op (and no clock read) when the gate is off.
+void hc_submit_end(int stage, std::chrono::steady_clock::time_point t0) {
+    if (!hc_submit_timing_enabled()) return;
+    const uint64_t ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
+    hc_submit_record(g_hc_submit_totals, stage, ns);
+    hc_submit_record(g_hc_submit_window, stage, ns);
+}
+
+HcSubmitTiming hc_submit_snapshot(const HcSubmitCounters& c) {
+    HcSubmitTiming out;
+    HcSubmitTimingStage* dst[kHcSubmitStageCount] = {
+        &out.norm_pending, &out.norm_fallback, &out.down, &out.up};
+    for (int i = 0; i < kHcSubmitStageCount; ++i) {
+        dst[i]->count = c.count[i];
+        dst[i]->total_ns = c.total_ns[i];
+        dst[i]->min_ns = c.min_ns[i];
+        dst[i]->max_ns = c.max_ns[i];
+    }
+    return out;
+}
+
+} // namespace
+
+HcSubmitTiming HcSubmitTimingTotals() {
+    return hc_submit_snapshot(g_hc_submit_totals);
+}
+
+HcSubmitTiming HcSubmitTimingTakeWindow() {
+    const HcSubmitTiming out = hc_submit_snapshot(g_hc_submit_window);
+    g_hc_submit_window = HcSubmitCounters{};
+    return out;
+}
 
 void grouped_rms_norm(
     Context& ctx, const bf16* x, const float* w, float eps, bf16* out,
@@ -238,6 +320,7 @@ void hc_inject_add_and_grouped_rms_norm(
     constexpr int wg = 256;
     const int total_groups = rows * groups;
 
+    const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
 
@@ -296,6 +379,7 @@ void hc_inject_add_and_grouped_rms_norm(
                 }
             });
     });
+    hc_submit_end(kHcSubmitNormFallback, hc_t0);
 }
 
 bool try_hc_decode_inject_add_and_grouped_rms_norm(
@@ -309,6 +393,7 @@ bool try_hc_decode_inject_add_and_grouped_rms_norm(
     constexpr int wg = 256;
     constexpr int groups = 4;
     const int dim8 = group_dim / 8;
+    const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
         cgh.parallel_for(
@@ -359,6 +444,7 @@ bool try_hc_decode_inject_add_and_grouped_rms_norm(
                 }
             });
     });
+    hc_submit_end(kHcSubmitNormPending, hc_t0);
     return true;
 }
 
@@ -377,6 +463,7 @@ void hc_decode_down_inject_impl(
     const size_t num_wgs = (static_cast<size_t>(total_rows) + rows_per_wg - 1) / rows_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
+    const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
@@ -430,6 +517,7 @@ void hc_decode_down_inject_impl(
                 }
             });
     });
+    hc_submit_end(kHcSubmitDown, hc_t0);
 }
 
 template<bool Batched>
@@ -457,6 +545,7 @@ void hc_decode_up_mix_impl(
     const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
+    const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
@@ -506,6 +595,7 @@ void hc_decode_up_mix_impl(
                 }
             });
     });
+    hc_submit_end(kHcSubmitUp, hc_t0);
 }
 
 template<bool Batched>
@@ -518,6 +608,7 @@ void hc_decode_up_mix_streams_impl(
     const int k8 = lowrank / 8;
     const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
+    const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<bf16, 1> gates(sycl::range<1>(dims_per_wg * groups), cgh);
         cgh.parallel_for(
@@ -577,6 +668,7 @@ void hc_decode_up_mix_streams_impl(
                 }
             });
     });
+    hc_submit_end(kHcSubmitUp, hc_t0);
 }
 
 } // namespace

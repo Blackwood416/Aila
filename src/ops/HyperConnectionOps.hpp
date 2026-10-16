@@ -127,4 +127,41 @@ void ple_dilated_conv_silu_add(
     int rows, int channels = 10240, int kernel_size = 4, int dilation = 3,
     bf16* residual = nullptr);
 
+// ---------------------------------------------------------------------------
+// HC decode submit timing (diagnostic, AILA_Q4E_HC_SUBMIT_TIMING, default off)
+// ---------------------------------------------------------------------------
+// Splits "how much of hc_host_ms is inside sycl::queue::submit" (see
+// docs/plans/qwen38-r1-hc-submit-attribution-2026-10-16.md section 5). Each
+// interval contains only the ctx.queue().submit(...) call itself: the
+// command-group recording runs inside submit and is included, while argument
+// preparation before the call (ranges, pointer math, inv_groups) is excluded.
+// The gate is read once; with it off nothing here touches the clock and every
+// accessor returns zeros.
+struct HcSubmitTimingStage {
+    uint64_t count = 0;
+    uint64_t total_ns = 0;
+    uint64_t min_ns = 0; // 0 while count == 0
+    uint64_t max_ns = 0;
+};
+
+struct HcSubmitTiming {
+    // try_hc_decode_inject_add_and_grouped_rms_norm (single-row fused
+    // inject+add+norm, the P1 pending path).
+    HcSubmitTimingStage norm_pending;
+    // hc_inject_add_and_grouped_rms_norm (multi-row fused inject+add+norm).
+    HcSubmitTimingStage norm_fallback;
+    // hc_decode_down_inject / hc_decode_down_inject_rows.
+    HcSubmitTimingStage down;
+    // hc_decode_up_mix / hc_decode_up_mix_rows (streams variant included).
+    HcSubmitTimingStage up;
+};
+
+// Cumulative since process start; never reset. All zeros when the gate is off.
+HcSubmitTiming HcSubmitTimingTotals();
+
+// Stats accumulated since the previous TakeWindow call, then the window is
+// reset (cumulative totals are untouched). The worker calls this once per
+// [Q4E AdaptiveWork] line to print per-forward submit sums/counts/min/max.
+HcSubmitTiming HcSubmitTimingTakeWindow();
+
 } // namespace ops
