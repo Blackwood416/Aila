@@ -2253,6 +2253,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_trace_markers = aila::env::read_flag("AILA_Q4E_TRACE_MARKERS", false);
     double prof_router_sync_ms = 0.0;
     double prof_acquire_ms = 0.0;
+    // P7 route-replay probe: counters only, env-gated, default off. Measures
+    // how much of a token's cold set equals the previous token's route for the
+    // same layer (input to a speculative CPU precompute design).
+    static const bool s_route_replay_count = aila::env::read_flag("AILA_Q4E_ROUTE_REPLAY_COUNT", false);
+    static std::array<std::array<int, 16>, 64> s_route_prev{};
+    static std::array<uint8_t, 64> s_route_prev_valid{};
+    uint64_t rr_slots = 0, rr_overlap = 0, rr_cold = 0, rr_cold_prev = 0;
     ExpertCacheStats prof_stats0{};
     const auto adaptive_stats0 = adaptive_cache_.Stats();
     // G5: baseline for the one-line layer-stage consumer accounting below.
@@ -2573,6 +2580,28 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             if (resident_epoch)
                 resident_binding.emplace(resident_epoch->BindRoute(router_host_ids_, resident_selected_host_, top_k));
             if (!use_adaptive_pipeline_ && expert_cache_.tracing()) expert_cache_.trace_router(L, router_host_ids_, count, top_k);
+            if (s_route_replay_count && count == 1 && L >= 0 && L < 64 &&
+                adaptive_cache_.IsAllocated()) {
+                int cold = 0, cold_prev = 0, overlap = 0;
+                for (int k = 0; k < top_k; ++k) {
+                    const int e = router_host_ids_[k];
+                    const bool is_cold = adaptive_cache_.GetSlot(L, e) < 0;
+                    bool in_prev = false;
+                    if (s_route_prev_valid[L]) {
+                        for (int j = 0; j < top_k; ++j) {
+                            if (s_route_prev[L][j] == e) { in_prev = true; break; }
+                        }
+                    }
+                    if (is_cold) ++cold;
+                    if (in_prev) { ++overlap; if (is_cold) ++cold_prev; }
+                }
+                rr_slots += static_cast<uint64_t>(top_k);
+                rr_cold += static_cast<uint64_t>(cold);
+                rr_cold_prev += static_cast<uint64_t>(cold_prev);
+                rr_overlap += static_cast<uint64_t>(overlap);
+                for (int k = 0; k < top_k; ++k) s_route_prev[L][k] = router_host_ids_[k];
+                s_route_prev_valid[L] = 1;
+            }
         };
         auto wait_actual_route = [&] {
             const auto begin = prof_clock::now();
@@ -2820,6 +2849,15 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             std::string dump_path = s_dump_dir + "/layer_" + std::to_string(L) + ".bin";
             dump_hidden_row(ctx, dump_path, buf_.hidden4, count - 1, 10240);
         }
+    }
+
+    if (s_route_replay_count && count > 1) s_route_prev_valid.fill(0);
+    if (s_route_replay_count && count == 1 && rr_slots > 0) {
+        AILA_LOG_INFO("[Q4E RouteReplay] pos=%d slots=%llu overlap=%llu cold=%llu cold_from_prev=%llu overlap_rate=%.3f cold_cover=%.3f",
+            start_pos, (unsigned long long)rr_slots, (unsigned long long)rr_overlap,
+            (unsigned long long)rr_cold, (unsigned long long)rr_cold_prev,
+            rr_slots ? double(rr_overlap) / double(rr_slots) : 0.0,
+            rr_cold ? double(rr_cold_prev) / double(rr_cold) : 0.0);
     }
 
     if (use_adaptive_pipeline_ && adaptive_cache_.IsAllocated() && count == 1) {
