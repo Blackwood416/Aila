@@ -1452,3 +1452,73 @@ conservation law (fill <-> bank_wait) holds. Both flags remain opt-in.
 
 | L90 | `AILA_Q4E_LM_HEAD_Q8` A/B/B/A +4.62% (17.451 -> 18.258 tok/s), sample 3.35 -> ~2.1 ms, output identical in test; below the +5% gate -> opt-in, and incompatible with MTP | p7-a1..a2 |
 | L91 | Speculative route replay closed: `cold_cover` 0.086-0.208 (median 0.12) vs the 0.70 gate -> expected 0.2-0.7 ms; counter shipped, precompute not built | p7r-b1 |
+
+### 6.42 2026-10-16: prefill is DEVICE-bound, and the expert kernels are the wall
+
+`dpe-b1` (`--prime --diag --generate=8` plus `AILA_Q4E_DEVICE_QUEUE_PROFILING=1`
+and `AILA_Q4E_DECODE_STAGE_EVENTS=1`, worker log kept) gives the first per-category
+device split for a 4096-token prefill block:
+
+| category | ms / block |
+|---|---:|
+| **experts_dev_ms** | **12,496 / 12,534** |
+| linear_dev_ms | 4,049 / 4,043 |
+| full_dev_ms | 2,835 / 3,042 |
+| hc_dev_ms | 273 / 276 |
+| shared_dev_ms | 190 / 189 |
+| router_dev_ms | 29 / 29 |
+| ple_dev_ms | 24 / 25 |
+| resid/stagein/inter | 29 / 0.08 / 0.07 |
+
+Sum ~= 19.9 s, which equals the block wall (19.93 / 20.17 s). So the prefill block
+is **device-bound**: the fill, the H2D and the fences are already hidden behind
+device work, which is exactly why every supply-side rearrangement (banks,
+parallel fill, layer arena, direct DMA) moved counters but not the wall.
+
+Why the expert kernels take 12.5 s: `launch_moe_expert_major_prefill_gate_up`
+(`src/ops/MoeExpertOps.cpp:1584`) assigns **one output row per 16-lane subgroup**
+(`rows_per_group = 256/16 = 16`), and the grid is
+`total_acts * intermediate_size / 16`. For every (activation, output-row) pair the
+kernel streams the whole packed weight row and the whole activation row, so with
+33.3k activations per layer x 640 rows:
+
+- activation traffic ~= 33.3k x 640 x 5,120 B ~= 107 GB/layer
+- weight traffic ~= 33.3k x 640 x 2,560 B ~= 54 GB/layer
+- total ~= 161 GB/layer = 7.7 TB/block -> 15 s at 512 GB/s, i.e. the measured
+  12.5 s is the bandwidth bound of a ~6x redundant stream.
+
+Note the two things that do NOT apply here: the prefill MoE is already
+expert-major (`RunGroupedExperts` lays each expert's activations out
+contiguously, `Qwen4ExpBnb4Backend.cpp:1747-1785`), and the grouped-XMX path
+(`AILA_Q4E_GROUPED_XMX_MIN_ROWS`, default 0) is off because the M8/N32/K32
+prototype lost by 3.0% (story) / 14.6% (256-token) on 2026-09-29 (x3 receipt).
+`AILA_Q4E_MOE_COMPACT_ACTS` is unrelated: it only moved the down-projection
+output layout and saved 94 MiB of USM with no speedup.
+
+Levers, in order of size:
+1. **Activation reuse in SLM (bit-exact)**: a work-group's 16 subgroups cover 16
+   consecutive output rows of the *same* activation (640 % 16 == 0), yet each
+   subgroup re-reads the 5 KB activation row from L2/VRAM. Staging that row in
+   SLM once per work-group divides the dominant 107 GB/layer by 16.
+   Expected: 12.5 s -> ~5 s, block ~12 s, ~340 tok/s.
+2. **Weight reuse across activations (bit-exact)**: the same weight rows are
+   re-read for every activation of that expert (~82 on average). Processing 2-4
+   activations per weight load divides the 54 GB/layer by the same factor.
+   Combined with (1): expert traffic ~= 20 GB/layer -> ~2-3 s, block ~9-10 s,
+   **~400 tok/s**.
+3. The M8/N32/K32 XMX tile stays closed; a *different* tile is not ruled out by
+   the x3 receipt but is now the weaker option than (1)+(2).
+
+| L92 | Prefill is device-bound: `experts_dev 12.5 s` of a 19.9 s block (linear 4.0, full 2.9, hc 0.27, shared 0.19); supply/fill/DMA are fully hidden, which explains every neutral supply experiment | dpe-b1 |
+| L93 | Expert kernel traffic model: one output row per 16-lane subgroup -> 107 GB/layer activations + 54 GB/layer weights = 7.7 TB/block ~= the measured 12.5 s at the 512 GB/s bound; SLM activation reuse (bit-exact) is the first lever, weight reuse across activations the second | MoeExpertOps.cpp:1584-1785 |
+
+**Grouped-XMX re-test at today's shapes (gx-b1) - still a loss, closed.**
+`AILA_Q4E_GROUPED_XMX_MIN_ROWS=8` on the standard arm (4096-token chunks,
+adaptive pipeline, the regime the 09-29 x3 receipt did not cover):
+TTFT 14000 = **93.3 s vs 69.6 s**, steady blocks **25.88 / 26.48 / 26.81 s vs
+19.05 / 19.64 / 19.89 s**, `bank_wait` 3.7 -> **9.7 s** (the slower expert
+kernels hold the staging banks longer), SSE body byte-identical. The M8/N32/K32
+tile loses in this regime as well, so the expert-kernel fix has to happen in the
+ALU path (role-P9 L1/L2 reuse), not by enabling this path.
+
+| L94 | Grouped-XMX re-test at 4096-token shapes: TTFT 93.3 vs 69.6 s, blocks 25.9-26.8 vs 19.1-19.9 s, bank_wait 3.7 -> 9.7 s, bit-exact -> stays default off; the expert-kernel fix must be ALU-side reuse | gx-b1 |
