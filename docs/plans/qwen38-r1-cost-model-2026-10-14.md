@@ -1431,3 +1431,24 @@ The earlier "-5.1% TTFT" reading does not reproduce at this config; the
 conservation law (fill <-> bank_wait) holds. Both flags remain opt-in.
 
 | L89 | Fix 1 adoption A/B/B/A NO-GO: fill 7.37 -> 2.48 s but bank_wait 3.70 -> 6.94 s; block wall -0.84% (19,887 -> 19,720 ms), TTFT 69.6 -> 68.9/69.6 s, bit-exact; flags stay opt-in | pfx-a1..a2 |
+
+**Decode tail round (P7) and the last two levers.**
+
+- **C1 `AILA_Q4E_LM_HEAD_Q8=1`** (already wired, default off): A/B/B/A with the
+  production bundle and `--generate=32`: A 17.413 / 17.49, B 17.974 / 18.541
+  -> **+4.62%** mean, output sha identical in this test (the argmax survives
+  head quantization). Its sample window drops 3.35 -> ~2.1 ms (the head is
+  1271 MB bf16 at 470 GB/s). Below the +5% default gate, so it stays opt-in,
+  and it disables MTP by construction (Model.cpp requires !lm_head_q8).
+- **C2 speculative CPU precompute from the previous route**: read-only counter
+  arm (`AILA_Q4E_ROUTE_REPLAY_COUNT=1`, bundle env) gives
+  `overlap_rate 0.19-0.31`, **`cold_cover 0.086-0.208`** (median ~0.12) over
+  5 sampled positions - far under the 0.70 gate, so expected saving is
+  0.2-0.7 ms. **Closed; not implemented.**
+- Harness note (P7): `--diag` / `AILA_PROFILE_Q4E_DECODE=1` adds ~3.5 ms of
+  tail to a decode arm (a `ctx.synchronize()` at Backend.cpp:3124); decode
+  arms should use `--production-timing`. The probe's rate formula also carries
+  a ~1.65 ms pseudo-error (the finalize flush lands inside `duration`).
+
+| L90 | `AILA_Q4E_LM_HEAD_Q8` A/B/B/A +4.62% (17.451 -> 18.258 tok/s), sample 3.35 -> ~2.1 ms, output identical in test; below the +5% gate -> opt-in, and incompatible with MTP | p7-a1..a2 |
+| L91 | Speculative route replay closed: `cold_cover` 0.086-0.208 (median 0.12) vs the 0.70 gate -> expected 0.2-0.7 ms; counter shipped, precompute not built | p7r-b1 |
