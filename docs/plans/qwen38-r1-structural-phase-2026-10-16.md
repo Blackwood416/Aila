@@ -243,3 +243,27 @@ Route both per-layer copies off the compute queue:
 3. Expected effect: compute-queue submits drop from ~20-28 us toward the
    5-8 us batched regime; if the whole submit ledger (~18.7 ms/token) follows,
    decode moves from 16.2 toward 20+ tok/s.
+
+### Follow-up probe: which fix actually keeps the batch open
+
+`probe_chain` extended (receipt `chain-probe4.log`):
+
+| per-iteration sequence | us per submit on the compute queue |
+|---|---:|
+| plain | 5.6 |
+| wait | 19.8 |
+| event status query | 17.6 |
+| host-pointer H2D memcpy on the same queue (USM host source) | 22.1 |
+| host-pointer H2D memcpy on the same queue (stack source) | 79.0 |
+| **memcpy issued on a second in-order queue (copy_q_ pattern)** | **8.0** |
+| **device-to-device memcpy on the same queue** | **7.9** |
+
+So the batch break is specific to **host-pointer copies issued on the compute
+queue**; the same copy on another queue, or a device-to-device copy on the
+same queue, costs only ~8 us and does not break the batch.
+
+Charter §2 note - this is not a re-run of Strata C2: C2 refuted building a
+new copy-only hardware queue for *transfer/compute overlap bandwidth* (+1.4%
+on A750, hang history, vendored L0 headers needed). This change uses the
+**existing** `copy_q_` and addresses the **submit-cost / L0-batch-cohesion**
+dimension, which C2 did not measure.
