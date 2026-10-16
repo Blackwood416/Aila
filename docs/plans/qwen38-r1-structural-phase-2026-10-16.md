@@ -66,6 +66,37 @@ in the big `per_kernel`-split binary, (b) drained-vs-batched launch regime,
 The decisive probe: same kernel, same binary, sweep `wait_every` {1,2,4,8,16,32}
 on both binaries.
 
+### Sweep result (same night): the regime is the lever, not the binary
+
+`probe_submit_shape.exe --n 128 --wait-every W`, idle, median us per submit
+(p10/median/p90; receipts `tmp/q4e-structural-20261016/shape-w{1,2,4,8,16,32}.log`):
+
+| arm | W=1 | W=2 | W=4 | W=8 | W=16 | W=32 |
+|---|---:|---:|---:|---:|---:|---:|
+| `R_down_real` (production kernel, verbatim) | 19.6/22.2/31.6 | 8.4/20.2/21.6 | 7.5/14.1/20.6 | 3.9/**7.0**/20.9 | 3.7/4.0/15.2 | 3.6/3.7/11.4 |
+| `C_down_slm` (same + SLM) | 22.7/24.1/24.9 | -/- | 10.4/17.1/25.3 | 5.1/9.0/23.4 | 5.4/6.0/18.0 | 4.7/4.8/13.7 |
+| `A_plain` (tiny scalar kernel) | 30.1/30.3/30.8 | 15.8/27.9/28.6 | 16.2/21.7/29.4 | 10.1/16.2/28.6 | 10.3/11.3/22.4 | 10.1/11.6/30.6 |
+| `S_sync` (empty single_task) | 15.3/16.7/17.3 | 6.4/16.3/17.6 | 6.1/11.4/18.8 | 2.9/5.9/18.3 | 2.8/3.2/13.8 | 2.8/2.8/13.3 |
+
+Reading: the real production kernel costs 22.2 us when each submit is followed
+by a wait (W=1) but 7.0 us at 8-deep batching and 3.7 us at 32-deep - a 3-6x
+regime swing, identical kernel, identical binary. Production measures 21-27 us
+per HC submit, i.e. the **W=1 value**, even though a decode layer issues
+8-16 submissions between its two host waits. The likeliest mechanism is that
+the UR/L0 dynamic batch closes when the host leaves a gap between submissions
+(routing/classification CPU work), so production effectively pays the drained
+round trip per submit. Under 18-thread DRAM contention even batched submits
+collapse (medians 318-382 us), but that arm oversaturates the bus more than the
+real worker does.
+
+Actionable forks this opens (queued below):
+1. Restructure HC submits into tight back-to-back bursts per layer (if the
+   batch stays open, per-submit drops toward 7 us -> ~2-3 ms/token at 288
+   submits).
+2. Try explicit UR batch knobs (e.g. `UR_L0_BATCH_SIZE`) as a zero-build A/B.
+3. Measure the production inter-submit gap directly (extend the HC timing with
+   a "time since previous submit" field) to confirm the gap-to-regime link.
+
 ## Noise floors (use for gates)
 
 | metric | A/A spread |
@@ -86,8 +117,10 @@ on both binaries.
 
 ## Next experiment queue (ranked)
 
-1. Submit-regime discriminator: `wait_every` sweep on both binaries (30 GPU-min).
-2. Multi-kernel attention-subchain graph using the proven param-table ABI
-   (build + 12 GPU-min; graph replay only pays with many kernels per graph).
-3. Only if (1) shows the 21-27 us regime is real and production-bound:
-   batch submissions / restructure sync cadence around the router readback.
+1. ~~Submit-regime discriminator~~ DONE (sweep above): regime, not binary size.
+2. Zero-build A/B on UR batch knobs (`UR_L0_BATCH_SIZE`) on the canonical
+   decode arm, then (if flat) a code change that bursts the per-layer HC
+   submits back-to-back; gate on the existing 1.05% A/A floor.
+3. Multi-kernel attention-subchain graph using the proven param-table ABI
+   (graph replay only pays with many kernels per graph; single-kernel replay
+   measured 32.8-49.2 us).
