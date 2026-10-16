@@ -124,3 +124,53 @@ Actionable forks this opens (queued below):
 3. Multi-kernel attention-subchain graph using the proven param-table ABI
    (graph replay only pays with many kernels per graph; single-kernel replay
    measured 32.8-49.2 us).
+
+## Late-night follow-up: batch knob, production-regime HC timing, knob screen
+
+### Static batching is confirmed dead
+
+`UR_L0_BATCH_SIZE=16` (receipt `ub16`): decode 6.423 tok/s vs the 16.2-16.4
+baseline (-61%). Static batches hold kernels until the batch fills or a wait
+fires, exactly the audit's batch-hold failure. Keep dynamic (0). A second
+memory effect was found while screening: the previous arm's ~52 GiB
+large-page arena is not always returned immediately, and starting the next
+worker too early fails model load (`MEM_LARGE_PAGES`, host_avail=190 MiB).
+All remaining scripts now gate on >=45 GiB available physical memory.
+
+### Production-regime HC submit cost (hct-a1, diag arm with the instrument)
+
+Per-token window, exact semantics: `hc_submit_<site>_us` is the window total,
+`_n` the call count, `_min_us`/`_max_us` per call.
+
+| site | calls/token | mean us | min us | max us |
+|---|---:|---:|---:|---:|
+| norm | 47 | 20.3 | 16.2 | 30.9 |
+| norm-fallback | 48 | 24.8 | 13.6 | 37.6 |
+
+Every call pays >=13.6 us - production sits in the drained (W=1-like) regime
+for *all* HC submits, not just first-in-batch ones. The AdaptiveWork log line
+truncates at 1025 chars, so the down/up fields (down total alone was 2856.6 us
+in one token) are lost; instrumentation fix in flight.
+
+Note on method: `--production-timing` deliberately strips diagnostic env
+(`WORK_SUMMARY`, `AILA_SERVER_WORKER_LOG`) before launching the server, so the
+per-site log is only available in diag arms; `hct-p1` (production timing +
+the instrument) ran fine and measured 16.694 tok/s, in line with the
+production baseline.
+
+### Zero-build knob screen (canonical decode arm, single A/B per owner rule)
+
+| arm | knob | decode tok/s |
+|---|---|---:|
+| dec-a1 / dec-a2 | - (A/A) | 16.372 / 16.202 |
+| hct-p1 | HC timing instrument only | 16.694 |
+| k1-inorder | `UR_L0_USE_DRIVER_INORDER_LISTS=1` | 16.821 |
+| k2-counter-ev | `UR_L0_USE_DRIVER_COUNTER_BASED_EVENTS=1` | 16.125 |
+| k3-reuse-ev | `UR_L0_REUSE_DISCARDED_EVENTS=1` (+SYCL_PI) | 17.069 |
+| k4-single-thr | `UR_L0_SINGLE_THREAD_MODE=1` | worker crash - NO-GO |
+| ub16 | `UR_L0_BATCH_SIZE=16` | 6.423 - NO-GO |
+
+Session drift is ~2% (the instrument-only arm moved +2.5% vs the A pair), so
+k1/k3 need paired confirmation against interleaved controls before any claim.
+Pending: k3 mechanism check (diag + HC timing: does the per-call cost drop
+from ~20 us toward the 5-7 us batched regime?), then A/k3/A/k3 pairing.
