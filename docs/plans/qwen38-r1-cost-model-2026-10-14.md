@@ -1324,3 +1324,110 @@ completing it; the target remains block <=15 s with `h2d_mb` near zero.
 | L60 | Build-id drift incident + fix: any main-tree reconfigure re-bakes AILA_BUILD_ID from HEAD; Worker header 867c89a vs server 626fada -> handshake "identity/path isolation mismatch" (killed r26-look2-a1). Rebuild server via tools/server/build.ps1 -SkipDependencies. Also: a failed arm's leftover worker held ~52 GiB large pages -> later arena tail allocs die with 1450 until the process is killed | COORD-NOTE 20:05 |
 | L61 | C4 queue-profiling gate committed (`f90af05`): AILA_Q4E_DEVICE_QUEUE_PROFILING now independent of the stage-event env with safe fallback; dev buckets need both | models/Model.cpp |
 | L62 | E7 AOT feasibility: single-TU AOT smokes all exit 0 (JM TU 16.9 s, AttentionOps 17.9 s); `-c` stage emits bitcode only, ocloc runs at link/device-link (~337 images) -> unverified; -fsycl-targets requires -fsycl so a global flag injection is impossible; needs an opt-in CMake option + a ~5 min GPU link probe | qwen38-r1-aot-feasibility-2026-10-15.md |
+
+### 6.40 2026-10-16 morning: three structural verdicts + the isolated supply gap
+
+Worktree `2e25fb8` + the 00:34 build (worker `7a81823169ad`, server `79ac6ce953`).
+
+**A. `AILA_Q4E_VERIFY_CPU_BATCH` is a NO-GO** (s2x A/B/B/A, MTP width 2,
+`AILA_Q4E_VERIFY_CPU_COLD=1` on both arms): rates 15.437 / 14.998 / 15.662 /
+15.535 -> A median 15.49 vs B median 15.33 (**-1.0%**) and SSE bodies are
+byte-identical (`2f34f37e...`). The batched path did engage -
+`[Q4E ArenaColdRowsEnabled] rows=2 tasks=12` (one job per layer instead of one
+per row) - yet `cpu_join` rose 22.4 -> 30.5 ms and `cpu_compute` 27.1 ->
+30.0 ms, so the verify window went 90 -> 96 ms. Default stays 0.
+
+**B. Layer-stage overlap premise falsified in isolation** (`AilaQwen4ExpLayerStageBench.exe`):
+load arm 150.5 ms alone, stage arm 121.3 ms alone (fill 74.6 + bankwait 39.2,
+9.48 GB/s), overlap arm 257.6 ms. The inflation is a **constant ~107 ms** and
+does not shrink with a longer load (150 -> 376 ms still inflates ~107 ms), so
+the staging is serialized against the device work rather than hidden; the
+bench gate itself prints `"verdict":"no_go"`. Together with the g5 e2e NO-GO
+(section 8 of qwen38-r1-layer-stage-2026-10-15.md) the whole-layer arena is
+closed.
+
+**C. The isolated supply pass is 2x faster than production** (same 49.0 GB, same
+banks=2/slots=16 fences): `AilaQwen4ExpPrefillBlockBench.exe --arms copy,block
+--reps 3` -> wall **5.78 s**, fill 4.97 s, copy 4.96 s, bankwait 0.095 s,
+copy_gbps 9.889, guards bitwise pass. Production costs `fill 7.19-8.66 s +
+bank_wait 3.60-3.78 s`, supply ~11.5 s/block. The ~5.7 s gap is now the
+largest single prefill number; role-P6 dispatched.
+
+**Bound consequence**: device drain 8.58 s + DMA 4.96 s ~= **13.5 s/block ~=
+300-310 tok/s** with the supply treated as additive (four receipts say H2D and
+memory-bound kernels add). 400 tok/s needs bytes -35% or a consumer kernel
+reading host experts directly across PCIe; that bandwidth is unmeasured
+(role-P5 probe dispatched).
+
+**T1 decode split at HEAD** (g5-a1/a2, count=1, 53-55 ms): `router_wait
+11.2-12.2`, `experts_host 20.6-22.8` (`cpu_compute 13.5-15.7` + `cpu_join
+8.8-12.2`, `cpu_tasks 197-290`), `hc_host 6.4`, `linear_host 3.2-3.6`,
+`full_host 2.7-2.9`. Per layer that is ~1.12 ms of submit wall and ~0.21 ms of
+it is spent in the CPU join.
+
+| L80 | `AILA_Q4E_VERIFY_CPU_BATCH` NO-GO: batch engages (rows=2 tasks=12 per layer) but cpu_join 22.4->30.5, cpu_compute 27.1->30.0, window 90->96 ms, rate 15.49 -> 15.33 (-1.0%), SSE byte-identical; default stays 0 | s2x-a1..a2 |
+| L81 | Layer-stage overlap falsified in isolation: load 150.5 / stage 121.3 / overlap 257.6 ms; inflation constant ~107 ms independent of load length; bench gate verdict no_go | ls-bench, q4e_layer_stage_bench |
+| L82 | Isolated supply pass 5.78 s (fill 4.97 overlapping copy 4.96, 9.889 GB/s, bitwise pass) vs production supply ~11.5 s -> 5.7 s/block unexplained; role-P6 | block-bench-copy-block.txt |
+| L83 | Bound: device 8.58 + DMA 4.96 ~= 13.5 s/block ~= 300-310 tok/s (supply additive per 4 receipts); 400 tok/s needs -35% bytes or in-kernel host reads (role-P5) | qwen38-r1-prefill-overlap-design-2026-10-16.md |
+| L84 | Width economics (measured chain p1=0.7419/q2=0.5543/q3=0.5294): tokens/step 1.742/2.153/2.371; 20 tok/s needs W<=87.1/107.7/118.6 vs 112.2/164.2/223.4 current -> only width 2 is live and it needs -25 ms; per-row marginal 40-50 ms, 82% host | qwen38-r1-mtp-width-economics-2026-10-16.md |
+
+### 6.41 2026-10-16 later morning: host-read probe, fill-gap resolution, merge NO-GO
+
+**D. Host-USM read bandwidth (role-P5 probe, `AilaQwen4ExpHostReadBench.exe`).**
+`[HR SUMMARY]` at 512 MiB / 1 GiB: `h2d 9.912/9.893`, `host_flat 9.799/9.814`,
+`host_flat16 9.805/9.804`, `host_moe 9.845/9.760` GB/s against
+`dev_flat 409/363`, `dev_moe 337/347` GB/s. Guards: `host-flat`/`host-flat16`
+`guard_ok=1`, `dev-moe`/`host-moe` `guard_ok=0` (the moe pattern does not read
+every word exactly once, so its coverage invariant fails while its bandwidth
+matches the flat arms). Conclusion: a kernel reading host USM across PCIe
+sustains the full PCIe rate, so mechanism Z cannot beat the DMA path; with
+`Z2 = 8.03 + 50.27/R + 0.6` that is ~13.8 s/block ~= 297 tok/s. Three
+independent lines now bound prefill at **13.0-13.8 s/block ~= 300-315 tok/s**;
+400 tok/s needs bytes -35%.
+
+**E. The 5.7 s/block supply gap was a false comparison plus F2 (role-P6).**
+- The isolated BlockBench fill (4.97 s) reads an 81 MB heap pool that stays hot
+  in L3; its `copy_gbps` is DMA-paced (`fill 4.953 ~= copy + wait`). Production
+  reads 49 GB of *cold private large pages*, so the two are not comparable.
+- Production fill rate: single-thread **6.4-6.5 GB/s** = 7.19-7.33 s; the same
+  arena with the 16-way TBB path is **18.9 GB/s = 2.47-2.52 s**.
+- F2: `bank_wait 3.74-3.91 s` is the host waiting for that bank's H2D, which is
+  queued behind the real consumer kernels in the layer's in-order queue; the
+  bench's consumer is 0.58 ms/chunk with an empty queue (0.095 s).
+- Page-eviction hypothesis refuted at source level: the arena is
+  `VirtualAlloc(MEM_LARGE_PAGES|MEM_COMMIT)` (non-pageable), and
+  `AILA_Q4E_HOST_ARENA_PREFETCH_ASYNC` only issues `PrefetchVirtualMemory` on
+  the SafeTensors mmap during load.
+
+**Fix 1 (measured, bit-exact, zero new mechanism)**: `AILA_Q4E_STAGE_COPY_PARALLEL=1`
+plus `AILA_Q4E_PREFILL_STAGING_BANKS=4` -> fill 7.19/7.33 -> 2.47/2.52 s, block
+19.05 -> 18.08 s, TTFT 14000 69.6 -> 65.9 s. It is not the section 2 item
+(that one is "pin the whole 51 GiB" -> `UR_OUT_OF_RESOURCES`); this only
+parallelises the existing memcpy into the existing 77.3 MiB pinned banks.
+Adoption A/B/B/A (`pfx-*`) run this hour.
+
+**F. `AILA_Q4E_VERIFY_CPU_MERGE` NO-GO (role-P3 implementation + this run).**
+The merge groups the window's cold CPU pairs by expert so one weight stream
+serves several rows. Measured merge factor from 7,200 builds:
+`cum_pairs=89,274 cum_groups=75,556` -> **f = 0.154**, far below the 0.50 the
+economics needed. A/B/B/A (all with `VERIFY_CPU_COLD=1 VERIFY_CPU_BATCH=1`):
+A 16.348 / 16.275 vs B 16.144 / 16.230 -> **-0.75%**, all four SSE bodies
+byte-identical (`2f34f37e...`). The router correlation between a token and its
+own draft is the limiting factor, not the implementation.
+
+| L85 | Host-USM kernel read = 9.76-9.85 GB/s (flat arms guard-passed, h2d 9.89): mechanism Z cannot beat the DMA lane; prefill bound 13.0-13.8 s/block ~= 300-315 tok/s; 400 needs bytes -35% | qwen38-r1-hostusm-read-2026-10-16.md |
+| L86 | Supply gap resolved: bench fill was L3-paced (81 MB hot pool) vs 49 GB cold large pages; production single-thread fill 6.4-6.5 GB/s vs 16-way TBB 18.9 GB/s; F2 = bank_wait waits for H2D behind consumer kernels; eviction hypothesis refuted by source | qwen38-r1-prefill-fill-gap-2026-10-16.md |
+| L87 | Fix 1 `STAGE_COPY_PARALLEL=1` + `BANKS=4`: fill 7.19/7.33 -> 2.47/2.52 s, block 19.05 -> 18.08 s, TTFT 69.6 -> 65.9 s, bit-exact; adoption A/B/B/A pfx-a1..a2 | fill-gap doc S6 |
+| L88 | `AILA_Q4E_VERIFY_CPU_MERGE` NO-GO: measured merge factor f=0.154 (75,556/89,274 over 7,200 builds) vs the 0.50 needed; A/B/B/A 16.31 -> 16.19 (-0.75%), SSE byte-identical; gate stays 0 | s4-a1..a2, qwen38-r1-cpu-merge-impl-2026-10-16.md |
+
+**Fix 1 adoption verdict (pfx A/B/B/A, 2026-10-16 ~11:05) - NO-GO, stays opt-in.**
+A arms TTFT 14000 = 69.6 / 69.6 s, last block `submitted` 19,887 / 19,892 ms
+(`fill 7,371 / 7,382`, `bank_wait 3,710 / 3,697`); B arms TTFT 68.9 / 69.6 s,
+`submitted` 19,720 / 19,728 ms (`fill 2,468 / 2,485`, `bank_wait 6,967 / 6,914`).
+All four SSE bodies byte-identical (`8a64a37d9143`). So the parallel fill really
+does take the fill from 7.37 to 2.48 s, but `bank_wait` absorbs +3.25 s and the
+block wall improves by only **-0.84%** - far below the +5% default-value gate.
+The earlier "-5.1% TTFT" reading does not reproduce at this config; the
+conservation law (fill <-> bank_wait) holds. Both flags remain opt-in.
+
+| L89 | Fix 1 adoption A/B/B/A NO-GO: fill 7.37 -> 2.48 s but bank_wait 3.70 -> 6.94 s; block wall -0.84% (19,887 -> 19,720 ms), TTFT 69.6 -> 68.9/69.6 s, bit-exact; flags stay opt-in | pfx-a1..a2 |
