@@ -15,12 +15,18 @@ Scope: `src/ops/MoeExpertOps.cpp` only (+344/-16). No `perf/`, no `CMakeLists.tx
    (the 16 sub-groups of a work-group all read the same activation rows, but each of
    them reads it from global/L1). That is what this patch adds, gated and default-off:
    `AILA_Q4E_PREFILL_ACT_SLM=1`.
-3. Budget arithmetic (section 3) shows the four-token kernels move ~10.3 TB/block of
-   *charged* activation traffic against ~0.97 TB of weight traffic, while the measured
-   12.5 s (device) cannot be explained by either "all x hits DRAM" (>800 GB/s, above the
-   426-512 GB/s device ceiling) or "all x hits L1" (129 GB/s, far below it). The flag is
-   the cheapest experiment that resolves that ambiguity, and it is pre-registered with
-   three outcomes in section 6.
+3. **L1 verdict (RUN, measured): NO-GO.** The arm `slm-b1` shows
+   `[Q4E PrefillActSlm] enabled=1 in_features=2560 intermediate_size=640 gate_up_quad_tile_bytes=20480`,
+   byte-identical SSE, but TTFT 70.1 s vs 69.6/69.6 s and steady blocks 19.24/19.82/20.07 s
+   vs 19.05/19.64/19.89 s (~+1%): the 16x intra-work-group activation re-read was already
+   served on-chip. The flag stays in the tree, default 0 (section 9).
+4. Excluding the activation side, the corrected budget for the expert kernels is
+   **weights 25.17 GB/layer = 1.208 TB/block at M=4, i.e. a 97.1 GB/s effective weight
+   stream that accounts for the whole 12.44 s `experts_dev`** against a 426 GB/s device
+   ceiling - the cache/dependency chain, not DRAM bandwidth, sets the rate (section 10).
+   The requested "M activations x 16 rows" tile is the *existing* quad bucket, and every
+   M>4 shape is already measured (section 1); section 10 gives the zero-code curve that
+   decides whether weight *bytes* are worth attacking at all.
 4. Bit-exactness: no arithmetic change at all - same staged bytes, same consumer
    indices, same FMA chains and reduction trees (section 5, plus a CPU index-coverage
    replay `tmp/q4e-sprint-r1-20261014/actslm/coverage_check.py`).
@@ -250,3 +256,134 @@ Pre-registered interpretation (decide with the numbers, not after):
   `docs/plans/qwen38-wgshare-screen-2026-10-10.md`,
   `docs/plans/qwen38-p4-slmshare-2026-10-13.md`, `docs/plans/qwen38-esimd-path-2026-10-12.md`,
   `tmp/q4e-sprint-r1-20261014/dpe-b1-worker.log`.
+
+## 9. L1 (activation rows in SLM) - measured verdict: NO-GO, keep default 0
+
+Arm: `tmp/q4e-sprint-r1-20261014/slm-b1` (`AILA_Q4E_PREFILL_ACT_SLM=1`, standard 14K arm),
+wiring proven by `[Q4E PrefillActSlm] enabled=1 in_features=2560 intermediate_size=640
+gate_up_quad_tile_bytes=20480` in the worker log, SSE byte-identical (bit-exactness as
+designed).
+
+| metric | A (baseline) | B (slm-b1) | delta |
+|---|---:|---:|---:|
+| TTFT 14000 | 69.6 / 69.6 s | 70.1 s | +0.5 s (+0.7%) |
+| steady block | 19.05 / 19.64 / 19.89 s | 19.24 / 19.82 / 20.07 s | +1% |
+
+Reading: the 16 sub-groups of a work-group read the same activation rows, and those reads
+were already served by L1/L2 (the DRAM-impossibility arithmetic in section 10 says the same:
+12.88 TB/block of charged activation traffic cannot be DRAM traffic). Staging them in SLM
+therefore only adds the cooperative copy, one extra barrier and occupancy pressure (20.5 KB
+per work-group). The implementation is kept for reproducibility, default 0; do not re-run
+the x-side line - this arm plus the weight model closes it.
+
+## 10. L2 (weight reuse across activations) - disposition and the deciding experiment
+
+### 10.1 The requested tile already exists (and is the default)
+
+The design "one work-group = M activations x 16 output rows, sub-group owns one row, the
+weight row is loaded once and reused across the M activations in registers" *is* the
+existing quad bucket:
+
+* Layout: `Qwen4ExpBnb4Backend.cpp:1724-1780` buckets each expert's activations into
+  eights -> quads -> pairs -> singles; all activations of one expert share that expert's
+  slot, so a bucket of 4 consecutive acts is 4 activations of the same expert.
+* Kernel: `launch_moe_expert_major_prefill_gate_up_4token` (`MoeExpertOps.cpp:2252`) and
+  `..._down_4token` (`:3800`) load `g4`/`u4` once per (row, iteration) and FMA them into 4
+  separate token accumulators (`gate_acc0..3`, `up_acc0..3`) - weight bytes divided by 4.
+* Gate: `AILA_Q4E_WEIGHT_REUSE` (default **true**) + `AILA_Q4E_4TOKEN_REUSE` (default
+  **true**), `Qwen4ExpBnb4Backend.cpp:1724-1726`.
+
+So "M=4 weight reuse" is the production default; the M=1 bound is what produces the
+"54-67 GB/layer" figure. The M>4 shapes are closed by measurement:
+
+| shape | mechanism | verdict |
+|---|---|---|
+| M=8 | same tile, 16 accumulators | **refuted**: +22.8..23.1% block, spill 3,904 B vs 320/576 B, kernel 1,373 vs 476 us (`qwen38-token8-window-screen-2026-10-10.md`) |
+| M=8 effective (weight lines shared by 4 sub-groups) | `AILA_Q4E_4TOKEN_WGSHARE=4` | adopted, but only -3.6..-3.8% (share=8 fails: L1 capacity) - sharing *lines* does not reduce the weight load/decode chain |
+| weight relay through SLM | P4 `_wgshare_slm` | NO-GO, -11..-18% (`qwen38-p4-slmshare-2026-10-13.md`) |
+| XMX/DPAS with M=8..128 | grouped XMX / ESIMD | NO-GO on real shapes (0.65-1.01x) |
+
+### 10.2 Corrected weight/activation budget from the `dpe-b1` receipt
+
+`dpe-b1-worker.log` block 1 (`AILA_Q4E_WORK_SUMMARY=1` + device events):
+`hits=365813 misses=1600267` over 48 layers = **40,960 acts/layer** (= 4096 tokens x
+top_k=10), `experts_dev_ms=12436`.
+
+| quantity | value |
+|---|---:|
+| M=4 weight bytes (gate/up 16.78 + down 8.39 GB/layer) | 25.17 GB/layer = 1.208 TB/block |
+| effective weight rate = bytes / `experts_dev` | **97.1 GB/s** (device streaming ceiling 426 GB/s) |
+| M=1 weight bytes (reuse off) | 100.66 GB/layer = 4.832 TB/block (4.0x M=4) |
+| charged activation traffic (M-independent) | 268.4 GB/layer = 12.88 TB/block |
+| unique activation bytes per work-group (= ActSlm staging volume) | 16.78 GB/layer = 0.81 TB/block |
+| `experts_dev` share of a 19.9 s block | 62% |
+
+Two readings follow, and they agree with the L1 arm:
+
+1. The charged activation traffic cannot be DRAM traffic (it would need 2.8x the measured
+   kernel time), so the activation side is on-chip - which is exactly why the L1/SLM arm
+   changed nothing.
+2. The weight bytes *at the observed 97.1 GB/s effective rate* account for the entire
+   `experts_dev` time. The kernel is therefore limited by the weight *load+decode chain*
+   (`_nounpack` oracle: -54..-68% when the packed loads/decode are removed; `_nolut`:
+   -13..-33% for the LUT gather alone), not by DRAM bandwidth (which would give 1.208 TB /
+   426 GB/s = 2.8 s, not 12.44 s).
+
+### 10.3 "If X were free" upper bounds for the expert kernels (charter section 6 form)
+
+| operand | measured/bounded effect | gate check (>= 20% block, or `experts_dev` <= 7 s) |
+|---|---|---|
+| activation re-reads -> SLM | measured +1% (L1 arm) | fails; line closed |
+| weight bytes -> 0 (M=inf, zero spill) | <= 12.44 s of a 19.9 s block -> block -62% ideal; the P4 oracle says ~-54..-68% of the kernel is weight-load+decode bound | passes in principle, but no bit-exact mechanism reaches it (M>4 closed above) |
+| weight bytes -> /2 (M=8) | -31% block [est] *if* no spill | at the gate, but refuted as-is by the 3,904 B spill |
+| weight bytes -> /4 (M=16) | -47% block [est] | needs 32 accumulators/lane; impossible in 128 GRF |
+| fewer bytes per weight (int8/W4A8) | proportional to the byte ratio, same chain | the only remaining byte-reduction route; roadmap B2 exists, adoption gate >= +5% |
+
+### 10.4 Deciding experiment (zero code, all bit-exact)
+
+The three reuse points already exist as gated, bit-exact paths, so the marginal cost of the
+weight stream can be measured directly without touching source:
+
+| arm | flag | weight bytes/layer | expected block if the kernel is weight-chain bound |
+|---|---|---:|---|
+| M=4 | default | 25.2 GB | 19.9 s (measured) |
+| M=2 | `AILA_Q4E_4TOKEN_REUSE=0` (pair buckets) | 50.3 GB | ~32 s block (1.6x) |
+| M=1 | `AILA_Q4E_WEIGHT_REUSE=0` (plain kernel) | 100.7 GB | ~57 s block (2.9x) |
+
+```powershell
+# GPU mutex first; >= 15 s between arms
+python tmp/q4e-sprint-r1-20261014/run.py p10-m4 --prime --diag --generate=8
+python tmp/q4e-sprint-r1-20261014/run.py p10-m2 --prime --diag --generate=8 AILA_Q4E_4TOKEN_REUSE=0
+python tmp/q4e-sprint-r1-20261014/run.py p10-m1 --prime --diag --generate=8 AILA_Q4E_WEIGHT_REUSE=0
+```
+
+Pre-registered reading (all arms must stay byte-identical on SSE):
+
+* block(M=1) >= 1.8x block(M=4): weight bytes dominate -> the byte-reduction line is the top
+  priority, and the concrete next step is the restructured M=8 tile below (or W4A8).
+* block(M=1) <= 1.2x block(M=4): weight *bytes* are not the binding constraint (the chain is
+  per-row, not per-byte) -> close the weight-reuse line entirely, including any further
+  M-tiling, and spend the GPU budget on the per-(act,row) work instead.
+* M=2 locates the curve between the two; report it either way.
+
+### 10.5 Contingent design: the M=8 tile with short live ranges (only if 10.4 says "bytes dominate")
+
+The existing M=8 kernel fails on register pressure because its source loads all 8
+activation vectors before the FMA block - 8 x `vec8` (32 GRF) + 16 accumulators + 16 scaled
+weight floats + addresses, which IGC keeps live; VTune measured 3,904 B of spill. The
+variant that has a chance is the same tile with **per-token consumption**: load `g4`/`u4`
+once per iteration, then for each token k load `in_v{k}`, apply the 8 gate and 8 up FMAs,
+and release it - the arithmetic order per accumulator is unchanged (each token's own chain
+is untouched, the scaled weight values are the same `qmap[nib]*scale`), so the tile stays
+bit-exact, while the live activation set drops from 8 vectors to 1. Wiring would reuse the
+existing eights bucket (`AILA_Q4E_8TOKEN_REUSE=1` layout) behind a new
+`AILA_Q4E_PREFILL_EXPERT_M_TILE=8` flag, with the stock eights kernel as the same-run
+control. Not implemented yet: the upstream prior (spill) plus the 10.4 curve should decide
+whether it is worth a build + two arms.
+
+### 10.6 Evidence for this section
+
+* `tmp/q4e-sprint-r1-20261014/dpe-b1-worker.log` (acts/layer, `experts_dev_ms`).
+* `tmp/q4e-sprint-r1-20261014/slm-b1-worker.log` + run log (L1 arm).
+* `tmp/q4e-sprint-r1-20261014/actslm/weight_traffic.{py,log}` (this section's arithmetic).
+* Prior verdicts: token8 screen, wgshare screen, P4 slmshare, ESIMD path (section 1 links).
