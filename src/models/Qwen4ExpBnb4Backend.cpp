@@ -288,6 +288,13 @@ Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     // V3 (G3): drain the layer stage first (its worker joins and its arena is
     // freed through the still-valid Context before the caches tear down).
     layer_stage_.Release();
+    if (context_ && xmx_scratch_.impl) ops::moe_expert_xmx_scratch_destroy(*context_, xmx_scratch_);
+    if (context_) {
+        for (int b = 0; b < 2; ++b) {
+            if (xmx_plan_dev_[b]) context_->free_device(xmx_plan_dev_[b]);
+            xmx_plan_dev_[b] = nullptr;
+        }
+    }
     if (export_enabled_ && !export_path_.empty()) {
         // P3 calibration: write the collected decode/prefill counts as a full
         // 24576-key profile in the legacy format before the caches go away.
@@ -1189,6 +1196,41 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
         expert_map_slot_dev_ = static_cast<ops::MoeExpertSlotDev*>(
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
+
+        // R1 expert-XMX path (docs/plans/qwen38-r1-prefill-expert-xmx-plan-2026-10-16.md):
+        // per-chunk plan staging (double buffered so host rewrites cannot race
+        // the async H2D) plus the flag-only ops scratch. Everything here is
+        // inert when AILA_Q4E_PREFILL_EXPERT_XMX is unset.
+        {
+            static const bool s_prefill_expert_xmx =
+                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", false);
+            const size_t bases_bytes = size_t(17) * sizeof(int);
+            const size_t rows_bytes = size_t(cap) * cfg_.num_experts_per_tok * sizeof(int);
+            const size_t ranks_off = bases_bytes + rows_bytes;
+            const size_t slots_off = (ranks_off + rows_bytes + 63u) & ~size_t(63u);
+            const size_t slots_bytes = size_t(16) * sizeof(ops::MoeExpertSlotDev);
+            xmx_plan_bytes_ = int(slots_off + slots_bytes);
+            xmx_tokens_off_ = int(bases_bytes);
+            xmx_ranks_off_ = int(ranks_off);
+            xmx_slots_off_ = int(slots_off);
+            if (s_prefill_expert_xmx) {
+                xmx_plan_host_[0].assign(size_t(xmx_plan_bytes_), 0);
+                xmx_plan_host_[1].assign(size_t(xmx_plan_bytes_), 0);
+                xmx_plan_dev_[0] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
+                xmx_plan_dev_[1] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
+                if (xmx_plan_dev_[0] && xmx_plan_dev_[1] &&
+                    ops::moe_expert_xmx_scratch_create(ctx, xmx_scratch_, 4096,
+                        hidden_size_, cfg_.moe_intermediate_size)) {
+                    prefill_expert_xmx_ = true;
+                    AILA_LOG_INFO(
+                        "[Q4E PrefillExpertXmx] enabled=1 max_chunk_rows=4096 channels=%d/%d "
+                        "plan_bytes=%d", hidden_size_, cfg_.moe_intermediate_size, xmx_plan_bytes_);
+                } else {
+                    AILA_LOG_WARN("[Q4E PrefillExpertXmx] unavailable (plan or scratch allocation "
+                                  "failed); falling back to the ALU path");
+                }
+            }
+        }
     } else {
         buf_.moe_down_acc = Tensor{};
     }
@@ -1736,6 +1778,13 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     const bf16* x_dev = x_base ? x_base : buf_.x.data_as<bf16>();
     bf16* h_dev = moe_h_base ? moe_h_base : buf_.moe_h.data_as<bf16>();
     float* down_dev = down_acc_base ? down_acc_base : buf_.moe_down_acc.data_as<float>();
+    // R1 expert-XMX consumer. Only the plain prefill call shape is replaced;
+    // every other (test/alternate-base) call stays on the ALU path verbatim.
+    if (prefill_expert_xmx_ &&
+        use_counts == nullptr && x_base == nullptr && moe_h_base == nullptr &&
+        down_acc_base == nullptr && route_base == 0 && token_base == 0) {
+        return RunGroupedExpertsXmx(ctx, layer, count, firstUnique, numUnique, actStart, ready);
+    }
     static const bool reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
     static const bool quads = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
     static const bool eights = aila::env::read_flag("AILA_Q4E_8TOKEN_REUSE", false);
@@ -1850,6 +1899,121 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     // This event covers ALU, XMX and any test-only readers on the compute queue.
     if (!use_adaptive_pipeline_) expert_cache_.record_consumer_reader_fences(prefill_unique_slots_.data() + firstUnique, numUnique, last);
     actStart += acts;
+    return last;
+}
+
+sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, int count,
+    int firstUnique, int numUnique, int& actStart, const sycl::event& ready) {
+    (void)layer;
+    const int top_k = cfg_.num_experts_per_tok;
+    const int hidden = hidden_size_;
+    const int intermediate = cfg_.moe_intermediate_size;
+    const int routed_rows = count * top_k;
+    const bf16* x_dev = buf_.x.data_as<bf16>();
+    float* down_dev = buf_.moe_down_acc.data_as<float>();
+    static const int rows_budget =
+        std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 2048));
+    const int max_band_rows = xmx_scratch_.max_chunk_rows;
+
+    // 1. Collect this segment's experts as (expert, slice offset, rows)
+    //    members, usage-descending. A member larger than the scratch band
+    //    (never observed: histogram max is 2437) is sliced so each slice fits
+    //    its own chunk; the last slice may join a packed chunk.
+    xmx_members_.clear();
+    int total_rows = 0;
+    for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
+        const int e = prefill_unique_[u];
+        const int n = prefill_expert_uses_[e];
+        if (n <= 0) continue;
+        total_rows += n;
+        for (int off = 0; off < n; off += max_band_rows) {
+            xmx_members_.push_back({e, off, std::min(max_band_rows, n - off)});
+        }
+    }
+    if (xmx_members_.empty()) return ready;
+    std::sort(xmx_members_.begin(), xmx_members_.end(),
+        [](const XmxPlanMember& a, const XmxPlanMember& b) {
+            if (a.rows != b.rows) return a.rows > b.rows;
+            if (a.expert != b.expert) return a.expert < b.expert;
+            return a.offset < b.offset;
+        });
+
+    sycl::event last = ready;
+    size_t mi = 0;
+    while (mi < xmx_members_.size()) {
+        const size_t chunk_begin = mi;
+        int b_count = 0, max_rows = 0;
+        if (xmx_members_[mi].rows > rows_budget) {
+            // Oversized single-expert slice: its own chunk, up to the band cap.
+            b_count = 1;
+            max_rows = xmx_members_[mi].rows;
+            ++mi;
+        } else {
+            while (mi < xmx_members_.size() && b_count < 16) {
+                const int n = xmx_members_[mi].rows;
+                const int m_try = (std::max(max_rows, n) + 15) & ~15;
+                if (b_count > 0 && size_t(b_count + 1) * size_t(m_try) > size_t(rows_budget)) break;
+                max_rows = std::max(max_rows, n);
+                ++b_count;
+                ++mi;
+            }
+        }
+        const int rows_per_band = (max_rows + 15) & ~15;
+        if (size_t(b_count) * size_t(rows_per_band) > size_t(max_band_rows)) {
+            throw std::runtime_error("Qwen4Exp: XMX chunk exceeds scratch capacity");
+        }
+
+        // 2. Build this chunk's plan tables on the host and upload them. Two
+        //    plan buffers ping-pong with the weight banks, so a host rewrite
+        //    can never race the previous chunk's async H2D.
+        const int bank = xmx_bank_;
+        auto* bases = reinterpret_cast<int*>(xmx_plan_host_[bank].data());
+        auto* tokens = reinterpret_cast<int*>(xmx_plan_host_[bank].data() + xmx_tokens_off_);
+        auto* ranks = reinterpret_cast<int*>(xmx_plan_host_[bank].data() + xmx_ranks_off_);
+        auto* slots = reinterpret_cast<ops::MoeExpertSlotDev*>(
+            xmx_plan_host_[bank].data() + xmx_slots_off_);
+        std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
+        int packed = 0;
+        for (int b = 0; b < b_count; ++b) {
+            const auto& m = xmx_members_[chunk_begin + b];
+            bases[b] = packed;
+            slots[b] = adaptive_prefill_slots_[m.expert];
+            expert_offsets_host_[m.expert] = b;
+            expert_curr_pos_host_[m.expert] = 0;
+            packed += m.rows;
+        }
+        bases[b_count] = packed;
+        for (int i = 0; i < routed_rows; ++i) {
+            const int e = router_host_ids_[i];
+            const int b = expert_offsets_host_[e];
+            if (b < 0) continue;
+            const auto& m = xmx_members_[chunk_begin + b];
+            const int k = expert_curr_pos_host_[e]++;
+            if (k < m.offset || k >= m.offset + m.rows) continue;
+            const int pos = bases[b] + (k - m.offset);
+            tokens[pos] = i / top_k;
+            ranks[pos] = i % top_k;
+        }
+        ctx.queue().memcpy(xmx_plan_dev_[bank], bases, size_t(b_count + 1) * sizeof(int));
+        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_tokens_off_, tokens, size_t(packed) * sizeof(int));
+        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_ranks_off_, ranks, size_t(packed) * sizeof(int));
+        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_slots_off_, slots,
+                           size_t(b_count) * sizeof(ops::MoeExpertSlotDev));
+
+        ops::MoeExpertXmxChunk chunk{};
+        chunk.num_experts = b_count;
+        chunk.top_k = top_k;
+        chunk.rows_per_band = rows_per_band;
+        chunk.member_row_base = reinterpret_cast<const int*>(xmx_plan_dev_[bank]);
+        chunk.member_token_ids = reinterpret_cast<const int*>(xmx_plan_dev_[bank] + xmx_tokens_off_);
+        chunk.member_ranks = reinterpret_cast<const int*>(xmx_plan_dev_[bank] + xmx_ranks_off_);
+        chunk.slots = reinterpret_cast<const ops::MoeExpertSlotDev*>(
+            xmx_plan_dev_[bank] + xmx_slots_off_);
+        last = ops::moe_expert_xmx_prefill_chunk(ctx, xmx_scratch_, chunk, bank, x_dev, down_dev,
+                                                 hidden, intermediate, 64, &ready);
+        xmx_bank_ ^= 1;
+    }
+    actStart += total_rows;
     return last;
 }
 

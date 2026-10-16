@@ -6,6 +6,7 @@
 #include "../ops/GdnChunkOps.hpp"
 #include "../ops/HyperConnectionOps.hpp"
 #include "../ops/MoeExpertOps.hpp"
+#include "../ops/MoeExpertXmx.hpp"
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
 #include "Qwen4ExpExpertCache.hpp"
@@ -444,6 +445,11 @@ private:
         const sycl::ext::oneapi::bfloat16* x_base = nullptr,
         sycl::ext::oneapi::bfloat16* moe_h_base = nullptr,
         float* down_acc_base = nullptr);
+    // R1 expert-XMX consumer (AILA_Q4E_PREFILL_EXPERT_XMX=1): usage-sorted
+    // chunks of <=16 experts, dequantize-once bf16 weights, oneDNN batched
+    // GEMMs. Replaces the ALU bucketing consumer for this segment only.
+    sycl::event RunGroupedExpertsXmx(Context& ctx, int layer, int count,
+        int firstUnique, int numUnique, int& actStart, const sycl::event& ready);
     // Layer-major variant of RunAdaptivePrefill: same union/resident ordering
     // and staging ping-pong, but every expert launch is split into two
     // 4096-row halves that share one staged bank, and resident hits are
@@ -618,6 +624,20 @@ private:
     Tensor expert_tiles_dev_;
     bool grouped_xmx_supported_ = false;
     int grouped_xmx_min_rows_override_ = -1; // test harness only; -1 uses cached environment
+    // R1 expert-XMX path. The plan staging holds the per-chunk bases/tokens/
+    // ranks/slots; the ops scratch owns the bf16 weight banks and oneDNN
+    // primitives and is allocated only when the flag is on.
+    struct XmxPlanMember { int expert = 0; int offset = 0; int rows = 0; };
+    std::vector<XmxPlanMember> xmx_members_;
+    std::vector<unsigned char> xmx_plan_host_[2];
+    unsigned char* xmx_plan_dev_[2] = {nullptr, nullptr};
+    int xmx_plan_bytes_ = 0;
+    int xmx_tokens_off_ = 0;
+    int xmx_ranks_off_ = 0;
+    int xmx_slots_off_ = 0;
+    int xmx_bank_ = 0;
+    bool prefill_expert_xmx_ = false;
+    ops::MoeExpertXmxScratch xmx_scratch_{};
     // Test-only override permits paired scheduling trials in one loaded model.
     int small_rows_resident_split_override_ = -1;
     bool expert_histogram_enabled_ = false;
