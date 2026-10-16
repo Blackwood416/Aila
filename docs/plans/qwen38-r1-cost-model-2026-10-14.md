@@ -1569,3 +1569,26 @@ degrade the pipeline badly. This also retroactively explains the earlier
 generate=8 artifact. Defaults stay reserve 3584 / slots 2800.
 
 | L97 | Decode residency screen: reserve 2048 + slots 3600 (2800 -> 3584 GPU-only experts) collapses the 14K rate to 7.363 tok/s vs 17.413/17.490 -> keep reserve 3584 / slots 2800; more residency is not a decode lever | rs-b1 |
+
+**Decode attention pair2 now supports the int8 KV cache (role-P10) - bench verified.**
+The production dispatcher previously restricted `AILA_ATTN_KVREUSE=pair2` to a
+bf16 cache, which made it incompatible with the best decode config (int8-KV is
+itself -3.5%). P10 added the int8 branches (K vec8<int8_t> with one per-token
+row-scale per (token,d), V token-major with four accumulators and one scale load
+per token) plus the dispatcher's `fmt_ok = bf16 || (int8 && !dpas)` and a
+`cached_len >= 2048` length gate (`AILA_ATTN_KVREUSE_MIN_LEN`, default 2048).
+
+`AilaQwen4ExpKernelTests.exe --kv-fp8-only`, off vs `AILA_ATTN_KVREUSE=pair2`,
+len=14336 B=2:
+
+| arm | off | pair2 |
+|---|---:|---:|
+| bf16 | 1.57775 ms | 1.3008 ms (-17.5%) |
+| int8 | 1.0482 ms | **0.9022 ms (-13.9%)** |
+
+The `[KV ACC]` int8 rows are identical in both runs (`max_abs=6.10352e-05`,
+`nrmse=0.00510548`), i.e. the pair2 int8 path matches the G=1 int8 kernel, and
+the 1834-length control is unchanged. The end-to-end A/B/B/A on the 14K arm
+(pa2-*) is the adoption gate.
+
+| L98 | Decode attention pair2 extended to the int8 KV cache (dispatcher `fmt_ok = bf16 || (int8 && !dpas)`, length gate default 2048): bench 14336 B=2 int8 1.0482 -> 0.9022 ms (-13.9%), bf16 1.5778 -> 1.3008 (-17.5%), KV ACC int8 identical -> bit-exact vs G=1 | q4e kv-fp8-only, off vs pair2 |

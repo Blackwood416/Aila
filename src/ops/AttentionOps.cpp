@@ -738,11 +738,26 @@ void attention_decode_exact_head256_partial_merge_impl(
 // AILA_ATTN_KVREUSE="pair2" selects the head-pair K/V reuse phase 1 below;
 // anything else (unset, "0", unknown spellings) keeps the unchanged default
 // path. Read once per process, so the variant is fixed for the process
-// lifetime and an A/B comparison runs one process per value.
+// lifetime and an A/B comparison runs one process per value. The switch alone
+// is not enough to dispatch the variant: the caller also applies the
+// attn_kv_reuse_min_len() length gate below.
 inline bool attn_kv_reuse_pair2() {
   static const bool pair2 =
       aila::env::read_string("AILA_ATTN_KVREUSE") == "pair2";
   return pair2;
+}
+
+// Length gate for the pair2 path, in attended tokens, read once per process
+// (AILA_ATTN_KVREUSE_MIN_LEN, default 2048). The pair2 bench measured -16.0%
+// at 4096 and -25.1% at 8192 but +8.0% at 1834 (reproduced, gate
+// "reject_1834_regression_le2pct" FAIL in receipt-k5-pair2.json), so shorter
+// contexts keep the ungrouped kernel. The gate lives at the attention_decode
+// call site, which is the frame that knows cached_len; it does not change any
+// arithmetic of either path, only which phase-1 kernel is submitted.
+inline int attn_kv_reuse_min_len() {
+  static const int min_len =
+      read_env_int_local("AILA_ATTN_KVREUSE_MIN_LEN", 2048);
+  return min_len;
 }
 
 // D256 decode attention with a head group of G=2: one work-group owns a token
@@ -761,10 +776,17 @@ inline bool attn_kv_reuse_pair2() {
 //
 // SLM: q_cache 2*256 f32 + logits 2*128 f32 + 2 f32 stats = 3.1 KB (G=1:
 // 2.0 KB), well inside the 128 KB per-Xe-core pool; the private register delta
-// is one float (score_b / acc_b) plus the live vec8. Only the bf16
-// instantiation is dispatched in this round; the accessor form also covers
-// fp8/int8, but the int8 vec-read specialization is deliberately not carried
-// into this variant (re-verify int8 before enabling it).
+// is one float (score_b / acc_b) plus the live vec8; the int8 V branch trades
+// that for four accumulators (acc_{a,b}_{lo,hi}) plus a hoisted row scale.
+//
+// Formats: bf16 is dispatched everywhere the variant is eligible. int8 is
+// dispatched wherever the default classifier is not the DPAS kernel - its K
+// read uses the same vec8 int8 loads and per-token row scale as the G=1
+// kv_i8_vec branch and its V read the same token-major form, with the
+// dequantized element shared by both heads, so both are bit-identical to the
+// G=1 int8 kernel (which is itself documented as bit-identical between its vec
+// and accessor forms). fp8 stays on the default path: it has no vec form and
+// no campaign behind it.
 template <int Quantized>
 void attention_decode_exact_head256_pair2_impl(
     Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
@@ -872,6 +894,46 @@ void attention_decode_exact_head256_pair2_impl(
                 score_a += q_cache[d + 7] * static_cast<float>(k_vec[7]);
                 score_b += q_cache[head_dim + d + 7] * static_cast<float>(k_vec[7]);
               }
+            } else if constexpr (Quantized == kKvFmtInt8) {
+              // int8 vec-read form, mirroring the G=1 kernel's kv_i8_vec
+              // branch: hoist the per-token row scale, read 8 codes per load,
+              // dequantize each code once and feed both heads. The per-element
+              // term q_cache[...] * (float(code) * row_scale) and its
+              // d-ascending accumulation order are identical to the G=1
+              // kernel's vec form and to its accessor form, so the scores are
+              // bit-identical to the G=1 int8 kernel.
+              const int8_t *k_tok = static_cast<const int8_t *>(k_ptr) +
+                  (static_cast<size_t>(kv_head) * max_seq_len + cache_t) * head_dim;
+              const float k_row_scale =
+                  k_scale[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+              for (int d = 0; d < head_dim; d += 8) {
+                const auto codes =
+                    *reinterpret_cast<const sycl::vec<int8_t, 8> *>(k_tok + d);
+                const float kv0 = static_cast<float>(codes[0]) * k_row_scale;
+                score_a += q_cache[d + 0] * kv0;
+                score_b += q_cache[head_dim + d + 0] * kv0;
+                const float kv1 = static_cast<float>(codes[1]) * k_row_scale;
+                score_a += q_cache[d + 1] * kv1;
+                score_b += q_cache[head_dim + d + 1] * kv1;
+                const float kv2 = static_cast<float>(codes[2]) * k_row_scale;
+                score_a += q_cache[d + 2] * kv2;
+                score_b += q_cache[head_dim + d + 2] * kv2;
+                const float kv3 = static_cast<float>(codes[3]) * k_row_scale;
+                score_a += q_cache[d + 3] * kv3;
+                score_b += q_cache[head_dim + d + 3] * kv3;
+                const float kv4 = static_cast<float>(codes[4]) * k_row_scale;
+                score_a += q_cache[d + 4] * kv4;
+                score_b += q_cache[head_dim + d + 4] * kv4;
+                const float kv5 = static_cast<float>(codes[5]) * k_row_scale;
+                score_a += q_cache[d + 5] * kv5;
+                score_b += q_cache[head_dim + d + 5] * kv5;
+                const float kv6 = static_cast<float>(codes[6]) * k_row_scale;
+                score_a += q_cache[d + 6] * kv6;
+                score_b += q_cache[head_dim + d + 6] * kv6;
+                const float kv7 = static_cast<float>(codes[7]) * k_row_scale;
+                score_a += q_cache[d + 7] * kv7;
+                score_b += q_cache[head_dim + d + 7] * kv7;
+              }
             } else {
               for (int d = 0; d < head_dim; d += 8) {
                 // One dequantized element per position, consumed by both heads;
@@ -957,9 +1019,17 @@ void attention_decode_exact_head256_pair2_impl(
           }
           item.barrier(sycl::access::fence_space::local_space);
 
-          for (int d = lid; d < head_dim; d += tile_wg) {
-            float acc_a = 0.0f;
-            float acc_b = 0.0f;
+          if constexpr (Quantized == kKvFmtInt8 && head_dim == 2 * tile_wg) {
+            // Token-major int8 form, mirroring the G=1 kv_i8_vec V branch: one
+            // row-scale load per token, one byte load per (token, d), and the
+            // dequantized value feeds both heads. The per-head term
+            // logits[i] * (float(code) * row_scale) and its i-ascending
+            // accumulation are identical to the G=1 kernel's vec and accessor
+            // forms, so the partials stay bit-identical.
+            const int8_t *v_head = static_cast<const int8_t *>(v_ptr) +
+                static_cast<size_t>(kv_head) * max_seq_len * head_dim;
+            float acc_a_lo = 0.0f, acc_a_hi = 0.0f;
+            float acc_b_lo = 0.0f, acc_b_hi = 0.0f;
             for (int i = 0; i < tile_len; ++i) {
               const int t = tile_start + i;
               int cache_t = 0;
@@ -974,12 +1044,45 @@ void attention_decode_exact_head256_pair2_impl(
               } else {
                 cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
               }
-              const float v_val = v_acc.load(kv_head, cache_t, d);
-              acc_a += logits[i] * v_val;
-              acc_b += logits[tile_t + i] * v_val;
+              const float p_a = logits[i];
+              const float p_b = logits[tile_t + i];
+              const float v_row_scale =
+                  v_scale[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+              const int8_t *v_row = v_head + static_cast<size_t>(cache_t) * head_dim;
+              acc_a_lo += p_a * (static_cast<float>(v_row[lid]) * v_row_scale);
+              acc_a_hi += p_a * (static_cast<float>(v_row[lid + tile_wg]) * v_row_scale);
+              acc_b_lo += p_b * (static_cast<float>(v_row[lid]) * v_row_scale);
+              acc_b_hi += p_b * (static_cast<float>(v_row[lid + tile_wg]) * v_row_scale);
             }
-            partial_a[kDecodeExact256PartialAccOffset + d] = acc_a;
-            partial_b[kDecodeExact256PartialAccOffset + d] = acc_b;
+            partial_a[kDecodeExact256PartialAccOffset + lid] = acc_a_lo;
+            partial_a[kDecodeExact256PartialAccOffset + lid + tile_wg] = acc_a_hi;
+            partial_b[kDecodeExact256PartialAccOffset + lid] = acc_b_lo;
+            partial_b[kDecodeExact256PartialAccOffset + lid + tile_wg] = acc_b_hi;
+          } else {
+            for (int d = lid; d < head_dim; d += tile_wg) {
+              float acc_a = 0.0f;
+              float acc_b = 0.0f;
+              for (int i = 0; i < tile_len; ++i) {
+                const int t = tile_start + i;
+                int cache_t = 0;
+                if (active_blocks != nullptr && num_active_blocks > 0) {
+                  if (t < num_active_blocks * 4) {
+                    cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                  } else {
+                    cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                  }
+                } else if (active_indices) {
+                  cache_t = active_indices[t];
+                } else {
+                  cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+                }
+                const float v_val = v_acc.load(kv_head, cache_t, d);
+                acc_a += logits[i] * v_val;
+                acc_b += logits[tile_t + i] * v_val;
+              }
+              partial_a[kDecodeExact256PartialAccOffset + d] = acc_a;
+              partial_b[kDecodeExact256PartialAccOffset + d] = acc_b;
+            }
           }
         });
   });
@@ -1047,7 +1150,8 @@ void attention_decode_exact_head256_partial_merge(
     const int *active_blocks = nullptr,
     int num_active_blocks = 0,
     const Tensor *k_scale = nullptr,
-    const Tensor *v_scale = nullptr) {
+    const Tensor *v_scale = nullptr,
+    bool kv_reuse_len_ok = false) {
   const bf16 *gate_ptr = gate_buf && gate_buf->valid() ? gate_buf->data_as<bf16>() : nullptr;
   const int fmt = kv_cache_format_of(k_cache);
   const float *k_scale_ptr = kv_scale_ptr(k_scale);
@@ -1055,32 +1159,59 @@ void attention_decode_exact_head256_partial_merge(
   if (fmt == kKvFmtInt8 && (!k_scale_ptr || !v_scale_ptr)) {
     throw std::invalid_argument("attention_decode(exact256): int8 KV cache requires k_scale/v_scale");
   }
-  // AILA_ATTN_KVREUSE=pair2 opt-in head-pair K/V reuse. Restricted to the bf16
-  // cache in this round: a quantized cache, or a head count that cannot be
-  // paired inside one kv-head, keeps the default path and reports that once.
+  // The int8 DPAS partials kernel is only the default classifier when the shape
+  // allows it (no routing, no window/sink) and the env asks for it; the pair2
+  // branch must not shadow it, because DPAS changes the accumulation grouping.
+  const bool int8_dpas_path =
+      fmt == kKvFmtInt8 && !active_indices && !active_blocks && sink_len == 0 &&
+      kv_int8_dpas_enabled(ctx.queue().get_device());
+  // AILA_ATTN_KVREUSE=pair2 opt-in head-pair K/V reuse: bf16, and int8 wherever
+  // the default classifier is not the DPAS kernel. A head count that cannot be
+  // paired inside one kv-head keeps the default path and reports that once.
+  // kv_reuse_len_ok carries the length gate, which the caller decides from the
+  // attended length (effective_len) it derived from cached_len.
   if (attn_kv_reuse_pair2()) {
-    const bool eligible = fmt == kKvFmtBf16 && num_kv_heads > 0 &&
+    const bool fmt_ok =
+        fmt == kKvFmtBf16 || (fmt == kKvFmtInt8 && !int8_dpas_path);
+    const bool heads_ok = fmt_ok && num_kv_heads > 0 &&
         num_heads % 2 == 0 && (num_heads / num_kv_heads) % 2 == 0;
-    static bool kvreuse_logged = false;
-    if (!kvreuse_logged) {
-      kvreuse_logged = true;
-      if (eligible) {
-        AILA_LOG_INFO("[ATTN] kvreuse=pair2 head_dim=256 heads=%d kv_heads=%d groups=%d",
-                      num_heads, num_kv_heads,
+    const bool eligible = kv_reuse_len_ok && heads_ok;
+    if (eligible) {
+      static bool kvreuse_active_logged = false;
+      if (!kvreuse_active_logged) {
+        kvreuse_active_logged = true;
+        AILA_LOG_INFO("[ATTN] kvreuse=pair2 head_dim=256 fmt=%d heads=%d kv_heads=%d effective_len=%d min_len=%d groups=%d",
+                      fmt, num_heads, num_kv_heads,
+                      effective_len, attn_kv_reuse_min_len(),
                       (num_heads / 2) *
                           ((effective_len + kDecodeExact256Tile - 1) /
                            kDecodeExact256Tile));
+      }
+      if (fmt == kKvFmtInt8) {
+        attention_decode_exact_head256_pair2_impl<kKvFmtInt8>(
+            ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+            tail_start, sink_len, effective_len, gate_ptr, active_indices,
+            active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+      } else {
+        attention_decode_exact_head256_pair2_impl<kKvFmtBf16>(
+            ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
+            tail_start, sink_len, effective_len, gate_ptr, active_indices,
+            active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
+      }
+      return;
+    }
+    // First skip of the process, so an arm can tell "gated off" from "not
+    // eligible" without reading the profile JSON.
+    static bool kvreuse_skip_logged = false;
+    if (!kvreuse_skip_logged) {
+      kvreuse_skip_logged = true;
+      if (!kv_reuse_len_ok) {
+        AILA_LOG_INFO("[ATTN] kvreuse=pair2 skipped len_gate head_dim=256 fmt=%d effective_len=%d min_len=%d",
+                      fmt, effective_len, attn_kv_reuse_min_len());
       } else {
         AILA_LOG_INFO("[ATTN] kvreuse=pair2 ignored fmt=%d heads=%d kv_heads=%d head_dim=256",
                       fmt, num_heads, num_kv_heads);
       }
-    }
-    if (eligible) {
-      attention_decode_exact_head256_pair2_impl<kKvFmtBf16>(
-          ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
-          tail_start, sink_len, effective_len, gate_ptr, active_indices,
-          active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
-      return;
     }
   }
   auto run = [&](auto tag) {
@@ -1089,8 +1220,7 @@ void attention_decode_exact_head256_partial_merge(
         tail_start, sink_len, effective_len, gate_ptr, active_indices,
         active_blocks, num_active_blocks, k_scale_ptr, v_scale_ptr);
   };
-  if (fmt == kKvFmtInt8 && !active_indices && !active_blocks && sink_len == 0 &&
-      kv_int8_dpas_enabled(ctx.queue().get_device())) {
+  if (int8_dpas_path) {
     attention_decode_exact_head256_partial_merge_impl<kKvFmtInt8, true>(
         ctx, q, k_cache, v_cache, output, partials_buf, num_heads, num_kv_heads,
         tail_start, sink_len, effective_len, gate_ptr, active_indices,
@@ -2079,10 +2209,19 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
 
   if (head_dim == 256 && cached_len > 0 && effective_len >= kDecodeExact256MinLen &&
       exact_partials_buf && exact_partials_buf->valid()) {
+    // Length gate for AILA_ATTN_KVREUSE=pair2, decided here because this frame
+    // owns both lengths. effective_len <= cached_len on every path, so the
+    // dense shape (cached_len == effective_len) and the indexed shape
+    // (cached_len is the whole prefix, effective_len the attended subset) are
+    // both held to the floor; at 1834 attended tokens the pair2 kernel
+    // regressed +8.0% and must not be reached.
+    const int kv_reuse_min_len = attn_kv_reuse_min_len();
+    const bool kv_reuse_len_ok =
+        cached_len >= kv_reuse_min_len && effective_len >= kv_reuse_min_len;
     attention_decode_exact_head256_partial_merge(
         ctx, q, k_cache, v_cache, output, *exact_partials_buf, num_heads,
         num_kv_heads, tail_start, sink_len, effective_len, gate_buf, active_indices,
-        active_blocks, num_active_blocks, k_scale, v_scale);
+        active_blocks, num_active_blocks, k_scale, v_scale, kv_reuse_len_ok);
     return;
   }
 
