@@ -309,3 +309,130 @@ new copy-only hardware queue for *transfer/compute overlap bandwidth* (+1.4%
 on A750, hang history, vendored L0 headers needed). This change uses the
 **existing** `copy_q_` and addresses the **submit-cost / L0-batch-cohesion**
 dimension, which C2 did not measure.
+
+## Day 2 implementation (2026-10-17): copy_q_ routing for the CPU complement,
+env-gated `AILA_Q4E_MOE_COPY_VIA_COPYQ` (default 0)
+
+### Where the canonical decode actually flushes (audit correction)
+
+The flush inventory above was derived from `execute_hetero_decode`, but the
+canonical arm never executes that function: `use_adaptive_pipeline_` is a
+`const bool = true` (`Qwen4ExpBnb4Backend.hpp:541`), `ForwardImpl` dispatches
+count<=4 to `RunResidentDecode(ctx,L,fuse,count,verify)` (the 5-argument
+overload), and the non-adaptive branch throws
+("legacy expert_cache pipeline has been removed", `Qwen4ExpBnb4Backend.cpp:3048`).
+`execute_hetero_decode` has no caller in `src/` (only GPU tests). The
+production CPU complement is the adaptive block of that overload
+(`Qwen4ExpBnb4Backend.cpp:1294-1611`) and it flushes per layer at:
+
+| # | op | site | consumer / dependency |
+|---:|---|---|---|
+| 1 | wait previous resident-input D2H | `Qwen4ExpExpertExecutor.cpp:765` | x_host_ reuse fence (`AILA_Q4E_CPU_DEFER_ARENA_WAIT`) |
+| 2 | activation x D2H (40 KB/token) | `Qwen4ExpExpertExecutor.cpp:768` (`StageResidentInput`) | CPU worker via `job.activation` (worker waits at `:459`) |
+| 3 | wait previous CPU-result H2D | `Qwen4ExpExpertExecutor.cpp:950` (`StartArenaCold`) | pinned CPU-output arena reuse fence |
+| 4 | CPU result H2D (coalesced rank spans) | `Qwen4ExpExpertExecutor.cpp:1083/1099` (`JoinResidentCold`) | ordered merge (`moe_ordered_accumulate_*`) |
+| 5 | route-weight H2D (40 B) | `Qwen4ExpBnb4Backend.cpp:1604` (`RunResidentDecode`) | same merge |
+| 6 | router readback wait | `Qwen4ExpBnb4Backend.cpp:2847` | data dependency (stays) |
+
+That is 2 waits + 3 host-pointer copies per layer, plus the router wait; the
+plan's 6th item (`:2162` status query -> straggler penalty) exists only in
+`execute_hetero_decode` (it also gates `set_straggler_penalty`, which only
+`plan_layer` reads, so the penalty is dead on the adaptive path).
+
+### What changed
+
+New shared helper `src/models/Qwen4ExpMoeCopyQueue.hpp`:
+
+- `aila::q4e::moe_copy_via_copyq()` - read-once static local
+  `AILA_Q4E_MOE_COPY_VIA_COPYQ`, default 0.
+- `submit_host_copy(ctx, copy_q, dst, src, bytes[, fence])` - a null `copy_q`
+  is the exact previous call (`ctx.queue().memcpy`), so flag-off keeps the
+  same queue, ordering and event; a non-null queue issues the copy there with
+  an explicit compute-queue dependency list.
+- `host_copy_fence` / `join_dependencies` - one fence for a copy batch, and
+  one event for kernels that take a single `const sycl::event*`.
+
+Copy queue plumbing:
+
+- `Qwen4ExpExpertCache::CopyQueue()` exposes the cache's in-order `copy_q_`.
+- **Finding:** the adaptive pipeline retires the expert cache
+  (`expert_cache_.init()` is not called; `Qwen4ExpBnb4Backend.cpp:967-971`
+  only inits the executor), so that `copy_q_` is **null** in the canonical
+  arm. The backend therefore hands the executor its own in-order `copy_q_`
+  (`expert_executor_.set_copy_queue(copy_q_.get())`, created at
+  `Qwen4ExpBnb4Backend.cpp:892`, before decode), and the executor falls back
+  to `cache_->CopyQueue()` for paths where the cache is initialized. The gate
+  logs `[Q4E MoeCopyViaCopyQ] enabled=1 source=owner|expert_cache` once, or a
+  warning line if no queue exists (so a flat B arm cannot be a silent no-op).
+
+Dependency timing (the part that must hold without touching the worker):
+
+1. **x D2H** (`StageResidentInput`, and the fallback copies in
+   `StartResidentCold`/`StartArenaCold`/`StartArenaColdRows`/`ExecuteVerifyRows`):
+   the source is `x_dev`, produced by this layer's attention/HC kernels, and
+   no compute-queue event is available at the call site. The copy therefore
+   takes a `ctx.queue().ext_oneapi_submit_barrier()` dependency: on an
+   in-order queue that barrier completes behind every command submitted so
+   far, so the D2H cannot read stale activations. This is also the only extra
+   compute-queue submit the change adds (one per layer). The returned copy
+   event is stored in `resident_input_event_`, which is exactly what
+   `job.activation` carries to the worker for all four job shapes
+   (`:807/:909/:959/:1147`); the worker already does
+   `current.activation.wait_and_throw()` before reading `x_host_`
+   (`:459`), so no worker change is needed and the async path is safe.
+   The synchronous hetero path keeps its explicit wait (`:2178`) on the same
+   event, which is now the copy event.
+2. **CPU result H2D** (`JoinResidentCold`/`JoinArenaColdRowsRow`): the source
+   is host memory the just-joined worker finished writing, so no producer
+   fence is needed. The copy takes the caller's per-row device event
+   (`device_last`, the `moe_decode_down_to_rank_f32` event) as its dependency;
+   that event is submitted after the previous layer's merge reader on the
+   same in-order compute queue, so the copy can neither overtake this row's
+   kernels nor the previous merge's read of `down`. `JoinResidentCold` returns
+   the copy event, the backend assigns it to `last` (`if (cpu_count)`), and the
+   merge already consumes `&last` - the consumer dependency is unchanged.
+   When no device event was submitted (all ranks CPU-served) the helper falls
+   back to one shared barrier for the rank-span batch.
+3. **Route-weight H2D** (`RunResidentDecode`): the same `device_last`
+   dependency, then `last = weights_ev` so the merge waits for the copy. It is
+   submitted after the CPU-result copies on the same in-order copy queue, so
+   one merge dependency covers both copies plus the device work.
+4. **Kept in place** (requirement 5): the two previous-copy waits
+   (`StageResidentInput` and `StartArenaCold`) still execute; they now wait on
+   copy-queue events, i.e. the 12.8 us deferred cross-queue class instead of
+   the ~19.7 us same-queue class.
+5. **Hetero path** (`execute_hetero_decode`, tests only): the same three
+   copies move under the gate, the worker activation chain
+   (`job.activation = x_d2h_ev`) is unchanged, and the merge folds
+   `{down_ev, weights_copy_ev, cpu_result_copy_ev}` into one dependency. The
+   `:2228` event status query and the `:2235/:2241` penalty updates are
+   skipped while the gate is on - the B arm therefore also measures the value
+   of the straggler heuristic (it is dead on the adaptive path anyway).
+6. **Flag off:** every site calls the same helper, which forwards to the
+   original `ctx.queue().memcpy`, and the extra dependency events are only
+   built when a copy queue is present. Queue, ordering and timing are
+   unchanged.
+
+### A/B (single A/B, owner rule)
+
+Script: `tmp/q4e-structural-20261016/run-copyq-ab.ps1` (agent6k hotset +
+int8 KV, primed 14K, `--generate=32`, 15 s pool drain, >=45 GiB gate). It is
+equivalent to:
+
+```powershell
+$H='E:\RiderProjects\Aila\perf\qwen4exp\profiles\qwen38-nf4-agent6k-v1.profile'
+$b=@("AILA_Q4E_HOTSET_PROFILE=$H",'AILA_KV_QUANT=1','AILA_KV_QUANT_FORMAT=int8','AILA_SERVER_KV_TYPE=int8')
+# A - flag off (new build default)
+python tmp/q4e-sprint-r1-20261014/run.py cq-a1 --prime --generate=32 @b
+# B - flag on
+python tmp/q4e-sprint-r1-20261014/run.py cq-b1 --prime --generate=32 @b AILA_Q4E_MOE_COPY_VIA_COPYQ=1
+```
+
+Gate: 19-token continue, A/A floor 1.05% (dec-a1/dec-a2 16.372/16.202 tok/s).
+Read on the B arm: `[Q4E MoeCopyViaCopyQ] enabled=1 source=owner` must appear
+once in the worker log (otherwise the arm is invalid), then compare
+`AdaptiveWork` HC submit n/mean (the mechanism should move 20-28 us toward
+8-12 us if the batch stays open) and the decode rate. If the B arm regresses,
+the first suspect is the one compute-queue barrier per layer for the x D2H
+(the only added submit); the fallback is to plumb the HC kernel event into
+`StageResidentInput` and drop the barrier entirely.

@@ -1,5 +1,6 @@
 #include "models/Qwen4ExpExpertExecutor.hpp"
 #include "models/Qwen4ExpHostArena.hpp"
+#include "models/Qwen4ExpMoeCopyQueue.hpp"
 #include "utils/EnvUtils.hpp"
 #include "ops/CpuTilePool.hpp"
 #include "profile/Profiling.hpp"
@@ -737,13 +738,35 @@ void Qwen4ExpExpertExecutor::init(
     initialized_ = true;
 }
 
+sycl::queue* Qwen4ExpExpertExecutor::copy_queue() const {
+    if (!q4e::moe_copy_via_copyq()) return nullptr;
+    sycl::queue* q = copy_q_override_;
+    if (!q && cache_) q = cache_->CopyQueue();
+    static std::atomic<bool> logged{false};
+    if (!logged.load(std::memory_order_relaxed) &&
+        !logged.exchange(true, std::memory_order_relaxed)) {
+        if (q) {
+            AILA_LOG_INFO("[Q4E MoeCopyViaCopyQ] enabled=1 source=%s "
+                          "host_copies=x_d2h+cpu_result_h2d (compute-queue barrier ordered)",
+                copy_q_override_ ? "owner" : "expert_cache");
+        } else {
+            AILA_LOG_INFO("[Q4E MoeCopyViaCopyQ] enabled=1 but no copy queue is "
+                          "available; host copies stay on the compute queue");
+        }
+    }
+    return q;
+}
+
 void Qwen4ExpExpertExecutor::StageResidentInput(const bf16* x_dev, int rows) {
     if(rows<1 || rows>max_cpu_tokens_ || verify_async_rows_ || cold_count_ || async_route_pending_ || async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)throw std::logic_error("CPU cold slot has an unfinished batch or invalid rows");
     static const bool deferArenaWait = aila::env::read_flag("AILA_Q4E_CPU_DEFER_ARENA_WAIT", false);
     // The unfinished-job guard above excludes CPU input readers. Copies on
     // the same in-order queue retain GPU write ordering without a host wait.
     if(!deferArenaWait && resident_input_event_!=sycl::event{})resident_input_event_.wait_and_throw();
-    resident_input_event_=ctx_->queue().memcpy(x_host_,x_dev,size_t(rows)*hidden_size_*sizeof(bf16));
+    // The returned event stays the worker's activation gate (job.activation),
+    // so a copy-queue D2H is still fully ordered before the first x_host_ read.
+    resident_input_event_=q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
+        size_t(rows)*hidden_size_*sizeof(bf16));
 }
 
 void Qwen4ExpExpertExecutor::PrepareAsyncResidentSources(int layers, int experts) {
@@ -884,7 +907,7 @@ int Qwen4ExpExpertExecutor::StartResidentCold(GpuReadyLease& route, const bf16* 
         job.output_reader=cpu_output_reader_event_;
         job.mapped_tasks=mapped_tasks;
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
-            ctx_->queue().memcpy(x_host_,x_dev,size_t(hidden_size_)*sizeof(bf16));
+            q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,size_t(hidden_size_)*sizeof(bf16));
         for(int c=0;c<cold_count_;++c)job.tasks[c]={cold_source_slots_[c],0};
         if((cpu_worker_->verify_q8 || cpu_worker_->verify_a64) && cold_cached_count_) {
             for(int c=0;c<cold_count_;++c) {
@@ -934,7 +957,8 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         job.x=x_host_; job.h=scratch_h_; job.out=cpu_out_host_; job.resident_prepared=true;
         job.output_reader=cpu_output_reader_event_;
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
-            ctx_->queue().memcpy(x_host_,x_dev,size_t(hidden_size_)*size_t(tokens)*sizeof(bf16));
+            q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
+                size_t(hidden_size_)*size_t(tokens)*sizeof(bf16));
         for (int c=0;c<cold_count_;++c) {
             const auto source=arena.GetExpertSlotHost(layer,ids[c]);
             if (!source.gate_up_packed || !source.down_packed || ranks[c]<0 || ranks[c]>=top_k_)
@@ -949,7 +973,7 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
     } catch (...) { AbortResidentCold(); throw; }
 }
 
-sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
+sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output, const sycl::event* order_dep) {
     cpu_result_packet_active_=false;
     if(!cold_count_ && !async_route_pending_)return {};
     const auto join=steady_ns();
@@ -1056,14 +1080,27 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output) {
         const size_t payload=size_t(cold_count_)*hidden_size_*sizeof(float);
         std::memcpy(ranks+16,cpu_out_host_,payload);
         const size_t bytes=16*sizeof(int)+payload;
-        prev_cpu_h2d_ev_=ctx_->queue().memcpy(cpu_result_packet_dev_,cpu_result_packet_host_,bytes);
+        prev_cpu_h2d_ev_=q4e::submit_host_copy(*ctx_,copy_queue(),
+            cpu_result_packet_dev_,cpu_result_packet_host_,bytes,order_dep);
         ++stats_.cpu_result_copies;stats_.cpu_result_bytes+=bytes;
         cpu_result_packet_active_=true;
-    } else for(int c=0;c<cold_count_;) {
-        int end=c+1;while(end<cold_count_ && cold_ranks_[end]==cold_ranks_[end-1]+1)++end;
-        const size_t bytes=size_t(end-c)*hidden_size_*sizeof(float);
-        prev_cpu_h2d_ev_=ctx_->queue().memcpy(output+size_t(cold_ranks_[c])*hidden_size_,cpu_out_host_+size_t(c)*hidden_size_,bytes);
-        ++stats_.cpu_result_copies;stats_.cpu_result_bytes+=bytes;c=end;
+    } else {
+        // One compute-queue fence covers the whole coalesced rank-span batch.
+        sycl::queue* copy_q=copy_queue();
+        sycl::event order_fence{};
+        const sycl::event* order_fence_ptr=nullptr;
+        if(order_dep){order_fence_ptr=order_dep;}
+        else if(copy_q){order_fence=q4e::host_copy_fence(*ctx_,copy_q);order_fence_ptr=&order_fence;}
+        for(int c=0;c<cold_count_;) {
+            int end=c+1;while(end<cold_count_ && cold_ranks_[end]==cold_ranks_[end-1]+1)++end;
+            const size_t bytes=size_t(end-c)*hidden_size_*sizeof(float);
+            // Returned as prev_cpu_h2d_ev_ so the in-order merge (and next
+            // layer's StartArenaCold drain) takes the copy event as dependency.
+            prev_cpu_h2d_ev_=q4e::submit_host_copy(*ctx_,copy_q,
+                output+size_t(cold_ranks_[c])*hidden_size_,
+                cpu_out_host_+size_t(c)*hidden_size_,bytes,order_fence_ptr);
+            ++stats_.cpu_result_copies;stats_.cpu_result_bytes+=bytes;c=end;
+        }
     }
     stats_.cpu_tasks_completed+=cold_count_;++stats_.cpu_async_layers;
     stats_.cpu_mapped_tasks_completed+=cold_mapped_count_;
@@ -1108,7 +1145,8 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
         job.output_reader = cpu_output_reader_event_;
         job.activation = resident_input_event_ != sycl::event{} ? resident_input_event_ :
-            ctx_->queue().memcpy(x_host_, x_dev, size_t(hidden_size_) * size_t(rows) * sizeof(bf16));
+            q4e::submit_host_copy(*ctx_, copy_queue(), x_host_, x_dev,
+                size_t(hidden_size_) * size_t(rows) * sizeof(bf16));
         int offset = 0;
         for (int r = 0; r < rows; ++r) {
             const int begin = row_task_begin[r], count = row_task_count[r];
@@ -1198,7 +1236,8 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
     } catch (...) { AbortResidentCold(); throw; }
 }
 
-sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int row) {
+sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int row,
+                                                        const sycl::event* order_dep) {
     if (!rank_output || !arena_cold_rows_pending_ || row != arena_cold_rows_next_row_ ||
         row < 0 || row >= arena_cold_rows_)
         throw std::logic_error("Invalid multi-row native arena CPU join");
@@ -1248,12 +1287,18 @@ sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int
     // in-order queue keeps later rows from overwriting it before the merge.
     const int begin = arena_cold_row_begin_[row], count = arena_cold_row_count_[row];
     sycl::event upload{};
+    sycl::queue* row_copy_q = copy_queue();
+    sycl::event row_fence{};
+    const sycl::event* row_fence_ptr = nullptr;
+    if (order_dep) row_fence_ptr = order_dep;
+    else if (row_copy_q) { row_fence = q4e::host_copy_fence(*ctx_, row_copy_q); row_fence_ptr = &row_fence; }
     for (int c = begin; c < begin + count;) {
         int end = c + 1;
         while (end < begin + count && cold_ranks_[end] == cold_ranks_[end - 1] + 1) ++end;
         const size_t bytes = size_t(end - c) * hidden_size_ * sizeof(float);
-        upload = ctx_->queue().memcpy(rank_output + size_t(cold_ranks_[c]) * hidden_size_,
-                                      cpu_out_host_ + size_t(c) * hidden_size_, bytes);
+        upload = q4e::submit_host_copy(*ctx_, row_copy_q,
+            rank_output + size_t(cold_ranks_[c]) * hidden_size_,
+            cpu_out_host_ + size_t(c) * hidden_size_, bytes, row_fence_ptr);
         ++stats_.cpu_result_copies; stats_.cpu_result_bytes += bytes;
         c = end;
     }
@@ -1356,7 +1401,8 @@ sycl::event Qwen4ExpExpertExecutor::ExecuteVerifyRows(Context& ctx, int layer, c
         job.mapped_tasks[c] = !cache_->large_page_resident();
     }
     if (job.count) {
-        job.activation = async_verify ? resident_input_event_ : ctx.queue().memcpy(x_host_, x, size_t(rows) * hidden_size_ * sizeof(bf16));
+        job.activation = async_verify ? resident_input_event_ :
+            q4e::submit_host_copy(ctx, copy_queue(), x_host_, x, size_t(rows) * hidden_size_ * sizeof(bf16));
         if (!async_verify) cpu_worker_->submit(job);
         cache_->TraceColdCpu(layer, route.cold_ids.data(), route.cold_ranks.data(), job.count);
     }
@@ -1886,13 +1932,28 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
     }
 
     const size_t total_acts = static_cast<size_t>(token_count) * top_k;
+    // AILA_Q4E_MOE_COPY_VIA_COPYQ: keep the three per-layer CPU-complement host
+    // copies off the compute queue. copyq_active is the single decision point;
+    // when it is false every site below is byte-for-byte the previous call.
+    const bool copyq_active = copy_queue() != nullptr;
+    bool weights_copy_on_copyq = false;
+    sycl::event weights_copy_ev{};
     // Copy router weights to device for ordered rank accumulation
-    ctx.queue().memcpy(weights_dev_, router_weights_host, total_acts * sizeof(float));
+    if (copyq_active) {
+        weights_copy_ev = q4e::submit_host_copy(ctx, copy_queue(), weights_dev_,
+            router_weights_host, total_acts * sizeof(float));
+        weights_copy_on_copyq = true;
+    } else {
+        ctx.queue().memcpy(weights_dev_, router_weights_host, total_acts * sizeof(float));
+    }
 
     // 1. If CPU tasks exist, initiate async fetch of activations x_dev to pinned host memory
     sycl::event x_d2h_ev{};
     if (plan.cpu_tasks > 0 && !active_cpu_leases_.empty()) {
-        x_d2h_ev = ctx.queue().memcpy(x_host_, x_dev, static_cast<size_t>(token_count) * hidden_size_ * sizeof(bf16));
+        // Consumed by the CPU worker through job.activation below (and by the
+        // synchronous wait at the join), so the copy-queue event is the fence.
+        x_d2h_ev = q4e::submit_host_copy(ctx, copy_queue(), x_host_, x_dev,
+            static_cast<size_t>(token_count) * hidden_size_ * sizeof(bf16));
     }
     const bool async_cpu = cpu_worker_ && plan.cpu_tasks > 0;
 
@@ -2084,6 +2145,7 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
 
     // 3. Concurrent CPU execution for Host-ready miss experts (runs in parallel with GPU!)
     sycl::event last_cpu_h2d_ev{};
+    bool cpu_result_copy_issued = false;
     auto cpu_t0 = std::chrono::high_resolution_clock::now();
     bool async_join_blocked = false;
 
@@ -2093,7 +2155,8 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
             const size_t bytes = static_cast<size_t>(end - begin) * hidden_size_ * sizeof(float);
             float* dst = down_acc_dev_ + static_cast<size_t>(plan.cpu_indices[begin]) * hidden_size_;
             const float* src = cpu_out_host_ + static_cast<size_t>(begin) * hidden_size_;
-            last_cpu_h2d_ev = ctx.queue().memcpy(dst, src, bytes);
+            last_cpu_h2d_ev = q4e::submit_host_copy(ctx, copy_queue(), dst, src, bytes);
+            cpu_result_copy_issued = true;
             ++stats_.cpu_result_copies;
             stats_.cpu_result_bytes += bytes;
             stats_.cpu_result_submit_ns += steady_ns() - submit_start;
@@ -2158,7 +2221,10 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
 
         // Async work that is not ready at merge admission exposes a host wait.
         // GPU status sampled after joining cannot classify that earlier overlap.
-        if (plan.gpu_tasks > 0) {
+        // AILA_Q4E_MOE_COPY_VIA_COPYQ also removes this compute-queue status
+        // query, and with it the straggler penalty it feeds: the B arm measures
+        // that heuristic's value as well.
+        if (plan.gpu_tasks > 0 && !copyq_active) {
             const auto gpu_status = down_ev.get_info<sycl::info::event::command_execution_status>();
             if (async_cpu ? async_join_blocked : gpu_status == sycl::info::event_command_status::complete) {
                 // Penalize an observed blocking join, or the original synchronous tail.
@@ -2178,10 +2244,25 @@ sycl::event Qwen4ExpExpertExecutor::execute_hetero_decode(
     }
 
     // 5. Ordered Rank Merge: merges all ranks in strict rank order (0..top_k-1)
+    // The merge takes a single dependency pointer, so with copy-queue routing the
+    // GPU subset event and both copy events are folded into one barrier; the
+    // gate-off path keeps the original down_ev / last_cpu_h2d_ev selection.
+    sycl::event merge_dep{};
+    const sycl::event* merge_dep_ptr = nullptr;
+    if (copyq_active) {
+        std::vector<sycl::event> deps;
+        if (plan.gpu_tasks > 0) deps.push_back(down_ev);
+        if (weights_copy_on_copyq) deps.push_back(weights_copy_ev);
+        if (cpu_result_copy_issued) deps.push_back(last_cpu_h2d_ev);
+        merge_dep = q4e::join_dependencies(ctx, deps);
+        if (!deps.empty()) merge_dep_ptr = &merge_dep;
+    } else {
+        merge_dep_ptr = plan.gpu_tasks > 0 ? &down_ev
+            : (last_cpu_h2d_ev != sycl::event{} ? &last_cpu_h2d_ev : nullptr);
+    }
     sycl::event merge_ev = ops::moe_ordered_accumulate_down_rows(
         ctx, down_acc_dev_, weights_dev_, y_dev, token_count, top_k,
-        hidden_size_, shared_out, shared_gate,
-        plan.gpu_tasks > 0 ? &down_ev : (last_cpu_h2d_ev != sycl::event{} ? &last_cpu_h2d_ev : nullptr));
+        hidden_size_, shared_out, shared_gate, merge_dep_ptr);
 
     prev_cpu_h2d_ev_ = last_cpu_h2d_ev;
     stats_.layers_hetero_executed++;

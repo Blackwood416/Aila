@@ -3,6 +3,7 @@
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
 #include "models/Qwen4ExpHotsetPolicy.hpp"
+#include "models/Qwen4ExpMoeCopyQueue.hpp"
 #include "Qwen4ExpDecodeFusion.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
@@ -968,6 +969,11 @@ bool Qwen4ExpBnb4Backend::load(
         // Reuse the existing CPU worker and tiny decode banks. The retired
         // cache supplies no weights/slots; StartArenaCold reads native owners.
         expert_executor_.init(ctx,expert_cache_,1,cfg_.num_experts_per_tok,hidden_size_,cfg_.moe_intermediate_size);
+        // This is the queue the adaptive decode actually owns (the retired
+        // cache's copy_q_ is null), so the per-layer CPU-complement host copies
+        // under AILA_Q4E_MOE_COPY_VIA_COPYQ use the same in-order queue the
+        // staging H2Ds already use.
+        expert_executor_.set_copy_queue(copy_q_.get());
     }
 
     // With K-only indexer projection (A2) the engine's 2-token warmup completes no QSA block, so
@@ -1574,13 +1580,32 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // G1b keeps one job outstanding for the whole window: the first
             // per-row join waits it, every later row only publishes its own
             // rank spans into this row's accumulator slice.
+            // AILA_Q4E_MOE_COPY_VIA_COPYQ: when this row submitted expert
+            // kernels, `last` is the compute-queue event they ended with. The
+            // copy-queue H2Ds below take it as their ordering dependency (a
+            // cross-queue dep instead of a same-queue host-pointer copy), and
+            // the merge then consumes the last copy event.
+            const bool device_event_live = hit_count > 0 || staging.count > 0;
+            const sycl::event device_last = last;
+            const sycl::event* copy_order =
+                (aila::q4e::moe_copy_via_copyq() && device_event_live) ? &device_last : nullptr;
             const auto cpu_ready=verify_cpu_batch
-                ? expert_executor_.JoinArenaColdRowsRow(down, t)
-                : expert_executor_.JoinResidentCold(down);
+                ? expert_executor_.JoinArenaColdRowsRow(down, t, copy_order)
+                : expert_executor_.JoinResidentCold(down, copy_order);
             if (cpu_count) last=cpu_ready;
             cpu_work.active=verify_cpu_batch && t + 1 < count;
             // 5. Accumulate ranked down rows into y
-            ctx.queue().memcpy(resident_weights_.data(), t_weights, top_k * sizeof(float));
+            // AILA_Q4E_MOE_COPY_VIA_COPYQ: the 40 B route-weight H2D moves to
+            // the in-order copy queue. It is submitted after the CPU result
+            // copies on the same queue, it is ordered after this row's device
+            // work, and `last` carries its completion into the merge.
+            if (aila::q4e::moe_copy_via_copyq() && copy_q_) {
+                const sycl::event* weights_order = copy_order;
+                last = aila::q4e::submit_host_copy(ctx, copy_q_.get(), resident_weights_.data(),
+                    t_weights, top_k * sizeof(float), weights_order);
+            } else {
+                ctx.queue().memcpy(resident_weights_.data(), t_weights, top_k * sizeof(float));
+            }
 
             const auto* cpu_rows=expert_executor_.ResidentCpuHostRows();
             last = cpu_rows ? ops::moe_ordered_accumulate_cpu_host_rows(ctx,down,resident_weights_.data_as<float>(),

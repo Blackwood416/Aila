@@ -435,6 +435,10 @@ public:
 
     int num_slots() const { return num_slots_; }
     size_t slot_bytes() const { return slot_bytes_; }
+    // In-order copy queue used by the miss/staging DMA paths. Null when the
+    // cache was never initialized (the adaptive pipeline retires this cache,
+    // and its owner hands the executor its own copy queue instead).
+    sycl::queue* CopyQueue() const { return copy_q_.get(); }
     bool uses_nested_codes() const { return compact_nested_; }
     bool is_initialized() const { return initialized_ && !faulted_; }
     bool is_faulted() const { return faulted_; }

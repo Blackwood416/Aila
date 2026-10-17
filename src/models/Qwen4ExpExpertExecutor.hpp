@@ -140,6 +140,12 @@ public:
     void init(Context& ctx, Qwen4ExpExpertCache& cache, int max_seq_len, int top_k = 10,
               int hidden_size = 2560, int intermediate_size = 640);
 
+    // Copy queue used by AILA_Q4E_MOE_COPY_VIA_COPYQ for the per-layer CPU
+    // complement host copies. The adaptive pipeline retires the expert cache
+    // (so its copy_q_ stays null), hence its owner hands over its own in-order
+    // copy queue; unset callers fall back to cache_->CopyQueue().
+    void set_copy_queue(sycl::queue* copy_q) { copy_q_override_ = copy_q; }
+
     // Plan layer experts from route output.
     // Pure CPU control logic; zero allocations on hot path (reuses internal plan storage).
     LayerMoePlan& plan_layer(
@@ -217,14 +223,18 @@ public:
     // The first call waits the worker; every call uploads that row's CPU rank
     // spans into rank_output (that row's accumulator slice) and returns the H2D
     // event. The last row clears the batch state.
-    sycl::event JoinArenaColdRowsRow(float* rank_output, int row);
+    // order_dep is an optional compute-queue event that already follows this
+    // layer's device work; AILA_Q4E_MOE_COPY_VIA_COPYQ then orders the CPU
+    // result H2D behind it instead of submitting a fresh compute-queue barrier.
+    sycl::event JoinArenaColdRowsRow(float* rank_output, int row,
+                                     const sycl::event* order_dep = nullptr);
     // Init-only immutable mapped views; no cache operation runs on the worker.
     void PrepareAsyncResidentSources(int layers, int experts);
     bool CanStartAsyncResidentRoute(int layer) const;
     void StartAsyncResidentRoute(int layer, const int* ids, const int* selected, const sycl::event& route_event);
     void RetireAsyncResidentRoute(GpuReadyLease& route);
     void StageResidentInput(const bf16* x_dev, int rows = 1);
-    sycl::event JoinResidentCold(float* rank_output);
+    sycl::event JoinResidentCold(float* rank_output, const sycl::event* order_dep = nullptr);
     const void* ResidentCpuResultPacket() const { return cpu_result_packet_active_ ? cpu_result_packet_dev_ : nullptr; }
     const ops::MoeCpuHostDownRows* ResidentCpuHostRows() const { return cpu_host_result_active_ ? &cpu_host_rows_ : nullptr; }
     // Register the actual GPU reader before admitting another CPU output writer.
@@ -269,6 +279,9 @@ private:
     struct CpuWorker;
     std::unique_ptr<CpuWorker> cpu_worker_;
     void cleanup();
+    // Effective copy queue for AILA_Q4E_MOE_COPY_VIA_COPYQ, or null when the
+    // gate is off or no queue exists (callers then keep the compute queue).
+    sycl::queue* copy_queue() const;
     uint64_t acquire_begin_ns_ = 0;
     uint64_t acquire_end_ns_ = 0;
 
@@ -332,6 +345,7 @@ private:
     // Zero-allocation preallocated staging for ensure_gpu_pending
     std::vector<int> pending_experts_buf_;
     std::vector<int> assigned_slots_buf_;
+    sycl::queue* copy_q_override_ = nullptr;
     sycl::event prev_cpu_h2d_ev_{};
     sycl::event cpu_output_reader_event_{};
     sycl::event resident_input_event_{};
