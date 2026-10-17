@@ -436,3 +436,31 @@ once in the worker log (otherwise the arm is invalid), then compare
 the first suspect is the one compute-queue barrier per layer for the x D2H
 (the only added submit); the fallback is to plumb the HC kernel event into
 `StageResidentInput` and drop the barrier entirely.
+
+### Follow-up (source-only, same gate): x D2H reuses the HC up-mix event
+
+The barrier above is now removed for the canonical decode shape. Event source
+trace: `ForwardImpl` MLP-HC (`Qwen4ExpBnb4Backend.cpp:2710-2720`) ->
+`RunHyperConnectionCombined` -> the `count == 1` fused branch ->
+`ops::hc_decode_down_inject` + `ops::hc_decode_up_mix`; the up-mix is the last
+kernel submission and writes `buf_.x`, i.e. the exact `x_dev` pointer the CPU
+complement copies out. `hc_decode_up_mix` now returns its
+`ctx.queue().submit()` event (`HyperConnectionOps.hpp/.cpp`), the backend
+helpers return `std::optional<sycl::event>` (only this branch reports one;
+every other HC shape still returns nullopt), and `StageResidentInput` takes an
+optional `const sycl::event* producer` used as the copy-queue dependency.
+
+Why the D2H dependency is unchanged: the copy still cannot start before
+`buf_.x` is fully written - it now waits on the up-mix kernel event instead of
+on the barrier. Because the compute queue is in-order and the up-mix is the
+last data submission before `StageResidentInput` (the statements in between
+are host-only; the only extra command the barrier covered is the optional
+`dev_mark(kDevHc)` device-span marker, which carries no data), the up-mix
+event completes behind every command the barrier used to cover, including the
+earlier `hc_decode_down_inject`. The consumer side is
+untouched: the copy event is still `resident_input_event_` -> `job.activation`,
+which the CPU worker waits before reading `x_host_`, and `stagein_hoisted`
+passes the same event. Shapes that cannot report an HC event keep the barrier
+fallback, and with `AILA_Q4E_MOE_COPY_VIA_COPYQ=0` the helper ignores
+`producer` and issues the original compute-queue copy (zero change). No new
+waits are introduced; the candidate is default-off through the parent flag.
