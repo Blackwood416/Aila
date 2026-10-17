@@ -144,6 +144,16 @@ struct HcSubmitTimingStage {
     uint64_t max_ns = 0;
 };
 
+// One gap bucket (see HcSubmitTiming::gap_b*): count is the number of HC
+// submits whose preceding inter-submit gap fell into the bucket, and
+// submit_total_ns is the sum of those submits' durations (bucket mean =
+// submit_total_ns / count). The gap is measured from the end of the previous HC
+// submit to the begin of the current one, across all four sites as one chain.
+struct HcGapBucket {
+    uint64_t count = 0;
+    uint64_t submit_total_ns = 0;
+};
+
 struct HcSubmitTiming {
     // try_hc_decode_inject_add_and_grouped_rms_norm (single-row fused
     // inject+add+norm, the P1 pending path).
@@ -154,6 +164,15 @@ struct HcSubmitTiming {
     HcSubmitTimingStage down;
     // hc_decode_up_mix / hc_decode_up_mix_rows (streams variant included).
     HcSubmitTimingStage up;
+
+    // Inter-submit gap buckets: b0 <10us, b1 <50us, b2 <200us, b3 >=200us.
+    // The first HC submit after process start (no previous end) is skipped.
+    HcGapBucket gap_b0;
+    HcGapBucket gap_b1;
+    HcGapBucket gap_b2;
+    HcGapBucket gap_b3;
+    // Largest gap sample seen in the same scope (totals or window).
+    uint64_t gap_max_ns = 0;
 };
 
 // Cumulative since process start; never reset. All zeros when the gate is off.

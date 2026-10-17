@@ -215,3 +215,72 @@ So each HC submit pays: one bundle-name check, one `HostKernel` heap allocation,
 ~10-12 captured-argument collection and cache lookups, all inside the measured
 interval; section 8's `A -> S -> B -> C/R` ladder prices exactly these
 increments against the 6.5 us control.
+
+## 10. Gap buckets (2026-10-16)
+
+The `wait-every` scan showed the HC submit cost is batch-state bound (W=1
+~22.2 us, W=8 7.0 us, W=32 3.7 us) while production measured 21-27 us per
+submit - i.e. production appears to pay a drained round trip per submit. The
+prime mechanism candidate: the host gap between two adjacent HC submits exceeds
+the UR/L0 dynamic-batch timeout and the batch is closed. The instrumentation
+now buckets that gap.
+
+Definition: `gap = hc_submit_begin(now) - previous hc_submit_end`, one shared
+chain across all four HC sites (attn_hc norm/down/up, mlp_hc norm/down/up,
+mixer) on the submission thread. The first HC submit after process start (no
+previous end) contributes no gap sample; the chain is not reset by the window
+take. Buckets: `b0 < 10 us`, `b1 < 50 us`, `b2 < 200 us`, `b3 >= 200 us`.
+
+Fields appended to `[Q4E AdaptiveWork]` (per-forward window; same gate,
+`AILA_Q4E_HC_SUBMIT_TIMING=1` plus the line's `AILA_Q4E_WORK_SUMMARY=1`):
+
+- `hc_gap_b0_n`/`hc_gap_b0_us` ... `hc_gap_b3_n`/`hc_gap_b3_us`: the count of
+  submits whose preceding gap fell into the bucket and the mean submit cost of
+  exactly those submits (bucket sum / count; 0.000 with no samples).
+- `hc_gap_max_us`: the largest gap sample in the window.
+
+Read: if the 21-27 us submits concentrate in the high-gap buckets (b2/b3) while
+b0/b1 carry the warm numbers (~4-7 us), the drained-round-trip mechanism is
+confirmed and the lever is removing/flushing host gaps (fewer boundaries,
+larger batches) rather than the CG shape. If b0 (<10 us gaps) already shows
+~21-27 us, the gap/batch-timeout story is refuted for that portion.
+
+Implementation notes: the gap state is one physical chain shared by the totals
+and window scopes (`g_hc_last_submit_end`, `g_hc_pending_gap_*` in
+`HyperConnectionOps.cpp`) and is deliberately not reset by
+`HcSubmitTimingTakeWindow`; only the bucket counters are scoped. Gate off: the
+helpers return before any clock read, exactly as before.
+
+Line-position note (2026-10-16 late session): the `[Q4E AdaptiveWork]` message
+is truncated by the logger's fixed buffer at ~1025 chars, and with the HC block
+appended at the end the `hc_submit_down/up` and all `hc_gap_*` fields were cut
+off (gap2-k3 receipt: the line ended mid-`hc_submit_down_us`). Fixed with both
+mechanisms:
+
+1. The 16 `hc_submit_*` + 9 `hc_gap_*` fields lead the `[Q4E AdaptiveWork]`
+   message, directly after `pos=/count=/ple_reused=`; the HC block ends at
+   rendered char 689 of the 1024 cap (verified locally), so every HC field
+   survives; the cut now only trims the trailing device-ms fields.
+2. A dedicated `[Q4E HcSubmit] pos=... count=... hc_host_ms=... <all 25
+   hc_* fields>` line, printed only when `AILA_Q4E_HC_SUBMIT_TIMING=1`
+   (28/28 format/arg pairs, rendered length 687 - no field can be cut).
+
+Field naming is uniform across all four submit stages:
+`<name>_us`, `<name>_n`, `<name>_min_us`, `<name>_max_us`.
+
+Final build receipts after the line fix: `build-refactor/AilaWorker.exe`
+**2026-10-16 23:17:32**, `Aila.exe` 23:17:39, `AilaShared.dll` 23:16:19,
+`AilaInference.dll` 23:16:15, `build-refactor-server/AilaServer.exe`
+**2026-10-16 23:18:33** (server rebuilt in the same window so the handshake
+identity matches). Race guard: both AilaLib objs (23:15:55 / 23:16:14) are later
+than their src mtimes. Binary check: `[Q4E HcSubmit]` and the gap field groups
+are present in `AilaWorker.exe`.
+
+Build-window note (2026-10-16 late session): the concurrent GPU arm sequence
+re-locks `build-refactor\libhwloc-15.dll` (loaded by every running
+`AilaWorker.exe`) and `AilaWorker.exe` itself, so `build.ps1` runs that land
+inside an arm fail in the `copy_runtime_dependencies` step with
+`Error copying file (if different) ... libhwloc-15.dll`. The runtime build is
+therefore gated on an arm-free window (`tmp/q4e-structural-20261016/
+build_on_window.ps1`: poll 10 s, build immediately when the processes vanish,
+retry on collisions).

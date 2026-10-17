@@ -27,8 +27,42 @@ struct HcSubmitCounters {
     uint64_t max_ns[kHcSubmitStageCount] = {};
 };
 
+// Gap buckets (b0 <10us, b1 <50us, b2 <200us, b3 >=200us) over the interval
+// between the previous HC submit's end and the current one's begin, one shared
+// chain across all four sites. submit_ns[i] accumulates the durations of the
+// submits whose preceding gap fell into bucket i, so the print can report a
+// per-bucket mean submit cost.
+constexpr int kHcGapBucketCount = 4;
+
+struct HcGapCounters {
+    uint64_t count[kHcGapBucketCount] = {};
+    uint64_t submit_ns[kHcGapBucketCount] = {};
+    uint64_t max_ns = 0;
+};
+
 HcSubmitCounters g_hc_submit_totals; // process lifetime, never reset
 HcSubmitCounters g_hc_submit_window; // since the last TakeWindow call
+HcGapCounters g_hc_gap_totals;       // process lifetime, never reset
+HcGapCounters g_hc_gap_window;       // since the last TakeWindow call
+
+// Physical gap chain (shared by the totals and window scopes; not reset by
+// TakeWindow). Set by hc_submit_begin, consumed by the matching hc_submit_end.
+std::chrono::steady_clock::time_point g_hc_last_submit_end{};
+int g_hc_pending_gap_bucket = -1;
+uint64_t g_hc_pending_gap_ns = 0;
+
+int hc_gap_bucket_of(uint64_t gap_ns) {
+    if (gap_ns < 10000ull) return 0;       // < 10 us
+    if (gap_ns < 50000ull) return 1;       // < 50 us
+    if (gap_ns < 200000ull) return 2;      // < 200 us
+    return 3;                              // >= 200 us
+}
+
+void hc_gap_record_sample(HcGapCounters& g, int bucket, uint64_t gap_ns, uint64_t submit_ns) {
+    g.count[bucket] += 1;
+    g.submit_ns[bucket] += submit_ns;
+    if (gap_ns > g.max_ns) g.max_ns = gap_ns;
+}
 
 bool hc_submit_timing_enabled() {
     static const bool s_enabled =
@@ -37,8 +71,18 @@ bool hc_submit_timing_enabled() {
 }
 
 std::chrono::steady_clock::time_point hc_submit_begin() {
-    return hc_submit_timing_enabled() ? std::chrono::steady_clock::now()
-                                      : std::chrono::steady_clock::time_point{};
+    if (!hc_submit_timing_enabled()) return std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    g_hc_pending_gap_bucket = -1;
+    if (g_hc_last_submit_end != std::chrono::steady_clock::time_point{}) {
+        const uint64_t gap_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_hc_last_submit_end).count());
+        g_hc_pending_gap_bucket = hc_gap_bucket_of(gap_ns);
+        // The bucket's submit-duration sum is added by hc_submit_end; store the
+        // gap for that call.
+        g_hc_pending_gap_ns = gap_ns;
+    }
+    return now;
 }
 
 void hc_submit_record(HcSubmitCounters& c, int stage, uint64_t ns) {
@@ -52,14 +96,20 @@ void hc_submit_record(HcSubmitCounters& c, int stage, uint64_t ns) {
 // call. No-op (and no clock read) when the gate is off.
 void hc_submit_end(int stage, std::chrono::steady_clock::time_point t0) {
     if (!hc_submit_timing_enabled()) return;
+    const auto now = std::chrono::steady_clock::now();
     const uint64_t ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
-            .count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - t0).count());
     hc_submit_record(g_hc_submit_totals, stage, ns);
     hc_submit_record(g_hc_submit_window, stage, ns);
+    if (g_hc_pending_gap_bucket >= 0) {
+        hc_gap_record_sample(g_hc_gap_totals, g_hc_pending_gap_bucket, g_hc_pending_gap_ns, ns);
+        hc_gap_record_sample(g_hc_gap_window, g_hc_pending_gap_bucket, g_hc_pending_gap_ns, ns);
+    }
+    g_hc_pending_gap_bucket = -1;
+    g_hc_last_submit_end = now;
 }
 
-HcSubmitTiming hc_submit_snapshot(const HcSubmitCounters& c) {
+HcSubmitTiming hc_submit_snapshot(const HcSubmitCounters& c, const HcGapCounters& g) {
     HcSubmitTiming out;
     HcSubmitTimingStage* dst[kHcSubmitStageCount] = {
         &out.norm_pending, &out.norm_fallback, &out.down, &out.up};
@@ -69,18 +119,26 @@ HcSubmitTiming hc_submit_snapshot(const HcSubmitCounters& c) {
         dst[i]->min_ns = c.min_ns[i];
         dst[i]->max_ns = c.max_ns[i];
     }
+    HcGapBucket* gap_dst[kHcGapBucketCount] = {
+        &out.gap_b0, &out.gap_b1, &out.gap_b2, &out.gap_b3};
+    for (int i = 0; i < kHcGapBucketCount; ++i) {
+        gap_dst[i]->count = g.count[i];
+        gap_dst[i]->submit_total_ns = g.submit_ns[i];
+    }
+    out.gap_max_ns = g.max_ns;
     return out;
 }
 
 } // namespace
 
 HcSubmitTiming HcSubmitTimingTotals() {
-    return hc_submit_snapshot(g_hc_submit_totals);
+    return hc_submit_snapshot(g_hc_submit_totals, g_hc_gap_totals);
 }
 
 HcSubmitTiming HcSubmitTimingTakeWindow() {
-    const HcSubmitTiming out = hc_submit_snapshot(g_hc_submit_window);
+    const HcSubmitTiming out = hc_submit_snapshot(g_hc_submit_window, g_hc_gap_window);
     g_hc_submit_window = HcSubmitCounters{};
+    g_hc_gap_window = HcGapCounters{};
     return out;
 }
 

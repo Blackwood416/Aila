@@ -3235,7 +3235,23 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         auto hc_sub_max_us = [](const ops::HcSubmitTimingStage& s) {
             return static_cast<double>(s.max_ns) * 1e-3;
         };
-        AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d submitted_ms=%.3f router_wait_ms=%.3f "
+        // Per-gap-bucket mean HC submit cost: the mean of the submits whose
+        // preceding inter-submit gap fell into the bucket (0 with no samples).
+        auto hc_gap_mean_us = [](const ops::HcGapBucket& b) {
+            return b.count ? static_cast<double>(b.submit_total_ns) /
+                                 static_cast<double>(b.count) * 1e-3
+                           : 0.0;
+        };
+        // The HC submit/gap block leads the message: the line is truncated at
+        // ~1025 chars, and hc_submit_down/up n/min/max must survive the cut.
+        AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d "
+            "hc_submit_norm_us=%.3f hc_submit_norm_n=%llu hc_submit_norm_min_us=%.3f hc_submit_norm_max_us=%.3f "
+            "hc_submit_normfb_us=%.3f hc_submit_normfb_n=%llu hc_submit_normfb_min_us=%.3f hc_submit_normfb_max_us=%.3f "
+            "hc_submit_down_us=%.3f hc_submit_down_n=%llu hc_submit_down_min_us=%.3f hc_submit_down_max_us=%.3f "
+            "hc_submit_up_us=%.3f hc_submit_up_n=%llu hc_submit_up_min_us=%.3f hc_submit_up_max_us=%.3f "
+            "hc_gap_b0_n=%llu hc_gap_b0_us=%.3f hc_gap_b1_n=%llu hc_gap_b1_us=%.3f "
+            "hc_gap_b2_n=%llu hc_gap_b2_us=%.3f hc_gap_b3_n=%llu hc_gap_b3_us=%.3f hc_gap_max_us=%.3f "
+            "submitted_ms=%.3f router_wait_ms=%.3f "
             "ple_host_ms=%.3f hc_host_ms=%.3f linear_host_ms=%.3f full_host_ms=%.3f "
             "experts_host_ms=%.3f head_host_ms=%.3f fill_ms=%.3f bank_wait_ms=%.3f swap_ms=%.3f "
             "cpu_compute_ms=%.3f cpu_join_ms=%.3f cpu_tasks=%llu hits=%llu misses=%llu staged=%llu h2d_mb=%.3f "
@@ -3243,12 +3259,22 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             "router_other_ms=%.3f shared_other_ms=%.3f tail_ms=%.3f dev_events=%d "
             "misc_dev_ms=%.3f hc_dev_ms=%.3f linear_dev_ms=%.3f full_dev_ms=%.3f router_dev_ms=%.3f "
             "shared_dev_ms=%.3f experts_dev_ms=%.3f resid_dev_ms=%.3f head_dev_ms=%.3f "
-            "inter_dev_ms=%.3f ple_dev_ms=%.3f stagein_dev_ms=%.3f prerouter_dev_ms=%.3f "
-            "hc_submit_norm_us=%.3f hc_submit_norm_n=%llu hc_submit_norm_min_us=%.3f hc_submit_norm_max_us=%.3f "
-            "hc_submit_normfb_us=%.3f hc_submit_normfb_n=%llu hc_submit_normfb_min_us=%.3f hc_submit_normfb_max_us=%.3f "
-            "hc_submit_down_us=%.3f hc_submit_down_n=%llu hc_submit_down_min_us=%.3f hc_submit_down_max_us=%.3f "
-            "hc_submit_up_us=%.3f hc_submit_up_n=%llu hc_submit_up_min_us=%.3f hc_submit_up_max_us=%.3f",
-            start_pos,count,int(reuse_ple),submitted_ms_now,prof_router_sync_ms,
+            "inter_dev_ms=%.3f ple_dev_ms=%.3f stagein_dev_ms=%.3f prerouter_dev_ms=%.3f",
+            start_pos,count,int(reuse_ple),
+            hc_sub_us(hc_submit.norm_pending), (unsigned long long)hc_submit.norm_pending.count,
+            hc_sub_min_us(hc_submit.norm_pending), hc_sub_max_us(hc_submit.norm_pending),
+            hc_sub_us(hc_submit.norm_fallback), (unsigned long long)hc_submit.norm_fallback.count,
+            hc_sub_min_us(hc_submit.norm_fallback), hc_sub_max_us(hc_submit.norm_fallback),
+            hc_sub_us(hc_submit.down), (unsigned long long)hc_submit.down.count,
+            hc_sub_min_us(hc_submit.down), hc_sub_max_us(hc_submit.down),
+            hc_sub_us(hc_submit.up), (unsigned long long)hc_submit.up.count,
+            hc_sub_min_us(hc_submit.up), hc_sub_max_us(hc_submit.up),
+            (unsigned long long)hc_submit.gap_b0.count, hc_gap_mean_us(hc_submit.gap_b0),
+            (unsigned long long)hc_submit.gap_b1.count, hc_gap_mean_us(hc_submit.gap_b1),
+            (unsigned long long)hc_submit.gap_b2.count, hc_gap_mean_us(hc_submit.gap_b2),
+            (unsigned long long)hc_submit.gap_b3.count, hc_gap_mean_us(hc_submit.gap_b3),
+            static_cast<double>(hc_submit.gap_max_ns) * 1e-3,
+            submitted_ms_now,prof_router_sync_ms,
             stage_ms[kStagePle],stage_ms[kStageHc],stage_ms[kStageLinearAttn],stage_ms[kStageFullAttn],
             stage_ms[kStageExperts],stage_ms[kStageHead],
             (a.staging_fill_ns-adaptive_stats0.staging_fill_ns)*1e-6,
@@ -3265,15 +3291,36 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             router_other_ms, shared_other_ms, submitted_ms_now - stage_sum_ms, int(dev_trace),
             dev_ms[kDevMisc], dev_ms[kDevHc], dev_ms[kDevLinear], dev_ms[kDevFull], dev_ms[kDevRouter],
             dev_ms[kDevShared], dev_ms[kDevExperts], dev_ms[kDevResid], dev_ms[kDevHead],
-            dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter],
-            hc_sub_us(hc_submit.norm_pending), (unsigned long long)hc_submit.norm_pending.count,
-            hc_sub_min_us(hc_submit.norm_pending), hc_sub_max_us(hc_submit.norm_pending),
-            hc_sub_us(hc_submit.norm_fallback), (unsigned long long)hc_submit.norm_fallback.count,
-            hc_sub_min_us(hc_submit.norm_fallback), hc_sub_max_us(hc_submit.norm_fallback),
-            hc_sub_us(hc_submit.down), (unsigned long long)hc_submit.down.count,
-            hc_sub_min_us(hc_submit.down), hc_sub_max_us(hc_submit.down),
-            hc_sub_us(hc_submit.up), (unsigned long long)hc_submit.up.count,
-            hc_sub_min_us(hc_submit.up), hc_sub_max_us(hc_submit.up));
+            dev_ms[kDevInter], dev_ms[kDevPle], dev_ms[kDevStageIn], dev_ms[kDevPreRouter]);
+        // Dedicated HC submit/gap line, printed only with
+        // AILA_Q4E_HC_SUBMIT_TIMING=1. It is short enough that none of its
+        // fields can be cut by the logger's ~1025 char cap; the same values
+        // also lead the [Q4E AdaptiveWork] line above.
+        static const bool s_hc_submit_line =
+            aila::env::read_int_raw("AILA_Q4E_HC_SUBMIT_TIMING", 0) != 0;
+        if (s_hc_submit_line) {
+            AILA_LOG_INFO("[Q4E HcSubmit] pos=%d count=%d hc_host_ms=%.3f "
+                "hc_submit_norm_us=%.3f hc_submit_norm_n=%llu hc_submit_norm_min_us=%.3f hc_submit_norm_max_us=%.3f "
+                "hc_submit_normfb_us=%.3f hc_submit_normfb_n=%llu hc_submit_normfb_min_us=%.3f hc_submit_normfb_max_us=%.3f "
+                "hc_submit_down_us=%.3f hc_submit_down_n=%llu hc_submit_down_min_us=%.3f hc_submit_down_max_us=%.3f "
+                "hc_submit_up_us=%.3f hc_submit_up_n=%llu hc_submit_up_min_us=%.3f hc_submit_up_max_us=%.3f "
+                "hc_gap_b0_n=%llu hc_gap_b0_us=%.3f hc_gap_b1_n=%llu hc_gap_b1_us=%.3f "
+                "hc_gap_b2_n=%llu hc_gap_b2_us=%.3f hc_gap_b3_n=%llu hc_gap_b3_us=%.3f hc_gap_max_us=%.3f",
+                start_pos, count, stage_ms[kStageHc],
+                hc_sub_us(hc_submit.norm_pending), (unsigned long long)hc_submit.norm_pending.count,
+                hc_sub_min_us(hc_submit.norm_pending), hc_sub_max_us(hc_submit.norm_pending),
+                hc_sub_us(hc_submit.norm_fallback), (unsigned long long)hc_submit.norm_fallback.count,
+                hc_sub_min_us(hc_submit.norm_fallback), hc_sub_max_us(hc_submit.norm_fallback),
+                hc_sub_us(hc_submit.down), (unsigned long long)hc_submit.down.count,
+                hc_sub_min_us(hc_submit.down), hc_sub_max_us(hc_submit.down),
+                hc_sub_us(hc_submit.up), (unsigned long long)hc_submit.up.count,
+                hc_sub_min_us(hc_submit.up), hc_sub_max_us(hc_submit.up),
+                (unsigned long long)hc_submit.gap_b0.count, hc_gap_mean_us(hc_submit.gap_b0),
+                (unsigned long long)hc_submit.gap_b1.count, hc_gap_mean_us(hc_submit.gap_b1),
+                (unsigned long long)hc_submit.gap_b2.count, hc_gap_mean_us(hc_submit.gap_b2),
+                (unsigned long long)hc_submit.gap_b3.count, hc_gap_mean_us(hc_submit.gap_b3),
+                static_cast<double>(hc_submit.gap_max_ns) * 1e-3);
+        }
     }
     // G5: one line per prefill forward that proves how the layer arena was
     // consumed (arena_experts vs bank fallback). A zero-hit consumer would
