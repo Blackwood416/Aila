@@ -1,8 +1,9 @@
 # Qwen3.8 R1 canonical decode: L0 flush inventory + copy-q residual breakers
 
 Date: 2026-10-17
-Base: HEAD `5a5138d` plus the uncommitted copy-q worktree changes present at
-audit time. Read-only audit: no source edits by this audit, no GPU run.
+Base: `5a5138d` plus the copy-q/HC-event plumbing committed as `53f1f8b`
+(source) and `93dc878` (docs). Line numbers were verified against that tree.
+Read-only audit: no source edits by this audit, no GPU run.
 
 Gate: `AILA_Q4E_MOE_COPY_VIA_COPYQ`, read once, default **off**
 (`src/models/Qwen4ExpMoeCopyQueue.hpp:23-27`). Sections 1-2 are the
