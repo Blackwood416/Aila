@@ -271,11 +271,12 @@ void burn_cpu_us(int cpu_us) {
     }
 }
 
-void release_graph_submission(const sycl::event& graph_event) {
+sycl::info::event_command_status release_graph_submission(
+    const sycl::event& graph_event) {
     // A driver entry is required to discharge the L0 dynamic batch. Querying
     // the graph event is the release primitive already measured in Aila's
     // submit probes; it neither waits nor changes graph semantics.
-    (void)graph_event
+    return graph_event
         .get_info<sycl::info::event::command_execution_status>();
 }
 
@@ -314,19 +315,52 @@ PollResult poll_host_word(sycl::queue& q, volatile uint32_t* word,
     return PollResult::Reached;
 }
 
-bool host_route_matches(HostRing* ring, uint32_t seq, std::string& error) {
-    for (uint32_t k = 0; k < kTopK; ++k) {
-        const int32_t got_id = ring->route.ids[k];
-        const float got_weight = ring->route.weights[k];
-        if (got_id != static_cast<int32_t>(expected_id(seq, k)) ||
-            bit_u32(got_weight) != bit_u32(expected_weight(seq, k))) {
+bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
+                        uint32_t seq, int timeout_ms, std::string& error) {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    uint32_t polls = 0;
+    for (;;) {
+        // On A770 the sequence word can become visible before its payload.
+        // The host initialized these lines with memset, so volatile alone can
+        // keep hitting the CPU's stale cache line while the GPU writes through
+        // uncached PCIe memory. Invalidate the route lines, enter the driver,
+        // then re-read the payload.
+        _mm_clflush(&ring->route.ids[0]);
+        _mm_clflush(&ring->route.ids[kTopK - 1]);
+        _mm_clflush(&ring->route.weights[0]);
+        _mm_clflush(&ring->route.weights[kTopK - 1]);
+        const auto graph_status = release_graph_submission(graph_event);
+        uint32_t bad_k = kTopK;
+        for (uint32_t k = 0; k < kTopK; ++k) {
+            const int32_t got_id = ring->route.ids[k];
+            const float got_weight = ring->route.weights[k];
+            if (got_id != static_cast<int32_t>(expected_id(seq, k)) ||
+                bit_u32(got_weight) != bit_u32(expected_weight(seq, k))) {
+                bad_k = k;
+                break;
+            }
+        }
+        if (bad_k == kTopK) {
+            std::atomic_thread_fence(std::memory_order_acquire);
+            return true;
+        }
+        if (graph_status == sycl::info::event_command_status::complete) {
             std::ostringstream os;
-            os << "route payload stale at k=" << k << " seq=" << seq;
+            os << "route payload stale after graph completion at k=" << bad_k
+               << " seq=" << seq << " polls=" << (polls + 1u);
             error = os.str();
             return false;
         }
+        if (Clock::now() >= deadline) {
+            std::ostringstream os;
+            os << "route payload timeout at k=" << bad_k << " seq=" << seq
+               << " polls=" << (polls + 1u);
+            error = os.str();
+            return false;
+        }
+        ++polls;
+        for (int i = 0; i < 64; ++i) _mm_pause();
     }
-    return true;
 }
 
 void write_host_result(HostRing* ring, uint32_t value_seq, uint32_t publish_seq) {
@@ -381,7 +415,8 @@ Handoff service_replay(Context& ctx,
         throw std::runtime_error("route " + error);
     }
     const auto t_route = Clock::now();
-    if (!host_route_matches(ring, expected_seq, error)) {
+    if (!host_route_matches(graph_event, ring, expected_seq, host_timeout_ms,
+                            error)) {
         *volatile_u32(&ctrl.host_route_error_count) =
             *volatile_u32(&ctrl.host_route_error_count) + 1u;
         try { graph_event.wait_and_throw(); } catch (...) {}
@@ -599,6 +634,17 @@ int main(int argc, char** argv) {
                         ctx, executable, ring, expected_seq, cpu_us,
                         options.host_timeout_ms, false);
                     if (h.timeout_delta || h.stale_delta || h.mismatch_delta) {
+                        std::cerr
+                            << "[TOKEN GRAPH WARMUP FAIL] seq=" << expected_seq
+                            << " cpu_us=" << cpu_us
+                            << " timeout_delta=" << h.timeout_delta
+                            << " stale_delta=" << h.stale_delta
+                            << " mismatch_delta=" << h.mismatch_delta
+                            << " timeout_spins="
+                            << *reinterpret_cast<volatile uint64_t*>(
+                                   &ring->ctrl.timeout_spins)
+                            << " route_us=" << h.route_to_flag_us
+                            << " done_us=" << h.route_to_done_us << '\n';
                         throw std::runtime_error(
                             "warmup exposed timeout/stale/mismatch");
                     }

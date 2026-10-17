@@ -3,7 +3,7 @@
 param(
     [uint32]$Replays = 1000,
     [string]$CpuUs = '0,50,200,500',
-    [uint32]$SpinMax = 20000,
+    [uint32]$SpinMax = 2000000,
     [int]$HostTimeoutMs = 2000,
     [int]$Warmup = 10,
     [string]$Log = ''

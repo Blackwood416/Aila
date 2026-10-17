@@ -1,7 +1,8 @@
 # Qwen4Exp token-graph P0 probe
 
 Date: 2026-10-17
-Status: **code prepared only; not built or executed**
+Status: **executed; NO-GO on current Windows/L0 for a host-serviced,
+whole-token graph**
 
 This directory tests the highest-leverage structural candidate from
 `docs/plans/qwen38-r1-strata-kernel-transfer-2026-10-17.md`:
@@ -91,3 +92,15 @@ P0 passes only if all of the following hold for every CPU arm:
 
 If the ring is not visible before graph completion, or the bounded device spin
 expires, record **NO-GO** and do not implement the token graph.
+
+## Actual result (2026-10-17)
+
+Limited Graph capture succeeds, but the route payload is not visible to the
+host until graph completion. Both 20,000 and 2,000,000 device spins timed out;
+the host saw `route_seq` and then needed ~376-378 ms for the payload, by which
+point the graph had exited. Event-status polling and host `_mm_clflush` did not
+change the result. Receipts: `gpu-run3.log`, `gpu-run5.log`.
+
+Do not use a host-serviced, whole-token graph on this path. A per-layer graph
+that ends before the host reads the route is a different design and would need
+its own probe.
