@@ -952,8 +952,21 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         }
     }
     try {
-        if (prev_cpu_h2d_ev_!=sycl::event{}) prev_cpu_h2d_ev_.wait_and_throw();
-        prev_cpu_h2d_ev_={}; cold_layer_=layer;
+        // F4 (AILA_Q4E_MOE_COPY_VIA_COPYQ): the previous CPU-result rank-span
+        // H2D is on the in-order copy queue. Hand it to the worker's
+        // transfer_reader (waited before any CPU expert kernel writes
+        // cpu_out_host_) instead of blocking the submit thread. Off the flag,
+        // or when no copy queue exists, keep the original same-thread wait.
+        const bool defer_transfer_wait =
+            q4e::moe_copy_via_copyq() && copy_queue() != nullptr;
+        sycl::event transfer_reader{};
+        if (defer_transfer_wait) {
+            transfer_reader = prev_cpu_h2d_ev_;
+        } else if (prev_cpu_h2d_ev_!=sycl::event{}) {
+            prev_cpu_h2d_ev_.wait_and_throw();
+            prev_cpu_h2d_ev_={};
+        }
+        cold_layer_=layer;
         cold_count_=std::min(count,max_cpu_credits_);
         cold_cached_count_=cold_count_; cold_mapped_count_=0;
         if (!cold_count_) return 0;
@@ -961,6 +974,11 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         job.count=cold_count_; job.hidden=hidden_size_; job.intermediate=intermediate_size_; job.tokens=tokens;
         job.x=x_host_; job.h=scratch_h_; job.out=cpu_out_host_; job.resident_prepared=true;
         job.output_reader=cpu_output_reader_event_;
+        // Covers the packet and host-read result modes alike: the worker waits
+        // this before writing job.out; the host-read consumer is separately
+        // fenced by job.output_reader. Cold-row/async-route services keep
+        // their own wait/transfer_reader handling.
+        job.transfer_reader=transfer_reader;
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
             q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
                 size_t(hidden_size_)*size_t(tokens)*sizeof(bf16));
@@ -972,6 +990,9 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
             job.tasks[c]={source,row_token};
         }
         cold_submit_ns_=steady_ns(); cpu_worker_->submit(job);
+        // Ownership of the previous upload event moved to the worker; a later
+        // JoinResidentCold publishes this layer's upload event here.
+        if (defer_transfer_wait) prev_cpu_h2d_ev_={};
         stats_.cpu_tasks_dispatched+=cold_count_;
         stats_.cpu_cached_tasks_dispatched+=cold_count_;
         return cold_count_;
