@@ -757,16 +757,21 @@ sycl::queue* Qwen4ExpExpertExecutor::copy_queue() const {
     return q;
 }
 
-void Qwen4ExpExpertExecutor::StageResidentInput(const bf16* x_dev, int rows) {
+void Qwen4ExpExpertExecutor::StageResidentInput(const bf16* x_dev, int rows,
+                                                const sycl::event* producer) {
     if(rows<1 || rows>max_cpu_tokens_ || verify_async_rows_ || cold_count_ || async_route_pending_ || async_route_collected_ || arena_verify_pending_ || cpu_host_result_active_)throw std::logic_error("CPU cold slot has an unfinished batch or invalid rows");
     static const bool deferArenaWait = aila::env::read_flag("AILA_Q4E_CPU_DEFER_ARENA_WAIT", false);
     // The unfinished-job guard above excludes CPU input readers. Copies on
     // the same in-order queue retain GPU write ordering without a host wait.
     if(!deferArenaWait && resident_input_event_!=sycl::event{})resident_input_event_.wait_and_throw();
-    // The returned event stays the worker's activation gate (job.activation),
-    // so a copy-queue D2H is still fully ordered before the first x_host_ read.
+    // With the gate on, `producer` is the last HC kernel event (it writes
+    // x_dev), so the copy queue needs no extra compute-queue barrier; without
+    // it the helper falls back to one. Gate off ignores producer entirely and
+    // keeps the original ctx.queue() copy. The returned event stays the
+    // worker's activation gate (job.activation), so the first x_host_ read is
+    // still ordered behind the copy.
     resident_input_event_=q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
-        size_t(rows)*hidden_size_*sizeof(bf16));
+        size_t(rows)*hidden_size_*sizeof(bf16),producer);
 }
 
 void Qwen4ExpExpertExecutor::PrepareAsyncResidentSources(int layers, int experts) {

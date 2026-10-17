@@ -469,11 +469,17 @@ private:
     void DenseLinear(Context& ctx, Linear& linear, Tensor* raw_weight,
                      Tensor& input, Tensor& output, int count, int out_features, int in_features);
     // grouped norm -> low-rank mix -> x = mean_s(mix * N); optionally inject = 2*sigmoid(W N / 4).
-    void RunHyperConnection(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject);
+    // Returns the x-writing (up-mix) submission event when this path produces
+    // one so the caller can order the activation D2H behind it without a
+    // compute-queue barrier. Only the count==1 fused decode branch reports it;
+    // all other shapes return nullopt (callers keep their old behavior).
+    std::optional<sycl::event> RunHyperConnection(Context& ctx, Qwen4ExpHyperConnectionLayer& hc,
+                                                  int count, bool with_inject);
     // P1: Fused residual add + grouped norm across attention -> MLP boundary
-    void RunHyperConnectionCombined(Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
-                                    const sycl::ext::oneapi::bfloat16* pending_y, const float* pending_inj,
-                                    DecodePendingMlpResidual* pending_mlp = nullptr);
+    std::optional<sycl::event> RunHyperConnectionCombined(
+        Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
+        const sycl::ext::oneapi::bfloat16* pending_y, const float* pending_inj,
+        DecodePendingMlpResidual* pending_mlp = nullptr);
 
     ModelSpec spec_;
     Qwen4ExpTextConfig cfg_;

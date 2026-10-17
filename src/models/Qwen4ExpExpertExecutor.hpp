@@ -233,7 +233,11 @@ public:
     bool CanStartAsyncResidentRoute(int layer) const;
     void StartAsyncResidentRoute(int layer, const int* ids, const int* selected, const sycl::event& route_event);
     void RetireAsyncResidentRoute(GpuReadyLease& route);
-    void StageResidentInput(const bf16* x_dev, int rows = 1);
+    // producer (optional) is the compute-queue event of the kernel that last
+    // wrote x_dev. AILA_Q4E_MOE_COPY_VIA_COPYQ uses it as the D2H dependency
+    // instead of submitting a compute-queue barrier; null keeps the barrier.
+    void StageResidentInput(const bf16* x_dev, int rows = 1,
+                            const sycl::event* producer = nullptr);
     sycl::event JoinResidentCold(float* rank_output, const sycl::event* order_dep = nullptr);
     const void* ResidentCpuResultPacket() const { return cpu_result_packet_active_ ? cpu_result_packet_dev_ : nullptr; }
     const ops::MoeCpuHostDownRows* ResidentCpuHostRows() const { return cpu_host_result_active_ ? &cpu_host_rows_ : nullptr; }

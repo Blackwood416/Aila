@@ -591,7 +591,7 @@ void hc_decode_down_inject_dispatch(
 }
 
 template<bool Batched>
-void hc_decode_up_mix_impl(
+sycl::event hc_decode_up_mix_impl(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
     bf16* x, int lowrank, int group_dim, int groups, int rows) {
     constexpr int wg = 256;
@@ -604,7 +604,7 @@ void hc_decode_up_mix_impl(
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
     const auto hc_t0 = hc_submit_begin();
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    sycl::event ev = ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
@@ -654,10 +654,11 @@ void hc_decode_up_mix_impl(
             });
     });
     hc_submit_end(kHcSubmitUp, hc_t0);
+    return ev;
 }
 
 template<bool Batched>
-void hc_decode_up_mix_streams_impl(
+sycl::event hc_decode_up_mix_streams_impl(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
     bf16* x, int lowrank, int group_dim, int rows) {
     constexpr int wg = 256, sg_size = 16, groups = 4;
@@ -667,7 +668,7 @@ void hc_decode_up_mix_streams_impl(
     const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
     const auto hc_t0 = hc_submit_begin();
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    sycl::event ev = ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<bf16, 1> gates(sycl::range<1>(dims_per_wg * groups), cgh);
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
@@ -727,6 +728,7 @@ void hc_decode_up_mix_streams_impl(
             });
     });
     hc_submit_end(kHcSubmitUp, hc_t0);
+    return ev;
 }
 
 } // namespace
@@ -737,11 +739,12 @@ void hc_decode_down_inject(
     hc_decode_down_inject_dispatch<false>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, 1, down_work_group);
 }
 
-void hc_decode_up_mix(
+sycl::event hc_decode_up_mix(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
     bf16* x, int lowrank, int group_dim, int groups, bool parallel_streams) {
-    if (parallel_streams && groups == 4) hc_decode_up_mix_streams_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, 1);
-    else hc_decode_up_mix_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, groups, 1);
+    if (parallel_streams && groups == 4)
+        return hc_decode_up_mix_streams_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, 1);
+    return hc_decode_up_mix_impl<false>(ctx, act, w_up, N, x, lowrank, group_dim, groups, 1);
 }
 
 void hc_decode_down_inject_rows(

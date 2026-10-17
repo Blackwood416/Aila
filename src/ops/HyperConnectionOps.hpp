@@ -81,7 +81,9 @@ void hc_decode_down_inject(
 // Single-row (decode) hyper-connection, stage B. One sub-group per output dim d:
 //   x[d] = mean_g( sigmoid(bf16(W_up[g * group_dim + d] . act)) * N[g * group_dim + d] )
 // W_up: [groups * group_dim, lowrank]; act: [lowrank]; x: [group_dim]
-void hc_decode_up_mix(
+// Returns the up-mix submission event so callers can order cross-queue work
+// (the production decode D2H) behind the kernel that writes `x`.
+sycl::event hc_decode_up_mix(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
     bf16* x, int lowrank, int group_dim, int groups, bool parallel_streams = false);
 

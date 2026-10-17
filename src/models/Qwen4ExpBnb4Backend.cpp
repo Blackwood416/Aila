@@ -2148,7 +2148,7 @@ void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::MarkConsumed() {
     ++consumedNorm;
 }
 
-void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
+std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject,
     const bf16* pending_y, const float* pending_inj, DecodePendingMlpResidual* pending_mlp) {
     const int hc_dim = 4 * hidden_size_;
@@ -2194,7 +2194,7 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
                 ctx, buf_.hc_mix_down.data_as<bf16>(), hc.mix_up_w->data_as<bf16>(),
                 buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(),
                 upd_h, upd_y, upd_inj, lowrank, hidden_size_, 4);
-            return;
+            return std::nullopt;
         }
     }
 
@@ -2232,7 +2232,7 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
             lowrank, hidden_size_, 4, count, hc_down_wg);
         ops::hc_decode_up_mix_rows(ctx, buf_.hc_mix_down.data_as<bf16>(), hc.mix_up_w->data_as<bf16>(),
             buf_.hc_N.data_as<bf16>(), buf_.x.data_as<bf16>(), lowrank, hidden_size_, 4, count, hc_up_streams);
-        return;
+        return std::nullopt;
     }
     if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
         ops::hc_decode_down_inject(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
@@ -2241,12 +2241,14 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
                                    static_cast<bf16*>(buf_.hc_mix_down.data()),
                                    static_cast<float*>(buf_.hc_inject_f32.data()),
                                    lowrank, hidden_size_, 4, hc_down_wg);
-        ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
-                              hc.mix_up_w->data_as<bf16>(),
-                              static_cast<const bf16*>(buf_.hc_N.data()),
-                              static_cast<bf16*>(buf_.x.data()),
-                              lowrank, hidden_size_, 4, hc_up_streams);
-        return;
+        // The up-mix is the last submission and writes buf_.x (the activation
+        // the decode CPU complement copies out); hand its event back so the
+        // copy queue can depend on the kernel directly instead of a barrier.
+        return ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
+                                     hc.mix_up_w->data_as<bf16>(),
+                                     static_cast<const bf16*>(buf_.hc_N.data()),
+                                     static_cast<bf16*>(buf_.x.data()),
+                                     lowrank, hidden_size_, 4, hc_up_streams);
     }
 
     DenseLinear(ctx, hc.input_mix_weight_down, hc.mix_down_w, buf_.hc_N, buf_.hc_mix_down,
@@ -2267,11 +2269,12 @@ void Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
                     count, 4, hc_dim);
         apply_two_sigmoid_div4(ctx, buf_.hc_inject_buf, buf_.hc_inject_f32, static_cast<size_t>(count) * 4);
     }
+    return std::nullopt;
 }
 
-void Qwen4ExpBnb4Backend::RunHyperConnection(
+std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnection(
     Context& ctx, Qwen4ExpHyperConnectionLayer& hc, int count, bool with_inject) {
-    RunHyperConnectionCombined(ctx, hc, count, with_inject, nullptr, nullptr);
+    return RunHyperConnectionCombined(ctx, hc, count, with_inject, nullptr, nullptr);
 }
 
 Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
@@ -2707,16 +2710,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // 2.3. Attn Residual Add & 2.4. MLP Hyper-Connection (P1 Fused)
         static const bool s_fuse_attn_mlp_gr = aila::env::read_flag("AILA_Q4E_FUSE_ATTN_MLP_GR", true);
+        // The MLP-HC up-mix is the last kernel writing buf_.x. Its event lets
+        // the CPU-complement activation D2H depend on the producer kernel
+        // directly (no compute-queue barrier). Shapes whose HC path cannot
+        // report an event leave this empty and keep the barrier fallback.
+        std::optional<sycl::event> mlp_hc_ev;
         if (s_fuse_attn_mlp_gr) {
-            RunHyperConnectionCombined(ctx, layer.mlp_hc, count, true,
-                                       static_cast<const bf16*>(buf_.y.data()),
-                                       static_cast<const float*>(buf_.hc_inject_f32.data()));
+            mlp_hc_ev = RunHyperConnectionCombined(ctx, layer.mlp_hc, count, true,
+                                                   static_cast<const bf16*>(buf_.y.data()),
+                                                   static_cast<const float*>(buf_.hc_inject_f32.data()));
         } else {
             ops::hc_inject_add(ctx, static_cast<bf16*>(buf_.hidden4.data()),
                                static_cast<const bf16*>(buf_.y.data()),
                                static_cast<const float*>(buf_.hc_inject_f32.data()),
                                count, hidden_size_, 4);
-            RunHyperConnection(ctx, layer.mlp_hc, count, true);
+            mlp_hc_ev = RunHyperConnection(ctx, layer.mlp_hc, count, true);
         }
         stage(kStageHc);
         dev_mark(kDevHc);
@@ -2729,7 +2737,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         const bool stagein_hoisted = s_stagein_hoist && use_adaptive_pipeline_ && count == 1 &&
             expert_executor_.cpu_overlap_enabled();
         if (stagein_hoisted)
-            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
+                mlp_hc_ev ? &*mlp_hc_ev : nullptr);
 
         // 2.5. MoE Computation
         static const int s_verify_cpu_rows = aila::env::read_int("AILA_Q4E_VERIFY_CPU_ROWS", 0);
@@ -2753,7 +2762,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // route also makes CPU input ready, before resident/shared GPU work.
         if (cpu_early_start || cpu_async_route || cpu_verify_async ||
             (!stagein_hoisted && use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
-            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count);
+            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
+                mlp_hc_ev ? &*mlp_hc_ev : nullptr);
         // Round 2: close the CPU input-staging window (lease/branch setup +
         // resident-input D2H on ctx.queue + the previous copy's host wait).
         dev_mark(kDevStageIn);
