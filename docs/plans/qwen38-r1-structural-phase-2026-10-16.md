@@ -231,6 +231,48 @@ Conclusions:
 
 ### Next change (scoped, ready to implement)
 
+#### Day 2 (2026-10-17): flush inventory in the canonical layer + fix design
+
+`probe_chain` day-2 arms (receipt `chain-probe5.log`):
+
+| per-iteration sequence | us per submit |
+|---|---:|
+| plain | 5.1 |
+| kernel with a **cross-queue** dependency on an other-queue event | 8.5 |
+| deferred wait on the previous iteration's other-queue copy + new copy | 12.8 |
+| `UR_L0_USE_COPY_ENGINE_FOR_IN_ORDER_QUEUE=1` (env knob, probe) | 22.7 - knob is a NO-GO |
+
+Cross-queue dependencies and deferred cross-queue waits cost ~+3..8 us instead
+of the ~+15..20 us same-queue penalties, so the copy_q_ routing design below
+holds.
+
+Canonical decode layer flush inventory (adaptive pipeline, hotset CPU
+complement active; all on `ctx.queue()` unless noted):
+
+| # | op | site | consumer / dependency |
+|---:|---|---|---|
+| 1 | wait (drain prev layer result-copy reader) | `Qwen4ExpExpertExecutor.cpp:1878` | buffer reuse fence |
+| 2 | wait (drain prev layer H2D) | `:1881` | buffer reuse fence |
+| 3 | host-ptr H2D weights (40 B/token) | `:1890` | accumulate at `:2182` (has `&last` dep hook) |
+| 4 | host-ptr D2H activations x (40 KB/token) | `:1903` | CPU worker (`job.activation`, explicit wait `:2115`) |
+| 5 | host-ptr H2D CPU results (coalesced) | `:2094` | accumulate at `:2182` |
+| 6 | event status query -> straggler penalty | `:2162` | drives `set_straggler_penalty` (`:2169/:2175` -> cpu credits `:1659/:1661`) |
+| 7 | router readback wait (48/token) | `Qwen4ExpBnb4Backend.cpp:2822` | data dependency (stays) |
+| 8 | resident-input wait (48/token) | `Qwen4ExpExpertExecutor.cpp:745` | removable via `AILA_Q4E_CPU_DEFER_ARENA_WAIT=1` (measured -1.1% earlier) |
+
+~6 flush events per layer x 48 layers ~= 288, matching the 286 measured
+all-drained HC submits.
+
+Implementation plan (env-gated `AILA_Q4E_MOE_COPY_VIA_COPYQ`, default off):
+
+1. Expose `copy_q_` (Qwen4ExpExpertCache.hpp:575) through a cache accessor.
+2. Route copies 3/4/5 through it, recording events; hand the events to the
+   accumulate (`&last` hook) and to the CPU worker's activation chain.
+3. Gate 6 behind the flag and A/B it (it also feeds the straggler penalty, so
+   the arm measures that heuristic's value too).
+4. A/B on the canonical decode arm (single A/B per owner rule; A/A floor
+   1.05% on the 19-token continue metric).
+
 Route both per-layer copies off the compute queue:
 
 1. The 40 B top-k weight H2D (`RunResidentDecode`) and the 5 KB top-k D2H
