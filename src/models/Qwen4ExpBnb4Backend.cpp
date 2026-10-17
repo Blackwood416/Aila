@@ -2547,6 +2547,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // D1 layer-boundary experiments (see the file-scope stash above).
     static const bool s_cpu_route_early = aila::env::read_flag("AILA_Q4E_CPU_ROUTE_EARLY", false);
     static const bool s_stagein_hoist = aila::env::read_flag("AILA_Q4E_STAGEIN_HOIST", false);
+    // Default-off alternative to the pre-router activation D2H: issue it after
+    // the mandatory per-layer router wait instead. Only meaningful with the
+    // copy-q gate; s_stagein_hoist keeps its existing (earlier) placement.
+    static const bool s_stagein_after_route =
+        aila::env::read_flag("AILA_Q4E_STAGEIN_AFTER_ROUTE", false);
     static const int s_hotset_swaps = aila::env::read_int_raw("AILA_Q4E_HOTSET_SWAPS", 96);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", false);
     static const bool s_predict_gating = aila::env::read_flag("AILA_Q4E_PREDICT_GATING", false);
@@ -2736,6 +2741,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // unchanged; it just enters the queue earlier.
         const bool stagein_hoisted = s_stagein_hoist && use_adaptive_pipeline_ && count == 1 &&
             expert_executor_.cpu_overlap_enabled();
+        // AILA_Q4E_STAGEIN_AFTER_ROUTE (default off): move the same D2H past
+        // the mandatory router wait so its cross-queue dependency never lands
+        // inside the router submission window. Requires the copy-q gate and is
+        // mutually exclusive with the hoisted (earlier) variant.
+        const bool stagein_after_route = s_stagein_after_route && !s_stagein_hoist &&
+            use_adaptive_pipeline_ && count == 1 && !is_prefill &&
+            expert_executor_.cpu_overlap_enabled() && copy_q_ &&
+            aila::q4e::moe_copy_via_copyq();
+        static bool stagein_after_route_logged = false;
+        if (stagein_after_route && !stagein_after_route_logged) {
+            AILA_LOG_INFO("[Q4E StageInAfterRoute] enabled=1 count=1 copy_q_gate=1");
+            stagein_after_route_logged = true;
+        }
         if (stagein_hoisted)
             expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
                 mlp_hc_ev ? &*mlp_hc_ev : nullptr);
@@ -2760,8 +2778,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             (!expert_cache_.adaptive_hotset() || s_hotset_swaps == 0) && expert_executor_.CanStartAsyncResidentRoute(L);
         // Place the activation copy ahead of the router so waiting for the
         // route also makes CPU input ready, before resident/shared GPU work.
-        if (cpu_early_start || cpu_async_route || cpu_verify_async ||
-            (!stagein_hoisted && use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled()))
+        if (!stagein_after_route &&
+            (cpu_early_start || cpu_async_route || cpu_verify_async ||
+             (!stagein_hoisted && use_adaptive_pipeline_ && count==1 && expert_executor_.cpu_overlap_enabled())))
             expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
                 mlp_hc_ev ? &*mlp_hc_ev : nullptr);
         // Round 2: close the CPU input-staging window (lease/branch setup +
@@ -2994,6 +3013,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             expert_executor_.RetireAsyncResidentRoute(*resident_binding);
             early_cold.active=false;early_cold.completed=true;
         } else if (!cpu_early_start) wait_actual_route();
+        // AILA_Q4E_STAGEIN_AFTER_ROUTE: the pre-existing router wait above has
+        // completed (the flag is mutually exclusive with the async-route
+        // branch), so the MLP-HC up-mix event is already done. Issue the
+        // activation D2H here; its cross-queue dependency can no longer keep
+        // the compute batch open across the router submission. No extra wait
+        // is added, and passing the same producer preserves the x_host_
+        // publication order for the CPU worker (job.activation).
+        if (stagein_after_route)
+            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
+                mlp_hc_ev ? &*mlp_hc_ev : nullptr);
         // D1 (opt-in): classify this layer's cold experts and start the CPU
         // batch here, right after the route is known, instead of inside
         // RunResidentDecode below. adaptive_cache_.ObserveRouting (called
