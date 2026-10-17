@@ -1,0 +1,176 @@
+{
+  "schema": "q4e-prefill-union-replay-v1",
+  "generated_at": "2026-10-17T02:53:49.493331+00:00",
+  "status": "blocked_missing_per_block_route_trace",
+  "inputs": {
+    "route_profile": {
+      "path": "E:\\RiderProjects\\Aila\\tmp\\q4e-sprint-r1-20261014\\prefill\\ttft14k-export.profile",
+      "sha256": "ce5341777509e9919d7bf8176f183b1624c6737ae5ca1f7755f57db403556982",
+      "kind": "aggregate_hotset_export"
+    },
+    "decode_profile": {
+      "path": "E:\\RiderProjects\\Aila\\perf\\qwen4exp\\profiles\\qwen38-nf4-agent6k-v1.profile",
+      "sha256": "90734a6eb35ad900556d99f4774320e16cbf7a98be02f7d143103937095ce26c",
+      "kind": "decode_hotset_profile"
+    },
+    "route_trace": null
+  },
+  "parameters": {
+    "slot_bytes": 2534400,
+    "slot_budgets": [
+      2400,
+      2792
+    ],
+    "promotion_slots": 512,
+    "min_occurrences": 2,
+    "request": null,
+    "expect_blocks": 4,
+    "reference_slots": 2792,
+    "promotion_slots_source": "AILA_Q4E_HOTSET_PROMPT_SWAPS=512 in xpb config"
+  },
+  "aggregate_route_profile": {
+    "layers": 48,
+    "experts": 512,
+    "identity": "nf4-original-expert-order-48x512-2560x640-b64-nested1-sample-fnv64-14151072976976870495",
+    "prefill_nonzero_keys": 23716,
+    "prefill_occurrences": 9569280,
+    "unique_observations": 138148,
+    "per_layer_union": [
+      500,
+      508,
+      507,
+      498,
+      508,
+      497,
+      501,
+      493,
+      492,
+      478,
+      487,
+      490,
+      479,
+      495,
+      488,
+      481,
+      490,
+      488,
+      498,
+      502,
+      506,
+      507,
+      512,
+      503,
+      498,
+      487,
+      502,
+      493,
+      497,
+      503,
+      495,
+      491,
+      496,
+      501,
+      500,
+      493,
+      466,
+      491,
+      502,
+      482,
+      501,
+      494,
+      490,
+      495,
+      486,
+      478,
+      487,
+      480
+    ],
+    "per_layer_union_min": 466,
+    "per_layer_union_median": 495.0,
+    "per_layer_union_max": 512,
+    "union_bytes": 60105830400,
+    "slot_bytes": 2534400
+  },
+  "budgets": {
+    "2400": {
+      "status": "blocked_missing_per_block_route_trace",
+      "budget_slots": 2400,
+      "base_permanent_slots": 1888,
+      "promotion_slots": 512,
+      "blocks": [],
+      "layer_distribution": [],
+      "summary": null,
+      "decode_hotset": {
+        "reference_slots": 2792,
+        "budget_slots": 2400,
+        "base_permanent_slots": 1888,
+        "promotion_overlay_slots": 512,
+        "borrowed_decode_slots": 512,
+        "borrowed_decode_mass": 16265,
+        "outside_budget_decode_slots": 392,
+        "outside_budget_decode_mass": 10734,
+        "reference_decode_mass": 159630,
+        "worst_case_missing_slots_vs_reference": 904,
+        "worst_case_decode_mass_at_risk": 26999,
+        "worst_case_decode_mass_pct": 16.913487,
+        "post_rollback_missing_slots_vs_reference": 392,
+        "post_rollback_decode_mass": 10734,
+        "post_rollback_decode_mass_pct": 6.7243,
+        "peak_missing_slots_vs_reference": 904,
+        "peak_decode_mass_at_risk": 26999,
+        "peak_decode_mass_pct": 16.913487
+      },
+      "rollback": {
+        "applied": true,
+        "post_prefill_restores_top_slots": 2400,
+        "post_rollback_missing_slots_vs_reference": 392
+      }
+    },
+    "2792": {
+      "status": "blocked_missing_per_block_route_trace",
+      "budget_slots": 2792,
+      "base_permanent_slots": 2280,
+      "promotion_slots": 512,
+      "blocks": [],
+      "layer_distribution": [],
+      "summary": null,
+      "decode_hotset": {
+        "reference_slots": 2792,
+        "budget_slots": 2792,
+        "base_permanent_slots": 2280,
+        "promotion_overlay_slots": 512,
+        "borrowed_decode_slots": 512,
+        "borrowed_decode_mass": 14282,
+        "outside_budget_decode_slots": 0,
+        "outside_budget_decode_mass": 0,
+        "reference_decode_mass": 159630,
+        "worst_case_missing_slots_vs_reference": 512,
+        "worst_case_decode_mass_at_risk": 14282,
+        "worst_case_decode_mass_pct": 8.94694,
+        "post_rollback_missing_slots_vs_reference": 0,
+        "post_rollback_decode_mass": 0,
+        "post_rollback_decode_mass_pct": 0.0,
+        "peak_missing_slots_vs_reference": 512,
+        "peak_decode_mass_at_risk": 14282,
+        "peak_decode_mass_pct": 8.94694
+      },
+      "rollback": {
+        "applied": true,
+        "post_prefill_restores_top_slots": 2792,
+        "post_rollback_missing_slots_vs_reference": 0
+      }
+    }
+  },
+  "limitations": [
+    "A profile is an aggregate count table; it does not encode block boundaries, row order, or route ids.",
+    "Without an exact route trace, blocks/layer distribution and promotion savings are null by design, not inferred.",
+    "Decode mass is a proxy for potential hotset loss; it is not a quality or throughput prediction.",
+    "The simulator is a cache/byte accounting model only."
+  ],
+  "todo": [
+    "Capture four prefill forward_begin/route records for prompt 13944 (four 4096-row windows plus the 1656-row tail) in route-trace-v1.",
+    "Include config.layers=48, experts=512, top_k=10, slot_bytes=2534400.",
+    "Provide one complete ids array per layer per forward.",
+    "Rerun this tool with --trace and the same two profiles; do not compare aggregate counts as block results."
+  ]
+}

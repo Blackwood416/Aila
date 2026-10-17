@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "q4e-prefill-union-route-trace-v1.schema.json",
+  "title": "Qwen4Exp exact prefill route trace",
+  "description": "One JSON object per line. The first object is config, followed by request/forward/route records. This schema is intentionally independent of legacy q4e_cache_replay traces.",
+  "$defs": {
+    "positive_int": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "config": {
+      "type": "object",
+      "required": ["type", "schema", "layers", "experts", "top_k", "slot_bytes"],
+      "properties": {
+        "type": {"const": "config"},
+        "schema": {"const": 1},
+        "layers": {"$ref": "#/$defs/positive_int"},
+        "experts": {"$ref": "#/$defs/positive_int"},
+        "top_k": {"$ref": "#/$defs/positive_int"},
+        "slot_bytes": {"$ref": "#/$defs/positive_int"},
+        "source": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "request_begin": {
+      "type": "object",
+      "required": ["type", "request", "prompt_tokens"],
+      "properties": {
+        "type": {"const": "request_begin"},
+        "request": {"type": "string", "minLength": 1},
+        "prompt_tokens": {"$ref": "#/$defs/positive_int"}
+      },
+      "additionalProperties": true
+    },
+    "forward_begin": {
+      "type": "object",
+      "required": ["type", "forward", "request", "position", "tokens"],
+      "properties": {
+        "type": {"const": "forward_begin"},
+        "forward": {"type": ["string", "integer"]},
+        "request": {"type": "string", "minLength": 1},
+        "position": {"type": "integer", "minimum": 0},
+        "tokens": {"$ref": "#/$defs/positive_int"},
+        "phase": {"enum": ["prefill", "decode"]}
+      },
+      "additionalProperties": true
+    },
+    "route": {
+      "type": "object",
+      "required": ["type", "forward", "layer", "rows", "ids"],
+      "properties": {
+        "type": {"const": "route"},
+        "forward": {"type": ["string", "integer"]},
+        "layer": {"type": "integer", "minimum": 0},
+        "rows": {"$ref": "#/$defs/positive_int"},
+        "top_k": {"$ref": "#/$defs/positive_int"},
+        "ids": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 0}
+        }
+      },
+      "additionalProperties": true
+    },
+    "request_end": {
+      "type": "object",
+      "required": ["type", "request"],
+      "properties": {
+        "type": {"const": "request_end"},
+        "request": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "note": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"const": "note"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/config"},
+    {"$ref": "#/$defs/request_begin"},
+    {"$ref": "#/$defs/forward_begin"},
+    {"$ref": "#/$defs/route"},
+    {"$ref": "#/$defs/request_end"},
+    {"$ref": "#/$defs/note"}
+  ]
+}
