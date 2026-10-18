@@ -145,5 +145,6 @@ replays=1000 timeouts=0
 ```
 
 The one-layer graph is 2.7% faster than the direct front; the important result
-is correctness of real state/router traffic through the mid-graph ring. The
-next gate is a two-layer, then whole-token graph.
+is correctness of real state/router traffic through the mid-graph ring. P1
+stops before MoE. The next gate is one full decode layer with device-count
+resident dispatch plus the CPU packet, then two layers, then the whole token.

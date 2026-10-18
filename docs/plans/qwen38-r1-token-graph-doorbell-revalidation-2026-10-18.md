@@ -151,9 +151,13 @@ The original self-imposed P0 gate of <=20 us median handoff is not met
 faster than the direct front, this is treated as a GO for the integration
 probe, not as a claim that the original latency gate passed.
 
-The next step is a two-layer graph with the same fixed-address route/result
-ring, followed by a 48-layer whole-token graph. The main remaining engineering
-risks are now:
+The P1 graph intentionally stops before MoE. The next step is one **full**
+decode layer: chain the captured front to a resident grouped dispatch whose
+count/descriptors are read from device memory, then consume the CPU packet and
+merge through the same uncached ring. Only after that layer is bit-exact should
+the probe capture two layers, then 48.
+
+The main remaining engineering risks are now:
 
 - fixed-address parameter tables for token/layer-varying scalars;
 - CPU expert result publication and cancellation;
