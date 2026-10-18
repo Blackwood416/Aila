@@ -12,6 +12,7 @@
 #include "engine/Engine.hpp"
 #include "models/Qwen4ExpBnb4Backend.hpp"
 #include "ops/GatedDeltaNetOps.hpp"
+#include "ops/MoeExpertOps.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/bit_cast.hpp>
@@ -55,6 +56,30 @@ struct Qwen4ExpGenerationTestAccess {
     }
     static size_t LayerCount(Qwen4ExpBnb4Backend& b) {
         return b.layers_.size();
+    }
+    static aila::Qwen4ExpAdaptiveCache& Adaptive(
+        Qwen4ExpBnb4Backend& b) {
+        return b.adaptive_cache_;
+    }
+    static const aila::LayerNestedMetadata& NestedMeta(
+        Qwen4ExpBnb4Backend& b, int layer) {
+        return b.host_arena_.GetLayerNestedMetadata(layer);
+    }
+    static Tensor& MoeH(Qwen4ExpBnb4Backend& b) { return b.buf_.moe_h; }
+    static Tensor& ResidentDown(Qwen4ExpBnb4Backend& b) {
+        return b.resident_down_;
+    }
+    static int ExpertsPerLayer(Qwen4ExpBnb4Backend& b) {
+        return b.cfg_.num_experts;
+    }
+    static int TopK(Qwen4ExpBnb4Backend& b) {
+        return b.cfg_.num_experts_per_tok;
+    }
+    static int HiddenSize(Qwen4ExpBnb4Backend& b) {
+        return b.hidden_size_;
+    }
+    static int IntermediateSize(Qwen4ExpBnb4Backend& b) {
+        return b.cfg_.moe_intermediate_size;
     }
     static Tensor& FrontHidden(Qwen4ExpBnb4Backend& b) {
         return b.buf_.hidden4;
@@ -291,6 +316,23 @@ void submit_real_route_publish(sycl::queue& q, HostRing* ring,
     });
 }
 
+void submit_resident_classify(sycl::queue& q, const int* ids,
+                              const int* slot_table, int* selected,
+                              int layer, int experts, int top_k) {
+    q.parallel_for(
+        sycl::range<1>(16),
+        [=](sycl::id<1> index) [[sycl::reqd_sub_group_size(16)]] {
+            const int rank = static_cast<int>(index[0]);
+            if (rank < top_k) {
+                const int expert = ids[rank];
+                selected[rank] =
+                    expert >= 0 && expert < experts
+                        ? slot_table[layer * experts + expert]
+                        : -1;
+            }
+        });
+}
+
 void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                         uint32_t spin_max) {
     q.submit([&](sycl::handler& h) {
@@ -447,9 +489,8 @@ PollResult poll_host_word(sycl::queue& q, volatile uint32_t* word,
     return PollResult::Reached;
 }
 
-bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
-                        uint32_t seq, int timeout_ms, bool synthetic_route,
-                        std::string& error) {
+bool host_route_matches(HostRing* ring, uint32_t seq, int timeout_ms,
+                        bool synthetic_route, std::string& error) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
     uint32_t polls = 0;
     for (;;) {
@@ -462,7 +503,6 @@ bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
         _mm_clflush(&ring->route.ids[kTopK - 1]);
         _mm_clflush(&ring->route.weights[0]);
         _mm_clflush(&ring->route.weights[kTopK - 1]);
-        const auto graph_status = release_graph_submission(graph_event);
         uint32_t bad_k = kTopK;
         for (uint32_t k = 0; k < kTopK; ++k) {
             const int32_t got_id = ring->route.ids[k];
@@ -482,13 +522,6 @@ bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
         if (bad_k == kTopK) {
             std::atomic_thread_fence(std::memory_order_acquire);
             return true;
-        }
-        if (graph_status == sycl::info::event_command_status::complete) {
-            std::ostringstream os;
-            os << "route payload stale after graph completion at k=" << bad_k
-               << " seq=" << seq << " polls=" << (polls + 1u);
-            error = os.str();
-            return false;
         }
         if (Clock::now() >= deadline) {
             std::ostringstream os;
@@ -555,7 +588,7 @@ Handoff service_replay(Context& ctx,
         throw std::runtime_error("route " + error);
     }
     const auto t_route = Clock::now();
-    if (!host_route_matches(graph_event, ring, expected_seq, host_timeout_ms,
+    if (!host_route_matches(ring, expected_seq, host_timeout_ms,
                             synthetic_route, error)) {
         *volatile_u32(&ctrl.host_route_error_count) =
             *volatile_u32(&ctrl.host_route_error_count) + 1u;
@@ -816,10 +849,76 @@ int run_real_front_model(const Options& options) {
         ctx.alloc_device(sizeof(int) * kTopK));
     float* graph_route_weights = static_cast<float*>(
         ctx.alloc_device(sizeof(float) * kTopK));
+    auto& adaptive = Qwen4ExpGenerationTestAccess::Adaptive(b);
+    const int top_k = Qwen4ExpGenerationTestAccess::TopK(b);
+    const int experts = Qwen4ExpGenerationTestAccess::ExpertsPerLayer(b);
+    const int hidden = Qwen4ExpGenerationTestAccess::HiddenSize(b);
+    const int intermediate =
+        Qwen4ExpGenerationTestAccess::IntermediateSize(b);
+    if (!adaptive.IsAllocated() || !adaptive.DeviceSlotTable() ||
+        top_k < 1 || top_k > 16)
+        throw std::runtime_error("adaptive resident graph state unavailable");
+    const auto& nested_meta =
+        Qwen4ExpGenerationTestAccess::NestedMeta(b, 0);
+    std::vector<ops::MoeExpertSlotDev> resident_descriptors(
+        static_cast<size_t>(adaptive.NumGpuSlots()));
+    for (int slot = 0; slot < adaptive.NumGpuSlots(); ++slot) {
+        if (adaptive.GetResidentEntry(slot).expert_id >= 0)
+            resident_descriptors[slot] =
+                adaptive.GetResidentSlotDev(slot, &nested_meta);
+    }
+    auto* resident_descriptors_dev =
+        static_cast<ops::MoeExpertSlotDev*>(ctx.alloc_device(
+            resident_descriptors.size() *
+            sizeof(ops::MoeExpertSlotDev)));
+    int* selected_dev =
+        static_cast<int*>(ctx.alloc_device(sizeof(int) * 16));
+    int* moe_test_ids_dev =
+        static_cast<int*>(ctx.alloc_device(sizeof(int) * top_k));
+    bf16* x_copy =
+        static_cast<bf16*>(ctx.alloc_device(sizeof(bf16) * hidden));
+    bf16* h_reference =
+        static_cast<bf16*>(ctx.alloc_device(
+            sizeof(bf16) * top_k * intermediate));
+    float* down_reference =
+        static_cast<float*>(ctx.alloc_device(
+            sizeof(float) * top_k * hidden));
+    ctx.memcpy_h2d(resident_descriptors_dev,
+                   resident_descriptors.data(),
+                   resident_descriptors.size() *
+                       sizeof(ops::MoeExpertSlotDev));
+    std::array<int, 16> moe_test_ids{};
+    std::vector<bool> used(static_cast<size_t>(experts), false);
+    int chosen = 0;
+    const int resident_target = std::min(5, top_k);
+    for (int slot = 0;
+         slot < adaptive.NumGpuSlots() && chosen < resident_target; ++slot) {
+        const auto entry = adaptive.GetResidentEntry(slot);
+        if (entry.layer != 0 || entry.expert_id < 0 ||
+            entry.expert_id >= experts || used[entry.expert_id])
+            continue;
+        moe_test_ids[chosen++] = entry.expert_id;
+        used[entry.expert_id] = true;
+    }
+    for (int expert = 0;
+         expert < experts && chosen < top_k; ++expert) {
+        if (used[expert] || adaptive.GetSlot(0, expert) >= 0) continue;
+        moe_test_ids[chosen++] = expert;
+        used[expert] = true;
+    }
+    for (int expert = 0;
+         expert < experts && chosen < top_k; ++expert) {
+        if (used[expert]) continue;
+        moe_test_ids[chosen++] = expert;
+        used[expert] = true;
+    }
+    ctx.memcpy_h2d(moe_test_ids_dev, moe_test_ids.data(),
+                   sizeof(int) * top_k);
     q.memset(epoch, 0, sizeof(DeviceEpoch)).wait_and_throw();
     q.memset(device_result, 0, sizeof(float) * kResultCount).wait_and_throw();
     q.memset(graph_route_ids, 0, sizeof(int) * kTopK).wait_and_throw();
     q.memset(graph_route_weights, 0, sizeof(float) * kTopK).wait_and_throw();
+    q.memset(selected_dev, -1, sizeof(int) * 16).wait_and_throw();
 
     std::cout << "[REAL FRONT GRAPH] model=" << options.real_front_model
               << " layers=" << Qwen4ExpGenerationTestAccess::LayerCount(b)
@@ -827,6 +926,18 @@ int run_real_front_model(const Options& options) {
               << (polled.ze_owned ? "zeMemAllocHost_uncached_bias"
                                   : "malloc_host_fallback")
               << '\n';
+
+    const size_t h_graph_bytes =
+        sizeof(bf16) * size_t(top_k) * intermediate;
+    const size_t down_graph_bytes =
+        sizeof(float) * size_t(top_k) * hidden;
+    q.memset(Qwen4ExpGenerationTestAccess::MoeH(b).data(),
+             0x7f, h_graph_bytes);
+    q.memset(Qwen4ExpGenerationTestAccess::ResidentDown(b).data(),
+             0x7f, down_graph_bytes);
+    q.memset(h_reference, 0x7f, h_graph_bytes);
+    q.memset(down_reference, 0x7f, down_graph_bytes);
+    ctx.synchronize();
 
     bool all_ok = true;
     {
@@ -838,6 +949,20 @@ int run_real_front_model(const Options& options) {
                 b, ds, graph_route_ids, graph_route_weights);
             submit_real_route_publish(
                 q, ring, epoch, graph_route_ids, graph_route_weights);
+            submit_resident_classify(
+                q, moe_test_ids_dev, adaptive.DeviceSlotTable(), selected_dev,
+                0, experts, top_k);
+            ops::moe_resident_gate_up(
+                ctx, resident_descriptors_dev, selected_dev,
+                Qwen4ExpGenerationTestAccess::FrontX(b).data_as<bf16>(),
+                Qwen4ExpGenerationTestAccess::MoeH(b).data_as<bf16>(),
+                top_k, hidden, intermediate, true, true);
+            ops::moe_resident_down(
+                ctx, resident_descriptors_dev, selected_dev,
+                Qwen4ExpGenerationTestAccess::MoeH(b).data_as<bf16>(),
+                Qwen4ExpGenerationTestAccess::ResidentDown(b)
+                    .data_as<float>(),
+                top_k, hidden, intermediate, true, true);
             submit_device_wait(q, ring, epoch, options.spin_max);
             submit_copy_from_mapped(q, ring, device_result);
             submit_bitwise_verify(q, ring, epoch, device_result);
@@ -867,11 +992,42 @@ int run_real_front_model(const Options& options) {
                 bit_u32(ring->route.weights[k]) ==
                     bit_u32(reference_weights[k]);
         }
+
+        std::array<int, 16> selected_host{};
+        ctx.memcpy_d2h(selected_host.data(), selected_dev,
+                       sizeof(int) * selected_host.size());
+        int resident_count = 0;
+        for (int k = 0; k < top_k; ++k)
+            resident_count += selected_host[k] >= 0 ? 1 : 0;
+        q.memcpy(x_copy,
+                 Qwen4ExpGenerationTestAccess::FrontX(b).data(),
+                 sizeof(bf16) * hidden)
+            .wait_and_throw();
+        ops::moe_resident_gate_up(
+            ctx, resident_descriptors_dev, selected_dev, x_copy,
+            h_reference, top_k, hidden, intermediate, true, true);
+        ops::moe_resident_down(
+            ctx, resident_descriptors_dev, selected_dev, h_reference,
+            down_reference, top_k, hidden, intermediate, true, true);
+        ctx.synchronize();
+        std::vector<float> graph_down(top_k * hidden);
+        std::vector<float> direct_down(top_k * hidden);
+        ctx.memcpy_d2h(
+            graph_down.data(),
+            Qwen4ExpGenerationTestAccess::ResidentDown(b).data(),
+            down_graph_bytes);
+        ctx.memcpy_d2h(direct_down.data(), down_reference, down_graph_bytes);
+        const bool moe_down_parity =
+            std::memcmp(graph_down.data(), direct_down.data(),
+                        down_graph_bytes) == 0;
         std::cout << "[REAL FRONT GRAPH] front_parity="
                   << (front_parity ? 1 : 0)
                   << " route_parity=" << (route_parity ? 1 : 0)
+                  << " resident_count=" << resident_count
+                  << " moe_down_parity=" << (moe_down_parity ? 1 : 0)
                   << " handoff_us=" << first.route_to_done_us << '\n';
-        all_ok &= front_parity && route_parity;
+        all_ok &= front_parity && route_parity && moe_down_parity &&
+                  resident_count > 0;
 
         for (int cpu_us : options.cpu_sweep) {
             ArmStats stats;
@@ -914,6 +1070,12 @@ int run_real_front_model(const Options& options) {
         ctx.synchronize();
     }
 
+    ctx.free_device(down_reference);
+    ctx.free_device(h_reference);
+    ctx.free_device(x_copy);
+    ctx.free_device(moe_test_ids_dev);
+    ctx.free_device(selected_dev);
+    ctx.free_device(resident_descriptors_dev);
     ctx.free_device(graph_route_weights);
     ctx.free_device(graph_route_ids);
     ctx.free_device(device_result);

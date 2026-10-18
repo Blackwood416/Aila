@@ -148,3 +148,18 @@ The one-layer graph is 2.7% faster than the direct front; the important result
 is correctness of real state/router traffic through the mid-graph ring. P1
 stops before MoE. The next gate is one full decode layer with device-count
 resident dispatch plus the CPU packet, then two layers, then the whole token.
+
+## P2 partial: real masked resident MoE
+
+The probe now also captures device resident classification and the existing
+fixed-top-10 `moe_resident_gate_up/down` kernels. With a test route containing
+five resident and five cold experts:
+
+```text
+front_parity=1 route_parity=1 resident_count=5 moe_down_parity=1
+replays=1000 replay_wall_us_median=653.4
+handoff_us_median=155.1 timeouts=0
+```
+
+This proves the graph-safe masked dispatch. It does not yet contain the real
+CPU worker, real packet, merge, shared expert or residual.
