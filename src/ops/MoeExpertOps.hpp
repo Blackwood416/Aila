@@ -135,6 +135,9 @@ void router_topk_ids_host(
 sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* weights,
     const int* table, int* selected, int* host_ids, float* host_weights, int* host_selected,
     int top_k, int experts);
+// Graph-safe classification: no host mirrors and no host reads.
+sycl::event moe_resident_classify_device(Context& ctx, const int* ids,
+    const int* table, int* selected, int top_k, int experts);
 // The nested_fixed256 flags below are a caller contract: when nested scales
 // are enabled, every referenced descriptor must use nested blocksize 256.
 sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,

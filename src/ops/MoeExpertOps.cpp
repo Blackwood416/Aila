@@ -4840,6 +4840,24 @@ sycl::event moe_resident_classify(Context& ctx, const int* ids, const float* wei
     });
 }
 
+sycl::event moe_resident_classify_device(Context& ctx, const int* ids,
+    const int* table, int* selected, int top_k, int experts) {
+    if (top_k < 1 || top_k > 16)
+        throw std::invalid_argument("Resident top-k bound");
+    return ctx.queue().parallel_for(
+        sycl::range<1>(16),
+        [=](sycl::id<1> index) [[sycl::reqd_sub_group_size(16)]] {
+            const int rank = static_cast<int>(index[0]);
+            if (rank < top_k) {
+                const int expert = ids[rank];
+                selected[rank] =
+                    expert >= 0 && expert < experts
+                        ? table[expert]
+                        : -1;
+            }
+        });
+}
+
 sycl::event moe_resident_gate_up(Context& ctx, const MoeExpertSlotDev* descriptors,
     const int* selected, const bf16* x, bf16* h, int top_k, int hidden, int intermediate, bool nested,
     bool nested_fixed256) {

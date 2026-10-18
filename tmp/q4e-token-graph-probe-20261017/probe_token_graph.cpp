@@ -346,21 +346,11 @@ void submit_copy_x_to_mapped(sycl::queue& q, const bf16* x,
     });
 }
 
-void submit_resident_classify(sycl::queue& q, const int* ids,
+void submit_resident_classify(Context& ctx, const int* ids,
                               const int* slot_table, int* selected,
-                              int layer, int experts, int top_k) {
-    q.parallel_for(
-        sycl::range<1>(16),
-        [=](sycl::id<1> index) [[sycl::reqd_sub_group_size(16)]] {
-            const int rank = static_cast<int>(index[0]);
-            if (rank < top_k) {
-                const int expert = ids[rank];
-                selected[rank] =
-                    expert >= 0 && expert < experts
-                        ? slot_table[layer * experts + expert]
-                        : -1;
-            }
-        });
+                              int experts, int top_k) {
+    ops::moe_resident_classify_device(
+        ctx, ids, slot_table, selected, top_k, experts);
 }
 
 void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
@@ -1063,8 +1053,8 @@ int run_real_front_model(const Options& options) {
             submit_real_route_publish(
                 q, ring, epoch, graph_route_ids, graph_route_weights);
             submit_resident_classify(
-                q, graph_route_ids, adaptive.DeviceSlotTable(), selected_dev,
-                0, experts, top_k);
+                ctx, graph_route_ids, adaptive.DeviceSlotTable(),
+                selected_dev, experts, top_k);
             ops::moe_resident_gate_up(
                 ctx, resident_descriptors_dev, selected_dev,
                 Qwen4ExpGenerationTestAccess::FrontX(b).data_as<bf16>(),

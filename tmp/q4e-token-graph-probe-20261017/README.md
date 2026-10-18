@@ -187,17 +187,17 @@ activation row to the uncached ring, then the host calls
 `Qwen4ExpExpertExecutor::RunGraphColdPacket` using the existing `CpuWorker` and
 host arena. The graph copies the real packet into device memory and merges it.
 
-Receipt `gpu-real-cpu-p2.log`:
+Receipt `gpu-real-cpu-p2-classify.log`:
 
 ```text
 resident_count=0 cpu_rows=10
 front_parity=1 route_parity=1
 moe_down_parity=1 packet_merge_parity=1
 replays=1000
-route_to_flag_us_median=345.7
-handoff_us_median=406.5 p99=568.0
-replay_wall_us_median=920.0
-first_cold_handoff_ms=16.0
+route_to_flag_us_median=348.4
+handoff_us_median=409.0 p99=594.0
+replay_wall_us_median=927.7
+first_cold_handoff_ms=14.6
 timeouts=0
 ```
 

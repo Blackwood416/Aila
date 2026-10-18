@@ -157,7 +157,7 @@ scratch/output banks and the native host arena. It submits/waits no SYCL copy
 and does not mutate adaptive residency. This is a service entry only; the
 production scheduler remains unchanged.
 
-Receipt: `gpu-real-cpu-p2.log`
+Receipt: `gpu-real-cpu-p2-classify.log`
 
 | item | result |
 |---|---:|
@@ -166,15 +166,18 @@ Receipt: `gpu-real-cpu-p2.log`
 | resident / CPU rows | 0 / 10 |
 | front / route / MoE down parity | bitwise / exact / bitwise |
 | real CPU packet merge parity | bitwise |
-| steady route-to-flag median | 345.7 us |
-| steady handoff median / p99 | 406.5 / 568.0 us |
-| steady replay wall median / p99 | 920.0 / 1,196.6 us |
-| first cold call handoff | 16.0 ms |
+| steady route-to-flag median | 348.4 us |
+| steady handoff median / p99 | 409.0 / 594.0 us |
+| steady replay wall median / p99 | 927.7 / 1,196.3 us |
+| first cold call handoff | 14.6 ms |
 | timeouts / stale / mismatch | 0 / 0 / 0 |
 
 The first call pays page/scale warm-up; 1,000 subsequent calls remain bounded.
 This is the first real end-to-end single-layer graph CPU handoff, not a full
 token graph and not yet an adoption result.
+
+The graph now uses the production `ops::moe_resident_classify_device` primitive
+(no host mirrors), not the probe-local classifier.
 
 Resident dispatch remains covered separately by the forced 5-resident /
 5-cold test and its packet merge receipt. The current real route happened to
