@@ -11,12 +11,26 @@ Receipts:
 - `tmp/q4e-structural-20261016/two-queue-long.log`
 - `tmp/q4e-structural-20261016/two-queue-immediate.log`
 - `tmp/q4e-structural-20261016/two-queue-copy.log`
+- `tmp/q4e-structural-20261016/l0-queue-groups-subdevices.log`
 
 ## 0. Answer
 
 The current driver exposes **no usable independent compute lane** through a
 second SYCL in-order compute queue. Two compute kernels on separate queues
 have zero measured kernel-time overlap.
+
+Direct Level Zero enumeration confirms why:
+
+```text
+[L0] subdevices=0
+[L0] groups=2
+[L0 GROUP] ordinal=0 flags=COMPUTE|COPY|COOPERATIVE numQueues=1
+[L0 GROUP] ordinal=1 flags=COPY numQueues=1
+```
+
+There is exactly one compute queue group, and the device does not expose
+subdevices. The second SYCL compute queue therefore maps onto the same
+physical compute engine. The only separate group is copy-only.
 
 The copy engine **is** independent enough to overlap a compute kernel:
 
