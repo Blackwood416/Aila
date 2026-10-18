@@ -311,7 +311,8 @@ public:
         const int* cold_expert_ids,
         int count,
         int ping_pong_index,
-        Qwen4ExpExpertExecutor* copy_executor = nullptr);
+        Qwen4ExpExpertExecutor* copy_executor = nullptr,
+        bool direct_arena = false);
 
     // =========================================================================
     // Telemetry & Statistics

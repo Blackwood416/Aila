@@ -550,6 +550,11 @@ private:
     std::vector<ops::MoeExpertSlotDev> adaptive_prefill_slots_;
     sycl::event RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count);
     int resident_decode_mode_ = 0; // 0 legacy, 1 host Ready binding, 2 GPU resident selection
+    // Token-scoped Bresenham credit for the opt-in adaptive cold split.
+    int cold_split_credit_ = 0;
+    int cold_split_num_ = 0;
+    bool direct_arena_stage_ = false;
+    bool cold_split_this_forward_ = false;
     int cold_mode_ = 0; // 0 dynamic, 1 frozen + GPU cold, 2 frozen + bounded CPU cold
     bool resident_prefill_ = false;
     bool cold_epoch_enabled_ = true; // disabled explicitly during synthetic engine warmup

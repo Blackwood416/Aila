@@ -1481,6 +1481,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // overlap the already submitted shared expert and resident kernels.
             if (d1_stash_valid && d1_stash_layer != layer) d1_stash_valid=false;
             int cpu_count=0;
+            bool direct_stage_for_row=false;
             // The multi-row gate falls back to the unchanged all-GPU staging
             // path whenever a routed miss has no native RAM owner, mirroring
             // the per-rank ownership the count==1 branch would have required.
@@ -1513,7 +1514,26 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 // x_base equals x_t for count==1, so the single-row call is
                 // byte-for-byte the T1 call; multi-row calls index the row
                 // staged by StageResidentInput above.
-                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),miss_count,x_base,
+                int cpu_target = miss_count;
+                const bool direct_cold_split = cold_split_this_forward_ &&
+                    cold_split_num_ > 0 && direct_arena_stage_;
+                if (direct_cold_split && miss_count > 0) {
+                    // Smooth the target over the token instead of applying
+                    // floor(miss_count * share) independently per layer.
+                    cold_split_credit_ += miss_count * cold_split_num_;
+                    const int gpu_share = std::min(miss_count, cold_split_credit_ >> 8);
+                    cold_split_credit_ &= 255;
+                    cpu_target = miss_count - gpu_share;
+                    direct_stage_for_row = true;
+                    static bool split_logged = false;
+                    if (!split_logged) {
+                        split_logged = true;
+                        AILA_LOG_INFO("[Q4E DirectColdSplit] enabled=1 share=%d/256 "
+                                      "scope=token cpu_max=%d direct_dma=1",
+                            cold_split_num_, expert_executor_.max_cpu_credits());
+                    }
+                }
+                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),cpu_target,x_base,
                     t, count);
             }
             cpu_work.active=verify_cpu_batch || cpu_count>0;
@@ -1523,7 +1543,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
                 staging = adaptive_cache_.StageColdExpertsAsync(
                     host_arena_, dma_q, layer, miss_experts.data()+cpu_count, gpu_cold_count, ping_pong_index_,
-                    &expert_executor_);
+                    &expert_executor_, direct_stage_for_row);
                 ping_pong_index_ ^= 1;
             }
 
@@ -2283,6 +2303,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
+    static const int s_cold_split_num =
+        std::clamp(aila::env::read_int_raw("AILA_Q4E_COLD_SPLIT_NUM", 0), 0, 256);
+    static const bool s_direct_arena_stage =
+        aila::env::read_flag("AILA_Q4E_STAGE_DIRECT_ARENA", false);
+    // The split is a token-level share, not a per-layer floor. Reset it once
+    // per forward; prefill and multi-row verify never consume it.
+    cold_split_credit_ = 0;
+    cold_split_num_ = s_cold_split_num;
+    direct_arena_stage_ = s_direct_arena_stage;
+    cold_split_this_forward_ = false;
     static const bool s_layer_major = aila::env::read_flag("AILA_Q4E_LAYER_MAJOR", false);
     if (s_layer_major && LayerMajorPrefillEligible(session, count, options)) {
         return ForwardLayerMajorPrefill(ctx, session, tokenIdsDevice, count,
@@ -2534,6 +2564,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool decode_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_DECODE", true);
     static const bool prefill_prefetch = aila::env::read_flag("AILA_Q4E_PREFETCH_PREFILL", true);
     const bool is_prefill = !options.decode_verification && (options.prefill_remaining >= 0 || count > 1);
+    cold_split_this_forward_ = cold_split_num_ > 0 && direct_arena_stage_ &&
+        use_adaptive_pipeline_ && count == 1 && !is_prefill && copy_q_ != nullptr;
     static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", false);
     const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp && count == 1 && !is_prefill && !interior;
     DecodePendingMlpResidual pending_mlp(ctx, buf_.hidden4.data_as<bf16>(),

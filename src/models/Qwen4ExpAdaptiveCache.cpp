@@ -605,7 +605,7 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
 
 StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     const Qwen4ExpHostArena& arena, sycl::queue& q, int layer, const int* experts, int count, int index,
-    Qwen4ExpExpertExecutor* copy_executor) {
+    Qwen4ExpExpertExecutor* copy_executor, bool direct_arena) {
     if (!IsAllocated() || !experts || count<1 || count>config_.staging_slots_per_buffer ||
         layer<0 || layer>=config_.num_layers || arena.SlotBytes()!=geom_.slot_bytes ||
         !q.has_property<sycl::property::queue::in_order>())
@@ -630,21 +630,23 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     // AILA_Q4E_STAGE_COPY_PARALLEL=0 restores the serial host copy.
     static const bool parallel_host_copy =
         aila::env::read_flag("AILA_Q4E_STAGE_COPY_PARALLEL", true);
-    if (parallel_host_copy && count>1 && copy_executor) {
-        // The executor's parallel host copy is bounded to 16 slots per call;
-        // deeper staging banks (AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS) must split
-        // into several calls instead of tripping its input validation.
-        constexpr int kMaxHostCopySlots = 16;
-        for (int offset = 0; offset < count; offset += kMaxHostCopySlots) {
-            const int n = std::min(kMaxHostCopySlots, count - offset);
-            copy_executor->CopyColdStagingHostSlots(
-                sources.data() + offset, staging_host_[pp] + size_t(offset) * geom_.slot_bytes,
-                geom_.slot_bytes, n, true);
+    if (!direct_arena) {
+        if (parallel_host_copy && count>1 && copy_executor) {
+            // The executor's parallel host copy is bounded to 16 slots per call;
+            // deeper staging banks (AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS) must split
+            // into several calls instead of tripping its input validation.
+            constexpr int kMaxHostCopySlots = 16;
+            for (int offset = 0; offset < count; offset += kMaxHostCopySlots) {
+                const int n = std::min(kMaxHostCopySlots, count - offset);
+                copy_executor->CopyColdStagingHostSlots(
+                    sources.data() + offset, staging_host_[pp] + size_t(offset) * geom_.slot_bytes,
+                    geom_.slot_bytes, n, true);
+            }
+        } else {
+            for (int i=0;i<count;++i)
+                std::memcpy(staging_host_[pp]+size_t(i)*geom_.slot_bytes,
+                            sources[i],geom_.slot_bytes);
         }
-    } else {
-        for (int i=0;i<count;++i)
-            std::memcpy(staging_host_[pp]+size_t(i)*geom_.slot_bytes,
-                        sources[i],geom_.slot_bytes);
     }
     for (int i=0;i<count;++i) {
         staging_experts_[pp][i]=batch.expert_ids[i]=experts[i];
@@ -653,10 +655,29 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
     stats_.staging_fill_ns += work_time_ns() - fill_begin;
     // The CPU can prepare the next host bank while the GPU still consumes the
     // device bank. Only the device write depends on its prior consumer.
-    batch.ready_event=q.submit([&](sycl::handler& cgh) {
-        if (staging_read_[pp]) cgh.depends_on(staging_reader_[pp]);
-        cgh.memcpy(staging_dev_[pp],staging_host_[pp],size_t(count)*geom_.slot_bytes);
-    });
+    if (direct_arena) {
+        // The large-page arena is a host USM source that the copy engine can
+        // read directly (9.05-9.23 GB/s measured). Keep the same in-order
+        // staging bank and prior-consumer dependency, but do not perform the
+        // 5.45 GB/s coordinator memcpy that made the cap=4 split negative.
+        sycl::event last{};
+        for (int i=0;i<count;++i) {
+            if (i==0 && staging_read_[pp]) {
+                last=q.memcpy(staging_dev_[pp]+size_t(i)*geom_.slot_bytes,
+                               sources[i],geom_.slot_bytes,
+                               std::vector<sycl::event>{staging_reader_[pp]});
+            } else {
+                last=q.memcpy(staging_dev_[pp]+size_t(i)*geom_.slot_bytes,
+                              sources[i],geom_.slot_bytes);
+            }
+        }
+        batch.ready_event=last;
+    } else {
+        batch.ready_event=q.submit([&](sycl::handler& cgh) {
+            if (staging_read_[pp]) cgh.depends_on(staging_reader_[pp]);
+            cgh.memcpy(staging_dev_[pp],staging_host_[pp],size_t(count)*geom_.slot_bytes);
+        });
+    }
     staging_copy_[pp]=batch.ready_event; staging_pending_[pp]=true;
     stats_.cold_bytes_transferred+=size_t(count)*geom_.slot_bytes;
     stats_.cold_experts_staged+=count;
