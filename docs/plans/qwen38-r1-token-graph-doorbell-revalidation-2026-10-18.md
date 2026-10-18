@@ -146,6 +146,11 @@ That is not the adoption argument. The result proves that a real captured
 decode segment preserves state and routing while removing its per-kernel host
 submission path.
 
+The original self-imposed P0 gate of <=20 us median handoff is not met
+(28.8 us). Because the complete real front with the handshake is still slightly
+faster than the direct front, this is treated as a GO for the integration
+probe, not as a claim that the original latency gate passed.
+
 The next step is a two-layer graph with the same fixed-address route/result
 ring, followed by a 48-layer whole-token graph. The main remaining engineering
 risks are now:
