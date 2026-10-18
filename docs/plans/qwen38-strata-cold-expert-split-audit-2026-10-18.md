@@ -33,7 +33,9 @@ Related inputs:
 3. **A fixed CPU/GPU fraction under the current bounce path is already
    refuted.** The canonical `CPU_MAX_EXPERTS=4` A/B moved about 24% of misses
    to GPU staging and changed the token from **66.006 ms to 95.518 ms**
-   (`-37%` rate), despite cutting `cpu_join` by 7.0 ms.
+   (`-30.9%` in the retained20 diagnostic), while the end-to-end 14K
+   continuation rate fell **15.50 -> 9.40 tok/s (-39%)**, despite cutting
+   `cpu_join` by 7.0 ms.
 4. **The root mismatch with Strata is lane independence, not the numeric
    ratio.** Aila's current GPU-cold path first performs an arena-to-pinned host
    memcpy on the coordinator, then queues H2D and GPU kernels. The measured
@@ -44,6 +46,29 @@ Related inputs:
    arena. A per-layer cap or a plain `COLD_POLICY=3` rerun is prohibited.
    Under perfect lane overlap this split has an e2e upper bound of only about
    `+6%`; it cannot be presented as the path to 20 tok/s.
+
+### 0.1 Two statements that must not be conflated
+
+**A. The canonical adaptive topology does not implement a three-way split.**
+It has GPU-resident hits and CPU misses only. `StartArenaCold` ignores
+`cold_policy_`; the policy3 fraction exists solely in the legacy
+`StartResidentCold` branch. Therefore no canonical adaptive experiment has
+tested Strata's three-way topology, and setting `COLD_POLICY=3` in the current
+bundle is not an experiment.
+
+**B. The current GPU-staging implementation is nevertheless uneconomic for a
+split.** `dec-cpu4-b1` used the available overflow path to send about 24% of
+misses to GPU staging. It is a valid proxy for *today's bounce path*, not for
+a direct-DMA independent lane. Its result is decisively negative: the
+retained20 diagnostic wall is `66.006 -> 95.518 ms`, and the end-to-end 14K
+continuation rate is `15.50 -> 9.40 tok/s (-39%)`. This closes cap/fraction
+sweeps on the current staging implementation; it does **not** establish that
+all imaginable three-way implementations are bad.
+
+Accordingly, cap=4 is a falsification receipt, not a candidate, a default, or
+a dose to interpolate around. The only admissible follow-up is a mechanism
+change that removes the local bounce fill and the lane serialization before
+retesting a fraction.
 
 ## 1. Canonical route and exact quantities
 
@@ -148,13 +173,20 @@ Receipt: `tmp/q4e-sprint-r1-20261014/decode/retained20-dec-cpu4.json`.
 | `router_wait_ms` | 12.686 | 25.436 | +12.750 |
 | `experts_host_ms` | 22.113 | 40.641 | +18.529 |
 | ForwardWall | 66.006 | 95.518 | +29.512 |
-| implied rate | 15.15 tok/s | 10.47 tok/s | -30.9% |
+| retained20 diagnostic rate | 15.15 tok/s | 10.47 tok/s | -30.9% |
+| end-to-end 14K continuation | 15.50 tok/s | 9.40 tok/s | -39.4% |
 
-This is the minimum-dose-like test that the current architecture had:
-CPU tasks remained the majority (173/228 misses), and GPU received 55 tasks
-(24.1%). The GPU fraction alone consumed 24.4 ms of host fill and 132.9 MB of
-H2D to save only 0.8 ms of measured CPU compute. This is a structural failure
-of lane independence, not a tuning miss.
+This is the only existing proxy for a fractional split on the current staging
+implementation, not a new dose to explore. CPU tasks remained the majority
+(173/228 misses), and GPU received 55 tasks (24.1%). The GPU fraction alone
+consumed 24.4 ms of host fill and 132.9 MB of H2D to save only 0.8 ms of
+measured CPU compute. This is a structural failure of lane independence, not a
+tuning miss.
+
+The two rate rows use different protocols and must not be merged: the first is
+the retained20 diagnostic wall, while the second is the user-facing 14K
+continuation rate recorded by `receipt-dc1-cpu4.json`. Both point in the same
+direction.
 
 ### 3.2 Legacy Strata fraction experiments
 
@@ -376,6 +408,7 @@ insufficient.
 
 - `tmp/q4e-sprint-r1-20261014/decode/retained20-r1-diag.json`
 - `tmp/q4e-sprint-r1-20261014/decode/retained20-dec-cpu4.json`
+- `tmp/q4e-sprint-r1-20261014/receipt-dc1-cpu4.json`
 - `tmp/q4e-sprint-r1-20261014/cq-a2/result.json`
 - `tmp/q4e-sprint-r1-20261014/cq-b1/result.json`
 - `docs/plans/qwen3.8-flash-next-hotset-h4-c2-results-2026-10-02.md`
