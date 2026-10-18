@@ -15,6 +15,8 @@
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
 #include <sycl/ext/oneapi/experimental/annotated_ptr/annotated_ptr.hpp>
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <level_zero/ze_api.h>
 
 #include <immintrin.h>
 
@@ -573,7 +575,21 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        HostRing* ring = static_cast<HostRing*>(ctx.alloc_host(sizeof(HostRing)));
+        auto ze_ctx =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                q.get_context());
+        ze_host_mem_alloc_desc_t host_desc{
+            ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr,
+            ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED};
+        void* ring_storage = nullptr;
+        const ze_result_t ring_result = zeMemAllocHost(
+            ze_ctx, &host_desc, sizeof(HostRing), alignof(HostRing),
+            &ring_storage);
+        const bool ring_is_ze_uncached =
+            ring_result == ZE_RESULT_SUCCESS && ring_storage != nullptr;
+        HostRing* ring = ring_is_ze_uncached
+            ? static_cast<HostRing*>(ring_storage)
+            : static_cast<HostRing*>(ctx.alloc_host(sizeof(HostRing)));
         if (reinterpret_cast<uintptr_t>(ring) % alignof(HostRing) != 0) {
             throw std::runtime_error("host ring is not 64-byte aligned");
         }
@@ -597,8 +613,11 @@ int main(int argc, char** argv) {
         }
         std::cout << '\n';
         std::cout
-            << "[TOKEN GRAPH RING] allocation=aila_context_alloc_host"
-               " ring_bytes=" << sizeof(HostRing)
+            << "[TOKEN GRAPH RING] allocation="
+            << (ring_is_ze_uncached
+                    ? "zeMemAllocHost_uncached_bias"
+                    : "aila_context_alloc_host_fallback")
+            << " ring_bytes=" << sizeof(HostRing)
             << " device_access=uncached_l1_l3"
                " copy=copy_from_mapped_kernel"
                " bounded_device_spin=1"
@@ -699,7 +718,10 @@ int main(int argc, char** argv) {
         ctx.synchronize();
         ctx.free_device(device_result);
         ctx.free_device(epoch);
-        ctx.free_host(ring);
+        if (ring_is_ze_uncached)
+            zeMemFree(ze_ctx, ring);
+        else
+            ctx.free_host(ring);
         return all_ok ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "[TOKEN GRAPH ERROR] " << e.what() << '\n';

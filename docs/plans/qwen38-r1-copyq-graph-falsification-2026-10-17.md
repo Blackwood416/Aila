@@ -2,6 +2,13 @@
 
 Date: 2026-10-17
 
+> 2026-10-18 correction: the whole-token-graph NO-GO below was caused by
+> ordinary host USM. Re-running with `ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED`
+> passes 4x1,000 captured-graph handoffs with zero timeouts and bit-exact
+> results. See
+> [token-graph doorbell revalidation](qwen38-r1-token-graph-doorbell-revalidation-2026-10-18.md).
+> The production integration remains unproven; the protocol gate is open.
+
 Scope: canonical Qwen4Exp decode (`count == 1`, adaptive pipeline, int8 KV,
 agent6k hotset) and the 14K prefill follow-up. All GPU arms used the paired
 Worker/Server build recorded below. No default was changed without the

@@ -1,8 +1,8 @@
 # Qwen4Exp token-graph P0 probe
 
 Date: 2026-10-17
-Status: **executed; NO-GO on current Windows/L0 for a host-serviced,
-whole-token graph**
+Status: **protocol GO after switching the host ring to uncached Level Zero
+memory; production integration not yet tested**
 
 This directory tests the highest-leverage structural candidate from
 `docs/plans/qwen38-r1-strata-kernel-transfer-2026-10-17.md`:
@@ -38,7 +38,9 @@ captured graph.
   `command_execution_status` query to discharge the Level Zero dynamic batch;
   periodic `ext_oneapi_empty` queries are only a bounded fallback.
 - There are no sleep calls. CPU workload uses `_mm_pause` busy-wait.
-- The host service ring is `Context::alloc_host` pinned USM.
+- The host service ring is `zeMemAllocHost` with
+  `ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED`; ordinary `Context::alloc_host` is
+  retained only as a fallback and is not valid evidence for the doorbell path.
 - Every device access to route, result, flag and completion words uses an
   Intel `annotated_ptr` with uncached L1+L3 cache-control hints.
 - The graph's mapped-host transfer is a kernel, never `queue.memcpy`.
@@ -93,7 +95,9 @@ P0 passes only if all of the following hold for every CPU arm:
 If the ring is not visible before graph completion, or the bounded device spin
 expires, record **NO-GO** and do not implement the token graph.
 
-## Actual result (2026-10-17)
+## Actual result
+
+### 2026-10-17: ordinary host USM (superseded)
 
 Limited Graph capture succeeds, but the route payload is not visible to the
 host until graph completion. Both 20,000 and 2,000,000 device spins timed out;
@@ -104,3 +108,22 @@ change the result. Receipts: `gpu-run3.log`, `gpu-run5.log`.
 Do not use a host-serviced, whole-token graph on this path. A per-layer graph
 that ends before the host reads the route is a different design and would need
 its own probe.
+
+### 2026-10-18: uncached Level Zero host ring
+
+The failure above was caused by ordinary host USM. With
+`zeMemAllocHost(..., ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED)` and the existing
+uncached L1+L3 device accesses, all four CPU-service arms pass 1,000 replays:
+
+| cpu service | handoff median | p99 | timeouts |
+|---:|---:|---:|---:|
+| 0 us | 28.9 us | 40.0 us | 0 |
+| 50 us | 78.9 us | 167.0 us | 0 |
+| 200 us | 228.9 us | 358.6 us | 0 |
+| 500 us | 528.9 us | 667.0 us | 0 |
+
+Fresh results are bit-exact and the stale negative control fires. Receipts:
+`gpu-run-uncached-smoke.log`, `gpu-run-uncached-sweep.log`.
+
+This opens the P1 real-layer capture gate. It does not yet prove an end-to-end
+performance win.

@@ -21,6 +21,7 @@ $obj = Join-Path $objDir 'probe_token_graph.obj'
 $cxx = Join-Path $stack.compilerRoot 'bin/icx-cl.exe'
 $build = Join-Path $repo $BuildDir
 $lib = Join-Path $build 'AilaLib.lib'
+$l0 = 'C:\Program Files\LevelZeroSDK\1.28.2'
 if (-not (Test-Path -LiteralPath $lib)) {
     throw "Missing $lib; build the primary runtime first"
 }
@@ -29,6 +30,7 @@ $includes = @('include', 'src/utils', 'src/core', 'src/ops', 'src/memory',
     ForEach-Object { '-I' + (Join-Path $repo $_) }
 $ext = @("-external:I$($stack.dnnlRoot)/include",
          "-external:I$($stack.tbbRoot)/include", '-external:W0')
+$ext += "/I$l0\include"
 $flags = @('/nologo', '/TP', '-DAILA_STATIC_LIB', '-DNOMINMAX',
            '-DWIN32_LEAN_AND_MEAN', '-D__TBB_NO_IMPLICIT_LINKAGE=1',
            '/DWIN32', '/D_WINDOWS', '/EHsc', '-O3', '-ffast-math',
@@ -44,6 +46,7 @@ $libs = @($lib,
           "$($stack.tbbRoot)/lib/tbb12.lib",
           (Join-Path $build 'simdjson.lib'),
           (Join-Path $build 'soxr.lib'),
+          "$l0\lib\ze_loader.lib",
           'windowscodecs.lib', 'ole32.lib', 'kernel32.lib', 'user32.lib',
           'gdi32.lib', 'shell32.lib', 'oleaut32.lib', 'uuid.lib',
           'advapi32.lib')

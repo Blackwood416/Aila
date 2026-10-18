@@ -4,6 +4,13 @@ Date: 2026-10-17
 Scope: read-only source and receipt study. No source change, no GPU run.
 Target: canonical Qwen4Exp decode, `count == 1`, adaptive pipeline.
 
+> 2026-10-18 update: the follow-up P0 now passes when the host control ring is
+> allocated with `zeMemAllocHost` + `ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED`.
+> See
+> [token-graph doorbell revalidation](qwen38-r1-token-graph-doorbell-revalidation-2026-10-18.md).
+> The analysis below remains the design basis; the "mid-graph visibility"
+> risk in its NO-GO path has been removed.
+
 ## 0. Decision
 
 **最高杠杆候选：把整个 decode token 录成一张 Limited SYCL Graph；路由后的
