@@ -3,6 +3,7 @@
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
+#include "GraphControl.hpp"
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 #include "oneapi/dnnl/dnnl.hpp"
@@ -340,6 +341,21 @@ namespace ops {
                                             Tensor* k_scale = nullptr,
                                             Tensor* v_scale = nullptr);
 
+    // Graph-safe decode preparation. control[start_pos] supplies RoPE and the
+    // K/V cache row; control[abort] fail-closes. No host position is required.
+    void decode_prepare_qgkv_packed_partial_graph(
+        Context& ctx, Tensor& q_gate_packed, Tensor& k, Tensor& v,
+        Tensor& q_out, Tensor& gate_out, Tensor& q_norm_weight,
+        Tensor& k_norm_weight, Tensor& k_cache, Tensor& v_cache,
+        GraphControl control, int num_heads_q, int num_kv_heads,
+        int head_dim, float eps, int rotary_dim, float theta,
+        bool interleaved = false, const int* pos_t = nullptr,
+        const int* pos_h = nullptr, const int* pos_w = nullptr,
+        int prompt_pos_len = 0, int text_pos_delta = 0,
+        int mrope_section_t = 0, int mrope_section_h = 0,
+        int mrope_section_w = 0, Tensor* k_scale = nullptr,
+        Tensor* v_scale = nullptr);
+
     // GQA Attention (decode 模式, seq_len=1)
     // q:       [1, num_heads * head_dim]
     // k_cache: [num_kv_heads, cached_len, head_dim]
@@ -358,6 +374,39 @@ namespace ops {
                           int num_active_blocks = 0,
                           const Tensor* k_scale = nullptr,
                           const Tensor* v_scale = nullptr);
+
+    // Graph-safe Qwen4Exp block-native sparse-QSA decode.
+    //
+    // control[graph_control::start_pos] is the absolute current position and
+    // control[graph_control::compressed_blocks] is the device complete-block
+    // count. The kernel derives:
+    //   visible_len     = start_pos + 1
+    //   selected_blocks = min(compressed_blocks, 512)
+    //   tail            = visible_len % 4
+    //   effective_len   = selected_blocks * 4 + tail
+    //   actual_tiles    = ceil(effective_len / 128)
+    //
+    // active_blocks is the existing s32 layout: ascending selected block IDs,
+    // followed by trailing token IDs. Only BF16 KV and head_dim=256 are
+    // accepted. The implementation uses the fixed 17-tile 512-block bound.
+    //
+    // Phase 1 always launches num_heads*MaxTiles work-groups and phase 2
+    // always launches num_heads work-groups. Groups beyond actual_tiles exit
+    // without touching output or partials. Both phases are no-ops when
+    // control[graph_control::abort] is non-zero or the device geometry is
+    // invalid; in that case the existing output is preserved.
+    void attention_decode_exact_head256_block_native_graph(
+        Context& ctx,
+        const Tensor& q,
+        const Tensor& k_cache,
+        const Tensor& v_cache,
+        Tensor& output,
+        Tensor& partials_buf,
+        const Tensor& active_blocks,
+        GraphControl control,
+        int num_heads,
+        int num_kv_heads,
+        const Tensor* gate_buf = nullptr);
 
 
     // Per-row decode geometry for the multi-row entry point below. Rows are

@@ -1273,6 +1273,7 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              Tensor& q_norm_weight, Tensor& k_norm_weight,
                                              Tensor& k_cache, Tensor& v_cache,
                                              int start_pos,
+                                             GraphControl control,
                                              int num_heads_q, int num_kv_heads, int head_dim,
                                              float eps, int rotary_dim, float theta,
                                              bool interleaved,
@@ -1316,11 +1317,15 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
             [=](sycl::nd_item<1> item) {
                 int head = item.get_group(0);
                 int lid = item.get_local_id(0);
+                if (control && control[graph_control::abort] != 0) return;
+                const int active_pos =
+                    control ? control[graph_control::start_pos] : start_pos;
+                if (active_pos < 0 || active_pos >= max_seq_len) return;
                 int packed_base = head * packed_per_head;
                 int q_base = head * head_dim;
 
                 auto rotary_position = [&](int d) {
-                    int global_pos = start_pos;
+                    int global_pos = active_pos;
                     int pos_scalar = global_pos;
                     if (global_pos >= prompt_pos_len) {
                         pos_scalar = global_pos + text_pos_delta;
@@ -1424,7 +1429,8 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                int cache_base = head * max_seq_len * head_dim + start_pos * head_dim;
+                int cache_base =
+                    head * max_seq_len * head_dim + active_pos * head_dim;
                 if constexpr (Quantized == kKvFmtInt8) {
                     // Opt-in INT8/INT8 KV: K is quantized after RoPE, V as-is.
                     // One subgroup-wide amax per (head, token) yields the
@@ -1440,7 +1446,8 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                         item.barrier(sycl::access::fence_space::local_space);
                     }
                     const float k_scale = local_sum[0] / 127.0f;
-                    if (lid == 0) k_scale_ptr[head * max_seq_len + start_pos] = k_scale;
+                    if (lid == 0)
+                        k_scale_ptr[head * max_seq_len + active_pos] = k_scale;
                     item.barrier(sycl::access::fence_space::local_space);
 
                     float vamax = 0.0f;
@@ -1454,7 +1461,8 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                         item.barrier(sycl::access::fence_space::local_space);
                     }
                     const float v_scale = local_sum[0] / 127.0f;
-                    if (lid == 0) v_scale_ptr[head * max_seq_len + start_pos] = v_scale;
+                    if (lid == 0)
+                        v_scale_ptr[head * max_seq_len + active_pos] = v_scale;
 
                     int8_t* k_cache_i8 = static_cast<int8_t*>(k_cache_ptr);
                     int8_t* v_cache_i8 = static_cast<int8_t*>(v_cache_ptr);
@@ -1505,7 +1513,43 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
     float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
     float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
     auto dispatch = [&](auto tag) {
-        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
+        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
+    };
+    if (k_cache.dtype() == dnnl::memory::data_type::s8) {
+        dispatch(std::integral_constant<int, kKvFmtInt8>{});
+    } else if (k_cache.dtype() == dnnl::memory::data_type::f8_e4m3) {
+        dispatch(std::integral_constant<int, kKvFmtFp8>{});
+    } else {
+        dispatch(std::integral_constant<int, kKvFmtBf16>{});
+    }
+}
+
+void decode_prepare_qgkv_packed_partial_graph(
+    Context& ctx, Tensor& q_gate_packed, Tensor& k, Tensor& v,
+    Tensor& q_out, Tensor& gate_out, Tensor& q_norm_weight,
+    Tensor& k_norm_weight, Tensor& k_cache, Tensor& v_cache,
+    GraphControl control, int num_heads_q, int num_kv_heads,
+    int head_dim, float eps, int rotary_dim, float theta,
+    bool interleaved, const int* pos_t, const int* pos_h,
+    const int* pos_w, int prompt_pos_len, int text_pos_delta,
+    int mrope_section_t, int mrope_section_h, int mrope_section_w,
+    Tensor* k_scale, Tensor* v_scale) {
+    if (!control) {
+        throw std::invalid_argument(
+            "decode_prepare_qgkv_packed_partial_graph requires control");
+    }
+    float* k_scale_ptr =
+        (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
+    float* v_scale_ptr =
+        (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
+    auto dispatch = [&](auto tag) {
+        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(
+            ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight,
+            k_norm_weight, k_cache, v_cache, -1, control, num_heads_q,
+            num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved,
+            pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+            mrope_section_t, mrope_section_h, mrope_section_w,
+            k_scale_ptr, v_scale_ptr);
     };
     if (k_cache.dtype() == dnnl::memory::data_type::s8) {
         dispatch(std::integral_constant<int, kKvFmtInt8>{});

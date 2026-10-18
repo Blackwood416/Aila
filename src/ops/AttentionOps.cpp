@@ -96,6 +96,10 @@ constexpr int kDecodeExact256MergeWg = 128;
 constexpr int kDecodeExact256MinLen = 1024;
 constexpr int kDecodeExact256PartialStride = 272;
 constexpr int kDecodeExact256PartialAccOffset = 16;
+constexpr int kDecodeExact256QsaBlockTopk = 512;
+constexpr int kDecodeExact256QsaMaxTiles =
+    (kDecodeExact256QsaBlockTopk * 4 + 3 + kDecodeExact256Tile - 1) /
+    kDecodeExact256Tile;
 constexpr int kDecodeExact128MinLen = 128;
 constexpr int kDecodeExact128PartialStride = 144;
 constexpr int kDecodeExact128PartialAccOffset = 16;
@@ -121,6 +125,54 @@ constexpr int kVisionBidiExact64VUnrollDisabled = 0;
 constexpr int kVisionBidiExact64VUnrollEnabled = 1;
 constexpr int kVisionBidiExact64VUnrollDefault =
     kVisionBidiExact64VUnrollEnabled;
+
+struct QsaDecodeGraphGeometry {
+  int visible_len = 0;
+  int selected_blocks = 0;
+  int effective_len = 0;
+  int actual_tiles = 0;
+  bool valid = false;
+};
+
+// Every work-group derives the same geometry from the device control table.
+// No host scalar selecting the grid or token count enters the graph.
+inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
+    const int* control, int max_tiles) {
+  QsaDecodeGraphGeometry geometry;
+  if (control == nullptr || control[graph_control::abort] != 0) {
+    return geometry;
+  }
+
+  const int start_pos = control[graph_control::start_pos];
+  const int compressed_blocks = control[graph_control::compressed_blocks];
+  const long long visible_len_ll = static_cast<long long>(start_pos) + 1;
+  if (start_pos < 0 || compressed_blocks < 0 || visible_len_ll <= 0 ||
+      visible_len_ll > 0x7fffffffLL) {
+    return geometry;
+  }
+
+  geometry.visible_len = static_cast<int>(visible_len_ll);
+  geometry.selected_blocks =
+      compressed_blocks < kDecodeExact256QsaBlockTopk
+          ? compressed_blocks
+          : kDecodeExact256QsaBlockTopk;
+  const int tail = geometry.visible_len & 3;
+  geometry.effective_len = geometry.selected_blocks * 4 + tail;
+  geometry.actual_tiles =
+      (geometry.effective_len + kDecodeExact256Tile - 1) /
+      kDecodeExact256Tile;
+  geometry.valid =
+      geometry.actual_tiles > 0 && geometry.actual_tiles <= max_tiles;
+  return geometry;
+}
+
+inline int qsa_decode_active_cache_token(
+    const int* active_blocks, int selected_blocks, int t) {
+  if (t < selected_blocks * 4) {
+    return active_blocks[t / 4] * 4 + (t & 3);
+  }
+  return active_blocks[selected_blocks + (t - selected_blocks * 4)];
+}
 
 template <int Quantized>
 void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
@@ -1230,6 +1282,278 @@ void attention_decode_exact_head256_partial_merge(
   else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
+template <int MaxTiles>
+void attention_decode_exact_head256_block_native_graph_impl(
+    Context &ctx, const Tensor &q, const Tensor &k_cache,
+    const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
+    const Tensor &active_blocks, GraphControl control, int num_heads,
+    int num_kv_heads, const Tensor *gate_buf) {
+  static_assert(MaxTiles >= kDecodeExact256QsaMaxTiles,
+                "QSA block-native graph MaxTiles must cover the 512-block bound");
+
+  constexpr int head_dim = 256;
+  constexpr int tile_t = kDecodeExact256Tile;
+  constexpr int tile_wg = kDecodeExact256TileWg;
+  constexpr int merge_wg = kDecodeExact256MergeWg;
+
+  if (control == nullptr) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: null control");
+  }
+  if (num_heads <= 0 || num_kv_heads <= 0 ||
+      num_heads % num_kv_heads != 0) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: invalid head geometry");
+  }
+
+  const int q_dim = num_heads * head_dim;
+  if (!q.valid() || q.dtype() != dnnl::memory::data_type::bf16 ||
+      q.numel() < q_dim) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: q must be BF16 with at least num_heads*256 elements");
+  }
+  if (!output.valid() || output.dtype() != dnnl::memory::data_type::bf16 ||
+      output.numel() < q_dim) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: output must be BF16 with at least num_heads*256 elements");
+  }
+  if (!k_cache.valid() || !v_cache.valid() ||
+      k_cache.dtype() != dnnl::memory::data_type::bf16 ||
+      v_cache.dtype() != dnnl::memory::data_type::bf16) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: BF16 KV cache required");
+  }
+  if (k_cache.ndim() != 3 || v_cache.ndim() != 3 ||
+      k_cache.shape(0) != num_kv_heads ||
+      v_cache.shape(0) != num_kv_heads ||
+      k_cache.shape(2) != head_dim ||
+      v_cache.shape(2) != head_dim ||
+      k_cache.shape(1) != v_cache.shape(1) || k_cache.shape(1) <= 0 ||
+      k_cache.shape(1) > 0x7fffffffLL) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: unsupported KV layout");
+  }
+  if (!partials_buf.valid() ||
+      partials_buf.dtype() != dnnl::memory::data_type::f32 ||
+      partials_buf.ndim() != 3 ||
+      partials_buf.shape(0) != num_heads ||
+      partials_buf.shape(1) < MaxTiles ||
+      partials_buf.shape(2) < kDecodeExact256PartialStride) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: partials must be f32 [num_heads, >=MaxTiles, 272]");
+  }
+  if (!active_blocks.valid() ||
+      active_blocks.dtype() != dnnl::memory::data_type::s32 ||
+      active_blocks.ndim() != 1 ||
+      active_blocks.shape(0) <
+          kDecodeExact256QsaBlockTopk + 4) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: active_blocks must hold 512 ids plus 4 tail ids");
+  }
+  if (gate_buf != nullptr &&
+      (!gate_buf->valid() ||
+       gate_buf->dtype() != dnnl::memory::data_type::bf16 ||
+       gate_buf->numel() < q_dim)) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph: gate must be BF16 with at least num_heads*256 elements");
+  }
+
+  const bf16 *q_ptr = q.data_as<bf16>();
+  const bf16 *k_ptr = k_cache.data_as<bf16>();
+  const bf16 *v_ptr = v_cache.data_as<bf16>();
+  bf16 *o_ptr = output.data_as<bf16>();
+  float *partials_ptr = partials_buf.data_as<float>();
+  const int *active_blocks_ptr = active_blocks.data_as<int>();
+  int *const control_ptr = control;
+  const bf16 *gate_ptr =
+      gate_buf != nullptr ? gate_buf->data_as<bf16>() : nullptr;
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const int partial_tile_capacity =
+      static_cast<int>(partials_buf.shape(1));
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
+    sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(num_heads) * MaxTiles * tile_wg, tile_wg),
+        [=](sycl::nd_item<1> item) {
+          const QsaDecodeGraphGeometry geometry =
+              qsa_decode_graph_geometry(control_ptr, MaxTiles);
+          if (!geometry.valid) {
+            return;
+          }
+
+          const int group = item.get_group(0);
+          const int head = group / MaxTiles;
+          const int tile_idx = group % MaxTiles;
+          if (tile_idx >= geometry.actual_tiles) {
+            return;
+          }
+
+          const int lid = item.get_local_id(0);
+          const int kv_head = head / heads_per_kv;
+          const int tile_start = tile_idx * tile_t;
+          const int tile_len =
+              sycl::min(tile_t, geometry.effective_len - tile_start);
+          float *partial =
+              partials_ptr +
+              (head * partial_tile_capacity + tile_idx) *
+                  kDecodeExact256PartialStride;
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score = -1e30f;
+          if (lid < tile_len) {
+            const int t = tile_start + lid;
+            const int cache_t = qsa_decode_active_cache_token(
+                active_blocks_ptr, geometry.selected_blocks, t);
+            using vec8 = sycl::vec<bf16, 8>;
+            const bf16 *k_tok =
+                k_ptr +
+                (static_cast<size_t>(kv_head) * max_seq_len + cache_t) *
+                    head_dim;
+            score = 0.0f;
+            for (int d = 0; d < head_dim; d += 8) {
+              const vec8 k_vec =
+                  *reinterpret_cast<const vec8 *>(k_tok + d);
+              score += q_cache[d + 0] * static_cast<float>(k_vec[0]);
+              score += q_cache[d + 1] * static_cast<float>(k_vec[1]);
+              score += q_cache[d + 2] * static_cast<float>(k_vec[2]);
+              score += q_cache[d + 3] * static_cast<float>(k_vec[3]);
+              score += q_cache[d + 4] * static_cast<float>(k_vec[4]);
+              score += q_cache[d + 5] * static_cast<float>(k_vec[5]);
+              score += q_cache[d + 6] * static_cast<float>(k_vec[6]);
+              score += q_cache[d + 7] * static_cast<float>(k_vec[7]);
+            }
+            score *= scale;
+          }
+          logits[lid] = score;
+          const float tile_max = sycl::reduce_over_group(
+              item.get_group(), score, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_score = 0.0f;
+          if (lid < tile_len) {
+            exp_score = sycl::native::exp(logits[lid] - stats[0]);
+            logits[lid] = exp_score;
+          } else {
+            logits[lid] = 0.0f;
+          }
+          const float tile_sum = sycl::reduce_over_group(
+              item.get_group(), exp_score, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum;
+            partial[0] = stats[0];
+            partial[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            float acc = 0.0f;
+            for (int i = 0; i < tile_len; ++i) {
+              const int t = tile_start + i;
+              const int cache_t = qsa_decode_active_cache_token(
+                  active_blocks_ptr, geometry.selected_blocks, t);
+              acc += logits[i] *
+                     static_cast<float>(
+                         v_ptr[(static_cast<size_t>(kv_head) *
+                                    max_seq_len +
+                                cache_t) *
+                                   head_dim +
+                               d]);
+            }
+            partial[kDecodeExact256PartialAccOffset + d] = acc;
+          }
+        });
+  });
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> tile_factors(
+        sycl::range<1>(MaxTiles), cgh);
+    sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            static_cast<size_t>(num_heads) * merge_wg, merge_wg),
+        [=](sycl::nd_item<1> item) {
+          const QsaDecodeGraphGeometry geometry =
+              qsa_decode_graph_geometry(control_ptr, MaxTiles);
+          if (!geometry.valid) {
+            return;
+          }
+
+          const int head = item.get_group(0);
+          const int lid = item.get_local_id(0);
+          if (lid == 0) {
+            float global_max = -1e30f;
+            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+                 ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * partial_tile_capacity + tile_idx) *
+                      kDecodeExact256PartialStride;
+              global_max = sycl::fmax(global_max, partial[0]);
+            }
+            float sum = 0.0f;
+            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+                 ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * partial_tile_capacity + tile_idx) *
+                      kDecodeExact256PartialStride;
+              const float factor =
+                  sycl::native::exp(partial[0] - global_max);
+              tile_factors[tile_idx] = factor;
+              sum += factor * partial[1];
+            }
+            norm_sum[0] = sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float inv_sum = 1.0f / norm_sum[0];
+          for (int d = lid; d < head_dim; d += merge_wg) {
+            float acc = 0.0f;
+            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+                 ++tile_idx) {
+              const float *partial =
+                  partials_ptr +
+                  (head * partial_tile_capacity + tile_idx) *
+                      kDecodeExact256PartialStride;
+              acc += tile_factors[tile_idx] *
+                     partial[kDecodeExact256PartialAccOffset + d];
+            }
+            float val = static_cast<float>(bf16(acc * inv_sum));
+            if (gate_ptr != nullptr) {
+              const float g_v =
+                  static_cast<float>(gate_ptr[head * head_dim + d]);
+              const float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_ptr[head * head_dim + d] = bf16(val);
+          }
+        });
+  });
+}
+
+template void attention_decode_exact_head256_block_native_graph_impl<
+    kDecodeExact256QsaMaxTiles>(
+    Context &ctx, const Tensor &q, const Tensor &k_cache,
+    const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
+    const Tensor &active_blocks, GraphControl control, int num_heads,
+    int num_kv_heads, const Tensor *gate_buf);
+
 
 template <int Quantized>
 void attention_decode_exact_head128_partial_merge_impl(
@@ -2056,6 +2380,17 @@ void attention_decode_rows_exact_merge_impl(
   });
 }
 } // namespace
+
+void attention_decode_exact_head256_block_native_graph(
+    Context &ctx, const Tensor &q, const Tensor &k_cache,
+    const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
+    const Tensor &active_blocks, GraphControl control, int num_heads,
+    int num_kv_heads, const Tensor *gate_buf) {
+  attention_decode_exact_head256_block_native_graph_impl<
+      kDecodeExact256QsaMaxTiles>(
+      ctx, q, k_cache, v_cache, output, partials_buf, active_blocks,
+      control, num_heads, num_kv_heads, gate_buf);
+}
 
 // ============================================================
 // SYCL Kernel: Attention Decode (seq_len=1, GQA)
@@ -5846,5 +6181,3 @@ void attention_prefill_qsa_batched_host(
   }
 }
 } // namespace ops
-
-

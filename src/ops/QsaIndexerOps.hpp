@@ -2,6 +2,7 @@
 
 #include "core/Context.hpp"
 #include "core/Tensor.hpp"
+#include "ops/GraphControl.hpp"
 #include <vector>
 
 namespace ops {
@@ -253,6 +254,17 @@ void qsa_compute_block_scores_compressed(
     Tensor& scores_out,
     int num_complete_blocks);
 
+// Graph-safe variant with a fixed max_blocks*128 launch grid. The active
+// complete-block count is read from control[graph_control::compressed_blocks].
+// Workgroups beyond min(active_blocks, max_blocks) exit without touching output.
+void qsa_compute_block_scores_compressed_graph(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    GraphControl control,
+    int max_blocks);
+
 void qsa_compute_block_scores_compressed_host(
     const bf16* q,
     const bf16* compressed_k,
@@ -303,6 +315,21 @@ int qsa_select_topk_blocks(
     int cached_len,
     int compress_ratio,
     Tensor& active_blocks_out);
+
+// Graph-safe selector with one fixed 256-thread workgroup. It reads the complete
+// block count and start position from control, then selects inside the kernel:
+// all blocks for <= block_topk, complement selection for block_topk + 1, and
+// exact cutoff selection above that. Equal scores prefer lower block IDs.
+// Selected block IDs are ascending followed by trailing token IDs in the
+// existing dense/block layout.
+void qsa_select_topk_blocks_graph(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    GraphControl control,
+    int block_topk,
+    int compress_ratio,
+    int max_blocks);
 
 int qsa_select_topk_blocks_host(
     const float* scores,

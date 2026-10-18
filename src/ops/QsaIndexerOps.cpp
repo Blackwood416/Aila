@@ -1263,6 +1263,61 @@ void qsa_compute_block_scores_compressed(
     });
 }
 
+void qsa_compute_block_scores_compressed_graph(
+    Context& ctx,
+    const Tensor& q,
+    const Tensor& compressed_k,
+    Tensor& scores_out,
+    GraphControl control,
+    int max_blocks) {
+    if (!control || max_blocks <= 0) return;
+    const bf16* q_ptr = q.data_as<bf16>();
+    const bf16* comp_k_ptr = compressed_k.data_as<bf16>();
+    float* scores_ptr = scores_out.data_as<float>();
+    int* const control_ptr = control;
+
+    constexpr int kHeadDim = 128;
+    constexpr int kWgSize = 128;
+    constexpr float inv_sqrt_d = 0.08838834764831845f;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(static_cast<size_t>(max_blocks) * kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                if (control_ptr[graph_control::abort] != 0) return;
+                const int raw_blocks =
+                    control_ptr[graph_control::compressed_blocks];
+                if (raw_blocks < 0 || raw_blocks > max_blocks) {
+                    control_ptr[graph_control::abort] = 1;
+                    return;
+                }
+                const int active_blocks = raw_blocks;
+                const int b = item.get_group(0);
+                if (b >= active_blocks) return;
+
+                const int lid = item.get_local_id(0);
+                const float kl = static_cast<float>(comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid]);
+                const float p0 = static_cast<float>(q_ptr[0 * kHeadDim + lid]) * kl;
+                const float p1 = static_cast<float>(q_ptr[1 * kHeadDim + lid]) * kl;
+                const float p2 = static_cast<float>(q_ptr[2 * kHeadDim + lid]) * kl;
+                const float p3 = static_cast<float>(q_ptr[3 * kHeadDim + lid]) * kl;
+
+                const float dot0 = sycl::reduce_over_group(item.get_group(), p0, sycl::plus<float>());
+                const float dot1 = sycl::reduce_over_group(item.get_group(), p1, sycl::plus<float>());
+                const float dot2 = sycl::reduce_over_group(item.get_group(), p2, sycl::plus<float>());
+                const float dot3 = sycl::reduce_over_group(item.get_group(), p3, sycl::plus<float>());
+
+                if (lid == 0) {
+                    const float r0 = sycl::max(0.0f, dot0);
+                    const float r1 = sycl::max(0.0f, dot1);
+                    const float r2 = sycl::max(0.0f, dot2);
+                    const float r3 = sycl::max(0.0f, dot3);
+                    scores_ptr[b] = (r0 + r1 + r2 + r3) * inv_sqrt_d;
+                }
+            });
+    });
+}
+
 void qsa_compute_block_scores_compressed_host(
     const bf16* q,
     const bf16* compressed_k,
@@ -1531,6 +1586,161 @@ int qsa_select_topk_blocks(
     });
 
     return block_topk;
+}
+
+void qsa_select_topk_blocks_graph(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    GraphControl control,
+    int block_topk,
+    int compress_ratio,
+    int max_blocks) {
+    if (!control || block_topk <= 0 || compress_ratio <= 0 || max_blocks <= 0) return;
+    const float* scores_ptr = scores.data_as<float>();
+    int* out_ptr = active_blocks_out.data_as<int>();
+    int* const control_ptr = control;
+    constexpr int kWgSize = 256;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<std::uint32_t, 1> local_worst_key(
+            sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> local_worst_id(
+            sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> selected_blocks(
+            sycl::range<1>(std::max(1, block_topk)), cgh);
+        sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
+        sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item) {
+                const int lid = item.get_local_id(0);
+                if (control_ptr[graph_control::abort] != 0) return;
+                const int raw_blocks =
+                    control_ptr[graph_control::compressed_blocks];
+                if (raw_blocks < 0 || raw_blocks > max_blocks) {
+                    if (lid == 0) control_ptr[graph_control::abort] = 1;
+                    return;
+                }
+                const int visible_len = sycl::max(0, control_ptr[graph_control::start_pos] + 1);
+                const int active_blocks = raw_blocks;
+                const int tail_start = active_blocks * compress_ratio;
+                const int tail_len = sycl::min(
+                    compress_ratio, sycl::max(0, visible_len - tail_start));
+
+                // Uniform, device-derived dispatch. No host value selects the path.
+                if (active_blocks <= block_topk) {
+                    for (int b = lid; b < active_blocks; b += kWgSize) {
+                        out_ptr[b] = b;
+                    }
+                    if (lid < tail_len) {
+                        out_ptr[active_blocks + lid] = tail_start + lid;
+                    }
+                    return;
+                }
+
+                if (active_blocks == block_topk + 1) {
+                    std::uint32_t my_worst_key = 0xffffffffU;
+                    int my_worst_id = -1;
+                    for (int b = lid; b < active_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (my_worst_id < 0 ||
+                            qsa_candidate_is_worse(key, b, my_worst_key, my_worst_id)) {
+                            my_worst_key = key;
+                            my_worst_id = b;
+                        }
+                    }
+                    local_worst_key[lid] = my_worst_key;
+                    local_worst_id[lid] = my_worst_id;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            const std::uint32_t other_key = local_worst_key[lid + stride];
+                            const int other_id = local_worst_id[lid + stride];
+                            if (other_id >= 0 &&
+                                (local_worst_id[lid] < 0 ||
+                                 qsa_candidate_is_worse(
+                                     other_key, other_id,
+                                     local_worst_key[lid], local_worst_id[lid]))) {
+                                local_worst_key[lid] = other_key;
+                                local_worst_id[lid] = other_id;
+                            }
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    const int worst_id = local_worst_id[0];
+                    for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                        out_ptr[idx] = (idx < worst_id) ? idx : (idx + 1);
+                    }
+                    if (lid < tail_len) {
+                        out_ptr[block_topk + lid] = tail_start + lid;
+                    }
+                    return;
+                }
+
+                if (lid == 0) {
+                    cutoff_key[0] = 0U;
+                    remaining_rank[0] = block_topk;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                std::uint32_t prefix_mask = 0U;
+                for (int bit = 31; bit >= 0; --bit) {
+                    const std::uint32_t bit_mask = std::uint32_t{1} << bit;
+                    const std::uint32_t prefix = cutoff_key[0];
+                    int count_one = 0;
+                    for (int b = lid; b < active_blocks; b += kWgSize) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if ((key & prefix_mask) == prefix && (key & bit_mask) != 0U) {
+                            ++count_one;
+                        }
+                    }
+                    local_cnt_one[lid] = count_one;
+                    item.barrier(sycl::access::fence_space::local_space);
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) local_cnt_one[lid] += local_cnt_one[lid + stride];
+                        item.barrier(sycl::access::fence_space::local_space);
+                    }
+                    if (lid == 0) {
+                        if (local_cnt_one[0] >= remaining_rank[0]) {
+                            cutoff_key[0] |= bit_mask;
+                        } else {
+                            remaining_rank[0] -= local_cnt_one[0];
+                        }
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    prefix_mask |= bit_mask;
+                }
+
+                if (lid == 0) {
+                    const std::uint32_t threshold = cutoff_key[0];
+                    int above_count = 0;
+                    for (int b = 0; b < active_blocks; ++b) {
+                        if (qsa_score_order_key(scores_ptr[b]) > threshold) ++above_count;
+                    }
+                    int ties_needed = block_topk - above_count;
+                    int added = 0;
+                    for (int b = 0; b < active_blocks; ++b) {
+                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                        if (key > threshold || (key == threshold && ties_needed > 0)) {
+                            selected_blocks[added++] = b;
+                            if (key == threshold) --ties_needed;
+                        }
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                for (int idx = lid; idx < block_topk; idx += kWgSize) {
+                    out_ptr[idx] = selected_blocks[idx];
+                }
+                if (lid < tail_len) {
+                    out_ptr[block_topk + lid] = tail_start + lid;
+                }
+            });
+    });
 }
 
 int qsa_select_topk_blocks_host(
