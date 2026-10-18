@@ -60,16 +60,16 @@ struct Qwen4ExpLayer {
     // Full Attention (12 layers):
     Bnb4BitLinear qkv_proj;        // q (12288 = 2*24*256), k (512), v (512) -> 13312
     Bnb4BitLinear o_proj;          // 2560 rows, in_features = 6144
-    Tensor* q_norm_weight = nullptr; // [256] f32 (1+w)
-    Tensor* k_norm_weight = nullptr; // [256] f32 (1+w)
+    Tensor* q_norm_weight = nullptr; // [256] bf16 (1+w)
+    Tensor* k_norm_weight = nullptr; // [256] bf16 (1+w)
 
     // QSA Indexer (M2 & W2)
     Linear index_qk_proj;          // (2560, 640) bf16
     Linear index_k_proj;           // (2560, 128) bf16 (A2: K-only projection for <= 2051)
     Tensor* index_qk_weight = nullptr; // raw [640, 2560]
     Tensor index_k_weight;         // view [128, 2560] pointing to K rows of index_qk_weight
-    Tensor* index_q_norm_weight = nullptr; // [128] f32 (1+w)
-    Tensor* index_k_norm_weight = nullptr; // [128] f32 (1+w)
+    Tensor* index_q_norm_weight = nullptr; // [128] bf16 (1+w)
+    Tensor* index_k_norm_weight = nullptr; // [128] bf16 (1+w)
 
     // MoE
     Linear router_gate;            // (2560, 512) bf16
@@ -184,6 +184,13 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         int length = -1;
         std::vector<LayerStateSnapshot> layers;
         Qwen4ExpPleSnapshot ple_snapshot;
+    };
+    struct QsaLayerGraphState {
+        using Executable = sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>;
+        std::unique_ptr<Executable> executable;
+        Tensor control;
+        std::array<int, ops::graph_control::words> control_host{};
     };
 
 public:
@@ -552,6 +559,14 @@ private:
         const Session& session, aila::TokenGraphBody body,
         aila::TokenGraphAttention attention,
         uint64_t topology_flags) const;
+    bool QsaLayerGraphEligible(
+        Context& ctx, const Session& session, const Tensor& input,
+        const Tensor& output, int count, int start_pos, bool allowQ8) const;
+    static bool QsaLayerBlockStateEligible(
+        int current_blocks, int target_blocks) noexcept;
+    aila::TokenGraphKey MakeQsaLayerGraphKey(const Session& session) const;
+    bool ForwardQsaLayerGraph(Context& ctx, Session& session, Tensor& input,
+                              Tensor& output, int start_pos);
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     friend struct Qwen4ExpMtpProbe;
@@ -652,6 +667,7 @@ private:
     uint64_t next_session_instance_id_ = 1;
     // Declared before defaultSession_ so it outlives Session teardown.
     aila::TokenGraphRuntime token_graph_runtime_;
+    QsaLayerGraphState qsa_layer_graph_;
     std::unique_ptr<Session> defaultSession_;
 
     std::vector<Qwen4ExpLayer> layers_;

@@ -71,8 +71,9 @@ Receipts:
 - The runtime is backend-wide, not per-Session. This matches one GPU device
   mutex and one in-order compute queue, but one abort blocks further graph
   capture until backend/session recreation.
-- `Aborting` has no return-to-Ready transition. The future owner must drain,
-  poison and release executable resources explicitly.
+- `Aborting -> Capturing` is allowed only after the caller drains the old
+  event and destroys its executable. The runtime cannot verify that external
+  precondition; P10's L3 path performs the drain explicitly.
 - No executable, event ownership, uncached ring service or graph body is wired
   here yet.
 - Default direct execution remains the production path.

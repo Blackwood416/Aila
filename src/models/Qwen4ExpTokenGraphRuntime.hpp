@@ -152,8 +152,9 @@ public:
     TokenGraphRuntime(TokenGraphRuntime&&) = delete;
     TokenGraphRuntime& operator=(TokenGraphRuntime&&) = delete;
 
-    // Empty/Ready -> Capturing. Re-capturing from Ready requires the caller to
-    // have drained and destroyed the previous executable first.
+    // Empty/Ready/Aborting -> Capturing. Aborting is accepted only after the
+    // caller has drained and destroyed the previous executable (for example a
+    // Reset/Truncate or a direct-path boundary). Poisoned remains terminal.
     bool BeginCapture(const TokenGraphKey& key) noexcept;
     bool MarkExecutableReady() noexcept;
 
@@ -210,8 +211,11 @@ static_assert(!std::is_move_constructible<TokenGraphRuntime>::value);
 static_assert(!std::is_move_assignable<TokenGraphRuntime>::value);
 
 inline bool TokenGraphRuntime::BeginCapture(const TokenGraphKey& key) noexcept {
-    if (phase_ != TokenGraphPhase::Empty && phase_ != TokenGraphPhase::Ready)
+    if (phase_ != TokenGraphPhase::Empty &&
+        phase_ != TokenGraphPhase::Ready &&
+        phase_ != TokenGraphPhase::Aborting) {
         return false;
+    }
     key_ = key;
     phase_ = TokenGraphPhase::Capturing;
     inFlightEvent_ = sycl::event{};

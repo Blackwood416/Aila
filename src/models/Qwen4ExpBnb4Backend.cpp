@@ -2452,11 +2452,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const int* tokenIdsDevice, int count, bool lastTokenOnly,
     const ForwardOptions& options) {
     ValidateSession(session);
+    if (session.token_graph_poisoned()) {
+        throw std::logic_error(
+            "Qwen4Exp token graph session is poisoned; recreate the session");
+    }
     // Direct execution must stop sharing the backend with a retained graph.
     // Empty is the default path: one branch, no allocation, no generation bump.
-    (void)AbortTokenGraph();
+    // The opt-in L3 graph spans only layer 3's attention tile and is launched
+    // synchronously below. Keep its reusable executable alive across ordinary
+    // count==1 forwards; every state/layout mutation still aborts it.
+    static const bool s_qsa_layer_graph =
+        aila::env::read_flag("AILA_Q4E_QSA_LAYER_GRAPH", false);
+    const bool preserve_l3_graph = s_qsa_layer_graph && count == 1;
+    if (!preserve_l3_graph) (void)AbortTokenGraph();
     if (count <= 0) return buf_.logits;
-    session.InvalidateTokenGraphState();
+    if (!preserve_l3_graph) session.InvalidateTokenGraphState();
     ValidateGdnHeadPath(session, count);
     if (count == 1 && session.graph_gdn_state_enabled_) {
         int linear_rows = 0;

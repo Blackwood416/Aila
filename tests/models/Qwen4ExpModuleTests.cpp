@@ -52,6 +52,23 @@ struct Qwen4ExpGenerationTestAccess {
             session, aila::TokenGraphBody::QsaLayerProof,
             aila::TokenGraphAttention::QsaSparse512BlockNative, 0);
     }
+    static aila::TokenGraphKey MakeQsaLayerGraphKey(
+        const Qwen4ExpBnb4Backend& backend,
+        const Qwen4ExpBnb4Backend::Session& session) {
+        return backend.MakeQsaLayerGraphKey(session);
+    }
+    static bool QsaLayerGraphEligible(
+        const Qwen4ExpBnb4Backend& backend, Context& ctx,
+        const Qwen4ExpBnb4Backend::Session& session,
+        const Tensor& input, const Tensor& output, int count, int start_pos) {
+        return backend.QsaLayerGraphEligible(
+            ctx, session, input, output, count, start_pos, false);
+    }
+    static bool QsaLayerBlockStateEligible(
+        int current_blocks, int target_blocks) {
+        return Qwen4ExpBnb4Backend::QsaLayerBlockStateEligible(
+            current_blocks, target_blocks);
+    }
     static uint64_t PleWorkspaceGeneration(const Qwen4ExpBnb4Backend& backend) {
         return backend.ple_.workspace_generation();
     }
@@ -2860,6 +2877,42 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     expect(initial_graph_key.ple_workspace_generation ==
                Qwen4ExpGenerationTestAccess::PleWorkspaceGeneration(backend),
            "token graph key must snapshot the PLE workspace generation");
+    const auto l3_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeQsaLayerGraphKey(backend, *session);
+    expect(l3_graph_key.session_instance_id ==
+               initial_graph_key.session_instance_id &&
+               l3_graph_key.session_generation ==
+                   initial_graph_key.session_generation &&
+               l3_graph_key.runtime_generation ==
+                   initial_graph_key.runtime_generation &&
+               l3_graph_key.runtime_capacity ==
+                   initial_graph_key.runtime_capacity &&
+               l3_graph_key.topology_generation ==
+                   initial_graph_key.topology_generation,
+           "L3 graph key must retain identity and layout generations");
+    expect(l3_graph_key.session_state_generation == 0 &&
+               l3_graph_key.residency_generation == 0 &&
+               l3_graph_key.descriptor_generation == 0 &&
+               l3_graph_key.ple_workspace_generation == 0 &&
+               l3_graph_key.ple_graph_view_generation == 0 &&
+               l3_graph_key.body == aila::TokenGraphBody::QsaLayerProof &&
+               l3_graph_key.attention ==
+                   aila::TokenGraphAttention::QsaSparse512BlockNative,
+           "L3 graph key must exclude unrelated mutable generations");
+    const Tensor empty_input;
+    const Tensor empty_output;
+    expect(!Qwen4ExpGenerationTestAccess::QsaLayerGraphEligible(
+               backend, ctx, *session, empty_input, empty_output, 1, 2052),
+           "incomplete L3 fixtures must fail closed to the direct path");
+    expect(!Qwen4ExpGenerationTestAccess::QsaLayerBlockStateEligible(
+               512, 514) &&
+               Qwen4ExpGenerationTestAccess::QsaLayerBlockStateEligible(
+                   513, 514) &&
+               Qwen4ExpGenerationTestAccess::QsaLayerBlockStateEligible(
+                   514, 514) &&
+               !Qwen4ExpGenerationTestAccess::QsaLayerBlockStateEligible(
+                   515, 514),
+           "L3 graph must accept exactly the pending-one compressed block");
 
     PleTicket speculative_ticket;
     speculative_ticket.session_ptr = session.get();
@@ -3381,6 +3434,15 @@ void test_token_graph_runtime_lifecycle(Context& ctx) {
                "Poisoned graph runtime must reject every transition");
         expect(!backend.AbortAndPoisonTokenGraph(*session),
                "second AbortAndPoison must be a no-op");
+
+        bool forward_rejected = false;
+        try {
+            (void)backend.Forward(ctx, *session, nullptr, 0);
+        } catch (const std::logic_error&) {
+            forward_rejected = true;
+        }
+        expect(forward_rejected,
+               "Poisoned Session must reject subsequent forward execution");
 
         bool key_rejected = false;
         try {

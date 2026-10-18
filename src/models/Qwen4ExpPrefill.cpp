@@ -1,11 +1,55 @@
 #include "Qwen4ExpBnb4Backend.hpp"
+#include "../ops/AttentionOps.hpp"
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <algorithm>
+#include <exception>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+
+namespace {
+
+constexpr int kQsaGraphLayer = 3;
+constexpr int kQsaGraphLayerOrdinal = 0;
+constexpr int kQsaGraphBlockTopK = 512;
+constexpr int kQsaGraphCompressRatio = 4;
+constexpr int kQsaGraphHeadDim = 256;
+constexpr int kQsaGraphIndexerHeadDim = 128;
+constexpr int kQsaGraphIndexerQHeads = 4;
+constexpr int kQsaGraphIndexerKvHeads = 1;
+constexpr uint64_t kQsaGraphSchemaFlags =
+    (uint64_t{1} << static_cast<unsigned>(aila::TokenGraphBody::QsaLayerProof)) |
+    (uint64_t{1} << (8 + static_cast<unsigned>(
+        aila::TokenGraphAttention::QsaSparse512BlockNative)));
+
+bool qsa_layer_graph_enabled() {
+    static const bool enabled =
+        aila::env::read_flag("AILA_Q4E_QSA_LAYER_GRAPH", false);
+    return enabled;
+}
+
+bool same_token_graph_key(const aila::TokenGraphKey& left,
+                          const aila::TokenGraphKey& right) {
+    return left.backend == right.backend &&
+           left.session == right.session &&
+           left.session_instance_id == right.session_instance_id &&
+           left.session_generation == right.session_generation &&
+           left.session_state_generation == right.session_state_generation &&
+           left.runtime_generation == right.runtime_generation &&
+           left.runtime_capacity == right.runtime_capacity &&
+           left.residency_generation == right.residency_generation &&
+           left.descriptor_generation == right.descriptor_generation &&
+           left.ple_workspace_generation == right.ple_workspace_generation &&
+           left.ple_graph_view_generation == right.ple_graph_view_generation &&
+           left.topology_generation == right.topology_generation &&
+           left.topology_flags == right.topology_flags &&
+           left.body == right.body &&
+           left.attention == right.attention;
+}
+
+} // namespace
 
 // Per-layer attention tile. The input/output banks belong to the entire routing
 // window, while QKV, GDN intermediates and score scratch belong to this tile.
@@ -163,6 +207,10 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         }
     } else {
         if (count == 1) {
+            if (qsa_layer_graph_enabled() &&
+                ForwardQsaLayerGraph(ctx, session, input, output, start_pos)) {
+                return;
+            }
             project_decode(layer.qkv_proj, input, buf_.full_qkv, 2);
             bf16* fused_ptr = static_cast<bf16*>(buf_.full_qkv.data());
             Tensor q_gate_view = Tensor::view(ctx, fused_ptr, {1, (int64_t)full_q_proj_dim_});
@@ -573,6 +621,409 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 project_prefill(layer.o_proj, buf_.attn_out, output);
             }
         }
+    }
+}
+
+bool Qwen4ExpBnb4Backend::QsaLayerBlockStateEligible(
+    int current_blocks, int target_blocks) noexcept {
+    return current_blocks >= 0 && target_blocks >= 0 &&
+           (current_blocks == target_blocks ||
+            (current_blocks < target_blocks &&
+             target_blocks - current_blocks == 1));
+}
+
+bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
+    Context& ctx, const Session& session, const Tensor& input,
+    const Tensor& output, int count, int start_pos, bool allowQ8) const {
+    const auto device = ctx.queue().get_device();
+    if (!device.has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !device.has(sycl::aspect::ext_oneapi_graph)) {
+        return false;
+    }
+    if (count != 1 || start_pos != session.CurrentLength() ||
+        start_pos < 0 || allowQ8 || verify_rows_alignment_ ||
+        gpuNf4Q8ReferenceForTest_ || decodeHcReferenceForTest_ ||
+        layers_.size() <= kQsaGraphLayer ||
+        layers_[kQsaGraphLayer].is_linear) {
+        return false;
+    }
+    if (session.mropePosT_.valid() || session.mropePosH_.valid() ||
+        session.mropePosW_.valid() || session.mropePromptLength_ != 0 ||
+        session.mropeTextPositionDelta_ != 0 ||
+        !session.embeddingOverridePositions_.empty() ||
+        !session.embeddingOverrideValues_.empty() ||
+        session.embeddingOverrideHiddenSize_ != 0) {
+        return false;
+    }
+    if (hidden_size_ != 2560 || full_q_heads_ != 24 ||
+        full_kv_heads_ != 2 || full_head_dim_ != kQsaGraphHeadDim ||
+        full_q_proj_dim_ != 24 * kQsaGraphHeadDim ||
+        full_kv_dim_ != 2 * kQsaGraphHeadDim ||
+        full_fused_qkv_dim_ != 13312 ||
+        cfg_.indexer_n_heads != kQsaGraphIndexerQHeads ||
+        cfg_.indexer_kv_heads != kQsaGraphIndexerKvHeads ||
+        cfg_.indexer_head_dim != kQsaGraphIndexerHeadDim ||
+        (cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4) !=
+            kQsaGraphCompressRatio) {
+        return false;
+    }
+    static const bool compressed_k_enabled =
+        aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
+    static const bool block_native_enabled =
+        aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
+    static const bool dense_gemv_enabled =
+        aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
+    if (!compressed_k_enabled || !block_native_enabled ||
+        !dense_gemv_enabled || attentionNf4Q8Enabled_) {
+        return false;
+    }
+    const int block_topk =
+        (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) /
+        kQsaGraphCompressRatio;
+    if (block_topk != kQsaGraphBlockTopK) return false;
+
+    const auto& layer = layers_[kQsaGraphLayer];
+    const auto& cache = session.layerCaches_[kQsaGraphLayer];
+    if (!layer.qkv_proj.supports_decode_graph() ||
+        !layer.o_proj.supports_decode_graph() ||
+        !layer.q_norm_weight || !layer.k_norm_weight ||
+        !layer.index_qk_weight || !layer.index_q_norm_weight ||
+        !layer.index_k_norm_weight ||
+        !layer.index_qk_weight->valid() ||
+        layer.index_qk_weight->dtype() != dnnl::memory::data_type::bf16 ||
+        layer.index_qk_weight->ndim() != 2 ||
+        layer.index_qk_weight->shape(0) != 640 ||
+        layer.index_qk_weight->shape(1) != hidden_size_ ||
+        !layer.q_norm_weight->valid() ||
+        layer.q_norm_weight->dtype() != dnnl::memory::data_type::bf16 ||
+        layer.q_norm_weight->ndim() != 1 ||
+        layer.q_norm_weight->shape(0) != full_head_dim_ ||
+        !layer.k_norm_weight->valid() ||
+        layer.k_norm_weight->dtype() != dnnl::memory::data_type::bf16 ||
+        layer.k_norm_weight->ndim() != 1 ||
+        layer.k_norm_weight->shape(0) != full_head_dim_ ||
+        layer.index_q_norm_weight->dtype() != dnnl::memory::data_type::bf16 ||
+        layer.index_q_norm_weight->ndim() != 1 ||
+        layer.index_q_norm_weight->shape(0) != kQsaGraphIndexerHeadDim ||
+        layer.index_k_norm_weight->dtype() != dnnl::memory::data_type::bf16 ||
+        layer.index_k_norm_weight->ndim() != 1 ||
+        layer.index_k_norm_weight->shape(0) != kQsaGraphIndexerHeadDim) {
+        return false;
+    }
+    if (!cache.k.valid() || !cache.v.valid() ||
+        cache.k.dtype() != dnnl::memory::data_type::bf16 ||
+        cache.v.dtype() != dnnl::memory::data_type::bf16 ||
+        cache.k.ndim() != 3 || cache.v.ndim() != 3 ||
+        cache.k.shape(0) != full_kv_heads_ ||
+        cache.v.shape(0) != full_kv_heads_ ||
+        cache.k.shape(1) != session.Capacity() ||
+        cache.v.shape(1) != session.Capacity() ||
+        cache.k.shape(2) != full_head_dim_ ||
+        cache.v.shape(2) != full_head_dim_ ||
+        cache.k_scale.valid() || cache.v_scale.valid() ||
+        !cache.indexer_k.valid() ||
+        cache.indexer_k.dtype() != dnnl::memory::data_type::bf16 ||
+        cache.indexer_k.ndim() != 2 ||
+        cache.indexer_k.shape(0) != session.Capacity() ||
+        cache.indexer_k.shape(1) != kQsaGraphIndexerHeadDim ||
+        !cache.indexer_compressed_k.valid() ||
+        cache.indexer_compressed_k.dtype() != dnnl::memory::data_type::bf16 ||
+        cache.indexer_compressed_k.ndim() != 2 ||
+        cache.indexer_compressed_k.shape(1) != kQsaGraphIndexerHeadDim) {
+        return false;
+    }
+
+    const int visible_len = start_pos + 1;
+    const int complete_blocks = visible_len / kQsaGraphCompressRatio;
+    const int max_blocks =
+        static_cast<int>(cache.indexer_compressed_k.shape(0));
+    if (complete_blocks <= kQsaGraphBlockTopK ||
+        complete_blocks > max_blocks || visible_len > session.Capacity() ||
+        !QsaLayerBlockStateEligible(
+            cache.num_compressed_blocks, complete_blocks)) {
+        return false;
+    }
+    if (input.data() != buf_.x.data() || output.data() != buf_.y.data() ||
+        input.dtype() != dnnl::memory::data_type::bf16 ||
+        output.dtype() != dnnl::memory::data_type::bf16 ||
+        input.numel() < hidden_size_ || output.numel() < hidden_size_ ||
+        !buf_.full_qkv.valid() || !buf_.q.valid() || !buf_.z.valid() ||
+        !buf_.attn_out.valid() || !buf_.indexer_qk.valid() ||
+        !buf_.indexer_q.valid() || !buf_.indexer_block_scores.valid() ||
+        !buf_.indexer_active_blocks.valid() ||
+        !buf_.decode_attn_partials.valid()) {
+        return false;
+    }
+    if (buf_.full_qkv.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.full_qkv.shape(1) < full_fused_qkv_dim_ ||
+        buf_.q.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.q.shape(1) < full_q_proj_dim_ ||
+        buf_.z.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.z.shape(1) < full_q_proj_dim_ ||
+        buf_.attn_out.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.attn_out.shape(1) < full_q_proj_dim_ ||
+        buf_.indexer_qk.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.indexer_qk.shape(1) < 640 ||
+        buf_.indexer_q.dtype() != dnnl::memory::data_type::bf16 ||
+        buf_.indexer_q.shape(1) < 512 ||
+        buf_.indexer_block_scores.dtype() != dnnl::memory::data_type::f32 ||
+        buf_.indexer_block_scores.ndim() != 1 ||
+        buf_.indexer_block_scores.shape(0) < max_blocks ||
+        buf_.indexer_active_blocks.dtype() != dnnl::memory::data_type::s32 ||
+        buf_.indexer_active_blocks.ndim() != 1 ||
+        buf_.indexer_active_blocks.shape(0) <
+            kQsaGraphBlockTopK + kQsaGraphCompressRatio ||
+        buf_.decode_attn_partials.dtype() != dnnl::memory::data_type::f32 ||
+        buf_.decode_attn_partials.ndim() != 3 ||
+        buf_.decode_attn_partials.shape(0) != full_q_heads_ ||
+        buf_.decode_attn_partials.shape(1) < 17 ||
+        buf_.decode_attn_partials.shape(2) < 272) {
+        return false;
+    }
+    return true;
+}
+
+aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeQsaLayerGraphKey(
+    const Session& session) const {
+    auto key = MakeTokenGraphKey(
+        session, aila::TokenGraphBody::QsaLayerProof,
+        aila::TokenGraphAttention::QsaSparse512BlockNative,
+        kQsaGraphSchemaFlags);
+    // The L3 body only bakes pointer/layout identity. K/V values, the
+    // compressed-block count and PLE/expert state are replay inputs or
+    // unrelated session state.
+    key.session_state_generation = 0;
+    key.residency_generation = 0;
+    key.descriptor_generation = 0;
+    key.ple_workspace_generation = 0;
+    key.ple_graph_view_generation = 0;
+    return key;
+}
+
+bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
+    Context& ctx, Session& session, Tensor& input, Tensor& output,
+    int start_pos) {
+    if (session.token_graph_poisoned()) {
+        throw std::logic_error(
+            "Qwen4Exp L3 graph session is poisoned; recreate the session");
+    }
+    if (!QsaLayerGraphEligible(
+            ctx, session, input, output, 1, start_pos, false)) {
+        return false;
+    }
+    ensure_runtime_buffers(ctx, 1);
+    const auto runtime_phase = token_graph_runtime_.phase();
+    if (runtime_phase == aila::TokenGraphPhase::Capturing ||
+        runtime_phase == aila::TokenGraphPhase::InFlight) {
+        std::exception_ptr drain_error;
+        bool drained = false;
+        try {
+            ctx.synchronize();
+            drained = true;
+        } catch (...) {
+            drain_error = std::current_exception();
+        }
+        (void)AbortAndPoisonTokenGraph(session);
+        if (drained) qsa_layer_graph_.executable.reset();
+        if (drain_error) std::rethrow_exception(drain_error);
+        throw std::runtime_error(
+            "Qwen4Exp L3 graph cannot capture while another graph owns the backend");
+    }
+
+    const auto key = MakeQsaLayerGraphKey(session);
+    const bool reuse =
+        runtime_phase == aila::TokenGraphPhase::Ready &&
+        same_token_graph_key(token_graph_runtime_.key(), key);
+    if (!reuse) {
+        ctx.synchronize();
+        qsa_layer_graph_.executable.reset();
+        if (!token_graph_runtime_.BeginCapture(key)) {
+            (void)AbortAndPoisonTokenGraph(session);
+            throw std::runtime_error(
+                "Qwen4Exp L3 graph failed to enter capture");
+        }
+        try {
+            if (!qsa_layer_graph_.control.valid()) {
+                qsa_layer_graph_.control = Tensor::allocate(
+                    ctx, {ops::graph_control::words},
+                    dnnl::memory::data_type::s32);
+            }
+            qsa_layer_graph_.control_host.fill(0);
+            qsa_layer_graph_.control_host[ops::graph_control::start_pos] =
+                start_pos;
+            qsa_layer_graph_.control_host[
+                ops::graph_control_layer_blocks_slot(kQsaGraphLayerOrdinal)] =
+                session.layerCaches_[kQsaGraphLayer].num_compressed_blocks;
+            ctx.memcpy_h2d(
+                qsa_layer_graph_.control.data(),
+                qsa_layer_graph_.control_host.data(),
+                qsa_layer_graph_.control.size_bytes());
+            ctx.synchronize();
+
+            auto& layer = layers_[kQsaGraphLayer];
+            auto& cache = session.layerCaches_[kQsaGraphLayer];
+            const int indexer_out_dim =
+                (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) *
+                cfg_.indexer_head_dim;
+            const int indexer_q_dim =
+                cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+            const int max_blocks =
+                static_cast<int>(cache.indexer_compressed_k.shape(0));
+            const int* control = qsa_layer_graph_.control.data_as<int>();
+
+            sycl::ext::oneapi::experimental::command_graph<
+                sycl::ext::oneapi::experimental::graph_state::modifiable>
+                recording(ctx.queue().get_context(), ctx.queue().get_device());
+            recording.begin_recording(ctx.queue());
+            try {
+                layer.qkv_proj.ForwardDecodeRows(
+                    ctx, linear_scratch_, input, buf_.full_qkv, 1);
+                ops::bf16_gemv_bf16(
+                    ctx, *layer.index_qk_weight, input.data_as<bf16>(),
+                    buf_.indexer_qk.data_as<bf16>(), indexer_out_dim,
+                    hidden_size_);
+
+                bf16* fused_ptr = buf_.full_qkv.data_as<bf16>();
+                Tensor q_gate_view = Tensor::view(
+                    ctx, fused_ptr, {1, full_q_proj_dim_});
+                Tensor k_view = Tensor::view(
+                    ctx, fused_ptr + full_q_proj_dim_,
+                    {1, full_kv_dim_});
+                Tensor v_view = Tensor::view(
+                    ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_,
+                    {1, full_kv_dim_});
+                Tensor indexer_qk_row = Tensor::view(
+                    ctx, buf_.indexer_qk.data_as<bf16>(),
+                    {1, indexer_out_dim});
+                Tensor indexer_q_row = Tensor::view(
+                    ctx, buf_.indexer_q.data_as<bf16>(),
+                    {1, indexer_q_dim});
+
+                ops::decode_prepare_qgkv_packed_partial_graph(
+                    ctx, q_gate_view, k_view, v_view, buf_.q, buf_.z,
+                    *layer.q_norm_weight, *layer.k_norm_weight,
+                    cache.k, cache.v, const_cast<int*>(control),
+                    full_q_heads_, full_kv_heads_, full_head_dim_,
+                    cfg_.rms_norm_eps, 64, cfg_.rope.rope_theta,
+                    cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
+                    0, 0, cfg_.rope.mrope_section[0],
+                    cfg_.rope.mrope_section[1],
+                    cfg_.rope.mrope_section[2], nullptr, nullptr,
+                    kQsaGraphLayerOrdinal);
+                ops::qsa_prepare_q_and_cache_k_graph(
+                    ctx, indexer_qk_row, *layer.index_q_norm_weight,
+                    cache.indexer_k, indexer_q_row,
+                    const_cast<int*>(control), cfg_.rope.rope_theta,
+                    cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
+                    0, 0, cfg_.rope.mrope_section[0],
+                    cfg_.rope.mrope_section[1],
+                    cfg_.rope.mrope_section[2],
+                    kQsaGraphLayerOrdinal);
+                ops::qsa_compress_one_completed_block_graph(
+                    ctx, cache.indexer_k, *layer.index_k_norm_weight,
+                    cache.indexer_compressed_k, const_cast<int*>(control),
+                    cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                    nullptr, nullptr, nullptr, 0, 0,
+                    cfg_.rope.mrope_section[0],
+                    cfg_.rope.mrope_section[1],
+                    cfg_.rope.mrope_section[2],
+                    kQsaGraphLayerOrdinal);
+                ops::qsa_compute_block_scores_compressed_graph(
+                    ctx, indexer_q_row, cache.indexer_compressed_k,
+                    buf_.indexer_block_scores, const_cast<int*>(control),
+                    max_blocks, kQsaGraphLayerOrdinal);
+                ops::qsa_select_topk_blocks_graph(
+                    ctx, buf_.indexer_block_scores,
+                    buf_.indexer_active_blocks, const_cast<int*>(control),
+                    kQsaGraphBlockTopK, kQsaGraphCompressRatio, max_blocks,
+                    kQsaGraphLayerOrdinal);
+                ops::attention_validate_qsa_active_blocks_graph(
+                    ctx, cache.k, cache.v, buf_.indexer_active_blocks,
+                    const_cast<int*>(control), full_kv_heads_,
+                    kQsaGraphLayerOrdinal);
+                ops::attention_decode_exact_head256_block_native_graph(
+                    ctx, buf_.q, cache.k, cache.v, buf_.attn_out,
+                    buf_.decode_attn_partials, buf_.indexer_active_blocks,
+                    const_cast<int*>(control), full_q_heads_,
+                    full_kv_heads_, &buf_.z, kQsaGraphLayerOrdinal);
+                layer.o_proj.ForwardDecodeRows(
+                    ctx, linear_scratch_, buf_.attn_out, output, 1);
+                recording.end_recording(ctx.queue());
+            } catch (...) {
+                recording.end_recording(ctx.queue());
+                throw;
+            }
+            qsa_layer_graph_.executable = std::make_unique<
+                QsaLayerGraphState::Executable>(recording.finalize());
+            if (!MarkReady()) {
+                throw std::runtime_error(
+                    "Qwen4Exp L3 graph failed to publish its executable");
+            }
+        } catch (...) {
+            try {
+                ctx.synchronize();
+            } catch (...) {
+            }
+            qsa_layer_graph_.executable.reset();
+            (void)AbortAndPoisonTokenGraph(session);
+            throw;
+        }
+    }
+
+    if (!qsa_layer_graph_.executable || !qsa_layer_graph_.control.valid()) {
+        (void)AbortAndPoisonTokenGraph(session);
+        throw std::runtime_error(
+            "Qwen4Exp L3 graph is missing its executable or control table");
+    }
+
+    const int blocks_slot =
+        ops::graph_control_layer_blocks_slot(kQsaGraphLayerOrdinal);
+    // The graph may advance the selected device counter by one completed block.
+    // Validate the post-replay target, not the pre-replay control value.
+    const int target_blocks =
+        (start_pos + 1) / kQsaGraphCompressRatio;
+    qsa_layer_graph_.control_host.fill(0);
+    qsa_layer_graph_.control_host[ops::graph_control::start_pos] = start_pos;
+    qsa_layer_graph_.control_host[blocks_slot] =
+        session.layerCaches_[kQsaGraphLayer].num_compressed_blocks;
+    (void)ctx.memcpy_h2d_async(
+        qsa_layer_graph_.control.data(),
+        qsa_layer_graph_.control_host.data(),
+        qsa_layer_graph_.control.size_bytes());
+
+    try {
+        auto graph_event = ctx.queue().ext_oneapi_graph(
+            *qsa_layer_graph_.executable);
+        const uint32_t sequence = token_graph_runtime_.next_sequence();
+        if (!Launch(session, sequence, graph_event)) {
+            throw std::runtime_error(
+                "Qwen4Exp L3 graph launch was rejected");
+        }
+        graph_event.wait_and_throw();
+        ctx.memcpy_d2h(
+            qsa_layer_graph_.control_host.data(),
+            qsa_layer_graph_.control.data(),
+            qsa_layer_graph_.control.size_bytes());
+        const bool gate_valid =
+            qsa_layer_graph_.control_host[ops::graph_control::abort] == 0 &&
+            qsa_layer_graph_.control_host[ops::graph_control::start_pos] ==
+                start_pos &&
+            qsa_layer_graph_.control_host[blocks_slot] == target_blocks;
+        if (!Complete(sequence, gate_valid)) {
+            throw std::runtime_error(
+                "Qwen4Exp L3 graph completion gate rejected");
+        }
+        session.layerCaches_[kQsaGraphLayer].num_compressed_blocks =
+            qsa_layer_graph_.control_host[blocks_slot];
+        return true;
+    } catch (...) {
+        try {
+            ctx.synchronize();
+        } catch (...) {
+        }
+        qsa_layer_graph_.executable.reset();
+        (void)AbortAndPoisonTokenGraph(session);
+        throw;
     }
 }
 
