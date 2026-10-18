@@ -3,6 +3,49 @@
 
 namespace ops {
 
+namespace {
+
+using device_atomic_int =
+    sycl::atomic_ref<int, sycl::memory_order::acq_rel,
+                     sycl::memory_scope::device,
+                     sycl::access::address_space::global_space>;
+
+inline void advance_device_conv_head(
+    int* slots, int current_head, int workgroups, int conv_rows) {
+    device_atomic_int arrivals(slots[delta_net_conv_head_device_arrivals_slot]);
+    if (arrivals.fetch_add(1, sycl::memory_order::acq_rel) != workgroups - 1) {
+        return;
+    }
+    device_atomic_int previous(slots[delta_net_conv_head_device_previous_slot]);
+    previous.store(current_head, sycl::memory_order::release);
+    device_atomic_int head(slots[delta_net_conv_head_device_head_slot]);
+    head.store((current_head + 1) % conv_rows, sycl::memory_order::release);
+    arrivals.store(0, sycl::memory_order::release);
+}
+
+void commit_linear_conv_history_from_device_head(
+    Context& ctx, const bf16* input, int input_stride,
+    float* history, int channels, int history_rows,
+    const int* conv_head_dev, int token_count) {
+    const int rows_to_copy = std::min(token_count, history_rows);
+    if (rows_to_copy <= 0) return;
+    const int first_token = token_count - rows_to_copy;
+    ctx.queue().parallel_for(
+        sycl::range<1>(static_cast<size_t>(rows_to_copy) * channels),
+        [=](sycl::id<1> index) {
+            const size_t channel = index[0] % static_cast<size_t>(channels);
+            const int token = first_token + static_cast<int>(index[0] / channels);
+            const int initial_head =
+                conv_head_dev[delta_net_conv_head_device_previous_slot] % history_rows;
+            const int row = (initial_head + token % history_rows) % history_rows;
+            history[static_cast<size_t>(row) * channels + channel] =
+                static_cast<float>(
+                    input[static_cast<size_t>(token) * input_stride + channel]);
+        });
+}
+
+} // namespace
+
 bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,
                                         int head_k_dim, int head_v_dim,
                                         int kernel, int conv_rows,
@@ -86,7 +129,11 @@ void run_linear_delta_decode_gpu_impl(
     const int head_v_dim = geom.head_v_dim;
     const int kernel = geom.kernel;
     const int conv_rows = geom.conv_rows;
-    const int conv_head = (conv_rows > 0) ? (state.conv_head % conv_rows) : 0;
+    const bool use_device_conv_head = state.conv_head_dev != nullptr && conv_rows > 0;
+    const int conv_head = use_device_conv_head
+        ? 0
+        : ((conv_rows > 0) ? (state.conv_head % conv_rows) : 0);
+    int* conv_head_dev = use_device_conv_head ? state.conv_head_dev : nullptr;
     const float eps = geom.eps;
     const float scale = geom.scale;
     constexpr int wg = 256;
@@ -103,20 +150,22 @@ void run_linear_delta_decode_gpu_impl(
     bool default_grouped_fastpath = supports_default_grouped_linear_delta_fastpath(
         q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows);
     bool allow_grouped_fastpath = experimental_gqa_fastpath || default_grouped_fastpath;
+    if (conv_head_dev && defer_grouped_history) {
+        throw std::invalid_argument(
+            "Device GDN conv head requires non-deferred history commit");
+    }
 
     if (supports_linear_delta_gqa_fastpath(q_heads, num_heads, head_k_dim, head_v_dim, kernel, conv_rows,
                                            allow_grouped_fastpath)) {
         constexpr int head_dim = 128;
         constexpr int head_wg = 128;
         const bool grouped_heads = num_heads > q_heads;
-        const int row0 = conv_head;
-        const int row1 = (conv_head + 1) % conv_rows;
-        const int row2 = (conv_head + 2) % conv_rows;
         ctx.queue().submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> q_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> k_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> out_local(sycl::range<1>(head_dim), cgh);
             sycl::local_accessor<float, 1> head_params(sycl::range<1>(2), cgh);
+            sycl::local_accessor<int, 1> conv_head_local(sycl::range<1>(1), cgh);
 
             cgh.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(num_heads * head_wg), sycl::range<1>(head_wg)),
@@ -137,6 +186,18 @@ void run_linear_delta_decode_gpu_impl(
                     int hk = linear_delta_key_head_for_value_head(hv, q_heads, num_heads);
                     bool write_shared_qk = linear_delta_is_group_leader(hv, q_heads, num_heads);
                     int lid = static_cast<int>(item.get_local_id(0));
+                    int local_conv_head = conv_head;
+                    if (conv_head_dev) {
+                        if (lid == 0) {
+                            conv_head_local[0] =
+                                conv_head_dev[delta_net_conv_head_device_head_slot] % conv_rows;
+                        }
+                        item.barrier(sycl::access::fence_space::local_space);
+                        local_conv_head = conv_head_local[0];
+                    }
+                    const int row0 = local_conv_head;
+                    const int row1 = (local_conv_head + 1) % conv_rows;
+                    const int row2 = (local_conv_head + 2) % conv_rows;
                     int q_base = hk * head_dim;
                     int k_base = q_dim + hk * head_dim;
                     int v_base = q_dim + q_dim + hv * head_dim;
@@ -166,7 +227,7 @@ void run_linear_delta_decode_gpu_impl(
                     item.barrier(sycl::access::fence_space::local_space);
 
                     if (!grouped_heads && lid < head_dim) {
-                        size_t dst = static_cast<size_t>(conv_head) * qkv_dim;
+                        size_t dst = static_cast<size_t>(local_conv_head) * qkv_dim;
                         if (write_shared_qk) {
                             conv_state_ptr[dst + q_base + lid] = static_cast<float>(qkv_ptr[q_base + lid]);
                             conv_state_ptr[dst + k_base + lid] = static_cast<float>(qkv_ptr[k_base + lid]);
@@ -257,14 +318,27 @@ void run_linear_delta_decode_gpu_impl(
                         float gate_val = (Act == GateActivation::Silu) ? silu_dev(z_reg) : sigmoid_dev(z_reg);
                         out_ptr[hv * head_dim + lid] = bf16(n * gate_val);
                     }
+                    if (conv_head_dev) {
+                        item.barrier(sycl::access::fence_space::local_space);
+                        if (lid == 0) {
+                            advance_device_conv_head(
+                                conv_head_dev, local_conv_head, num_heads, conv_rows);
+                        }
+                    }
                 });
         });
         if (grouped_heads && !defer_grouped_history) {
-            commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
-                                       qkv_dim, conv_rows, conv_head, 1);
+            if (conv_head_dev) {
+                commit_linear_conv_history_from_device_head(
+                    ctx, qkv_ptr, qkv_dim, conv_state_ptr,
+                    qkv_dim, conv_rows, conv_head_dev, 1);
+            } else {
+                commit_linear_conv_history(ctx, qkv_ptr, qkv_dim, conv_state_ptr,
+                                           qkv_dim, conv_rows, conv_head, 1);
+            }
         }
         state.device_state_dirty = true;
-        if (conv_rows > 0) {
+        if (!conv_head_dev && conv_rows > 0) {
             state.conv_head = (conv_head + 1) % conv_rows;
         }
         return;
@@ -295,6 +369,9 @@ void run_linear_delta_decode_gpu_impl(
                 };
 
                 int lid = static_cast<int>(item.get_local_id(0));
+                const int active_conv_head = conv_head_dev
+                    ? (conv_head_dev[delta_net_conv_head_device_head_slot] % conv_rows)
+                    : conv_head;
 
                 for (int i = lid; i < z_dim; i += wg) {
                     z_local[i] = static_cast<float>(z_ptr[i]);
@@ -305,7 +382,7 @@ void run_linear_delta_decode_gpu_impl(
                     const bf16* w = conv_w_ptr + static_cast<size_t>(c) * kernel;
                     if (conv_rows > 0 && conv_state_ptr) {
                         for (int j = 0; j < kernel - 1; ++j) {
-                            int row = (conv_head + j) % conv_rows;
+                            int row = (active_conv_head + j) % conv_rows;
                             v += conv_state_ptr[static_cast<size_t>(row) * qkv_dim + c]
                                 * static_cast<float>(w[j]);
                         }
@@ -323,7 +400,7 @@ void run_linear_delta_decode_gpu_impl(
                 item.barrier(sycl::access::fence_space::local_space);
 
                 if (conv_rows > 0 && conv_state_ptr) {
-                    size_t dst_base = static_cast<size_t>(conv_head) * qkv_dim;
+                    size_t dst_base = static_cast<size_t>(active_conv_head) * qkv_dim;
                     for (int idx = lid; idx < qkv_dim; idx += wg) {
                         conv_state_ptr[dst_base + idx] = static_cast<float>(qkv_ptr[idx]);
                     }
@@ -402,11 +479,18 @@ void run_linear_delta_decode_gpu_impl(
                     float gate_val = (Act == GateActivation::Silu) ? silu_dev(zg) : sigmoid_dev(zg);
                     out_ptr[idx] = bf16(n * gate_val);
                 }
+                if (conv_head_dev) {
+                    item.barrier(sycl::access::fence_space::local_space);
+                    if (lid == 0) {
+                        advance_device_conv_head(
+                            conv_head_dev, active_conv_head, 1, conv_rows);
+                    }
+                }
             });
     });
 
     state.device_state_dirty = true;
-    if (conv_rows > 0) {
+    if (!conv_head_dev && conv_rows > 0) {
         state.conv_head = (conv_head + 1) % conv_rows;
     }
 }
@@ -814,4 +898,3 @@ void run_linear_delta_prefill_gpu_batched(
 }
 
 } // namespace ops
-

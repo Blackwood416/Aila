@@ -77,6 +77,15 @@ struct Qwen4ExpGenerationTestAccess {
     static aila::Qwen4ExpHostArena& HostArena(Qwen4ExpBnb4Backend& b) {
         return b.host_arena_;
     }
+    static Qwen4ExpLayer& Layer(Qwen4ExpBnb4Backend& b, int layer) {
+        return b.layers_.at(static_cast<size_t>(layer));
+    }
+    static Qwen4ExpBuffers& Buffers(Qwen4ExpBnb4Backend& b) {
+        return b.buf_;
+    }
+    static Bnb4BitLinearScratch& LinearScratch(Qwen4ExpBnb4Backend& b) {
+        return b.linear_scratch_;
+    }
     static int ExpertsPerLayer(Qwen4ExpBnb4Backend& b) {
         return b.cfg_.num_experts;
     }
@@ -88,6 +97,9 @@ struct Qwen4ExpGenerationTestAccess {
     }
     static int IntermediateSize(Qwen4ExpBnb4Backend& b) {
         return b.cfg_.moe_intermediate_size;
+    }
+    static int SharedIntermediateSize(Qwen4ExpBnb4Backend& b) {
+        return b.cfg_.shared_expert_intermediate_size;
     }
     static Tensor& FrontHidden(Qwen4ExpBnb4Backend& b) {
         return b.buf_.hidden4;
@@ -140,6 +152,87 @@ struct Qwen4ExpGenerationTestAccess {
             route_ids, route_weights, 1,
             b.cfg_.num_experts, b.cfg_.num_experts_per_tok, true);
     }
+    static void LayerFrontRoute(Qwen4ExpBnb4Backend& b, int layer_index,
+                                ops::DeltaNetState& state,
+                                int* route_ids, float* route_weights) {
+        auto& ctx = *b.context_;
+        auto& layer = b.layers_.at(static_cast<size_t>(layer_index));
+        if (!layer.is_linear)
+            throw std::runtime_error("two-layer P3 requires GDN layers");
+        b.RunHyperConnection(ctx, layer.attn_hc, 1, true);
+        layer.linear_all_proj.ForwardDecodeRows(
+            ctx, b.linear_scratch_, b.buf_.x, b.buf_.linear_all, 1);
+        const auto* p = b.buf_.linear_all.data_as<bf16>();
+        ops::DeltaNetWeights weights{
+            layer.linear_conv1d_weight->data_as<bf16>(),
+            layer.linear_norm_weight->data_as<float>(),
+            layer.linear_A_log->data_as<float>(),
+            layer.linear_dt_bias->data_as<bf16>()};
+        ops::run_linear_delta_decode_gpu(
+            ctx, layer.geom, weights, state, p, p + b.linear_qkv_dim_,
+            p + b.linear_qkv_dim_ + b.linear_z_dim_,
+            p + b.linear_qkv_dim_ + b.linear_z_dim_ + b.linear_kv_heads_,
+            b.buf_.attn_out.data_as<bf16>());
+        layer.linear_o_proj.ForwardDecodeRows(
+            ctx, b.linear_scratch_, b.buf_.attn_out, b.buf_.y, 1);
+        b.RunHyperConnectionCombined(
+            ctx, layer.mlp_hc, 1, true, b.buf_.y.data_as<bf16>(),
+            b.buf_.hc_inject_f32.data_as<float>());
+        b.DenseLinear(
+            ctx, layer.router_gate, layer.router_w,
+            b.buf_.x, b.buf_.router_scores, 1, b.cfg_.num_experts,
+            b.hidden_size_);
+        ops::router_softmax_topk_device(
+            ctx, b.buf_.router_scores.data_as<bf16>(), nullptr,
+            route_ids, route_weights, 1,
+            b.cfg_.num_experts, b.cfg_.num_experts_per_tok, true);
+    }
+    static void SharedExpert(Qwen4ExpBnb4Backend& b, int layer_index) {
+        auto& ctx = *b.context_;
+        auto& layer = b.layers_.at(static_cast<size_t>(layer_index));
+        b.DenseLinear(ctx, layer.shared_expert_gate,
+                      layer.shared_expert_gate_w, b.buf_.x,
+                      b.buf_.shared_gate_buf, 1, 1, b.hidden_size_);
+        if (!Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+                ctx, layer.shared_gate_up_proj, b.buf_.x,
+                b.buf_.shared_inter_buf,
+                b.cfg_.shared_expert_intermediate_size)) {
+            layer.shared_gate_up_proj.ForwardDecodeRows(
+                ctx, b.linear_scratch_, b.buf_.x,
+                b.buf_.shared_gate_up_buf, 1);
+            ops::moe_silu_gate_up_mul_flat(
+                ctx, b.buf_.shared_gate_up_buf.data_as<bf16>(),
+                b.buf_.shared_inter_buf.data_as<bf16>(), 1,
+                b.cfg_.shared_expert_intermediate_size);
+        }
+        layer.shared_down_proj.ForwardDecodeRows(
+            ctx, b.linear_scratch_, b.buf_.shared_inter_buf,
+            b.buf_.shared_out_buf, 1);
+    }
+    static void ResidentExperts(
+        Qwen4ExpBnb4Backend& b,
+        const ops::MoeExpertSlotDev* resident_descriptors,
+        const int* selected, float* resident_down) {
+        auto& ctx = *b.context_;
+        ops::moe_resident_gate_up(
+            ctx, resident_descriptors, selected,
+            b.buf_.x.data_as<bf16>(), b.buf_.moe_h.data_as<bf16>(),
+            b.cfg_.num_experts_per_tok, b.hidden_size_,
+            b.cfg_.moe_intermediate_size, true, true);
+        ops::moe_resident_down(
+            ctx, resident_descriptors, selected,
+            b.buf_.moe_h.data_as<bf16>(), resident_down,
+            b.cfg_.num_experts_per_tok, b.hidden_size_,
+            b.cfg_.moe_intermediate_size, true, true);
+    }
+    static void FinalBridge(Qwen4ExpBnb4Backend& b) {
+        auto& ctx = *b.context_;
+        ops::hc_inject_add(
+            ctx, b.buf_.hidden4.data_as<bf16>(),
+            b.buf_.y.data_as<bf16>(),
+            b.buf_.hc_inject_f32.data_as<float>(), 1,
+            b.hidden_size_, 4);
+    }
     static void Front(Qwen4ExpBnb4Backend& b, ops::DeltaNetState& state) {
         FrontRoute(b, state, b.router_host_ids_, b.router_host_weights_);
     }
@@ -154,6 +247,17 @@ constexpr int kHidden = 2560;
 constexpr int kMaxPacketRows = 16;
 constexpr uint32_t kDefaultSpinMax = 20000;
 constexpr uint32_t kPollFlushEvery = 1024;
+
+// Consumed by packet copy and merge; only kGateValid permits data movement.
+enum : uint32_t {
+    kGatePending = 0,
+    kGateValid = 1,
+    kGateTimeout = 2,
+    kGateStale = 3,
+    kGateChannelMismatch = 4,
+    kGatePacketMismatch = 5,
+    kGatePacketShape = 6,
+};
 
 // Intel cache-control hints. These are the load/store half of the Strata
 // doorbell fix: system-scope atomics alone can remain in the L1/L3 cache on Arc.
@@ -190,7 +294,11 @@ struct alignas(64) ControlRing {
     uint32_t mismatch_count;
     uint32_t host_route_error_count;
     uint64_t timeout_spins;
-    uint64_t reserved[3];
+    uint32_t channel_mismatch_count;
+    uint32_t packet_seq_mismatch_count;
+    uint32_t packet_shape_error_count;
+    uint32_t gate_abort_count;
+    uint64_t reserved[1];
 };
 
 struct alignas(64) RouteRing {
@@ -221,7 +329,11 @@ struct alignas(64) CpuPacketRing {
 
 struct alignas(64) DeviceEpoch {
     uint32_t seq;
-    uint32_t reserved[15];
+    uint32_t gate_state;
+    // First fail-closed reason in a multi-handoff replay. The first route
+    // publication clears it; later handoffs never turn a failed epoch valid.
+    uint32_t sticky_abort;
+    uint32_t reserved[13];
 };
 
 static_assert(sizeof(ControlRing) == 64);
@@ -230,6 +342,55 @@ static_assert(sizeof(ResultRing) == 384);
 static_assert(sizeof(HostRing) == 576);
 static_assert(sizeof(CpuPacketRing) == 169088);
 static_assert(sizeof(DeviceEpoch) == 64);
+
+bool validate_cpu_packet_shape(const int* rank_to_row, int rows, int top_k,
+                               std::string& error) {
+    if (top_k < 1 || top_k > kMaxPacketRows) {
+        error = "CPU packet top_k is out of range";
+        return false;
+    }
+    if (rows < 0 || rows > kMaxPacketRows || rows > top_k) {
+        error = "CPU packet rows are out of range";
+        return false;
+    }
+    if (!rank_to_row) {
+        error = "CPU packet rank map is null";
+        return false;
+    }
+
+    uint32_t seen_rows = 0;
+    int mapped_rows = 0;
+    for (int rank = 0; rank < top_k; ++rank) {
+        const int row = rank_to_row[rank];
+        if (row == -1) continue;
+        if (row < 0 || row >= rows) {
+            error = "CPU packet rank maps outside rows";
+            return false;
+        }
+        const uint32_t bit = 1u << static_cast<uint32_t>(row);
+        if (seen_rows & bit) {
+            error = "CPU packet rank map has duplicate rows";
+            return false;
+        }
+        seen_rows |= bit;
+        ++mapped_rows;
+    }
+    if (mapped_rows != rows) {
+        error = "CPU packet row count does not match rank map";
+        return false;
+    }
+    return true;
+}
+
+bool validate_cpu_packet_shape(const CpuPacketRing* packet, int top_k,
+                               std::string& error) {
+    if (!packet) {
+        error = "CPU packet is null";
+        return false;
+    }
+    return validate_cpu_packet_shape(
+        packet->rank_to_row, static_cast<int>(packet->rows), top_k, error);
+}
 
 struct PolledRing {
     HostRing* ptr = nullptr;
@@ -298,11 +459,13 @@ inline volatile float* volatile_float(float* p) {
     return reinterpret_cast<volatile float*>(p);
 }
 
-void submit_route_publish(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch) {
+void submit_route_publish(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
+                          bool clear_abort = true) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
             const uint32_t seq = epoch->seq + 1u;
             epoch->seq = seq;
+            if (clear_abort) epoch->sticky_abort = 0;
             for (uint32_t k = 0; k < kTopK; ++k) {
                 uncached_store(&ring->route.ids[k],
                                static_cast<int32_t>(expected_id(seq, k)));
@@ -319,11 +482,13 @@ void submit_route_publish(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch) {
 
 void submit_real_route_publish(sycl::queue& q, HostRing* ring,
                                DeviceEpoch* epoch, const int* ids,
-                               const float* weights) {
+                               const float* weights,
+                               bool clear_abort = true) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
             const uint32_t seq = epoch->seq + 1u;
             epoch->seq = seq;
+            if (clear_abort) epoch->sticky_abort = 0;
             for (uint32_t k = 0; k < kTopK; ++k) {
                 uncached_store(&ring->route.ids[k],
                                static_cast<int32_t>(ids[k]));
@@ -354,10 +519,17 @@ void submit_resident_classify(Context& ctx, const int* ids,
 }
 
 void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
+                        CpuPacketRing* packet, int top_k,
                         uint32_t spin_max) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
             const uint32_t seq = epoch->seq;
+            if (epoch->sticky_abort != 0) {
+                epoch->gate_state = epoch->sticky_abort;
+                return;
+            }
+            epoch->gate_state = kGatePending;
+
             uint32_t flag = 0;
             uint32_t spins = 0;
             for (;;) {
@@ -368,18 +540,44 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                                    sycl::memory_scope::system);
                 flag = uncached_load(&ring->ctrl.cpu_flag);
                 if (flag == seq) break;
+                if (flag > seq) break;
                 if (++spins >= spin_max) break;
             }
             if (flag != seq) {
-                uncached_store(&ring->ctrl.timeout_count,
-                               uncached_load(&ring->ctrl.timeout_count) + 1u);
-                uncached_store(&ring->ctrl.timeout_spins,
-                               static_cast<uint64_t>(spins));
+                uint32_t* reason = flag > seq
+                    ? &ring->ctrl.channel_mismatch_count
+                    : &ring->ctrl.timeout_count;
+                uncached_store(reason, uncached_load(reason) + 1u);
+                if (flag <= seq) {
+                    uncached_store(&ring->ctrl.timeout_spins,
+                                   static_cast<uint64_t>(spins));
+                }
+                uncached_store(
+                    &ring->ctrl.gate_abort_count,
+                    uncached_load(&ring->ctrl.gate_abort_count) + 1u);
+                epoch->sticky_abort =
+                    flag > seq ? kGateChannelMismatch : kGateTimeout;
+                epoch->gate_state =
+                    flag > seq ? kGateChannelMismatch : kGateTimeout;
                 return;
             }
             // The matching flag establishes publication of result_seq/result.
             sycl::atomic_fence(sycl::memory_order::acquire,
                                sycl::memory_scope::system);
+
+            const uint32_t route_seq =
+                uncached_load(&ring->ctrl.route_seq);
+            if (route_seq != seq) {
+                uncached_store(
+                    &ring->ctrl.channel_mismatch_count,
+                    uncached_load(&ring->ctrl.channel_mismatch_count) + 1u);
+                uncached_store(
+                    &ring->ctrl.gate_abort_count,
+                    uncached_load(&ring->ctrl.gate_abort_count) + 1u);
+                epoch->sticky_abort = kGateChannelMismatch;
+                epoch->gate_state = kGateChannelMismatch;
+                return;
+            }
 
             bool stale = uncached_load(&ring->ctrl.result_seq) != seq;
             if (!stale) {
@@ -400,30 +598,102 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
             if (stale) {
                 uncached_store(&ring->ctrl.stale_count,
                                uncached_load(&ring->ctrl.stale_count) + 1u);
+                uncached_store(
+                    &ring->ctrl.gate_abort_count,
+                    uncached_load(&ring->ctrl.gate_abort_count) + 1u);
+                epoch->sticky_abort = kGateStale;
+                epoch->gate_state = kGateStale;
+                return;
             }
+
+            if (packet) {
+                const uint32_t packet_seq =
+                    uncached_load(&packet->ready_seq);
+                const uint32_t rows = uncached_load(&packet->rows);
+                if (packet_seq != seq) {
+                    uncached_store(
+                        &ring->ctrl.packet_seq_mismatch_count,
+                        uncached_load(
+                            &ring->ctrl.packet_seq_mismatch_count) + 1u);
+                    uncached_store(
+                        &ring->ctrl.gate_abort_count,
+                        uncached_load(&ring->ctrl.gate_abort_count) + 1u);
+                    epoch->sticky_abort = kGatePacketMismatch;
+                    epoch->gate_state = kGatePacketMismatch;
+                    return;
+                }
+
+                uint32_t seen_rows = 0;
+                uint32_t mapped_rows = 0;
+                bool shape_ok =
+                    top_k >= 1 && top_k <= kMaxPacketRows &&
+                    rows <= static_cast<uint32_t>(kMaxPacketRows) &&
+                    rows <= static_cast<uint32_t>(top_k);
+                for (int rank = 0; shape_ok && rank < top_k; ++rank) {
+                    const int row =
+                        uncached_load(&packet->rank_to_row[rank]);
+                    if (row == -1) continue;
+                    if (row < 0 || row >= static_cast<int>(rows)) {
+                        shape_ok = false;
+                        break;
+                    }
+                    const uint32_t bit =
+                        1u << static_cast<uint32_t>(row);
+                    if (seen_rows & bit) {
+                        shape_ok = false;
+                        break;
+                    }
+                    seen_rows |= bit;
+                    ++mapped_rows;
+                }
+                if (shape_ok && mapped_rows != rows) shape_ok = false;
+                if (!shape_ok) {
+                    uncached_store(
+                        &ring->ctrl.packet_shape_error_count,
+                        uncached_load(
+                            &ring->ctrl.packet_shape_error_count) + 1u);
+                    uncached_store(
+                        &ring->ctrl.gate_abort_count,
+                        uncached_load(&ring->ctrl.gate_abort_count) + 1u);
+                    epoch->sticky_abort = kGatePacketShape;
+                    epoch->gate_state = kGatePacketShape;
+                    return;
+                }
+            }
+
+            sycl::atomic_fence(sycl::memory_order::release,
+                               sycl::memory_scope::device);
+            epoch->gate_state = kGateValid;
         });
     });
 }
 
 // The graph must not contain queue.memcpy: a copy-engine node can split the
 // WDDM submission. This kernel reads mapped pinned host USM directly.
-void submit_copy_from_mapped(sycl::queue& q, HostRing* ring, float* device_result) {
+void submit_copy_from_mapped(sycl::queue& q, HostRing* ring,
+                             DeviceEpoch* epoch, float* device_result) {
     q.parallel_for(sycl::range<1>(kResultCount), [=](sycl::id<1> id) {
         const size_t i = id[0];
-        device_result[i] = uncached_load(&ring->result.values[i]);
+        device_result[i] = epoch->gate_state == kGateValid
+            ? uncached_load(&ring->result.values[i])
+            : 0.0f;
     });
 }
 
 void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
-                            int* packet_dev) {
+                            DeviceEpoch* epoch, int* packet_dev, int top_k) {
     q.parallel_for(
         sycl::range<1>(kMaxPacketRows +
                        size_t(kMaxPacketRows) * kHidden),
         [=](sycl::id<1> id) {
             const size_t i = id[0];
+            const bool valid = epoch->gate_state == kGateValid;
             if (i < kMaxPacketRows) {
-                packet_dev[i] = uncached_load(&packet->rank_to_row[i]);
-            } else {
+                packet_dev[i] =
+                    valid && static_cast<int>(i) < top_k
+                    ? uncached_load(&packet->rank_to_row[i])
+                    : -1;
+            } else if (valid) {
                 auto* values = reinterpret_cast<float*>(
                     packet_dev + kMaxPacketRows);
                 values[i - kMaxPacketRows] =
@@ -432,12 +702,88 @@ void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
         });
 }
 
+void submit_gated_ordered_merge(sycl::queue& q, const float* down_acc,
+                                const float* weights, bf16* y, int out_features,
+                                int top_k, const int* cpu_packet,
+                                const DeviceEpoch* epoch) {
+    constexpr size_t wg_size = 256;
+    const size_t num_wgs =
+        (static_cast<size_t>(out_features) + wg_size - 1) / wg_size;
+    const auto* cpu_ranks = cpu_packet;
+    const auto* cpu_down =
+        reinterpret_cast<const float*>(cpu_ranks + kMaxPacketRows);
+
+    q.parallel_for(
+        sycl::nd_range<1>(num_wgs * wg_size, wg_size),
+        [=](sycl::nd_item<1> item) {
+            // A failed gate is a hard no-op: never read the CPU packet and
+            // never overwrite the previous layer output.
+            if (epoch && epoch->gate_state != kGateValid) return;
+            const size_t row = item.get_global_id(0);
+            if (row >= static_cast<size_t>(out_features)) return;
+
+            float total_val = 0.0f;
+            for (int k = 0; k < top_k; ++k) {
+                const int cpu_row = cpu_ranks[k];
+                const float val = cpu_row >= 0
+                    ? cpu_down[size_t(cpu_row) * out_features + row]
+                    : down_acc[size_t(k) * out_features + row];
+                total_val += weights[k] * val;
+            }
+            y[row] = bf16(total_val);
+        });
+}
+
+void submit_zero_bytes(sycl::queue& q, void* dst, size_t bytes) {
+    auto* out = static_cast<uint8_t*>(dst);
+    q.parallel_for(sycl::range<1>(bytes),
+                   [=](sycl::id<1> id) { out[id[0]] = 0; });
+}
+
+void submit_copy_bytes(sycl::queue& q, void* dst, const void* src,
+                       size_t bytes) {
+    auto* out = static_cast<uint8_t*>(dst);
+    const auto* in = static_cast<const uint8_t*>(src);
+    q.parallel_for(sycl::range<1>(bytes),
+                   [=](sycl::id<1> id) { out[id[0]] = in[id[0]]; });
+}
+
+// Probe-local mirror of Qwen4ExpBnb4Backend.cpp::add_shared_expert_to_y.
+// Keeping the vec8 BF16 store order preserves the production rounding.
+void submit_add_shared_expert_to_y(sycl::queue& q, bf16* y,
+                                   const bf16* shared_out,
+                                   const bf16* shared_gate) {
+    using vec8 = sycl::vec<bf16, 8>;
+    constexpr int dim8 = kHidden / 8;
+    constexpr int wg = 64;
+    constexpr size_t num_wgs = (dim8 + wg - 1) / wg;
+    q.parallel_for(
+        sycl::nd_range<1>(num_wgs * wg, wg),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            const size_t d8 = item.get_global_id(0);
+            if (d8 >= static_cast<size_t>(dim8)) return;
+            const float g = static_cast<float>(shared_gate[0]);
+            const float gate_act = 1.0f / (1.0f + sycl::native::exp(-g));
+            const size_t elem = d8 * 8;
+            const vec8 s_vec =
+                *reinterpret_cast<const vec8*>(shared_out + elem);
+            vec8 y_vec = *reinterpret_cast<const vec8*>(y + elem);
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                y_vec[v] = bf16(static_cast<float>(y_vec[v]) +
+                                gate_act * static_cast<float>(s_vec[v]));
+            }
+            *reinterpret_cast<vec8*>(y + elem) = y_vec;
+        });
+}
+
 void submit_bitwise_verify(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                            const float* device_result) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
             const uint32_t seq = epoch->seq;
-            bool mismatch = uncached_load(&ring->ctrl.result_seq) != seq;
+            bool mismatch = epoch->gate_state != kGateValid ||
+                uncached_load(&ring->ctrl.result_seq) != seq;
             if (!mismatch) {
                 for (uint32_t k = 0; k < kTopK; ++k) {
                     for (uint32_t j = 0; j < kResultWidth; ++j) {
@@ -620,6 +966,7 @@ struct Handoff {
     uint32_t timeout_delta = 0;
     uint32_t stale_delta = 0;
     uint32_t mismatch_delta = 0;
+    uint32_t gate_abort_delta = 0;
 };
 
 Handoff service_replay(Context& ctx,
@@ -640,6 +987,17 @@ Handoff service_replay(Context& ctx,
     const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
     const uint32_t stale_before = *volatile_u32(&ctrl.stale_count);
     const uint32_t mismatch_before = *volatile_u32(&ctrl.mismatch_count);
+    const uint32_t gate_abort_before =
+        *volatile_u32(&ctrl.gate_abort_count);
+
+    if (cpu_packet && !cpu_packet_fill) {
+        std::string packet_error;
+        if (!validate_cpu_packet_shape(
+                cpu_packet_ranks, cpu_packet_rows, kTopK, packet_error)) {
+            throw std::runtime_error("CPU packet rejected before launch: " +
+                                     packet_error);
+        }
+    }
 
     const auto t_launch = Clock::now();
     auto graph_event = q.ext_oneapi_graph(graph);
@@ -677,6 +1035,11 @@ Handoff service_replay(Context& ctx,
             write_host_packet(cpu_packet, value_seq, expected_seq,
                               cpu_packet_ranks, cpu_packet_rows);
         }
+        std::string packet_error;
+        if (!validate_cpu_packet_shape(cpu_packet, kTopK, packet_error)) {
+            std::cerr << "[TOKEN GRAPH PACKET GATE] seq=" << expected_seq
+                      << " " << packet_error << '\n';
+        }
     }
     write_host_result(ring, value_seq, expected_seq);
     const auto t_flag = Clock::now();
@@ -704,6 +1067,8 @@ Handoff service_replay(Context& ctx,
     out.stale_delta = *volatile_u32(&ctrl.stale_count) - stale_before;
     out.mismatch_delta =
         *volatile_u32(&ctrl.mismatch_count) - mismatch_before;
+    out.gate_abort_delta =
+        *volatile_u32(&ctrl.gate_abort_count) - gate_abort_before;
     return out;
 }
 
@@ -759,6 +1124,21 @@ std::vector<int> parse_cpu_sweep(const std::string& text) {
     return out;
 }
 
+std::array<int, 2> parse_layer_pair(const std::string& text) {
+    std::array<int, 2> out{};
+    std::stringstream ss(text);
+    std::string item;
+    int count = 0;
+    while (std::getline(ss, item, ',')) {
+        if (item.empty() || count >= 2)
+            throw std::runtime_error("--layers requires exactly two integers");
+        out[count++] = std::stoi(item);
+    }
+    if (count != 2 || out[0] < 0 || out[1] < 0)
+        throw std::runtime_error("--layers requires two non-negative integers");
+    return out;
+}
+
 struct Options {
     uint32_t replays = 1000;
     int warmup = 10;
@@ -766,10 +1146,13 @@ struct Options {
     int host_timeout_ms = 2000;
     std::vector<int> cpu_sweep{0, 50, 200, 500};
     std::string real_front_model;
+    bool two_layer = false;
+    std::array<int, 2> layers{4, 5};
 };
 
 Options parse_options(int argc, char** argv) {
     Options o;
+    bool replays_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&](const char* name) -> std::string {
@@ -779,6 +1162,7 @@ Options parse_options(int argc, char** argv) {
         };
         if (arg == "--replays") {
             o.replays = static_cast<uint32_t>(std::stoul(next("--replays")));
+            replays_explicit = true;
         } else if (arg == "--warmup") {
             o.warmup = std::stoi(next("--warmup"));
         } else if (arg == "--spin-max") {
@@ -789,18 +1173,30 @@ Options parse_options(int argc, char** argv) {
             o.cpu_sweep = parse_cpu_sweep(next("--cpu-us"));
         } else if (arg == "--real-front-model") {
             o.real_front_model = next("--real-front-model");
+        } else if (arg == "--two-layer") {
+            o.two_layer = true;
+        } else if (arg == "--layers") {
+            o.layers = parse_layer_pair(next("--layers"));
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "usage: probe_token_graph.exe [--replays N] [--warmup N]\n"
                    "       [--cpu-us 0,50,200,500] [--spin-max N]\n"
-                   "       [--host-timeout-ms N] [--real-front-model DIR]\n";
+                   "       [--host-timeout-ms N] [--real-front-model DIR]\n"
+                   "       [--two-layer] [--layers 4,5]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + arg);
         }
     }
-    if (o.replays < 1000)
+    if (o.two_layer) {
+        if (o.real_front_model.empty())
+            throw std::runtime_error("--two-layer requires --real-front-model");
+        if (!replays_explicit) o.replays = 4;
+        if (o.replays < 1 || o.replays > 16)
+            throw std::runtime_error("--two-layer --replays must be in [1, 16]");
+    } else if (o.replays < 1000) {
         throw std::runtime_error("--replays must be >= 1000 for P0");
+    }
     if (o.warmup < 0) throw std::runtime_error("--warmup must be >= 0");
     if (!o.spin_max) throw std::runtime_error("--spin-max must be > 0");
     if (o.host_timeout_ms <= 0)
@@ -831,6 +1227,979 @@ std::vector<uint8_t> snapshot_front(Context& ctx,
     device(Qwen4ExpGenerationTestAccess::FrontInject(b).data(),
            4 * sizeof(float));
     return bytes;
+}
+
+constexpr int kHidden4 = 10240;
+constexpr size_t kCpuPacketDeviceBytes =
+    sizeof(int) * kMaxPacketRows +
+    sizeof(float) * kMaxPacketRows * kHidden;
+
+struct LayerCaptureDev {
+    Tensor hidden;
+    Tensor route_ids;
+    Tensor route_weights;
+    Tensor selected;
+    Tensor moe_h;
+    Tensor resident_down;
+    Tensor packet;
+    Tensor routed_y;
+    Tensor y_shared;
+    Tensor shared_gate;
+    Tensor shared_inter;
+    Tensor shared_out;
+};
+
+struct LayerLane {
+    int layer = -1;
+    Tensor state;
+    Tensor history;
+    Tensor conv_head;
+    Tensor route_ids;
+    Tensor route_weights;
+    Tensor selected;
+    Tensor packet;
+    LayerCaptureDev capture;
+};
+
+struct HostLayerSnapshot {
+    std::vector<uint8_t> hidden;
+    std::vector<uint8_t> state;
+    std::vector<uint8_t> history;
+    std::vector<uint8_t> conv_head;
+    std::vector<uint8_t> route_ids;
+    std::vector<uint8_t> route_weights;
+    std::vector<uint8_t> selected;
+    std::vector<uint8_t> moe_h;
+    std::vector<uint8_t> resident_down;
+    std::vector<uint8_t> packet;
+    std::vector<uint8_t> routed_y;
+    std::vector<uint8_t> y_shared;
+    std::vector<uint8_t> shared_gate;
+    std::vector<uint8_t> shared_inter;
+    std::vector<uint8_t> shared_out;
+    int cpu_rows = 0;
+};
+
+void allocate_layer_capture(Context& ctx, LayerCaptureDev& capture,
+                            int intermediate, int top_k) {
+    capture.hidden = Tensor::allocate(
+        ctx, {kHidden4}, dnnl::memory::data_type::bf16);
+    capture.route_ids = Tensor::allocate(
+        ctx, {kTopK}, dnnl::memory::data_type::s32);
+    capture.route_weights = Tensor::allocate(
+        ctx, {kTopK}, dnnl::memory::data_type::f32);
+    capture.selected = Tensor::allocate(
+        ctx, {kMaxPacketRows}, dnnl::memory::data_type::s32);
+    capture.moe_h = Tensor::allocate(
+        ctx, {int64_t(top_k), int64_t(intermediate)},
+        dnnl::memory::data_type::bf16);
+    capture.resident_down = Tensor::allocate(
+        ctx, {int64_t(top_k), int64_t(kHidden)},
+        dnnl::memory::data_type::f32);
+    capture.packet = Tensor::allocate(
+        ctx, {int64_t(kCpuPacketDeviceBytes)},
+        dnnl::memory::data_type::u8);
+    capture.routed_y = Tensor::allocate(
+        ctx, {kHidden}, dnnl::memory::data_type::bf16);
+    capture.y_shared = Tensor::allocate(
+        ctx, {kHidden}, dnnl::memory::data_type::bf16);
+    capture.shared_gate = Tensor::allocate(
+        ctx, {1}, dnnl::memory::data_type::bf16);
+    capture.shared_inter = Tensor::allocate(
+        ctx, {int64_t(intermediate)}, dnnl::memory::data_type::bf16);
+    capture.shared_out = Tensor::allocate(
+        ctx, {kHidden}, dnnl::memory::data_type::bf16);
+}
+
+void allocate_layer_lane(Context& ctx, LayerLane& lane, int layer,
+                         const ops::DeltaNetGeometry& geom,
+                         int intermediate, int top_k) {
+    lane.layer = layer;
+    lane.state = Tensor::allocate(
+        ctx, {int64_t(geom.v_heads) * geom.head_k_dim * geom.head_v_dim},
+        dnnl::memory::data_type::f32);
+    lane.history = Tensor::allocate(
+        ctx, {int64_t(geom.conv_rows) * geom.qkv_dim},
+        dnnl::memory::data_type::f32);
+    lane.conv_head = Tensor::allocate(
+        ctx, {ops::delta_net_conv_head_device_slots},
+        dnnl::memory::data_type::s32);
+    lane.route_ids = Tensor::allocate(
+        ctx, {kTopK}, dnnl::memory::data_type::s32);
+    lane.route_weights = Tensor::allocate(
+        ctx, {kTopK}, dnnl::memory::data_type::f32);
+    lane.selected = Tensor::allocate(
+        ctx, {kMaxPacketRows}, dnnl::memory::data_type::s32);
+    lane.packet = Tensor::allocate(
+        ctx, {int64_t(kCpuPacketDeviceBytes)},
+        dnnl::memory::data_type::u8);
+    allocate_layer_capture(ctx, lane.capture, intermediate, top_k);
+}
+
+void reset_layer_lane(Context& ctx, LayerLane& lane) {
+    std::vector<float> initial_state(lane.state.numel());
+    std::vector<float> initial_history(lane.history.numel());
+    for (size_t j = 0; j < initial_state.size(); ++j) {
+        initial_state[j] =
+            float(int((j * 17 + lane.layer * 31 + 5) % 101) - 50) *
+            0.0002f;
+    }
+    for (size_t j = 0; j < initial_history.size(); ++j) {
+        initial_history[j] =
+            float(int((j * 7 + lane.layer * 13 + 3) % 101) - 50) *
+            0.002f;
+    }
+    const std::array<int, 3> initial_head{
+        2, 2, 0};
+    ctx.memcpy_h2d(lane.state.data(), initial_state.data(),
+                   lane.state.size_bytes());
+    ctx.memcpy_h2d(lane.history.data(), initial_history.data(),
+                   lane.history.size_bytes());
+    ctx.memcpy_h2d(lane.conv_head.data(), initial_head.data(),
+                   lane.conv_head.size_bytes());
+    ctx.queue()
+        .memset(lane.selected.data(), 0xff,
+                lane.selected.size_bytes())
+        .wait_and_throw();
+}
+
+void seed_hidden4(Context& ctx, Qwen4ExpBnb4Backend& b, int seed) {
+    std::array<bf16, kHidden4> input{};
+    for (int j = 0; j < kHidden4; ++j) {
+        input[j] =
+            bf16(float(int((j * 11 + seed * 3) % 103) - 51) * .015f);
+    }
+    ctx.memcpy_h2d(
+        Qwen4ExpGenerationTestAccess::FrontHidden(b).data(),
+        input.data(), sizeof(input));
+}
+
+std::vector<uint8_t> read_tensor_bytes(Context& ctx, Tensor& tensor) {
+    std::vector<uint8_t> bytes(tensor.size_bytes());
+    if (!bytes.empty())
+        ctx.memcpy_d2h(bytes.data(), tensor.data(), bytes.size());
+    return bytes;
+}
+
+HostLayerSnapshot snapshot_layer(Context& ctx, LayerLane& lane,
+                                 int cpu_rows) {
+    HostLayerSnapshot out;
+    out.hidden = read_tensor_bytes(ctx, lane.capture.hidden);
+    out.state = read_tensor_bytes(ctx, lane.state);
+    out.history = read_tensor_bytes(ctx, lane.history);
+    out.conv_head = read_tensor_bytes(ctx, lane.conv_head);
+    out.route_ids = read_tensor_bytes(ctx, lane.capture.route_ids);
+    out.route_weights =
+        read_tensor_bytes(ctx, lane.capture.route_weights);
+    out.selected = read_tensor_bytes(ctx, lane.capture.selected);
+    out.moe_h = read_tensor_bytes(ctx, lane.capture.moe_h);
+    out.resident_down =
+        read_tensor_bytes(ctx, lane.capture.resident_down);
+    out.packet = read_tensor_bytes(ctx, lane.capture.packet);
+    out.routed_y = read_tensor_bytes(ctx, lane.capture.routed_y);
+    out.y_shared = read_tensor_bytes(ctx, lane.capture.y_shared);
+    out.shared_gate =
+        read_tensor_bytes(ctx, lane.capture.shared_gate);
+    out.shared_inter =
+        read_tensor_bytes(ctx, lane.capture.shared_inter);
+    out.shared_out = read_tensor_bytes(ctx, lane.capture.shared_out);
+    out.cpu_rows = cpu_rows;
+    return out;
+}
+
+bool same_bytes(const std::vector<uint8_t>& a,
+                const std::vector<uint8_t>& b);
+
+void compare_field(bool& all, const char* field, int token, int layer,
+                   const std::vector<uint8_t>& direct,
+                   const std::vector<uint8_t>& graph) {
+    if (same_bytes(direct, graph)) return;
+    all = false;
+    std::cerr << "[TWO LAYER PARITY FAIL] token=" << token
+              << " layer=" << layer << " field=" << field
+              << " direct_bytes=" << direct.size()
+              << " graph_bytes=" << graph.size() << '\n';
+}
+
+struct LayerParity {
+    bool hidden = true;
+    bool state = true;
+    bool history = true;
+    bool conv_head = true;
+    bool routes = true;
+    bool selected = true;
+    bool moe_h = true;
+    bool resident_down = true;
+    bool packet = true;
+    bool routed_y = true;
+    bool shared = true;
+    bool y_shared = true;
+    bool cpu_rows = true;
+};
+
+void compare_layer_snapshots(int token, int layer,
+                             const HostLayerSnapshot& direct,
+                             const HostLayerSnapshot& graph,
+                             LayerParity& parity) {
+    compare_field(parity.hidden, "hidden4", token, layer,
+                  direct.hidden, graph.hidden);
+    compare_field(parity.state, "linear_state", token, layer,
+                  direct.state, graph.state);
+    compare_field(parity.history, "linear_conv_state", token, layer,
+                  direct.history, graph.history);
+    compare_field(parity.conv_head, "conv_head_dev", token, layer,
+                  direct.conv_head, graph.conv_head);
+    compare_field(parity.routes, "route", token, layer,
+                  direct.route_ids, graph.route_ids);
+    compare_field(parity.routes, "route_weights", token, layer,
+                  direct.route_weights, graph.route_weights);
+    compare_field(parity.selected, "selected", token, layer,
+                  direct.selected, graph.selected);
+    compare_field(parity.moe_h, "moe_h", token, layer,
+                  direct.moe_h, graph.moe_h);
+    compare_field(parity.resident_down, "resident_down", token, layer,
+                  direct.resident_down, graph.resident_down);
+    compare_field(parity.packet, "cpu_packet", token, layer,
+                  direct.packet, graph.packet);
+    compare_field(parity.routed_y, "routed_merge", token, layer,
+                  direct.routed_y, graph.routed_y);
+    compare_field(parity.shared, "shared_gate", token, layer,
+                  direct.shared_gate, graph.shared_gate);
+    compare_field(parity.shared, "shared_inter", token, layer,
+                  direct.shared_inter, graph.shared_inter);
+    compare_field(parity.shared, "shared_out", token, layer,
+                  direct.shared_out, graph.shared_out);
+    compare_field(parity.y_shared, "y_after_shared", token, layer,
+                  direct.y_shared, graph.y_shared);
+    if (direct.cpu_rows != graph.cpu_rows) {
+        parity.cpu_rows = false;
+        std::cerr << "[TWO LAYER PARITY FAIL] token=" << token
+                  << " layer=" << layer << " field=cpu_rows"
+                  << " direct=" << direct.cpu_rows
+                  << " graph=" << graph.cpu_rows << '\n';
+    }
+}
+
+struct PacketServiceResult {
+    int cpu_rows = 0;
+    bool shape_ok = true;
+    std::string error;
+};
+
+PacketServiceResult fill_cpu_packet_for_layer(
+    aila::Qwen4ExpExpertExecutor& executor,
+    const aila::Qwen4ExpHostArena& arena,
+    aila::Qwen4ExpAdaptiveCache& adaptive, int layer,
+    const int* route_ids, int top_k, CpuPacketRing* packet) {
+    PacketServiceResult out;
+    std::array<int, kMaxPacketRows> cold_ids{};
+    std::array<int, kMaxPacketRows> cold_ranks{};
+    int cold_count = 0;
+    for (int rank = 0; rank < top_k; ++rank) {
+        const int expert = route_ids[rank];
+        if (adaptive.GetSlot(layer, expert) >= 0) continue;
+        cold_ids[cold_count] = expert;
+        cold_ranks[cold_count] = rank;
+        ++cold_count;
+    }
+    if (cold_count == 0) {
+        std::fill_n(packet->rank_to_row, kMaxPacketRows, -1);
+        std::memset(packet->values, 0,
+                    sizeof(float) * kMaxPacketRows * kHidden);
+        packet->rows = 0;
+        out.cpu_rows = 0;
+    } else {
+        out.cpu_rows = executor.RunGraphColdPacket(
+            arena, layer, cold_ids.data(), cold_ranks.data(),
+            cold_count, packet->x, packet->rank_to_row,
+            packet->values);
+        packet->rows = static_cast<uint32_t>(out.cpu_rows);
+        if (out.cpu_rows < kMaxPacketRows) {
+            std::memset(
+                packet->values +
+                    size_t(out.cpu_rows) * kHidden, 0,
+                sizeof(float) * size_t(kMaxPacketRows - out.cpu_rows) *
+                    kHidden);
+        }
+    }
+    out.shape_ok =
+        validate_cpu_packet_shape(packet, top_k, out.error);
+    return out;
+}
+
+void publish_cpu_packet(CpuPacketRing* packet, uint32_t seq) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    *volatile_u32(&packet->ready_seq) = seq;
+}
+
+void submit_capture_layer_tail(sycl::queue& q, LayerLane& lane,
+                               Qwen4ExpBnb4Backend& b, int top_k,
+                               int intermediate) {
+    auto& buf = Qwen4ExpGenerationTestAccess::Buffers(b);
+    submit_copy_bytes(
+        q, lane.capture.hidden.data(), buf.hidden4.data(),
+        sizeof(bf16) * kHidden4);
+    submit_copy_bytes(
+        q, lane.capture.route_ids.data(), lane.route_ids.data(),
+        sizeof(int) * kTopK);
+    submit_copy_bytes(
+        q, lane.capture.route_weights.data(), lane.route_weights.data(),
+        sizeof(float) * kTopK);
+    submit_copy_bytes(
+        q, lane.capture.selected.data(), lane.selected.data(),
+        sizeof(int) * kMaxPacketRows);
+    submit_copy_bytes(
+        q, lane.capture.moe_h.data(), buf.moe_h.data(),
+        sizeof(bf16) * size_t(top_k) * intermediate);
+    submit_copy_bytes(
+        q, lane.capture.resident_down.data(),
+        Qwen4ExpGenerationTestAccess::ResidentDown(b).data(),
+        sizeof(float) * size_t(top_k) * kHidden);
+    submit_copy_bytes(
+        q, lane.capture.packet.data(), lane.packet.data(),
+        kCpuPacketDeviceBytes);
+    submit_copy_bytes(
+        q, lane.capture.y_shared.data(), buf.y.data(),
+        sizeof(bf16) * kHidden);
+    submit_copy_bytes(
+        q, lane.capture.shared_gate.data(), buf.shared_gate_buf.data(),
+        sizeof(bf16));
+    submit_copy_bytes(
+        q, lane.capture.shared_inter.data(), buf.shared_inter_buf.data(),
+        sizeof(bf16) * intermediate);
+    submit_copy_bytes(
+        q, lane.capture.shared_out.data(), buf.shared_out_buf.data(),
+        sizeof(bf16) * kHidden);
+}
+
+ops::DeltaNetState layer_state(LayerLane& lane, int host_head) {
+    return ops::DeltaNetState{
+        lane.state.data_as<float>(), lane.history.data_as<float>(),
+        host_head, false, lane.conv_head.data_as<int>()};
+}
+
+void submit_graph_layer(
+    Context& ctx, Qwen4ExpBnb4Backend& b, LayerLane& lane,
+    HostRing* ring, DeviceEpoch* epoch, CpuPacketRing* cpu_packet,
+    const ops::MoeExpertSlotDev* resident_descriptors,
+    const int* layer_slot_table, int top_k, int intermediate,
+    int experts, uint32_t spin_max, bool clear_abort) {
+    sycl::queue& q = ctx.queue();
+    auto& buf = Qwen4ExpGenerationTestAccess::Buffers(b);
+    auto state = layer_state(lane, 2);
+    Qwen4ExpGenerationTestAccess::LayerFrontRoute(
+        b, lane.layer, state, lane.route_ids.data_as<int>(),
+        lane.route_weights.data_as<float>());
+    submit_copy_x_to_mapped(q, buf.x.data_as<bf16>(), cpu_packet);
+    submit_real_route_publish(
+        q, ring, epoch, lane.route_ids.data_as<int>(),
+        lane.route_weights.data_as<float>(), clear_abort);
+    submit_resident_classify(
+        ctx, lane.route_ids.data_as<int>(), layer_slot_table,
+        lane.selected.data_as<int>(), experts, top_k);
+    submit_zero_bytes(
+        q, buf.moe_h.data(),
+        sizeof(bf16) * size_t(top_k) * intermediate);
+    submit_zero_bytes(
+        q, Qwen4ExpGenerationTestAccess::ResidentDown(b).data(),
+        sizeof(float) * size_t(top_k) * kHidden);
+    Qwen4ExpGenerationTestAccess::ResidentExperts(
+        b, resident_descriptors, lane.selected.data_as<int>(),
+        Qwen4ExpGenerationTestAccess::ResidentDown(b).data_as<float>());
+    Qwen4ExpGenerationTestAccess::SharedExpert(b, lane.layer);
+    submit_device_wait(
+        q, ring, epoch, cpu_packet, top_k, spin_max);
+    submit_copy_cpu_packet(
+        q, cpu_packet, epoch, lane.packet.data_as<int>(), top_k);
+    submit_gated_ordered_merge(
+        q, Qwen4ExpGenerationTestAccess::ResidentDown(b)
+               .data_as<float>(),
+        lane.route_weights.data_as<float>(), buf.y.data_as<bf16>(),
+        kHidden, top_k, lane.packet.data_as<int>(), epoch);
+    submit_copy_bytes(
+        q, lane.capture.routed_y.data(), buf.y.data(),
+        sizeof(bf16) * kHidden);
+    submit_add_shared_expert_to_y(
+        q, buf.y.data_as<bf16>(), buf.shared_out_buf.data_as<bf16>(),
+        buf.shared_gate_buf.data_as<bf16>());
+    Qwen4ExpGenerationTestAccess::FinalBridge(b);
+    submit_capture_layer_tail(
+        q, lane, b, top_k, intermediate);
+}
+
+HostLayerSnapshot run_direct_layer(
+    Context& ctx, Qwen4ExpBnb4Backend& b, LayerLane& lane,
+    CpuPacketRing* cpu_packet,
+    const ops::MoeExpertSlotDev* resident_descriptors,
+    const int* layer_slot_table, int top_k, int intermediate,
+    int experts) {
+    sycl::queue& q = ctx.queue();
+    auto& buf = Qwen4ExpGenerationTestAccess::Buffers(b);
+    auto state = layer_state(lane, 2);
+    Qwen4ExpGenerationTestAccess::LayerFrontRoute(
+        b, lane.layer, state, lane.route_ids.data_as<int>(),
+        lane.route_weights.data_as<float>());
+    ctx.synchronize();
+
+    std::array<int, kMaxPacketRows> route_ids{};
+    ctx.memcpy_d2h(route_ids.data(), lane.route_ids.data(),
+                   sizeof(int) * kTopK);
+    q.memcpy(cpu_packet->x, buf.x.data(), sizeof(bf16) * kHidden)
+        .wait_and_throw();
+    PacketServiceResult service = fill_cpu_packet_for_layer(
+        Qwen4ExpGenerationTestAccess::Executor(b),
+        Qwen4ExpGenerationTestAccess::HostArena(b),
+        Qwen4ExpGenerationTestAccess::Adaptive(b), lane.layer,
+        route_ids.data(), top_k, cpu_packet);
+    if (!service.shape_ok)
+        throw std::runtime_error(
+            "direct CPU packet shape invalid: " + service.error);
+
+    q.memcpy(lane.packet.data(), cpu_packet->rank_to_row,
+             sizeof(int) * kMaxPacketRows)
+        .wait_and_throw();
+    q.memcpy(
+         reinterpret_cast<uint8_t*>(lane.packet.data()) +
+             sizeof(int) * kMaxPacketRows,
+         cpu_packet->values,
+         sizeof(float) * kMaxPacketRows * kHidden)
+        .wait_and_throw();
+    submit_resident_classify(
+        ctx, lane.route_ids.data_as<int>(), layer_slot_table,
+        lane.selected.data_as<int>(), experts, top_k);
+    submit_zero_bytes(
+        q, buf.moe_h.data(),
+        sizeof(bf16) * size_t(top_k) * intermediate);
+    submit_zero_bytes(
+        q, Qwen4ExpGenerationTestAccess::ResidentDown(b).data(),
+        sizeof(float) * size_t(top_k) * kHidden);
+    Qwen4ExpGenerationTestAccess::ResidentExperts(
+        b, resident_descriptors, lane.selected.data_as<int>(),
+        Qwen4ExpGenerationTestAccess::ResidentDown(b).data_as<float>());
+    Qwen4ExpGenerationTestAccess::SharedExpert(b, lane.layer);
+    submit_gated_ordered_merge(
+        q, Qwen4ExpGenerationTestAccess::ResidentDown(b)
+               .data_as<float>(),
+        lane.route_weights.data_as<float>(), buf.y.data_as<bf16>(),
+        kHidden, top_k, lane.packet.data_as<int>(), nullptr);
+    submit_copy_bytes(
+        q, lane.capture.routed_y.data(), buf.y.data(),
+        sizeof(bf16) * kHidden);
+    submit_add_shared_expert_to_y(
+        q, buf.y.data_as<bf16>(), buf.shared_out_buf.data_as<bf16>(),
+        buf.shared_gate_buf.data_as<bf16>());
+    Qwen4ExpGenerationTestAccess::FinalBridge(b);
+    submit_capture_layer_tail(
+        q, lane, b, top_k, intermediate);
+    ctx.synchronize();
+    return snapshot_layer(ctx, lane, service.cpu_rows);
+}
+
+struct TwoLayerServiceResult {
+    std::array<int, 2> cpu_rows{};
+    std::array<double, 2> route_to_flag_us{};
+    double launch_to_route_us = 0.0;
+    double replay_wall_us = 0.0;
+    uint32_t timeout_delta = 0;
+    uint32_t stale_delta = 0;
+    uint32_t mismatch_delta = 0;
+    uint32_t gate_abort_delta = 0;
+    uint32_t host_route_error_delta = 0;
+    uint32_t packet_shape_error_delta = 0;
+};
+
+TwoLayerServiceResult service_two_layer_replay(
+    Context& ctx,
+    ex::command_graph<ex::graph_state::executable>& graph,
+    HostRing* ring, uint32_t expected_first_seq, int cpu_us,
+    int host_timeout_ms, const std::array<int, 2>& layers,
+    CpuPacketRing* cpu_packet, int top_k,
+    aila::Qwen4ExpExpertExecutor& executor,
+    const aila::Qwen4ExpHostArena& arena,
+    aila::Qwen4ExpAdaptiveCache& adaptive) {
+    sycl::queue& q = ctx.queue();
+    auto& ctrl = ring->ctrl;
+    const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
+    const uint32_t stale_before = *volatile_u32(&ctrl.stale_count);
+    const uint32_t mismatch_before =
+        *volatile_u32(&ctrl.mismatch_count);
+    const uint32_t gate_abort_before =
+        *volatile_u32(&ctrl.gate_abort_count);
+    const uint32_t host_route_error_before =
+        *volatile_u32(&ctrl.host_route_error_count);
+    const uint32_t packet_shape_before =
+        *volatile_u32(&ctrl.packet_shape_error_count);
+
+    const auto t_launch = Clock::now();
+    auto graph_event = q.ext_oneapi_graph(graph);
+    release_graph_submission(graph_event);
+
+    TwoLayerServiceResult out;
+    std::string error;
+    for (int index = 0; index < 2; ++index) {
+        const uint32_t seq = expected_first_seq + uint32_t(index);
+        const PollResult route_poll =
+            poll_host_word(q, volatile_u32(&ctrl.route_seq), seq,
+                           host_timeout_ms, error);
+        if (route_poll != PollResult::Reached) {
+            try { graph_event.wait_and_throw(); } catch (...) {}
+            throw std::runtime_error("two-layer route " +
+                                     std::to_string(index) + " " + error);
+        }
+        const auto t_route = Clock::now();
+        if (index == 0)
+            out.launch_to_route_us = us_between(t_launch, t_route);
+        if (!host_route_matches(
+                ring, seq, host_timeout_ms, false, error)) {
+            *volatile_u32(&ctrl.host_route_error_count) =
+                *volatile_u32(&ctrl.host_route_error_count) + 1u;
+            try { graph_event.wait_and_throw(); } catch (...) {}
+            throw std::runtime_error(
+                "two-layer route payload " + std::to_string(index) +
+                " " + error);
+        }
+
+        std::array<int, kMaxPacketRows> route_ids{};
+        for (int k = 0; k < kTopK; ++k)
+            route_ids[k] = ring->route.ids[k];
+        burn_cpu_us(cpu_us);
+        PacketServiceResult service = fill_cpu_packet_for_layer(
+            executor, arena, adaptive, layers[index], route_ids.data(),
+            top_k, cpu_packet);
+        out.cpu_rows[index] = service.cpu_rows;
+        publish_cpu_packet(cpu_packet, seq);
+        write_host_result(ring, seq, seq);
+        const auto t_flag = Clock::now();
+        out.route_to_flag_us[index] = us_between(t_route, t_flag);
+    }
+
+    const uint32_t final_seq = expected_first_seq + 1u;
+    const PollResult done_poll =
+        poll_host_word(q, volatile_u32(&ctrl.done_seq), final_seq,
+                       host_timeout_ms, error);
+    if (done_poll != PollResult::Reached) {
+        try { graph_event.wait_and_throw(); } catch (...) {}
+        throw std::runtime_error("two-layer done " + error);
+    }
+    const auto t_done = Clock::now();
+    graph_event.wait_and_throw();
+    out.replay_wall_us = us_between(t_launch, Clock::now());
+    out.timeout_delta =
+        *volatile_u32(&ctrl.timeout_count) - timeout_before;
+    out.stale_delta = *volatile_u32(&ctrl.stale_count) - stale_before;
+    out.mismatch_delta =
+        *volatile_u32(&ctrl.mismatch_count) - mismatch_before;
+    out.gate_abort_delta =
+        *volatile_u32(&ctrl.gate_abort_count) - gate_abort_before;
+    out.host_route_error_delta =
+        *volatile_u32(&ctrl.host_route_error_count) -
+        host_route_error_before;
+    out.packet_shape_error_delta =
+        *volatile_u32(&ctrl.packet_shape_error_count) -
+        packet_shape_before;
+    (void)t_done;
+    return out;
+}
+
+int run_two_layer_model(const Options& options) {
+    InferenceEngine engine;
+    if (!engine.init(options.real_front_model, 512))
+        throw std::runtime_error("two-layer model init failed");
+    Context& ctx = Qwen4ExpGenerationTestAccess::Ctx(engine);
+    sycl::queue& q = ctx.queue();
+    auto& b = Qwen4ExpGenerationTestAccess::Backend(engine);
+    if (!q.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !q.get_device().has(sycl::aspect::ext_oneapi_graph))
+        throw std::runtime_error("static graph unsupported");
+
+    const int top_k = Qwen4ExpGenerationTestAccess::TopK(b);
+    const int experts = Qwen4ExpGenerationTestAccess::ExpertsPerLayer(b);
+    const int hidden = Qwen4ExpGenerationTestAccess::HiddenSize(b);
+    const int intermediate =
+        Qwen4ExpGenerationTestAccess::IntermediateSize(b);
+    const int shared_intermediate =
+        Qwen4ExpGenerationTestAccess::SharedIntermediateSize(b);
+    if (top_k != kTopK || hidden != kHidden ||
+        intermediate != 640 || shared_intermediate != 640)
+        throw std::runtime_error(
+            "P3 requires Qwen4Exp 10/2560/640/640 geometry");
+    if (options.layers[0] == options.layers[1])
+        throw std::runtime_error("--layers must name two distinct layers");
+    for (int layer : options.layers) {
+        if (layer < 0 ||
+            layer >= static_cast<int>(Qwen4ExpGenerationTestAccess::LayerCount(b)))
+            throw std::runtime_error("layer index out of range");
+        if (!Qwen4ExpGenerationTestAccess::Layer(b, layer).is_linear)
+            throw std::runtime_error("P3 layers must both be GDN");
+    }
+
+    auto& adaptive = Qwen4ExpGenerationTestAccess::Adaptive(b);
+    auto& executor = Qwen4ExpGenerationTestAccess::Executor(b);
+    auto& arena = Qwen4ExpGenerationTestAccess::HostArena(b);
+    if (!adaptive.IsAllocated() || !adaptive.DeviceSlotTable() ||
+        adaptive.NumLayers() <= std::max(options.layers[0], options.layers[1]))
+        throw std::runtime_error("adaptive resident table unavailable");
+    if (!executor.cpu_overlap_enabled() || !arena.IsAllocated() ||
+        arena.NumLayers() <=
+            std::max(options.layers[0], options.layers[1]))
+        throw std::runtime_error("CPU arena or worker unavailable");
+    if (executor.max_cpu_credits() < top_k)
+        throw std::runtime_error(
+            "P3 requires AILA_Q4E_CPU_MAX_EXPERTS >= top_k");
+
+    const auto& geom0 = Qwen4ExpGenerationTestAccess::Layer(b, options.layers[0]).geom;
+    const auto& geom1 = Qwen4ExpGenerationTestAccess::Layer(b, options.layers[1]).geom;
+    if (geom0.conv_rows != 3 || geom1.conv_rows != 3 ||
+        geom0.qkv_dim != 10240 || geom1.qkv_dim != 10240)
+        throw std::runtime_error("P3 requires the default GDN ring geometry");
+    if (!ops::supports_default_grouped_linear_delta_fastpath(
+            geom0.q_heads, geom0.v_heads, geom0.head_k_dim,
+            geom0.head_v_dim, geom0.kernel, geom0.conv_rows) ||
+        !ops::supports_default_grouped_linear_delta_fastpath(
+            geom1.q_heads, geom1.v_heads, geom1.head_k_dim,
+            geom1.head_v_dim, geom1.kernel, geom1.conv_rows))
+        throw std::runtime_error(
+            "P3 requires the default grouped GDN fastpath");
+
+    std::array<LayerLane, 2> direct_lanes{};
+    std::array<LayerLane, 2> graph_lanes{};
+    for (int index = 0; index < 2; ++index) {
+        const auto& geom =
+            Qwen4ExpGenerationTestAccess::Layer(
+                b, options.layers[index])
+                .geom;
+        allocate_layer_lane(
+            ctx, direct_lanes[index], options.layers[index], geom,
+            intermediate, top_k);
+        allocate_layer_lane(
+            ctx, graph_lanes[index], options.layers[index], geom,
+            intermediate, top_k);
+        reset_layer_lane(ctx, direct_lanes[index]);
+        reset_layer_lane(ctx, graph_lanes[index]);
+    }
+    seed_hidden4(ctx, b, 0);
+    ctx.synchronize();
+
+    // Build one global descriptor table. A slot's descriptor must use the
+    // layer metadata that owns that slot, not the current probe layer.
+    std::vector<ops::MoeExpertSlotDev> resident_descriptors(
+        static_cast<size_t>(adaptive.NumGpuSlots()));
+    int valid_resident_slots = 0;
+    for (int slot = 0; slot < adaptive.NumGpuSlots(); ++slot) {
+        const auto entry = adaptive.GetResidentEntry(slot);
+        if (entry.layer < 0 || entry.expert_id < 0) continue;
+        const auto& meta =
+            Qwen4ExpGenerationTestAccess::NestedMeta(
+                b, entry.layer);
+        resident_descriptors[slot] =
+            adaptive.GetResidentSlotDev(slot, &meta);
+        ++valid_resident_slots;
+    }
+    auto* resident_descriptors_dev =
+        static_cast<ops::MoeExpertSlotDev*>(ctx.alloc_device(
+            resident_descriptors.size() *
+            sizeof(ops::MoeExpertSlotDev)));
+    q.memcpy(resident_descriptors_dev, resident_descriptors.data(),
+             resident_descriptors.size() *
+                 sizeof(ops::MoeExpertSlotDev))
+        .wait_and_throw();
+
+    PolledRing polled = allocate_polled_ring(ctx);
+    HostRing* ring = polled.ptr;
+    void* packet_storage = nullptr;
+    ze_host_mem_alloc_desc_t packet_desc{
+        ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr,
+        ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED};
+    if (zeMemAllocHost(
+            polled.ze_ctx, &packet_desc, sizeof(CpuPacketRing),
+            alignof(CpuPacketRing), &packet_storage) !=
+            ZE_RESULT_SUCCESS ||
+        !packet_storage)
+        throw std::runtime_error(
+            "two-layer uncached CPU packet allocation failed");
+    auto* cpu_packet = static_cast<CpuPacketRing*>(packet_storage);
+    std::memset(cpu_packet, 0, sizeof(CpuPacketRing));
+    DeviceEpoch* epoch =
+        static_cast<DeviceEpoch*>(ctx.alloc_device(sizeof(DeviceEpoch)));
+    float* device_result = static_cast<float*>(
+        ctx.alloc_device(sizeof(float) * kResultCount));
+    q.memset(epoch, 0, sizeof(DeviceEpoch)).wait_and_throw();
+    q.memset(device_result, 0, sizeof(float) * kResultCount)
+        .wait_and_throw();
+
+    std::cout << "[TWO LAYER GRAPH CONFIG] model="
+              << options.real_front_model
+              << " layers=" << options.layers[0] << ','
+              << options.layers[1] << " tokens=" << options.replays
+              << " top_k=" << top_k << " hidden=" << hidden
+              << " intermediate=" << intermediate
+              << " resident_slots=" << adaptive.NumGpuSlots()
+              << " valid_slots=" << valid_resident_slots
+              << " cpu_max_experts=" << executor.max_cpu_credits()
+              << " cpu_us="
+              << (options.cpu_sweep.empty() ? 0 : options.cpu_sweep.front())
+              << " spin_max=" << options.spin_max
+              << " host_timeout_ms=" << options.host_timeout_ms
+              << " conv_head=2"
+              << " allocation="
+              << (polled.ze_owned
+                      ? "zeMemAllocHost_uncached_bias"
+                      : "malloc_host_fallback")
+              << '\n';
+
+    // Warm BNB4 decode scratch and the CPU worker outside capture.
+    for (int index = 0; index < 2; ++index) {
+        (void)run_direct_layer(
+            ctx, b, direct_lanes[index], cpu_packet,
+            resident_descriptors_dev,
+            adaptive.DeviceSlotTable() +
+                direct_lanes[index].layer * experts,
+            top_k, intermediate, experts);
+    }
+    for (int index = 0; index < 2; ++index)
+        reset_layer_lane(ctx, direct_lanes[index]);
+    seed_hidden4(ctx, b, 0);
+    ctx.synchronize();
+
+    const size_t token_count = options.replays;
+    std::vector<std::array<HostLayerSnapshot, 2>> direct_snapshots(
+        token_count);
+    for (size_t token = 0; token < token_count; ++token) {
+        for (int index = 0; index < 2; ++index) {
+            direct_snapshots[token][index] = run_direct_layer(
+                ctx, b, direct_lanes[index], cpu_packet,
+                resident_descriptors_dev,
+                adaptive.DeviceSlotTable() +
+                    direct_lanes[index].layer * experts,
+                top_k, intermediate, experts);
+        }
+    }
+
+    // Graph clone remains at the exact seeded state. Capture only after the
+    // direct reference has warmed every path.
+    for (int index = 0; index < 2; ++index)
+        reset_layer_lane(ctx, graph_lanes[index]);
+    seed_hidden4(ctx, b, 0);
+    ctx.synchronize();
+
+    auto executable = [&]() {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            q.get_context(), q.get_device());
+        recording.begin_recording(q);
+        try {
+            for (int index = 0; index < 2; ++index) {
+                submit_graph_layer(
+                    ctx, b, graph_lanes[index], ring, epoch,
+                    cpu_packet, resident_descriptors_dev,
+                    adaptive.DeviceSlotTable() +
+                        graph_lanes[index].layer * experts,
+                    top_k, intermediate, experts, options.spin_max,
+                    index == 0);
+            }
+            submit_copy_from_mapped(
+                q, ring, epoch, device_result);
+            submit_bitwise_verify(
+                q, ring, epoch, device_result);
+            recording.end_recording(q);
+        } catch (...) {
+            recording.end_recording(q);
+            throw;
+        }
+        return recording.finalize();
+    }();
+    std::cout << "[TWO LAYER GRAPH] capture=ok layers="
+              << options.layers[0] << ',' << options.layers[1]
+              << " waits=2\n";
+
+    seed_hidden4(ctx, b, 0);
+    ctx.synchronize();
+    uint32_t expected_first_seq = 1;
+    LayerParity layer4_parity;
+    LayerParity layer5_parity;
+    bool head_sequence_ok = true;
+    uint64_t graph_cpu_rows = 0;
+    uint64_t direct_cpu_rows = 0;
+    uint32_t service_faults = 0;
+    std::ostringstream head_path;
+    head_path << "2";
+
+    std::vector<std::array<HostLayerSnapshot, 2>> graph_snapshots(
+        token_count);
+    for (size_t token = 0; token < token_count; ++token) {
+        const TwoLayerServiceResult service =
+            service_two_layer_replay(
+                ctx, executable, ring, expected_first_seq,
+                options.cpu_sweep.empty() ? 0 : options.cpu_sweep.front(),
+                options.host_timeout_ms, options.layers, cpu_packet,
+                top_k, executor, arena, adaptive);
+        graph_cpu_rows +=
+            static_cast<uint64_t>(service.cpu_rows[0]) +
+            static_cast<uint64_t>(service.cpu_rows[1]);
+        service_faults += service.timeout_delta;
+        service_faults += service.stale_delta;
+        service_faults += service.mismatch_delta;
+        service_faults += service.gate_abort_delta;
+        service_faults += service.host_route_error_delta;
+        service_faults += service.packet_shape_error_delta;
+        for (int index = 0; index < 2; ++index) {
+            graph_snapshots[token][index] =
+                snapshot_layer(ctx, graph_lanes[index],
+                               service.cpu_rows[index]);
+        }
+        compare_layer_snapshots(
+            static_cast<int>(token), options.layers[0],
+            direct_snapshots[token][0], graph_snapshots[token][0],
+            layer4_parity);
+        compare_layer_snapshots(
+            static_cast<int>(token), options.layers[1],
+            direct_snapshots[token][1], graph_snapshots[token][1],
+            layer5_parity);
+
+        int actual_head = -1;
+        for (int index = 0; index < 2; ++index) {
+            const auto& direct = direct_snapshots[token][index].conv_head;
+            const auto& graph = graph_snapshots[token][index].conv_head;
+            if (direct.size() < 3 * sizeof(int) ||
+                graph.size() < 3 * sizeof(int)) {
+                head_sequence_ok = false;
+                continue;
+            }
+            int direct_head[3]{};
+            int graph_head[3]{};
+            std::memcpy(direct_head, direct.data(),
+                        sizeof(direct_head));
+            std::memcpy(graph_head, graph.data(),
+                        sizeof(graph_head));
+            const int expected =
+                (2 + static_cast<int>(token) + 1) % 3;
+            if (direct_head[0] != expected ||
+                graph_head[0] != expected ||
+                direct_head[1] != (expected + 2) % 3 ||
+                graph_head[1] != (expected + 2) % 3 ||
+                direct_head[2] != 0 || graph_head[2] != 0)
+                head_sequence_ok = false;
+            if (index == 0) actual_head = direct_head[0];
+        }
+        if (actual_head >= 0)
+            head_path << "->" << actual_head;
+        direct_cpu_rows +=
+            static_cast<uint64_t>(direct_snapshots[token][0].cpu_rows) +
+            static_cast<uint64_t>(direct_snapshots[token][1].cpu_rows);
+        std::cout << "[TWO LAYER TOKEN] token=" << token
+                  << " l4_cpu_rows=" << service.cpu_rows[0]
+                  << " l5_cpu_rows=" << service.cpu_rows[1]
+                  << " l4_handoff_us="
+                  << service.route_to_flag_us[0]
+                  << " l5_handoff_us="
+                  << service.route_to_flag_us[1]
+                  << " replay_us=" << service.replay_wall_us << '\n';
+        expected_first_seq += 2u;
+    }
+
+    const bool all_parity =
+        layer4_parity.hidden && layer5_parity.hidden &&
+        layer4_parity.state && layer5_parity.state &&
+        layer4_parity.history && layer5_parity.history &&
+        layer4_parity.routes && layer5_parity.routes &&
+        layer4_parity.selected && layer5_parity.selected &&
+        layer4_parity.moe_h && layer5_parity.moe_h &&
+        layer4_parity.resident_down && layer5_parity.resident_down &&
+        layer4_parity.packet && layer5_parity.packet &&
+        layer4_parity.routed_y && layer5_parity.routed_y &&
+        layer4_parity.shared && layer5_parity.shared &&
+        layer4_parity.y_shared && layer5_parity.y_shared &&
+        layer4_parity.cpu_rows && layer5_parity.cpu_rows;
+    const bool service_ok =
+        service_faults == 0 && graph_cpu_rows > 0 &&
+        direct_cpu_rows > 0;
+    const bool ring_ok =
+        *volatile_u32(&ring->ctrl.timeout_count) == 0 &&
+        *volatile_u32(&ring->ctrl.stale_count) == 0 &&
+        *volatile_u32(&ring->ctrl.mismatch_count) == 0 &&
+        *volatile_u32(&ring->ctrl.channel_mismatch_count) == 0 &&
+        *volatile_u32(&ring->ctrl.packet_seq_mismatch_count) == 0 &&
+        *volatile_u32(&ring->ctrl.packet_shape_error_count) == 0 &&
+        *volatile_u32(&ring->ctrl.gate_abort_count) == 0 &&
+        *volatile_u32(&ring->ctrl.host_route_error_count) == 0;
+    const bool all_ok =
+        all_parity && head_sequence_ok && service_ok && ring_ok;
+
+    std::cout << "[TWO LAYER GRAPH PARITY]"
+              << " hidden_l4=" << (layer4_parity.hidden ? 1 : 0)
+              << " hidden_l5=" << (layer5_parity.hidden ? 1 : 0)
+              << " state="
+              << (layer4_parity.state && layer5_parity.state ? 1 : 0)
+              << " history="
+              << (layer4_parity.history && layer5_parity.history ? 1 : 0)
+              << " heads="
+              << (layer4_parity.conv_head &&
+                          layer5_parity.conv_head && head_sequence_ok
+                      ? 1
+                      : 0)
+              << " routes="
+              << (layer4_parity.routes && layer5_parity.routes ? 1 : 0)
+              << " selected="
+              << (layer4_parity.selected && layer5_parity.selected
+                      ? 1
+                      : 0)
+              << " moe_h="
+              << (layer4_parity.moe_h && layer5_parity.moe_h ? 1 : 0)
+              << " resident_down="
+              << (layer4_parity.resident_down &&
+                          layer5_parity.resident_down
+                      ? 1
+                      : 0)
+              << " packet="
+              << (layer4_parity.packet && layer5_parity.packet ? 1 : 0)
+              << " routed_merge="
+              << (layer4_parity.routed_y && layer5_parity.routed_y
+                      ? 1
+                      : 0)
+              << " shared="
+              << (layer4_parity.shared && layer5_parity.shared ? 1 : 0)
+              << " y_shared="
+              << (layer4_parity.y_shared && layer5_parity.y_shared
+                      ? 1
+                      : 0)
+              << " cpu_rows="
+              << (layer4_parity.cpu_rows && layer5_parity.cpu_rows
+                      ? 1
+                      : 0)
+              << '\n';
+    std::cout << "[TWO LAYER GRAPH STATUS] timeouts="
+              << *volatile_u32(&ring->ctrl.timeout_count)
+              << " stale=" << *volatile_u32(&ring->ctrl.stale_count)
+              << " mismatches="
+              << *volatile_u32(&ring->ctrl.mismatch_count)
+              << " channel_mismatches="
+              << *volatile_u32(&ring->ctrl.channel_mismatch_count)
+              << " packet_seq_mismatches="
+              << *volatile_u32(
+                     &ring->ctrl.packet_seq_mismatch_count)
+              << " packet_shape_errors="
+              << *volatile_u32(&ring->ctrl.packet_shape_error_count)
+              << " gate_aborts="
+              << *volatile_u32(&ring->ctrl.gate_abort_count)
+              << " host_route_errors="
+              << *volatile_u32(&ring->ctrl.host_route_error_count)
+              << " graph_cpu_rows=" << graph_cpu_rows
+              << " direct_cpu_rows=" << direct_cpu_rows
+              << " heads=" << head_path.str() << '\n';
+    std::cout << "[TWO LAYER GRAPH] verdict all_ok="
+              << (all_ok ? 1 : 0)
+              << " bit_exact=" << (all_parity ? 1 : 0)
+              << " head_sequence=" << (head_sequence_ok ? 1 : 0)
+              << " service_ok=" << (service_ok ? 1 : 0)
+              << " ring_ok=" << (ring_ok ? 1 : 0) << '\n';
+
+    ctx.synchronize();
+    ctx.free_device(device_result);
+    ctx.free_device(epoch);
+    ctx.free_device(resident_descriptors_dev);
+    zeMemFree(polled.ze_ctx, packet_storage);
+    free_polled_ring(ctx, polled);
+    return all_ok ? 0 : 1;
 }
 
 int run_real_front_model(const Options& options) {
@@ -1031,7 +2400,10 @@ int run_real_front_model(const Options& options) {
             cold_ranks[cold_count] = rank;
             ++cold_count;
         }
-        if (!cold_count) return 0;
+        if (!cold_count) {
+            std::fill_n(cpu_packet->rank_to_row, kMaxPacketRows, -1);
+            return 0;
+        }
         return graph_executor.RunGraphColdPacket(
             graph_arena, 0, cold_ids.data(), cold_ranks.data(),
             cold_count, cpu_packet->x, cpu_packet->rank_to_row,
@@ -1066,15 +2438,17 @@ int run_real_front_model(const Options& options) {
                 Qwen4ExpGenerationTestAccess::ResidentDown(b)
                     .data_as<float>(),
                 top_k, hidden, intermediate, true, true);
-            submit_device_wait(q, ring, epoch, options.spin_max);
-            submit_copy_cpu_packet(q, cpu_packet, graph_packet_dev);
-            ops::moe_ordered_accumulate_down_rows(
-                ctx,
+            submit_device_wait(
+                q, ring, epoch, cpu_packet, top_k, options.spin_max);
+            submit_copy_cpu_packet(
+                q, cpu_packet, epoch, graph_packet_dev, top_k);
+            submit_gated_ordered_merge(
+                q,
                 Qwen4ExpGenerationTestAccess::ResidentDown(b)
                     .data_as<float>(),
-                graph_route_weights, merge_y, 1, top_k, hidden,
-                nullptr, nullptr, nullptr, graph_packet_dev);
-            submit_copy_from_mapped(q, ring, device_result);
+                graph_route_weights, merge_y, hidden, top_k,
+                graph_packet_dev, epoch);
+            submit_copy_from_mapped(q, ring, epoch, device_result);
             submit_bitwise_verify(q, ring, epoch, device_result);
             recording.end_recording(q);
         } catch (...) {
@@ -1203,13 +2577,34 @@ int run_real_front_model(const Options& options) {
                 nullptr, 0, real_cpu_fill);
             stats.stale_detected =
                 stale.timeout_delta == 0 && stale.stale_delta >= 1 &&
-                stale.mismatch_delta >= 1;
+                stale.mismatch_delta >= 1 &&
+                stale.gate_abort_delta >= 1;
             print_arm(stats);
             all_ok &= stats.fresh_ok && stats.stale_detected &&
                       stats.measured >= 1000;
         }
         ctx.synchronize();
     }
+
+    std::cout << "[REAL FRONT GRAPH STATUS] timeouts="
+              << *volatile_u32(&ring->ctrl.timeout_count)
+              << " stale="
+              << *volatile_u32(&ring->ctrl.stale_count)
+              << " mismatches="
+              << *volatile_u32(&ring->ctrl.mismatch_count)
+              << " channel_mismatches="
+              << *volatile_u32(&ring->ctrl.channel_mismatch_count)
+              << " packet_seq_mismatches="
+              << *volatile_u32(&ring->ctrl.packet_seq_mismatch_count)
+              << " packet_shape_errors="
+              << *volatile_u32(&ring->ctrl.packet_shape_error_count)
+              << " gate_aborts="
+              << *volatile_u32(&ring->ctrl.gate_abort_count)
+              << " host_route_errors="
+              << *volatile_u32(&ring->ctrl.host_route_error_count)
+              << '\n';
+    std::cout << "[REAL FRONT GRAPH] verdict all_ok=" << (all_ok ? 1 : 0)
+              << '\n';
 
     ctx.free_device(merge_y_reference);
     ctx.free_device(merge_y);
@@ -1226,8 +2621,6 @@ int run_real_front_model(const Options& options) {
     ctx.free_device(epoch);
     zeMemFree(polled.ze_ctx, cpu_packet);
     free_polled_ring(ctx, polled);
-    std::cout << "[REAL FRONT GRAPH] verdict all_ok=" << (all_ok ? 1 : 0)
-              << '\n';
     return all_ok ? 0 : 1;
 }
 
@@ -1236,6 +2629,8 @@ int run_real_front_model(const Options& options) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        if (options.two_layer)
+            return run_two_layer_model(options);
         if (!options.real_front_model.empty())
             return run_real_front_model(options);
         Context ctx;
@@ -1297,9 +2692,10 @@ int main(int argc, char** argv) {
                     ? "zeMemAllocHost_uncached_bias"
                     : "aila_context_alloc_host_fallback")
             << " ring_bytes=" << sizeof(HostRing)
-            << " device_access=uncached_l1_l3"
+              << " device_access=uncached_l1_l3"
                " copy=copy_from_mapped_kernel"
                " bounded_device_spin=1"
+               " fail_closed_gate=valid_abort"
                " release=event_status_then_queue_empty_fallback\n";
 
         ctx.synchronize();
@@ -1311,8 +2707,9 @@ int main(int argc, char** argv) {
             recording.begin_recording(q);
             try {
                 submit_route_publish(q, ring, epoch);
-                submit_device_wait(q, ring, epoch, options.spin_max);
-                submit_copy_from_mapped(q, ring, device_result);
+                submit_device_wait(
+                    q, ring, epoch, nullptr, kTopK, options.spin_max);
+                submit_copy_from_mapped(q, ring, epoch, device_result);
                 submit_bitwise_verify(q, ring, epoch, device_result);
                 recording.end_recording(q);
             } catch (...) {
@@ -1371,7 +2768,8 @@ int main(int argc, char** argv) {
                     options.host_timeout_ms, true);
                 stats.stale_detected =
                     stale.timeout_delta == 0 && stale.stale_delta >= 1 &&
-                    stale.mismatch_delta >= 1;
+                    stale.mismatch_delta >= 1 &&
+                    stale.gate_abort_delta >= 1;
 
                 print_arm(stats);
                 if (!stats.fresh_ok || !stats.stale_detected ||
@@ -1386,6 +2784,15 @@ int main(int argc, char** argv) {
                       << *volatile_u32(&ring->ctrl.stale_count)
                       << " mismatches="
                       << *volatile_u32(&ring->ctrl.mismatch_count)
+                      << " channel_mismatches="
+                      << *volatile_u32(&ring->ctrl.channel_mismatch_count)
+                      << " packet_seq_mismatches="
+                      << *volatile_u32(
+                             &ring->ctrl.packet_seq_mismatch_count)
+                      << " packet_shape_errors="
+                      << *volatile_u32(&ring->ctrl.packet_shape_error_count)
+                      << " gate_aborts="
+                      << *volatile_u32(&ring->ctrl.gate_abort_count)
                       << " host_route_errors="
                       << *volatile_u32(&ring->ctrl.host_route_error_count)
                       << '\n';

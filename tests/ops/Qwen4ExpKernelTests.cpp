@@ -2172,6 +2172,139 @@ void test_gated_delta_net_sigmoid(Context& ctx) {
     check_close(out_gpu, std::vector<float>(out_ref.begin(), out_ref.end()), "GDN single-write out parity (decode)", 2e-2f);
 }
 
+void test_gdn_device_conv_head(Context& ctx) {
+    constexpr int q_heads = 16;
+    constexpr int v_heads = 48;
+    constexpr int head_dim = 128;
+    constexpr int kernel = 4;
+    constexpr int steps = 5;
+    constexpr int initial_head = 2;
+    auto geom = ops::DeltaNetGeometry::create(
+        q_heads, v_heads, head_dim, head_dim, kernel, 1e-6f,
+        ops::GateActivation::Sigmoid);
+    const int conv_rows = geom.conv_rows;
+    const int final_head = (initial_head + steps) % conv_rows;
+    const int last_written_head = (initial_head + steps - 1) % conv_rows;
+
+    std::mt19937 rng(8042);
+    std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+    auto make_bf16 = [&](size_t count) {
+        std::vector<bf16> values(count);
+        for (auto& value : values) value = bf16(dist(rng));
+        return values;
+    };
+    auto make_f32 = [&](size_t count) {
+        std::vector<float> values(count);
+        for (auto& value : values) value = dist(rng);
+        return values;
+    };
+
+    auto conv_w = make_bf16(static_cast<size_t>(geom.qkv_dim) * kernel);
+    auto dt_bias = make_bf16(v_heads);
+    auto fused = make_bf16(static_cast<size_t>(steps) * geom.all_dim);
+    auto initial_state = make_f32(static_cast<size_t>(v_heads) * head_dim * head_dim);
+    auto initial_history = make_f32(static_cast<size_t>(conv_rows) * geom.qkv_dim);
+    std::vector<float> norm_w(head_dim, 1.0f);
+    std::vector<float> a_log(v_heads, -1.0f);
+
+    Tensor conv_w_dev = Tensor::allocate(ctx, {geom.qkv_dim, kernel}, dnnl::memory::data_type::bf16);
+    Tensor norm_w_dev = Tensor::allocate(ctx, {head_dim}, dnnl::memory::data_type::f32);
+    Tensor a_log_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::f32);
+    Tensor dt_bias_dev = Tensor::allocate(ctx, {v_heads}, dnnl::memory::data_type::bf16);
+    Tensor fused_dev = Tensor::allocate(
+        ctx, {steps, geom.all_dim}, dnnl::memory::data_type::bf16);
+    Tensor host_state_dev = Tensor::allocate(
+        ctx, {v_heads, head_dim, head_dim}, dnnl::memory::data_type::f32);
+    Tensor host_history_dev = Tensor::allocate(
+        ctx, {conv_rows, geom.qkv_dim}, dnnl::memory::data_type::f32);
+    Tensor device_state_dev = Tensor::allocate(
+        ctx, {v_heads, head_dim, head_dim}, dnnl::memory::data_type::f32);
+    Tensor device_history_dev = Tensor::allocate(
+        ctx, {conv_rows, geom.qkv_dim}, dnnl::memory::data_type::f32);
+    Tensor host_out_dev = Tensor::allocate(
+        ctx, {steps, geom.kv_dim}, dnnl::memory::data_type::bf16);
+    Tensor device_out_dev = Tensor::allocate(
+        ctx, {steps, geom.kv_dim}, dnnl::memory::data_type::bf16);
+    Tensor conv_head_dev = Tensor::allocate(
+        ctx, {ops::delta_net_conv_head_device_slots}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(conv_w_dev.data(), conv_w.data(), conv_w.size() * sizeof(bf16));
+    ctx.memcpy_h2d(norm_w_dev.data(), norm_w.data(), norm_w.size() * sizeof(float));
+    ctx.memcpy_h2d(a_log_dev.data(), a_log.data(), a_log.size() * sizeof(float));
+    ctx.memcpy_h2d(dt_bias_dev.data(), dt_bias.data(), dt_bias.size() * sizeof(bf16));
+    ctx.memcpy_h2d(fused_dev.data(), fused.data(), fused.size() * sizeof(bf16));
+    ctx.memcpy_h2d(host_state_dev.data(), initial_state.data(), initial_state.size() * sizeof(float));
+    ctx.memcpy_h2d(host_history_dev.data(), initial_history.data(), initial_history.size() * sizeof(float));
+    ctx.memcpy_h2d(device_state_dev.data(), initial_state.data(), initial_state.size() * sizeof(float));
+    ctx.memcpy_h2d(device_history_dev.data(), initial_history.data(), initial_history.size() * sizeof(float));
+
+    ops::DeltaNetWeights weights{
+        conv_w_dev.data_as<bf16>(),
+        norm_w_dev.data_as<float>(),
+        a_log_dev.data_as<float>(),
+        dt_bias_dev.data_as<bf16>()};
+    auto run = [&](ops::DeltaNetState& state, Tensor& out) {
+        for (int step = 0; step < steps; ++step) {
+            const bf16* row = fused_dev.data_as<bf16>() + size_t(step) * geom.all_dim;
+            ops::run_linear_delta_decode_gpu(
+                ctx, geom, weights, state, row, row + geom.qkv_dim,
+                row + geom.qkv_dim + geom.z_dim,
+                row + geom.qkv_dim + geom.z_dim + geom.v_heads,
+                out.data_as<bf16>() + size_t(step) * geom.kv_dim);
+        }
+    };
+
+    ops::DeltaNetState host_meta{
+        host_state_dev.data_as<float>(), host_history_dev.data_as<float>(),
+        initial_head, false};
+    run(host_meta, host_out_dev);
+
+    int slots_host[3] = {initial_head, initial_head, 0};
+    ctx.memcpy_h2d(conv_head_dev.data(), slots_host, sizeof(slots_host));
+    ops::DeltaNetState device_meta{
+        device_state_dev.data_as<float>(), device_history_dev.data_as<float>(),
+        initial_head, false};
+    device_meta.conv_head_dev = conv_head_dev.data_as<int>();
+    run(device_meta, device_out_dev);
+    ctx.synchronize();
+
+    std::vector<bf16> host_out(static_cast<size_t>(steps) * geom.kv_dim);
+    std::vector<bf16> device_out(host_out.size());
+    std::vector<float> host_state_after(initial_state.size());
+    std::vector<float> device_state_after(initial_state.size());
+    std::vector<float> host_history(initial_history.size());
+    std::vector<float> device_history(initial_history.size());
+    ctx.memcpy_d2h(host_out.data(), host_out_dev.data(), host_out.size() * sizeof(bf16));
+    ctx.memcpy_d2h(device_out.data(), device_out_dev.data(), device_out.size() * sizeof(bf16));
+    ctx.memcpy_d2h(host_state_after.data(), host_state_dev.data(), host_state_after.size() * sizeof(float));
+    ctx.memcpy_d2h(device_state_after.data(), device_state_dev.data(), device_state_after.size() * sizeof(float));
+    ctx.memcpy_d2h(host_history.data(), host_history_dev.data(), host_history.size() * sizeof(float));
+    ctx.memcpy_d2h(device_history.data(), device_history_dev.data(), device_history.size() * sizeof(float));
+    ctx.memcpy_d2h(slots_host, conv_head_dev.data(), sizeof(slots_host));
+
+    if (std::memcmp(host_out.data(), device_out.data(), host_out.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(host_state_after.data(), device_state_after.data(), host_state_after.size() * sizeof(float)) != 0 ||
+        std::memcmp(host_history.data(), device_history.data(), host_history.size() * sizeof(float)) != 0) {
+        throw std::runtime_error("GDN device conv head changed output or recurrent state");
+    }
+    if (slots_host[0] != final_head || slots_host[1] != last_written_head ||
+        slots_host[2] != 0) {
+        throw std::runtime_error(
+            "GDN device conv slots mismatch: head=" + std::to_string(slots_host[0]) +
+            " previous=" + std::to_string(slots_host[1]) +
+            " arrivals=" + std::to_string(slots_host[2]));
+    }
+    if (host_meta.conv_head != final_head || device_meta.conv_head != initial_head) {
+        throw std::runtime_error("GDN host/device conv head mirrors diverged unexpectedly");
+    }
+    if (!host_meta.device_state_dirty || !device_meta.device_state_dirty) {
+        throw std::runtime_error("GDN device conv head did not mark state dirty");
+    }
+    std::cout << "[PASS] GDN device conv head graph-safe advance (steps=" << steps
+              << ", final=" << slots_host[0] << ", prior=" << slots_host[1]
+              << ", bitwise state/history/output)\n";
+}
+
 static void run_attention_decode_gate_fusion_case(
     Context& ctx, int num_heads, int num_kv_heads, int head_dim,
     int cached_len, int max_seq_len, bool with_partials) {
@@ -5636,6 +5769,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--gdn-order-only") {
             test_gated_delta_net_sigmoid(ctx);
+            test_gdn_device_conv_head(ctx);
             test_gdn_decode_order(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
@@ -5792,6 +5926,7 @@ int main(int argc, char** argv) {
         test_non_moe_prefill_dense_xmx_evaluation(ctx);
         test_direct_prefill_io(ctx);
         test_gated_delta_net_sigmoid(ctx);
+        test_gdn_device_conv_head(ctx);
         test_attention_decode_gate_fusion(ctx);
         test_attention_prefill_gate_fusion(ctx);
         test_attention_prefill_cached_gate_fusion(ctx);

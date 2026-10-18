@@ -61,11 +61,22 @@ struct DeltaNetWeights {
     const bf16* dt_bias = nullptr;      // [v_heads]
 };
 
+inline constexpr int delta_net_conv_head_device_slots = 3;
+inline constexpr int delta_net_conv_head_device_head_slot = 0;
+inline constexpr int delta_net_conv_head_device_previous_slot = 1;
+inline constexpr int delta_net_conv_head_device_arrivals_slot = 2;
+
 struct DeltaNetState {
     float* state = nullptr;             // [v_heads, head_k_dim, head_v_dim]
     float* conv_state = nullptr;        // [conv_rows, qkv_dim]
     int conv_head = 0;
     bool device_state_dirty = false;
+    // Optional decode-only, device-resident ring metadata. The caller owns
+    // three int32 slots: [head, previous_head, arrival_count]. Initialize
+    // head/previous_head before capture and keep arrival_count zero. Replays
+    // read and advance this state without synchronizing with the host; the
+    // host conv_head mirror remains unchanged and deferred history is invalid.
+    int* conv_head_dev = nullptr;
 };
 
 bool supports_linear_delta_gqa_fastpath(int q_heads, int kv_heads,

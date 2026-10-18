@@ -203,3 +203,26 @@ timeouts=0
 
 The real route is all-cold for this fixture; mixed resident/CPU coverage is
 retained by the earlier forced mask receipt.
+
+## P3 two complete GDN layers
+
+`--two-layer --layers 4,5` captures L4 and L5 in one executable. Both layers
+use the real router, resident/CPU classification, `RunGraphColdPacket`, shared
+expert, routed merge and final hidden residual bridge.
+
+Receipt `gpu-two-layer-p3.log`:
+
+```text
+tokens=4
+heads=2->0->1->2->0
+graph_cpu_rows=68 direct_cpu_rows=68
+hidden_l4=1 hidden_l5=1 state=1 history=1 routes=1
+selected=1 moe_h=1 resident_down=1 packet=1
+routed_merge=1 shared=1 y_shared=1
+timeouts=0 stale=0 gate_aborts=0
+verdict all_ok=1 bit_exact=1
+```
+
+Run with `AILA_Q4E_COLD_MODE=2` and
+`AILA_Q4E_CPU_MAX_EXPERTS=16`. This is a correctness gate, not a performance
+comparison.
