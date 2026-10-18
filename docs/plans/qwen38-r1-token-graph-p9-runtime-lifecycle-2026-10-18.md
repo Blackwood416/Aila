@@ -46,6 +46,9 @@ token-graph-key-only      PASS  0.5 s
 gdn-graph-state-only      PASS  0.4 s
 ```
 
+The post-build runtime check passed again at `75c239e` in 0.7 s after the
+full 291-target runtime/Worker build.
+
 The runtime test covers:
 
 - default direct path remains `Empty` and performs no graph allocation;
@@ -59,6 +62,7 @@ The runtime test covers:
 Receipts:
 
 - `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-runtime-p9.log`
+- `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-runtime-p9-final.log`
 - `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-key-p9.log`
 - `tmp/q4e-token-graph-probe-20261017/gpu-gdn-graph-state-p9.log`
 
