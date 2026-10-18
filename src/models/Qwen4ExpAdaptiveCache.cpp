@@ -33,6 +33,8 @@ Qwen4ExpAdaptiveCache::Qwen4ExpAdaptiveCache(Qwen4ExpAdaptiveCache&& other) noex
       slot_table_(std::move(other.slot_table_)),
       slot_table_dev_(other.slot_table_dev_),
       slot_to_expert_(std::move(other.slot_to_expert_)),
+      residency_generation_(other.residency_generation_),
+      descriptor_generation_(other.descriptor_generation_),
       usage_(std::move(other.usage_)),
       access_count_(std::move(other.access_count_)),
       stats_(other.stats_)
@@ -81,6 +83,10 @@ Qwen4ExpAdaptiveCache& Qwen4ExpAdaptiveCache::operator=(Qwen4ExpAdaptiveCache&& 
         slot_table_ = std::move(other.slot_table_);
         slot_table_dev_ = other.slot_table_dev_;
         slot_to_expert_ = std::move(other.slot_to_expert_);
+        residency_generation_ = std::max(
+            residency_generation_, other.residency_generation_ + 1);
+        descriptor_generation_ = std::max(
+            descriptor_generation_, other.descriptor_generation_ + 1);
         usage_ = std::move(other.usage_);
         access_count_ = std::move(other.access_count_);
         stats_ = other.stats_;
@@ -181,6 +187,7 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     // Initialize device slot table to kAdaptiveNotResident
     ctx_->queue().fill(slot_table_dev_, kAdaptiveNotResident, total_experts_).wait_and_throw();
 
+    BumpResidentMappingGenerations();
     return true;
 }
 
@@ -263,10 +270,12 @@ bool Qwen4ExpAdaptiveCache::Allocate(
     // Initialize device slot table to kAdaptiveNotResident
     standalone_queue_->fill(slot_table_dev_, kAdaptiveNotResident, total_experts_).wait_and_throw();
 
+    BumpResidentMappingGenerations();
     return true;
 }
 
 void Qwen4ExpAdaptiveCache::Release() noexcept {
+    BumpResidentMappingGenerations();
     // Copy queue is independent of the compute queue. Drain both before any
     // USM or native source can be released, including partial startup failures.
     for (int i=0;i<AdaptiveCacheConfig::kMaxStagingBanks;++i) {
@@ -354,6 +363,8 @@ ops::MoeExpertSlotDev Qwen4ExpAdaptiveCache::GetStagingSlotDev(
 std::vector<uint8_t*> Qwen4ExpAdaptiveCache::InitializeResidency(
     const std::vector<std::pair<int,int>>* profile) {
     if (!IsAllocated()) throw std::logic_error("Adaptive cache is not allocated");
+    // Invalidate even if validation below rejects a partially edited profile.
+    BumpResidentMappingGenerations();
     std::fill(slot_table_.begin(),slot_table_.end(),kAdaptiveNotResident);
     std::fill(slot_to_expert_.begin(),slot_to_expert_.end(),ResidentSlotEntry{});
     std::vector<uint8_t*> owners(total_experts_,nullptr);
@@ -401,6 +412,7 @@ bool Qwen4ExpAdaptiveCache::Warmup(const Qwen4ExpHostArena& arena, sycl::queue& 
 
 sycl::event Qwen4ExpAdaptiveCache::SyncSlotTableToDevice(sycl::queue& q) {
     if (!slot_table_dev_ || slot_table_.empty()) return sycl::event{};
+    BumpDescriptorGeneration();
     return q.memcpy(slot_table_dev_, slot_table_.data(), slot_table_.size() * sizeof(int32_t));
 }
 
@@ -574,6 +586,8 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
     if (resident_read_) {
         q.submit([&](sycl::handler& cgh) { cgh.depends_on(resident_reader_); cgh.single_task([] {}); });
     }
+    // A later plan may fail validation after earlier slots have changed.
+    BumpResidentMappingGenerations();
     for (const auto& p:plans) {
         if (GetSlot(p.layer,p.victim_expert)!=p.victim_slot || GetSlot(p.layer,p.candidate_expert)>=0)
             throw std::logic_error("Stale adaptive swap plan");
@@ -652,6 +666,7 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         staging_experts_[pp][i]=batch.expert_ids[i]=experts[i];
         batch.staging_slots[i]=i;
     }
+    BumpDescriptorGeneration();
     stats_.staging_fill_ns += work_time_ns() - fill_begin;
     // The CPU can prepare the next host bank while the GPU still consumes the
     // device bank. Only the device write depends on its prior consumer.

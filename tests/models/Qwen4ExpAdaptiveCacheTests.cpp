@@ -146,20 +146,36 @@ int main(int argc,char** argv) {
         cfg.num_gpu_slots=2; cfg.staging_slots_per_buffer=2;
         aila::Qwen4ExpAdaptiveCache cache;
         std::string error; require(cache.Allocate(ctx,cfg,&error),error.c_str());
+        const auto allocated_residency=cache.ResidencyGeneration();
+        const auto allocated_descriptor=cache.DescriptorGeneration();
+        require(allocated_residency>0 && allocated_descriptor>0,
+                "allocation must publish cache generations");
         const std::vector<std::pair<int,int>> initial={{0,3},{0,1}};
         const std::vector<std::pair<int,int>> duplicate={{0,3},{0,3}};
         bool duplicate_rejected=false;
         try { (void)cache.InitializeResidency(&duplicate); }
         catch (const std::invalid_argument&) { duplicate_rejected=true; }
         require(duplicate_rejected,"duplicate initial resident expert must be rejected");
+        require(cache.ResidencyGeneration()>allocated_residency &&
+                cache.DescriptorGeneration()>allocated_descriptor,
+                "failed residency edit must invalidate graph-facing generations");
         auto owners=cache.InitializeResidency(&initial);
+        const auto initialized_residency=cache.ResidencyGeneration();
+        const auto initialized_descriptor=cache.DescriptorGeneration();
+        require(initialized_residency>allocated_residency &&
+                initialized_descriptor>allocated_descriptor,
+                "successful residency init must advance generations");
         require(cache.GetResidentEntry(0).layer==0 && cache.GetResidentEntry(0).expert_id==3 &&
                 cache.GetResidentEntry(1).layer==0 && cache.GetResidentEntry(1).expert_id==1,
                 "ranked initial prefix must preserve slot order");
         aila::HostArenaConfig hc; hc.num_layers=1; hc.num_experts_per_layer=E;
         aila::Qwen4ExpHostArena arena;
         require(arena.Allocate(ctx,hc,&error,owners),error.c_str());
-        arena.LoadLayerDirect(0,gu.Ref(),dn.Ref()); cache.FinishInitialLoad(ctx.queue());
+        arena.LoadLayerDirect(0,gu.Ref(),dn.Ref());
+        const auto before_publish=cache.DescriptorGeneration();
+        cache.FinishInitialLoad(ctx.queue());
+        require(cache.DescriptorGeneration()>before_publish,
+                "device slot-table publication must advance descriptor generation");
         require(arena.ResidentExperts()==2 && !arena.GetExpertPointer(0,3) && !arena.GetExpertPointer(0,1) &&
                 arena.GetExpertPointer(0,0) && arena.GetExpertPointer(0,2),"GPU/RAM complement follows ranked prefix");
         const auto& g=arena.Geometry();
@@ -221,7 +237,12 @@ int main(int argc,char** argv) {
         cpu.init(ctx,retired_cache,1,E,H,I);
         for (int round=0;round<2;++round) {
             const int cold[2]={round ? 3:2,round ? 2:3};
+            const auto before_stage_residency=cache.ResidencyGeneration();
+            const auto before_stage_descriptor=cache.DescriptorGeneration();
             auto staged=cache.StageColdExpertsAsync(arena,copy,0,cold,2,0,&cpu);
+            require(cache.ResidencyGeneration()==before_stage_residency &&
+                    cache.DescriptorGeneration()>before_stage_descriptor,
+                    "staging changes descriptors but not resident mapping");
             std::array<ops::MoeExpertSlotDev,E> slots{};
             slots[0]=cache.GetResidentSlotDev(cache.GetSlot(0,0),&meta);
             slots[1]=cache.GetResidentSlotDev(cache.GetSlot(0,1),&meta);
@@ -268,7 +289,12 @@ int main(int argc,char** argv) {
         check_cpu(2);
         const auto host_bytes=ctx.current_pinned_host_bytes(),device_bytes=ctx.current_allocated_bytes();
         for (const auto& plan:std::array<aila::AdaptiveSwapPlan,2>{{{0,2,0,0,5},{0,0,2,0,5}}}) {
+            const auto before_swap_residency=cache.ResidencyGeneration();
+            const auto before_swap_descriptor=cache.DescriptorGeneration();
             cache.ExecuteSwapsAsync(arena,copy,{plan}).wait_and_throw();
+            require(cache.ResidencyGeneration()>before_swap_residency &&
+                    cache.DescriptorGeneration()>before_swap_descriptor,
+                    "resident swap must advance both graph-facing generations");
             require(!arena.GetExpertPointer(0,plan.candidate_expert),"incoming GPU sole owner");
             check_payload(arena.GetExpertPointer(0,plan.victim_expert),plan.victim_expert,g,gu,dn);
             ctx.memcpy_d2h(payload.data(),cache.GetSlotDevicePtr(0),payload.size());
@@ -277,7 +303,12 @@ int main(int argc,char** argv) {
         }
         require(ctx.current_pinned_host_bytes()==host_bytes && ctx.current_allocated_bytes()==device_bytes,"no steady-state USM allocations");
         for (auto* d:allocations) ctx.free_device(d);
+        const auto before_release_residency=cache.ResidencyGeneration();
+        const auto before_release_descriptor=cache.DescriptorGeneration();
         cache.Release(); arena.Release();
+        require(cache.ResidencyGeneration()>before_release_residency &&
+                cache.DescriptorGeneration()>before_release_descriptor,
+                "release must invalidate graph-facing generations");
         // Full key-space uniqueness without allocating or transferring 58 GiB.
         aila::AdaptiveCacheConfig full; full.hidden_size=256; full.moe_intermediate_size=64;
         require(cache.Allocate(ctx,full,&error),error.c_str());

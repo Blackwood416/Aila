@@ -139,7 +139,8 @@ struct QsaDecodeGraphGeometry {
 inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
     const int* control, int max_tiles) {
   QsaDecodeGraphGeometry geometry;
-  if (control == nullptr || control[graph_control::abort] != 0) {
+  if (control == nullptr ||
+      graph_control_aborted(const_cast<int*>(control))) {
     return geometry;
   }
 
@@ -147,7 +148,9 @@ inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
   const int compressed_blocks = control[graph_control::compressed_blocks];
   const long long visible_len_ll = static_cast<long long>(start_pos) + 1;
   if (start_pos < 0 || compressed_blocks < 0 || visible_len_ll <= 0 ||
-      visible_len_ll > 0x7fffffffLL) {
+      visible_len_ll > 0x7fffffffLL ||
+      compressed_blocks != static_cast<int>(visible_len_ll / 4)) {
+    graph_control_mark_abort(const_cast<int*>(control));
     return geometry;
   }
 
@@ -163,6 +166,9 @@ inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
       kDecodeExact256Tile;
   geometry.valid =
       geometry.actual_tiles > 0 && geometry.actual_tiles <= max_tiles;
+  if (!geometry.valid) {
+    graph_control_mark_abort(const_cast<int*>(control));
+  }
   return geometry;
 }
 

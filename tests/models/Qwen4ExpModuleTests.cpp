@@ -41,6 +41,13 @@ struct Qwen4ExpGenerationTestAccess {
                                 Qwen4ExpBnb4Backend::Session& session) {
         backend.PublishGdnHostHeadsToDevice(ctx, session);
     }
+    static aila::TokenGraphKey MakeTokenGraphKey(
+        const Qwen4ExpBnb4Backend& backend,
+        const Qwen4ExpBnb4Backend::Session& session) {
+        return backend.MakeTokenGraphKey(
+            session, aila::TokenGraphBody::QsaLayerProof,
+            aila::TokenGraphAttention::QsaSparse512BlockNative, 0);
+    }
     static Qwen4ExpBuffers& HcFixture(Qwen4ExpBnb4Backend& backend, Context& ctx, int dim, int lowrank) {
         backend.context_ = &ctx;
         backend.hidden_size_ = dim;
@@ -2809,6 +2816,12 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     backend.init_for_testing(ctx, 4); // 4 layers: 0, 1, 2 linear, 3 attention
     auto session = backend.CreateSession(ctx, /*maxSnapshots=*/3);
     expect(session != nullptr, "CreateSession failed");
+    const auto initial_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    expect(initial_graph_key.backend == &backend &&
+               initial_graph_key.session == session.get() &&
+               !session->token_graph_poisoned(),
+           "initial token graph key identity is invalid");
 
     auto& caches = session->layer_caches_for_testing();
     expect(caches.size() == 48, "expected 48 layer caches allocated in session");
@@ -2860,8 +2873,17 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     caches[1].linear_conv_head = 0;
 
     // 3. Truncate to length 10 -> must restore snapshot 10
+    const auto before_truncate_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
     int restored = backend.Truncate(*session, 10);
     expect(restored == 10, "Truncate must restore length 10");
+    const auto after_truncate_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    expect(after_truncate_graph_key.session_generation >
+               before_truncate_graph_key.session_generation &&
+               after_truncate_graph_key.session_state_generation >
+                   before_truncate_graph_key.session_state_generation,
+           "Truncate must invalidate token graph state generation");
     expect(session->CurrentLength() == 10, "CurrentLength must be 10");
     expect(caches[0].linear_conv_head == 42, "Layer 0 conv head must be restored to 42");
     expect(caches[1].linear_conv_head == 7, "Layer 1 conv head must be restored to 7");
@@ -2914,11 +2936,35 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     backend.capture_snapshot_for_testing(ctx, *session, 13, 1, true);
     expect(session->snapshot_for_testing(13) != nullptr, "Explicit single-token anchor must be captured");
     expect(backend.Truncate(*session, 13) == 13, "Single-token anchor must be restorable");
+    const auto before_reset_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
     backend.Reset(*session);
+    const auto after_reset_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    expect(after_reset_graph_key.session_generation >
+               before_reset_graph_key.session_generation &&
+               after_reset_graph_key.session_state_generation >
+                   before_reset_graph_key.session_state_generation,
+           "Reset must invalidate token graph state generation");
     expect(initial_storage == storage_addresses(), "Anchor restore must preserve storage");
     for (const auto& slot : session->snapshot_slots_for_testing()) {
         expect(slot.length == -1, "Reset must invalidate every snapshot");
     }
+    const auto before_poison_graph_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    session->PoisonTokenGraph();
+    expect(session->token_graph_poisoned() &&
+               session->token_graph_generation() >
+                   before_poison_graph_key.session_state_generation,
+           "poison must permanently invalidate token graph state");
+    bool poisoned_key_rejected = false;
+    try {
+        (void)Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    } catch (const std::logic_error&) {
+        poisoned_key_rejected = true;
+    }
+    expect(poisoned_key_rejected,
+           "poisoned session must reject token graph key creation");
     session.reset();
     auto no_snapshots = backend.CreateSession(ctx, 0);
     backend.capture_snapshot_for_testing(ctx, *no_snapshots, 13, 1, true);
@@ -3669,7 +3715,14 @@ void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
     backend.init_for_testing(ctx, 4);
 
     // Ensure buffers for large sequence length (e.g. 4096 tokens)
+    const auto runtime_generation_before = backend.runtime_generation();
     backend.ensure_runtime_buffers_for_testing(ctx, 4096);
+    const auto runtime_generation_after = backend.runtime_generation();
+    expect(runtime_generation_after > runtime_generation_before,
+           "runtime buffer growth must advance runtime generation");
+    backend.ensure_runtime_buffers_for_testing(ctx, 4096);
+    expect(backend.runtime_generation() == runtime_generation_after,
+           "unchanged runtime capacity must preserve runtime generation");
     const auto& buf = backend.buf_for_testing();
 
     // Verify scores buffer is strictly bounded by kDensePrefillLimit (2052)
@@ -6014,6 +6067,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--gdn-graph-state-only") {
             test_graph_gdn_device_head_state(ctx);
             std::cout << "AilaQwen4ExpModuleTests: GDN GRAPH STATE PASSED\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--token-graph-key-only") {
+            test_snapshot_capture_and_truncate(ctx);
+            std::cout << "AilaQwen4ExpModuleTests: TOKEN GRAPH KEY PASSED\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--ple-only") {

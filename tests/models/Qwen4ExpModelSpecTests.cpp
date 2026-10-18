@@ -1,4 +1,5 @@
 #include "engine/Types.hpp"
+#include "models/Qwen4ExpTokenGraph.hpp"
 #include "utils/ModelSpec.hpp"
 
 #include <iostream>
@@ -6,6 +7,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <cmath>
+#include <type_traits>
 
 namespace fs = std::filesystem;
 
@@ -205,6 +207,36 @@ void test_synthetic_qwen4exp_modelspec() {
     std::cout << "[Qwen4ExpModelSpecTests] Synthetic fixture passed.\n";
 }
 
+void test_token_graph_pod_contract() {
+    static_assert(std::is_trivially_copyable<aila::TokenGraphKey>::value,
+                  "TokenGraphKey must remain trivially copyable");
+    static_assert(std::is_standard_layout<aila::TokenGraphKey>::value,
+                  "TokenGraphKey must remain standard-layout");
+    static_assert(std::is_trivially_copyable<aila::TokenGraphLease>::value,
+                  "TokenGraphLease must remain trivially copyable");
+    static_assert(std::is_standard_layout<aila::TokenGraphLease>::value,
+                  "TokenGraphLease must remain standard-layout");
+
+    const aila::TokenGraphKey key{};
+    expect(key.backend == nullptr && key.session == nullptr,
+           "token graph key must not infer object identity");
+    expect(key.session_generation == 0 && key.session_state_generation == 0 &&
+               key.runtime_generation == 0 && key.runtime_capacity == 0 &&
+               key.residency_generation == 0 && key.descriptor_generation == 0 &&
+               key.topology_generation == 0 && key.topology_flags == 0,
+           "token graph key defaults must be zero");
+    expect(key.body == aila::TokenGraphBody::QsaLayerProof,
+           "token graph body default changed");
+    expect(key.attention == aila::TokenGraphAttention::QsaDenseContiguous,
+           "token graph attention default changed");
+
+    const aila::TokenGraphLease lease{};
+    expect(lease.phase == aila::TokenGraphPhase::Empty &&
+               lease.next_sequence == 0 && lease.last_completed_sequence == 0 &&
+               !lease.executable_ready && !lease.abort_requested,
+           "token graph lease defaults changed");
+}
+
 static std::string resolve_qwen4exp_model_dir() {
     const char* env_dir = std::getenv("AILA_QWEN4EXP_MODEL_DIR");
     if (env_dir && fs::exists(env_dir)) return env_dir;
@@ -251,6 +283,7 @@ void test_real_qwen4exp_modelspec_if_present() {
 int main() {
     try {
         test_synthetic_qwen4exp_modelspec();
+        test_token_graph_pod_contract();
         test_real_qwen4exp_modelspec_if_present();
         std::cout << "AilaQwen4ExpModelSpecTests: ALL PASSED\n";
         return 0;

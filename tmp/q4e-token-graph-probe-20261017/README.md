@@ -252,5 +252,26 @@ AilaQwen4ExpModuleTests --gdn-graph-state-only
 AilaQwen4ExpModuleTests --ple-only
 ```
 
-These cover state replay only. QSA block scoring, selector and attention still
-need fixed-grid graph variants before a full-token graph can be captured.
+These P4 receipts cover replayable state only. P5/P6 below add fixed-grid QSA
+scoring, selector and block-native attention, but still stop before a real L3
+model layer.
+
+## P5/P6 fixed-grid QSA attention
+
+Focused graph tests:
+
+```text
+AilaQwen4ExpKernelTests --qsa-graph-only
+AilaQwen4ExpKernelTests --attention-graph-only
+AilaQwen4ExpKernelTests --qgkv-graph-only
+AilaQwen4ExpKernelTests --qsa-layer-graph-only
+AilaQwen4ExpModuleTests --token-graph-key-only
+```
+
+`--qsa-layer-graph-only` captures six QSA nodes in one executable and replays
+`start_pos=2052..2055` with 513..514 compressed blocks. The graph-derived
+selector output feeds block-native attention directly. All compared buffers
+are bitwise equal to the direct path, and `abort=1` is a no-op.
+
+This is still a synthetic composite layer. It does not include real L3 model
+projections or the production graph lease.

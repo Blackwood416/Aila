@@ -42,7 +42,7 @@ void qsa_prepare_q_and_cache_k_graph(
     const Tensor& q_norm_w,
     Tensor& k_cache,
     Tensor& q_out,
-    const int* position_dev,
+    GraphControl control,
     float theta,
     bool interleaved = false,
     const int* pos_t = nullptr,

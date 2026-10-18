@@ -1317,10 +1317,13 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
             [=](sycl::nd_item<1> item) {
                 int head = item.get_group(0);
                 int lid = item.get_local_id(0);
-                if (control && control[graph_control::abort] != 0) return;
+                if (control && graph_control_aborted(control)) return;
                 const int active_pos =
                     control ? control[graph_control::start_pos] : start_pos;
-                if (active_pos < 0 || active_pos >= max_seq_len) return;
+                if (active_pos < 0 || active_pos >= max_seq_len) {
+                    if (control) graph_control_mark_abort(control);
+                    return;
+                }
                 int packed_base = head * packed_per_head;
                 int q_base = head * head_dim;
 

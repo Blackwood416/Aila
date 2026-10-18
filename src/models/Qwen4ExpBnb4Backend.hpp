@@ -15,6 +15,7 @@
 #include "Qwen4ExpAdaptiveCache.hpp"
 #include "Qwen4ExpLayerStage.hpp"
 #include "Qwen4ExpPle.hpp"
+#include "Qwen4ExpTokenGraph.hpp"
 #include "Qwen4ExpHotsetPolicy.hpp"
 #include "engine/Types.hpp"
 
@@ -193,7 +194,21 @@ public:
         int CurrentLength() const { return currentLength_; }
         int Capacity() const { return capacity_; }
         uint64_t generation() const { return generation_; }
-        void bump_generation() { ++generation_; }
+        uint64_t token_graph_generation() const { return token_graph_generation_; }
+        bool token_graph_poisoned() const { return token_graph_poisoned_; }
+        // Every host-side mutation that is visible to a captured graph must
+        // invalidate this generation. A failed capture after
+        // Qwen4ExpPle::create_graph_view() must call PoisonTokenGraph() because
+        // ordinary PLE consume is permanently fail-closed for that session.
+        void InvalidateTokenGraphState() noexcept { ++token_graph_generation_; }
+        void PoisonTokenGraph() noexcept {
+            token_graph_poisoned_ = true;
+            InvalidateTokenGraphState();
+        }
+        void bump_generation() {
+            ++generation_;
+            InvalidateTokenGraphState();
+        }
         // Exact device payload of the tensors this Session owns (Full K/V,
         // QSA indexer keys, DeltaNet state/conv history, PLE conv state).
         // Excludes model weights, expert cache and shared execution scratch.
@@ -226,6 +241,8 @@ public:
         int capacity_ = 0;
         std::size_t cacheBytes_ = 0;
         uint64_t generation_ = 1;
+        uint64_t token_graph_generation_ = 1;
+        bool token_graph_poisoned_ = false;
         int consecutive_no_miss_layers_ = 0;
 
         std::vector<Qwen4ExpLayerCache> layerCaches_;
@@ -262,6 +279,17 @@ public:
     int max_seq_len() const override { return max_seq_len_; }
     int vocab_size() const override { return cfg_.vocab_size; }
     ModelFamily family() const override { return ModelFamily::Qwen4Exp; }
+    uint64_t runtime_generation() const noexcept { return runtime_generation_; }
+    uint64_t residency_generation() const noexcept {
+        return adaptive_cache_.ResidencyGeneration();
+    }
+    uint64_t descriptor_generation() const noexcept {
+        return adaptive_cache_.DescriptorGeneration();
+    }
+    uint64_t topology_generation() const noexcept { return topology_generation_; }
+    const aila::TokenGraphLease& token_graph_lease() const noexcept {
+        return token_graph_lease_;
+    }
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
     // Qwen4Exp has no cross-session decode batch path; the Model session
@@ -307,6 +335,7 @@ public:
     void clear_mrope_positions() override;
 
     void set_prefill_xmx(bool enabled) {
+        ++topology_generation_;
         for (auto& layer : layers_) {
             if (layer.is_linear) {
                 layer.linear_o_proj.set_allow_dense_xmx(enabled);
@@ -323,6 +352,7 @@ public:
     }
 
     void set_direct_prefill_io(bool enabled) {
+        ++topology_generation_;
         for (auto& layer : layers_) {
             if (layer.is_linear) {
                 layer.linear_o_proj.set_direct_prefill_io(enabled);
@@ -448,6 +478,10 @@ private:
     // Whole-token graph replay must call this after every launch: authority and
     // dirty-bit writes executed during capture do not run again on replay.
     void MarkGdnGraphStateDirty(Session& session);
+    aila::TokenGraphKey MakeTokenGraphKey(
+        const Session& session, aila::TokenGraphBody body,
+        aila::TokenGraphAttention attention,
+        uint64_t topology_flags) const;
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     friend struct Qwen4ExpMtpProbe;
@@ -700,6 +734,9 @@ private:
     uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
+    uint64_t runtime_generation_ = 0;
+    uint64_t topology_generation_ = 0;
+    aila::TokenGraphLease token_graph_lease_{};
     int moe_compact_tile_ = 0; // bounded activation rows, separate from router window
     int prefill_attention_tile_ = 0; // opt-in; independent of the routing window
 };

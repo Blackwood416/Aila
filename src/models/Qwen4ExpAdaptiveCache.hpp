@@ -139,6 +139,8 @@ public:
     int NumLayers() const noexcept { return config_.num_layers; }
     int NumExpertsPerLayer() const noexcept { return config_.num_experts_per_layer; }
     int NumGpuSlots() const noexcept { return num_slots_; }
+    std::uint64_t ResidencyGeneration() const noexcept { return residency_generation_; }
+    std::uint64_t DescriptorGeneration() const noexcept { return descriptor_generation_; }
     int StagingSlotsPerBuffer() const noexcept { return config_.staging_slots_per_buffer; }
     int StagingBanks() const noexcept { return config_.staging_banks; }
     size_t SlotBytes() const noexcept { return geom_.slot_bytes; }
@@ -323,6 +325,11 @@ public:
 
 private:
     void InitGeometry();
+    void BumpResidentMappingGenerations() noexcept {
+        ++residency_generation_;
+        ++descriptor_generation_;
+    }
+    void BumpDescriptorGeneration() noexcept { ++descriptor_generation_; }
 
     AdaptiveCacheConfig config_{};
     ExpertSlotGeometry geom_{};
@@ -353,6 +360,8 @@ private:
     std::vector<int32_t> slot_table_;           // Host table [num_layers * num_experts_per_layer]
     int32_t* slot_table_dev_ = nullptr;         // Device table [num_layers * num_experts_per_layer]
     std::vector<ResidentSlotEntry> slot_to_expert_; // Reverse table [num_slots_]
+    std::uint64_t residency_generation_ = 0;
+    std::uint64_t descriptor_generation_ = 0;
 
     // Frequency / Usage tracking
     std::vector<float> usage_;                  // [num_layers * num_experts_per_layer]

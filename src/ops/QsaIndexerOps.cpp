@@ -178,7 +178,7 @@ void qsa_prepare_q_and_cache_k_impl(
     Tensor& k_cache,
     Tensor& q_out,
     int pos,
-    const int* position_dev,
+    GraphControl control,
     float theta,
     bool interleaved,
     const int* pos_t,
@@ -190,11 +190,12 @@ void qsa_prepare_q_and_cache_k_impl(
     int mrope_section_h,
     int mrope_section_w) {
     (void)mrope_section_t;
-    if (!position_dev && pos < 0) return;
+    if (!control && pos < 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
     const bf16* qn_ptr = q_norm_w.data_as<bf16>();
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
     bf16* q_out_ptr = q_out.data_as<bf16>();
+    const int capacity = static_cast<int>(k_cache.shape(0));
 
     constexpr int kHeadDim = 128;
     constexpr int kRotaryDim = 64;
@@ -211,8 +212,13 @@ void qsa_prepare_q_and_cache_k_impl(
             [=](sycl::nd_item<1> item) {
                 const int head = item.get_group(0);
                 const int lid = item.get_local_id(0);
-                const int active_pos = position_dev ? position_dev[0] : pos;
-                if (active_pos < 0) return;
+                if (control && graph_control_aborted(control)) return;
+                const int active_pos =
+                    control ? control[graph_control::start_pos] : pos;
+                if (active_pos < 0 || active_pos >= capacity) {
+                    if (control) graph_control_mark_abort(control);
+                    return;
+                }
                 const float pos_scalar = static_cast<float>(
                     active_pos >= prompt_pos_len
                         ? active_pos + text_pos_delta
@@ -292,7 +298,7 @@ void qsa_prepare_q_and_cache_k_graph(
     const Tensor& q_norm_w,
     Tensor& k_cache,
     Tensor& q_out,
-    const int* position_dev,
+    GraphControl control,
     float theta,
     bool interleaved,
     const int* pos_t,
@@ -303,11 +309,26 @@ void qsa_prepare_q_and_cache_k_graph(
     int mrope_section_t,
     int mrope_section_h,
     int mrope_section_w) {
-    if (!position_dev)
+    if (!control)
         throw std::invalid_argument(
-            "qsa_prepare_q_and_cache_k_graph requires a device position");
+            "qsa_prepare_q_and_cache_k_graph requires graph control");
+    if (!indexer_qk.valid() ||
+        indexer_qk.dtype() != dnnl::memory::data_type::bf16 ||
+        indexer_qk.numel() < 5 * 128 ||
+        !q_norm_w.valid() ||
+        q_norm_w.dtype() != dnnl::memory::data_type::bf16 ||
+        q_norm_w.numel() < 128 ||
+        !k_cache.valid() ||
+        k_cache.dtype() != dnnl::memory::data_type::bf16 ||
+        k_cache.ndim() < 1 || k_cache.shape(0) <= 0 ||
+        !q_out.valid() ||
+        q_out.dtype() != dnnl::memory::data_type::bf16 ||
+        q_out.numel() < 4 * 128) {
+        throw std::invalid_argument(
+            "qsa_prepare_q_and_cache_k_graph shape mismatch");
+    }
     qsa_prepare_q_and_cache_k_impl(
-        ctx, indexer_qk, q_norm_w, k_cache, q_out, -1, position_dev, theta,
+        ctx, indexer_qk, q_norm_w, k_cache, q_out, -1, control, theta,
         interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
         mrope_section_t, mrope_section_h, mrope_section_w);
 }
@@ -1270,7 +1291,20 @@ void qsa_compute_block_scores_compressed_graph(
     Tensor& scores_out,
     GraphControl control,
     int max_blocks) {
-    if (!control || max_blocks <= 0) return;
+    if (!control || max_blocks <= 0)
+        throw std::invalid_argument(
+            "qsa_compute_block_scores_compressed_graph requires control and max_blocks");
+    if (!q.valid() || q.dtype() != dnnl::memory::data_type::bf16 ||
+        q.numel() < 4 * 128 ||
+        !compressed_k.valid() ||
+        compressed_k.dtype() != dnnl::memory::data_type::bf16 ||
+        compressed_k.numel() < int64_t(max_blocks) * 128 ||
+        !scores_out.valid() ||
+        scores_out.dtype() != dnnl::memory::data_type::f32 ||
+        scores_out.numel() < max_blocks) {
+        throw std::invalid_argument(
+            "qsa_compute_block_scores_compressed_graph shape mismatch");
+    }
     const bf16* q_ptr = q.data_as<bf16>();
     const bf16* comp_k_ptr = compressed_k.data_as<bf16>();
     float* scores_ptr = scores_out.data_as<float>();
@@ -1284,14 +1318,12 @@ void qsa_compute_block_scores_compressed_graph(
         cgh.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(max_blocks) * kWgSize, kWgSize),
             [=](sycl::nd_item<1> item) {
-                if (control_ptr[graph_control::abort] != 0) return;
-                const int raw_blocks =
-                    control_ptr[graph_control::compressed_blocks];
-                if (raw_blocks < 0 || raw_blocks > max_blocks) {
-                    control_ptr[graph_control::abort] = 1;
+                int visible_len = 0;
+                int active_blocks = 0;
+                if (!graph_control_consistent_blocks(
+                        control_ptr, max_blocks, visible_len,
+                        active_blocks))
                     return;
-                }
-                const int active_blocks = raw_blocks;
                 const int b = item.get_group(0);
                 if (b >= active_blocks) return;
 
@@ -1596,7 +1628,19 @@ void qsa_select_topk_blocks_graph(
     int block_topk,
     int compress_ratio,
     int max_blocks) {
-    if (!control || block_topk <= 0 || compress_ratio <= 0 || max_blocks <= 0) return;
+    if (!control || block_topk <= 0 || compress_ratio <= 0 ||
+        max_blocks <= 0)
+        throw std::invalid_argument(
+            "qsa_select_topk_blocks_graph requires valid graph geometry");
+    if (!scores.valid() ||
+        scores.dtype() != dnnl::memory::data_type::f32 ||
+        scores.numel() < max_blocks ||
+        !active_blocks_out.valid() ||
+        active_blocks_out.dtype() != dnnl::memory::data_type::s32 ||
+        active_blocks_out.numel() < block_topk + compress_ratio) {
+        throw std::invalid_argument(
+            "qsa_select_topk_blocks_graph shape mismatch");
+    }
     const float* scores_ptr = scores.data_as<float>();
     int* out_ptr = active_blocks_out.data_as<int>();
     int* const control_ptr = control;
@@ -1617,15 +1661,12 @@ void qsa_select_topk_blocks_graph(
             sycl::nd_range<1>(kWgSize, kWgSize),
             [=](sycl::nd_item<1> item) {
                 const int lid = item.get_local_id(0);
-                if (control_ptr[graph_control::abort] != 0) return;
-                const int raw_blocks =
-                    control_ptr[graph_control::compressed_blocks];
-                if (raw_blocks < 0 || raw_blocks > max_blocks) {
-                    if (lid == 0) control_ptr[graph_control::abort] = 1;
+                int visible_len = 0;
+                int active_blocks = 0;
+                if (!graph_control_consistent_blocks(
+                        control_ptr, max_blocks, visible_len,
+                        active_blocks))
                     return;
-                }
-                const int visible_len = sycl::max(0, control_ptr[graph_control::start_pos] + 1);
-                const int active_blocks = raw_blocks;
                 const int tail_start = active_blocks * compress_ratio;
                 const int tail_len = sycl::min(
                     compress_ratio, sycl::max(0, visible_len - tail_start));

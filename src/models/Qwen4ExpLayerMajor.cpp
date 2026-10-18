@@ -165,6 +165,7 @@ void Qwen4ExpBnb4Backend::EnsureLayerMajorCarries(Context& ctx, int count) {
         return;
     }
     // Growth is outside the decode hot path; drain before replacing carries.
+    ++runtime_generation_;
     ctx.synchronize();
     lm_hidden_ = Tensor::allocate(ctx, {count, 10240}, dnnl::memory::data_type::bf16);
     lm_x_ = Tensor::allocate(ctx, {count, hidden_size_}, dnnl::memory::data_type::bf16);
@@ -193,6 +194,7 @@ void Qwen4ExpBnb4Backend::EnsureLayerMajorMaps(Context& ctx, int count) {
     if (layer_major_map_capacity_ >= count || runtime_seq_capacity_ >= count) return;
     const int top_k = cfg_.num_experts_per_tok;
     const size_t map_entries = static_cast<size_t>(count) * top_k;
+    ++runtime_generation_;
     ctx.synchronize();
     auto grow_host_ints = [&](int*& ptr) {
         if (ptr) ctx.free_host(ptr);
@@ -224,6 +226,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardLayerMajorPrefill(
     Context& ctx, Session& session, const int* tokenIdsDevice, int count,
     bool lastTokenOnly, const ForwardOptions& options) {
     ValidateSession(session);
+    session.InvalidateTokenGraphState();
     constexpr int kChunks = 2;
     const int chunk = count / kChunks;
     const int top_k = cfg_.num_experts_per_tok;

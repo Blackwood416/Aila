@@ -327,6 +327,7 @@ void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
 void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
     Context& ctx, Session& session) {
     if (!session.gdn_conv_heads_dev_.valid()) return;
+    session.InvalidateTokenGraphState();
     sycl::event last_d2h{};
     for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
@@ -358,6 +359,7 @@ void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
 void Qwen4ExpBnb4Backend::PublishGdnHostHeadsToDevice(
     Context& ctx, Session& session) {
     if (!session.gdn_conv_heads_dev_.valid()) return;
+    session.InvalidateTokenGraphState();
     std::fill(session.gdn_conv_heads_host_.begin(),
               session.gdn_conv_heads_host_.end(), 0);
     for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
@@ -1156,6 +1158,9 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         std::max(0, aila::env::read_int("AILA_Q4E_RUNTIME_MIN_CAP", 0));
     if (s_runtime_min_cap > seq_len) seq_len = std::min(s_runtime_min_cap, max_seq_len_);
     if (seq_len <= runtime_seq_capacity_) return;
+    // The resize replaces resident scratch pointers. Invalidate before the
+    // first mutation so even a failed allocation cannot leave an old key valid.
+    ++runtime_generation_;
     int cap = std::max(seq_len, runtime_seq_capacity_ == 0 ? std::min(max_seq_len_, 64) : runtime_seq_capacity_ * 2);
     cap = std::min(cap, max_seq_len_);
     if (cap < seq_len) cap = seq_len;
@@ -2431,6 +2436,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
+    session.InvalidateTokenGraphState();
     ValidateGdnHeadPath(session, count);
     if (count == 1 && session.graph_gdn_state_enabled_) {
         int linear_rows = 0;
@@ -4054,12 +4060,37 @@ void Qwen4ExpBnb4Backend::ValidateSession(const Session& session) const {
     }
 }
 
+aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeTokenGraphKey(
+    const Session& session, aila::TokenGraphBody body,
+    aila::TokenGraphAttention attention, uint64_t topology_flags) const {
+    ValidateSession(session);
+    if (session.token_graph_poisoned()) {
+        throw std::logic_error(
+            "Qwen4Exp token graph is poisoned; recreate the session");
+    }
+    aila::TokenGraphKey key{};
+    key.backend = this;
+    key.session = &session;
+    key.session_generation = session.generation();
+    key.session_state_generation = session.token_graph_generation();
+    key.runtime_generation = runtime_generation_;
+    key.runtime_capacity = runtime_seq_capacity_;
+    key.residency_generation = adaptive_cache_.ResidencyGeneration();
+    key.descriptor_generation = adaptive_cache_.DescriptorGeneration();
+    key.topology_generation = topology_generation_;
+    key.topology_flags = topology_flags;
+    key.body = body;
+    key.attention = attention;
+    return key;
+}
+
 void Qwen4ExpBnb4Backend::set_embedding_overrides(
     const std::vector<int>& positions,
     const std::vector<sycl::ext::oneapi::bfloat16>& embeddings,
     int hidden_size) {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    session.InvalidateTokenGraphState();
     session.embeddingOverridePositions_ = positions;
     session.embeddingOverrideValues_ = embeddings;
     session.embeddingOverrideHiddenSize_ = hidden_size;
@@ -4068,6 +4099,7 @@ void Qwen4ExpBnb4Backend::set_embedding_overrides(
 void Qwen4ExpBnb4Backend::clear_embedding_overrides() {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    session.InvalidateTokenGraphState();
     session.embeddingOverridePositions_.clear();
     session.embeddingOverrideValues_.clear();
     session.embeddingOverrideHiddenSize_ = 0;
@@ -4085,6 +4117,7 @@ void Qwen4ExpBnb4Backend::set_mrope_positions(
         clear_mrope_positions();
         return;
     }
+    session.InvalidateTokenGraphState();
     session.mropePosT_ = Tensor::allocate(ctx, {static_cast<int64_t>(pos_t.size())}, dnnl::memory::data_type::s32);
     session.mropePosH_ = Tensor::allocate(ctx, {static_cast<int64_t>(pos_h.size())}, dnnl::memory::data_type::s32);
     session.mropePosW_ = Tensor::allocate(ctx, {static_cast<int64_t>(pos_w.size())}, dnnl::memory::data_type::s32);
@@ -4098,6 +4131,7 @@ void Qwen4ExpBnb4Backend::set_mrope_positions(
 void Qwen4ExpBnb4Backend::clear_mrope_positions() {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    session.InvalidateTokenGraphState();
     session.mropePosT_ = Tensor();
     session.mropePosH_ = Tensor();
     session.mropePosW_ = Tensor();

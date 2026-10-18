@@ -192,6 +192,8 @@ public:
 
     // Builds a fixed-address one-token view. This may allocate/grow workspace
     // and initialize state.conv_head_dev, so call it outside graph recording.
+    // Once this succeeds, a capture failure must poison the owning session:
+    // ordinary consume() intentionally fails closed with conv_head_dev set.
     Qwen4ExpPleGraphView create_graph_view(
         Context& ctx,
         Qwen4ExpPleState& state,
