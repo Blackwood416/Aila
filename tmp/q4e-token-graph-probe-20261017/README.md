@@ -293,9 +293,8 @@ Run only under the global GPU mutex, after `wsl.exe --shutdown`, with at least
 54 GiB free:
 
 ```powershell
-tmp/q4e-token-graph-probe-20261017/probe_qsa_layer.exe `
-  --model C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 `
-  --capacity 2060
+pwsh -NoProfile -File tmp/q4e-token-graph-probe-20261017/run_qsa_layer.ps1 `
+  -Log tmp/q4e-token-graph-probe-20261017/gpu-qsa-real-l3.log
 ```
 
 Receipt `gpu-qsa-real-l3.log`:
