@@ -1,0 +1,5 @@
+[RUN] 2026-10-18T17:55:40.2473845+08:00 case=gdn free_gib=56.6
+[Test] Graph GDN device-head ownership and fail-closed transitions...
+[PASS] Graph GDN device-head ownership verified.
+AilaQwen4ExpModuleTests: GDN GRAPH STATE PASSED
+[RUN] case=gdn exit=0 wall_s=0.4

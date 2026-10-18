@@ -169,6 +169,10 @@ public:
     // drain the executable/event before Poison() and resource release.
     bool Abort() noexcept;
 
+    // Session teardown must not leave a diagnostic key pointing at freed
+    // memory. This keeps the stream poisoned while clearing the key identity.
+    bool RetireSession(const void* session) noexcept;
+
     // Aborting/any state -> Poisoned. Poisoning is permanent.
     bool Poison() noexcept;
 
@@ -259,6 +263,13 @@ inline bool TokenGraphRuntime::Complete(
 inline bool TokenGraphRuntime::Abort() noexcept {
     if (phase_ == TokenGraphPhase::Poisoned) return false;
     return EnterAborting();
+}
+
+inline bool TokenGraphRuntime::RetireSession(const void* session) noexcept {
+    if (!session || key_.session != session) return false;
+    (void)EnterAborting();
+    key_ = TokenGraphKey{};
+    return true;
 }
 
 inline bool TokenGraphRuntime::Poison() noexcept {

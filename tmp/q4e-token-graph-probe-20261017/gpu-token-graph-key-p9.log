@@ -1,0 +1,5 @@
+[RUN] 2026-10-18T17:55:39.7787106+08:00 case=key free_gib=56.6
+[Test] Running Phase S5 batched async snapshot capture & truncate test...
+[PASS] Phase S5 batched async snapshot capture & truncate verified successfully.
+AilaQwen4ExpModuleTests: TOKEN GRAPH KEY PASSED
+[RUN] case=key exit=0 wall_s=0.5

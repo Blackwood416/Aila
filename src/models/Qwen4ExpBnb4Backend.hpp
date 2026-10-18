@@ -16,6 +16,7 @@
 #include "Qwen4ExpLayerStage.hpp"
 #include "Qwen4ExpPle.hpp"
 #include "Qwen4ExpTokenGraph.hpp"
+#include "Qwen4ExpTokenGraphRuntime.hpp"
 #include "Qwen4ExpHotsetPolicy.hpp"
 #include "engine/Types.hpp"
 
@@ -205,8 +206,21 @@ public:
         // invalidate this generation. A failed capture after
         // Qwen4ExpPle::create_graph_view() must call PoisonTokenGraph() because
         // ordinary PLE consume is permanently fail-closed for that session.
-        void InvalidateTokenGraphState() noexcept { ++token_graph_generation_; }
+        void InvalidateTokenGraphState() noexcept {
+            ++token_graph_generation_;
+            // Host state is about to change under any captured addresses.
+            // Abort is not a wait: callers with work in flight must drain it
+            // before releasing graph resources.
+            if (token_graph_runtime_ &&
+                token_graph_runtime_->phase() !=
+                    aila::TokenGraphPhase::Empty) {
+                (void)token_graph_runtime_->Abort();
+            }
+        }
         void PoisonTokenGraph() noexcept {
+            if (token_graph_runtime_) {
+                (void)token_graph_runtime_->Poison();
+            }
             token_graph_poisoned_ = true;
             InvalidateTokenGraphState();
         }
@@ -248,10 +262,14 @@ public:
         friend class Qwen4ExpMtpRuntime;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
-                std::size_t maxSnapshots, uint64_t instanceId);
+                std::size_t maxSnapshots, uint64_t instanceId,
+                aila::TokenGraphRuntime* tokenGraphRuntime);
 
         Context* context_ = nullptr;
         std::shared_ptr<const SessionOwner> owner_;
+        // Session and backend have the same ownership lifetime: the backend
+        // owns the Context already referenced here as a raw pointer.
+        aila::TokenGraphRuntime* token_graph_runtime_ = nullptr;
         uint64_t session_instance_id_ = 0;
         int currentLength_ = 0;
         int capacity_ = 0;
@@ -304,8 +322,11 @@ public:
         return adaptive_cache_.DescriptorGeneration();
     }
     uint64_t topology_generation() const noexcept { return topology_generation_; }
-    const aila::TokenGraphLease& token_graph_lease() const noexcept {
-        return token_graph_lease_;
+    const aila::TokenGraphRuntime& token_graph_runtime() const noexcept {
+        return token_graph_runtime_;
+    }
+    aila::TokenGraphLease token_graph_lease() const noexcept {
+        return token_graph_runtime_.Snapshot();
     }
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
@@ -317,22 +338,25 @@ public:
     template <typename Launch>
     auto SubmitTokenGraph(Session& session, Launch&& launch)
         -> decltype(std::forward<Launch>(launch)()) {
-        ValidateSession(session);
-        ValidateGdnHeadPath(session, 1);
-        if (session.graph_gdn_state_enabled_) {
-            for (const auto& cache : session.layerCaches_) {
-                if (cache.linear_state.valid() &&
-                    !GdnDeviceHeadReadable(cache)) {
-                    throw std::invalid_argument(
-                        "Qwen4Exp token graph cannot launch before the host "
-                        "GDN heads are published to the device");
-                }
-            }
-        }
+        ValidateTokenGraphLaunch(session);
         auto result = std::forward<Launch>(launch)();
         MarkGdnGraphStateDirty(session);
         return result;
     }
+
+    // Minimal lifecycle surface. Graph body capture/executable ownership stays
+    // with the caller until ForwardTokenGraph is implemented.
+    bool BeginCapture(Session& session, aila::TokenGraphBody body,
+                      aila::TokenGraphAttention attention,
+                      uint64_t topology_flags);
+    bool MarkReady() noexcept;
+    bool Launch(Session& session, uint32_t sequence, sycl::event event);
+    bool Complete(uint32_t sequence, bool gate_valid) noexcept;
+    // Abort does not wait for the in-flight event. The orchestration caller must
+    // drain it before Poison/resources release; direct paths continue on the
+    // same in-order queue and invalidate their host-visible state below.
+    bool AbortTokenGraph() noexcept;
+    bool AbortAndPoisonTokenGraph(Session& session) noexcept;
     // Qwen4Exp has no cross-session decode batch path; the Model session
     // backend also excludes ForwardDecodeBatch at compile time.
     bool SupportsDecodeBatch() const noexcept { return false; }
@@ -376,6 +400,7 @@ public:
     void clear_mrope_positions() override;
 
     void set_prefill_xmx(bool enabled) {
+        (void)AbortTokenGraph();
         ++topology_generation_;
         for (auto& layer : layers_) {
             if (layer.is_linear) {
@@ -393,6 +418,7 @@ public:
     }
 
     void set_direct_prefill_io(bool enabled) {
+        (void)AbortTokenGraph();
         ++topology_generation_;
         for (auto& layer : layers_) {
             if (layer.is_linear) {
@@ -521,6 +547,7 @@ private:
     // Whole-token graph replay must call this after every launch: authority and
     // dirty-bit writes executed during capture do not run again on replay.
     void MarkGdnGraphStateDirty(Session& session);
+    void ValidateTokenGraphLaunch(Session& session);
     aila::TokenGraphKey MakeTokenGraphKey(
         const Session& session, aila::TokenGraphBody body,
         aila::TokenGraphAttention attention,
@@ -623,6 +650,8 @@ private:
     std::shared_ptr<const SessionOwner> sessionOwner_;
     // CreateSession() and graph orchestration share the backend thread.
     uint64_t next_session_instance_id_ = 1;
+    // Declared before defaultSession_ so it outlives Session teardown.
+    aila::TokenGraphRuntime token_graph_runtime_;
     std::unique_ptr<Session> defaultSession_;
 
     std::vector<Qwen4ExpLayer> layers_;
@@ -781,7 +810,6 @@ private:
     int runtime_seq_capacity_ = 0;
     uint64_t runtime_generation_ = 0;
     uint64_t topology_generation_ = 0;
-    aila::TokenGraphLease token_graph_lease_{};
     int moe_compact_tile_ = 0; // bounded activation rows, separate from router window
     int prefill_attention_tile_ = 0; // opt-in; independent of the routing window
 };

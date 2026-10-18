@@ -231,8 +231,10 @@ static thread_local std::array<int, 16> d1_stash_ranks{};
 Qwen4ExpBnb4Backend::Session::Session(
     Context& ctx, int capacity,
     std::shared_ptr<const SessionOwner> owner,
-    std::size_t maxSnapshots, uint64_t instanceId)
+    std::size_t maxSnapshots, uint64_t instanceId,
+    aila::TokenGraphRuntime* tokenGraphRuntime)
     : context_(&ctx), owner_(std::move(owner)),
+      token_graph_runtime_(tokenGraphRuntime),
       session_instance_id_(instanceId),
       capacity_(capacity), snapshots_(maxSnapshots) {
     // INT8 KV is opt-in and default-off; both switches must be present.
@@ -288,6 +290,9 @@ Qwen4ExpBnb4Backend::Session::Session(
 }
 
 Qwen4ExpBnb4Backend::Session::~Session() {
+    if (token_graph_runtime_) {
+        (void)token_graph_runtime_->RetireSession(this);
+    }
     if (context_) {
         context_->synchronize();
     }
@@ -336,6 +341,7 @@ void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
 void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
     Context& ctx, Session& session) {
     if (!session.gdn_conv_heads_dev_.valid()) return;
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     sycl::event last_d2h{};
     for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
@@ -368,6 +374,7 @@ void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
 void Qwen4ExpBnb4Backend::PublishGdnHostHeadsToDevice(
     Context& ctx, Session& session) {
     if (!session.gdn_conv_heads_dev_.valid()) return;
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     std::fill(session.gdn_conv_heads_host_.begin(),
               session.gdn_conv_heads_host_.end(), 0);
@@ -398,6 +405,7 @@ void Qwen4ExpBnb4Backend::PrepareGdnGraphState(
         throw std::invalid_argument(
             "Qwen4Exp graph GDN state was not enabled for this session");
     }
+    (void)AbortTokenGraph();
     for (const auto& cache : session.layerCaches_) {
         if (cache.linear_conv_head_device_authority) {
             throw std::invalid_argument(
@@ -2444,6 +2452,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const int* tokenIdsDevice, int count, bool lastTokenOnly,
     const ForwardOptions& options) {
     ValidateSession(session);
+    // Direct execution must stop sharing the backend with a retained graph.
+    // Empty is the default path: one branch, no allocation, no generation bump.
+    (void)AbortTokenGraph();
     if (count <= 0) return buf_.logits;
     session.InvalidateTokenGraphState();
     ValidateGdnHeadPath(session, count);
@@ -3821,11 +3832,11 @@ Qwen4ExpBnb4Backend::StateSnapshot& Qwen4ExpBnb4Backend::ReserveSnapshot(Session
 
 void Qwen4ExpBnb4Backend::CaptureSnapshot(
     Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
-    if (session.snapshots_.empty()) return;
     if (session.token_graph_poisoned()) {
         throw std::logic_error(
             "Qwen4Exp cannot checkpoint a poisoned token-graph session");
     }
+    if (session.snapshots_.empty()) return;
     int step = aila::env::read_int("AILA_Q4E_PREFILL_STEP", 64);
     if (step <= 0) step = 64;
     if (!force && tokenCount <= 1 && nextLength % step != 0) return;
@@ -3875,6 +3886,9 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
 
 int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
     ValidateSession(session);
+    // Abort before touching graph-visible state. The synchronize below is the
+    // caller-side drain; AbortTokenGraph() itself never waits.
+    (void)AbortTokenGraph();
     if (newLength < 0 || newLength > session.currentLength_) {
         return session.currentLength_;
     }
@@ -3938,6 +3952,8 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
 
 void Qwen4ExpBnb4Backend::Reset(Session& session) {
     ValidateSession(session);
+    // Abort first, then drain before mutating model-visible cache state.
+    (void)AbortTokenGraph();
     session.context_->synchronize();
     session.consecutive_no_miss_layers_ = 0;
     for (auto& snapshot : session.snapshots_) snapshot.length = -1;
@@ -3989,7 +4005,8 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
     }
     const uint64_t instanceId = next_session_instance_id_++;
     auto session = std::unique_ptr<Session>(
-        new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots, instanceId));
+        new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots, instanceId,
+                    &token_graph_runtime_));
     ple_.init_state(ctx, session->ple_state_);
     // Exact device payload of the tensors this Session owns, matching
     // qwen4exp_session_memory's device reservation. Model weights, expert
@@ -4088,6 +4105,76 @@ bool Qwen4ExpBnb4Backend::PleTicketEpochMatches(
         ticket.ticket_epoch == session.ple_ticket_epoch();
 }
 
+void Qwen4ExpBnb4Backend::ValidateTokenGraphLaunch(Session& session) {
+    ValidateSession(session);
+    ValidateGdnHeadPath(session, 1);
+    if (!session.graph_gdn_state_enabled_) return;
+    for (const auto& cache : session.layerCaches_) {
+        if (cache.linear_state.valid() && !GdnDeviceHeadReadable(cache)) {
+            throw std::invalid_argument(
+                "Qwen4Exp token graph cannot launch before the host "
+                "GDN heads are published to the device");
+        }
+    }
+}
+
+bool Qwen4ExpBnb4Backend::BeginCapture(
+    Session& session, aila::TokenGraphBody body,
+    aila::TokenGraphAttention attention, uint64_t topology_flags) {
+    const auto key =
+        MakeTokenGraphKey(session, body, attention, topology_flags);
+    return token_graph_runtime_.BeginCapture(key);
+}
+
+bool Qwen4ExpBnb4Backend::MarkReady() noexcept {
+    return token_graph_runtime_.MarkExecutableReady();
+}
+
+bool Qwen4ExpBnb4Backend::Launch(
+    Session& session, uint32_t sequence, sycl::event event) {
+    if (token_graph_runtime_.phase() != aila::TokenGraphPhase::Ready) {
+        return false;
+    }
+    const auto& key = token_graph_runtime_.key();
+    if (key.session != &session ||
+        key.session_instance_id != session.session_instance_id()) {
+        return false;
+    }
+    if (key.body == aila::TokenGraphBody::QsaLayerProof) {
+        ValidateSession(session);
+    } else {
+        ValidateTokenGraphLaunch(session);
+    }
+    if (!token_graph_runtime_.Launch(sequence, std::move(event))) {
+        return false;
+    }
+    if (key.body != aila::TokenGraphBody::QsaLayerProof) {
+        MarkGdnGraphStateDirty(session);
+    }
+    return true;
+}
+
+bool Qwen4ExpBnb4Backend::Complete(
+    uint32_t sequence, bool gate_valid) noexcept {
+    return token_graph_runtime_.Complete(sequence, gate_valid);
+}
+
+bool Qwen4ExpBnb4Backend::AbortTokenGraph() noexcept {
+    // Empty is the default direct-only state. Never turn it into Aborting.
+    if (token_graph_runtime_.phase() == aila::TokenGraphPhase::Empty) {
+        return false;
+    }
+    return token_graph_runtime_.Abort();
+}
+
+bool Qwen4ExpBnb4Backend::AbortAndPoisonTokenGraph(
+    Session& session) noexcept {
+    if (session.owner_ != sessionOwner_) return false;
+    const bool changed = token_graph_runtime_.Poison();
+    session.PoisonTokenGraph();
+    return changed;
+}
+
 aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeTokenGraphKey(
     const Session& session, aila::TokenGraphBody body,
     aila::TokenGraphAttention attention, uint64_t topology_flags) const {
@@ -4134,6 +4221,7 @@ void Qwen4ExpBnb4Backend::set_embedding_overrides(
     int hidden_size) {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     session.embeddingOverridePositions_ = positions;
     session.embeddingOverrideValues_ = embeddings;
@@ -4143,6 +4231,7 @@ void Qwen4ExpBnb4Backend::set_embedding_overrides(
 void Qwen4ExpBnb4Backend::clear_embedding_overrides() {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     session.embeddingOverridePositions_.clear();
     session.embeddingOverrideValues_.clear();
@@ -4161,6 +4250,7 @@ void Qwen4ExpBnb4Backend::set_mrope_positions(
         clear_mrope_positions();
         return;
     }
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     session.mropePosT_ = Tensor::allocate(ctx, {static_cast<int64_t>(pos_t.size())}, dnnl::memory::data_type::s32);
     session.mropePosH_ = Tensor::allocate(ctx, {static_cast<int64_t>(pos_h.size())}, dnnl::memory::data_type::s32);
@@ -4175,6 +4265,7 @@ void Qwen4ExpBnb4Backend::set_mrope_positions(
 void Qwen4ExpBnb4Backend::clear_mrope_positions() {
     if (!defaultSession_) return;
     auto& session = *defaultSession_;
+    (void)AbortTokenGraph();
     session.InvalidateTokenGraphState();
     session.mropePosT_ = Tensor();
     session.mropePosH_ = Tensor();

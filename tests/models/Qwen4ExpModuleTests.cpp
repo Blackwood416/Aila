@@ -3262,6 +3262,149 @@ void test_graph_gdn_device_head_state(Context& ctx) {
     std::cout << "[PASS] Graph GDN device-head ownership verified.\n";
 }
 
+void test_token_graph_runtime_lifecycle(Context& ctx) {
+    std::cout << "[Test] Token graph backend lifecycle and direct-path abort...\n";
+    _putenv("AILA_Q4E_GRAPH_GDN_STATE=");
+
+    const auto make_ready = [](Qwen4ExpBnb4Backend& backend,
+                               Qwen4ExpBnb4Backend::Session& session) {
+        const auto key =
+            Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, session);
+        expect(backend.BeginCapture(session, key.body, key.attention,
+                                    key.topology_flags),
+               "backend BeginCapture failed");
+        expect(backend.MarkReady(), "backend MarkReady failed");
+    };
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Empty,
+               "default direct backend must start with an Empty graph runtime");
+
+        const auto allocations = ctx.device_allocation_count();
+        (void)backend.Forward(ctx, *session, nullptr, 0);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Empty,
+               "default direct forward must leave the graph runtime Empty");
+        expect(ctx.device_allocation_count() == allocations,
+               "default direct forward must not allocate graph resources");
+
+        make_ready(backend, *session);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Ready,
+               "captured graph did not become Ready");
+        (void)backend.Forward(ctx, *session, nullptr, 0);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Aborting,
+               "direct forward must abort a Ready token graph");
+    }
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        make_ready(backend, *session);
+        expect(backend.Launch(*session, 1, sycl::event{}),
+               "first token graph launch must succeed");
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::InFlight,
+               "launch did not enter InFlight");
+        expect(!backend.Launch(*session, 2, sycl::event{}),
+               "second in-flight token graph launch must be rejected");
+        expect(backend.Complete(1, true),
+               "matching graph completion must succeed");
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Ready,
+               "successful completion must return to Ready");
+
+        backend.Reset(*session);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Aborting,
+               "Reset must abort a Ready token graph before mutation");
+    }
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        make_ready(backend, *session);
+        session->current_length_for_testing() = 2;
+        expect(backend.Truncate(*session, 0) == 0,
+               "Truncate-to-zero fixture failed");
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Aborting,
+               "Truncate must abort a Ready token graph before mutation");
+    }
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        make_ready(backend, *session);
+        session.reset();
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Aborting,
+               "Session destruction must abort its retained token graph key");
+        expect(backend.token_graph_runtime().key().session == nullptr,
+               "Token graph key retained a destroyed Session pointer");
+    }
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        make_ready(backend, *session);
+        Qwen4ExpGenerationTestAccess::InvalidateMtpRestoreState(*session);
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Aborting,
+               "MTP restore-state invalidation must abort the graph runtime");
+    }
+
+    {
+        Qwen4ExpBnb4Backend backend;
+        backend.init_for_testing(ctx, 4);
+        auto session = backend.CreateSession(ctx, 0);
+        make_ready(backend, *session);
+        expect(backend.AbortAndPoisonTokenGraph(*session),
+               "AbortAndPoison must transition an active runtime");
+        expect(backend.token_graph_runtime().phase() ==
+                   aila::TokenGraphPhase::Poisoned &&
+                   session->token_graph_poisoned(),
+               "AbortAndPoison must poison both runtime and Session");
+        expect(!backend.AbortTokenGraph() &&
+                   !backend.MarkReady() &&
+                   !backend.Launch(*session, 1, sycl::event{}) &&
+                   !backend.Complete(1, true),
+               "Poisoned graph runtime must reject every transition");
+        expect(!backend.AbortAndPoisonTokenGraph(*session),
+               "second AbortAndPoison must be a no-op");
+
+        bool key_rejected = false;
+        try {
+            (void)Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(
+                backend, *session);
+        } catch (const std::logic_error&) {
+            key_rejected = true;
+        }
+        expect(key_rejected,
+               "Poisoned Session must continue rejecting graph keys");
+
+        bool checkpoint_rejected = false;
+        try {
+            backend.capture_snapshot_for_testing(ctx, *session, 1, 1, true);
+        } catch (const std::logic_error&) {
+            checkpoint_rejected = true;
+        }
+        expect(checkpoint_rejected,
+               "Poisoned Session must continue rejecting checkpoints");
+    }
+
+    std::cout << "[PASS] Token graph backend lifecycle verified.\n";
+}
+
 void test_supports_interior_checkpoint_whitelist(Context& ctx) {
     std::cout << "[Test] X2 interior checkpoint eligibility and opt-out...\n";
     Qwen4ExpBnb4Backend backend;
@@ -6285,6 +6428,11 @@ int main(int argc, char** argv) {
             std::cout << "AilaQwen4ExpModuleTests: TOKEN GRAPH KEY PASSED\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--token-graph-runtime-only") {
+            test_token_graph_runtime_lifecycle(ctx);
+            std::cout << "AilaQwen4ExpModuleTests: TOKEN GRAPH RUNTIME PASSED\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--ple-only") {
             test_real_model_ple_and_cache_if_present(ctx, true);
             std::cout << "AilaQwen4ExpModuleTests: PLE PASSED\n";
@@ -6318,6 +6466,7 @@ int main(int argc, char** argv) {
         test_prefill_weight_reuse_backend_alignment(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_graph_gdn_device_head_state(ctx);
+        test_token_graph_runtime_lifecycle(ctx);
         test_supports_interior_checkpoint_whitelist(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
