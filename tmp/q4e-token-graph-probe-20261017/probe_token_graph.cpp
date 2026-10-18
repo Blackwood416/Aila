@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -68,6 +69,13 @@ struct Qwen4ExpGenerationTestAccess {
     static Tensor& MoeH(Qwen4ExpBnb4Backend& b) { return b.buf_.moe_h; }
     static Tensor& ResidentDown(Qwen4ExpBnb4Backend& b) {
         return b.resident_down_;
+    }
+    static aila::Qwen4ExpExpertExecutor& Executor(
+        Qwen4ExpBnb4Backend& b) {
+        return b.expert_executor_;
+    }
+    static aila::Qwen4ExpHostArena& HostArena(Qwen4ExpBnb4Backend& b) {
+        return b.host_arena_;
     }
     static int ExpertsPerLayer(Qwen4ExpBnb4Backend& b) {
         return b.cfg_.num_experts;
@@ -208,6 +216,7 @@ struct alignas(64) CpuPacketRing {
     uint32_t reserved[14];
     int32_t rank_to_row[kMaxPacketRows];
     float values[kMaxPacketRows * kHidden];
+    bf16 x[kHidden];
 };
 
 struct alignas(64) DeviceEpoch {
@@ -219,7 +228,7 @@ static_assert(sizeof(ControlRing) == 64);
 static_assert(sizeof(RouteRing) == 128);
 static_assert(sizeof(ResultRing) == 384);
 static_assert(sizeof(HostRing) == 576);
-static_assert(sizeof(CpuPacketRing) == 163968);
+static_assert(sizeof(CpuPacketRing) == 169088);
 static_assert(sizeof(DeviceEpoch) == 64);
 
 struct PolledRing {
@@ -324,6 +333,16 @@ void submit_real_route_publish(sycl::queue& q, HostRing* ring,
                                sycl::memory_scope::system);
             uncached_store(&ring->ctrl.route_seq, seq);
         });
+    });
+}
+
+void submit_copy_x_to_mapped(sycl::queue& q, const bf16* x,
+                             CpuPacketRing* packet) {
+    auto* dst = reinterpret_cast<uint16_t*>(packet->x);
+    q.parallel_for(sycl::range<1>(kHidden), [=](sycl::id<1> id) {
+        const uint16_t value =
+            reinterpret_cast<const uint16_t*>(x)[id[0]];
+        uncached_store(dst + id[0], value);
     });
 }
 
@@ -603,6 +622,7 @@ void write_host_result(HostRing* ring, uint32_t value_seq, uint32_t publish_seq)
 
 struct Handoff {
     uint32_t seq = 0;
+    int cpu_rows = 0;
     double launch_to_route_us = 0.0;
     double route_to_flag_us = 0.0;
     double route_to_done_us = 0.0;
@@ -622,7 +642,9 @@ Handoff service_replay(Context& ctx,
                        bool synthetic_route = true,
                        CpuPacketRing* cpu_packet = nullptr,
                        const int* cpu_packet_ranks = nullptr,
-                       int cpu_packet_rows = 0) {
+                       int cpu_packet_rows = 0,
+                       const std::function<int(uint32_t)>&
+                           cpu_packet_fill = {}) {
     sycl::queue& q = ctx.queue();
     auto& ctrl = ring->ctrl;
     const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
@@ -653,9 +675,19 @@ Handoff service_replay(Context& ctx,
     const uint32_t value_seq =
         stale_injection ? expected_seq - 1u : expected_seq;
     burn_cpu_us(cpu_us);
-    if (cpu_packet)
-        write_host_packet(cpu_packet, value_seq, expected_seq,
-                          cpu_packet_ranks, cpu_packet_rows);
+    int actual_cpu_rows = cpu_packet_rows;
+    if (cpu_packet) {
+        if (cpu_packet_fill) {
+            actual_cpu_rows = cpu_packet_fill(value_seq);
+            cpu_packet->rows = static_cast<uint32_t>(actual_cpu_rows);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            *volatile_u32(&cpu_packet->ready_seq) = expected_seq;
+        } else {
+            write_host_packet(cpu_packet, value_seq, expected_seq,
+                              cpu_packet_ranks, cpu_packet_rows);
+        }
+    }
     write_host_result(ring, value_seq, expected_seq);
     const auto t_flag = Clock::now();
 
@@ -672,6 +704,7 @@ Handoff service_replay(Context& ctx,
 
     Handoff out;
     out.seq = expected_seq;
+    out.cpu_rows = actual_cpu_rows;
     out.launch_to_route_us = us_between(t_launch, t_route);
     out.route_to_flag_us = us_between(t_route, t_flag);
     out.route_to_done_us = us_between(t_route, t_done);
@@ -919,6 +952,8 @@ int run_real_front_model(const Options& options) {
     float* graph_route_weights = static_cast<float*>(
         ctx.alloc_device(sizeof(float) * kTopK));
     auto& adaptive = Qwen4ExpGenerationTestAccess::Adaptive(b);
+    auto& graph_executor = Qwen4ExpGenerationTestAccess::Executor(b);
+    auto& graph_arena = Qwen4ExpGenerationTestAccess::HostArena(b);
     const int top_k = Qwen4ExpGenerationTestAccess::TopK(b);
     const int experts = Qwen4ExpGenerationTestAccess::ExpertsPerLayer(b);
     const int hidden = Qwen4ExpGenerationTestAccess::HiddenSize(b);
@@ -927,6 +962,9 @@ int run_real_front_model(const Options& options) {
     if (!adaptive.IsAllocated() || !adaptive.DeviceSlotTable() ||
         top_k < 1 || top_k > 16)
         throw std::runtime_error("adaptive resident graph state unavailable");
+    if (!graph_executor.cpu_overlap_enabled() ||
+        !graph_arena.IsAllocated())
+        throw std::runtime_error("graph CPU worker or arena unavailable");
     const auto& nested_meta =
         Qwen4ExpGenerationTestAccess::NestedMeta(b, 0);
     std::vector<ops::MoeExpertSlotDev> resident_descriptors(
@@ -942,8 +980,6 @@ int run_real_front_model(const Options& options) {
             sizeof(ops::MoeExpertSlotDev)));
     int* selected_dev =
         static_cast<int*>(ctx.alloc_device(sizeof(int) * 16));
-    int* moe_test_ids_dev =
-        static_cast<int*>(ctx.alloc_device(sizeof(int) * top_k));
     const size_t cpu_packet_bytes =
         sizeof(int) * kMaxPacketRows +
         sizeof(float) * kMaxPacketRows * kHidden;
@@ -967,40 +1003,6 @@ int run_real_front_model(const Options& options) {
                    resident_descriptors.data(),
                    resident_descriptors.size() *
                        sizeof(ops::MoeExpertSlotDev));
-    std::array<int, 16> moe_test_ids{};
-    std::vector<bool> used(static_cast<size_t>(experts), false);
-    int chosen = 0;
-    const int resident_target = std::min(5, top_k);
-    for (int slot = 0;
-         slot < adaptive.NumGpuSlots() && chosen < resident_target; ++slot) {
-        const auto entry = adaptive.GetResidentEntry(slot);
-        if (entry.layer != 0 || entry.expert_id < 0 ||
-            entry.expert_id >= experts || used[entry.expert_id])
-            continue;
-        moe_test_ids[chosen++] = entry.expert_id;
-        used[entry.expert_id] = true;
-    }
-    for (int expert = 0;
-         expert < experts && chosen < top_k; ++expert) {
-        if (used[expert] || adaptive.GetSlot(0, expert) >= 0) continue;
-        moe_test_ids[chosen++] = expert;
-        used[expert] = true;
-    }
-    for (int expert = 0;
-         expert < experts && chosen < top_k; ++expert) {
-        if (used[expert]) continue;
-        moe_test_ids[chosen++] = expert;
-        used[expert] = true;
-    }
-    ctx.memcpy_h2d(moe_test_ids_dev, moe_test_ids.data(),
-                   sizeof(int) * top_k);
-    std::array<int, kMaxPacketRows> packet_rank_to_row{};
-    packet_rank_to_row.fill(-1);
-    int cpu_rows = 0;
-    for (int rank = 0; rank < top_k; ++rank) {
-        if (adaptive.GetSlot(0, moe_test_ids[rank]) < 0)
-            packet_rank_to_row[rank] = cpu_rows++;
-    }
     q.memset(epoch, 0, sizeof(DeviceEpoch)).wait_and_throw();
     q.memset(device_result, 0, sizeof(float) * kResultCount).wait_and_throw();
     q.memset(graph_route_ids, 0, sizeof(int) * kTopK).wait_and_throw();
@@ -1028,6 +1030,24 @@ int run_real_front_model(const Options& options) {
     q.memset(down_reference, 0x7f, down_graph_bytes);
     ctx.synchronize();
 
+    auto real_cpu_fill = [&](uint32_t) -> int {
+        std::array<int, 16> cold_ids{};
+        std::array<int, 16> cold_ranks{};
+        int cold_count = 0;
+        for (int rank = 0; rank < top_k; ++rank) {
+            const int expert = ring->route.ids[rank];
+            if (adaptive.GetSlot(0, expert) >= 0) continue;
+            cold_ids[cold_count] = expert;
+            cold_ranks[cold_count] = rank;
+            ++cold_count;
+        }
+        if (!cold_count) return 0;
+        return graph_executor.RunGraphColdPacket(
+            graph_arena, 0, cold_ids.data(), cold_ranks.data(),
+            cold_count, cpu_packet->x, cpu_packet->rank_to_row,
+            cpu_packet->values);
+    };
+
     bool all_ok = true;
     {
         ex::command_graph<ex::graph_state::modifiable> recording(
@@ -1036,10 +1056,14 @@ int run_real_front_model(const Options& options) {
         try {
             Qwen4ExpGenerationTestAccess::FrontRoute(
                 b, ds, graph_route_ids, graph_route_weights);
+            submit_copy_x_to_mapped(
+                q,
+                Qwen4ExpGenerationTestAccess::FrontX(b).data_as<bf16>(),
+                cpu_packet);
             submit_real_route_publish(
                 q, ring, epoch, graph_route_ids, graph_route_weights);
             submit_resident_classify(
-                q, moe_test_ids_dev, adaptive.DeviceSlotTable(), selected_dev,
+                q, graph_route_ids, adaptive.DeviceSlotTable(), selected_dev,
                 0, experts, top_k);
             ops::moe_resident_gate_up(
                 ctx, resident_descriptors_dev, selected_dev,
@@ -1073,7 +1097,7 @@ int run_real_front_model(const Options& options) {
         uint32_t expected_seq = 1;
         const Handoff first = service_replay(
             ctx, executable, ring, expected_seq, 0, options.host_timeout_ms,
-            false, false, cpu_packet, packet_rank_to_row.data(), cpu_rows);
+            false, false, cpu_packet, nullptr, 0, real_cpu_fill);
         if (first.timeout_delta || first.stale_delta ||
             first.mismatch_delta) {
             throw std::runtime_error("real-front handshake failed");
@@ -1144,14 +1168,14 @@ int run_real_front_model(const Options& options) {
                   << (front_parity ? 1 : 0)
                   << " route_parity=" << (route_parity ? 1 : 0)
                   << " resident_count=" << resident_count
-                  << " cpu_rows=" << cpu_rows
+                  << " cpu_rows=" << first.cpu_rows
                   << " moe_down_parity=" << (moe_down_parity ? 1 : 0)
                   << " packet_merge_parity="
                   << (packet_merge_parity ? 1 : 0)
                   << " handoff_us=" << first.route_to_done_us << '\n';
         all_ok &= front_parity && route_parity && moe_down_parity &&
-                  packet_merge_parity && resident_count > 0 &&
-                  cpu_rows > 0;
+                  packet_merge_parity && first.cpu_rows > 0 &&
+                  resident_count + first.cpu_rows == top_k;
 
         for (int cpu_us : options.cpu_sweep) {
             ArmStats stats;
@@ -1161,7 +1185,7 @@ int run_real_front_model(const Options& options) {
                 const Handoff h = service_replay(
                     ctx, executable, ring, expected_seq, cpu_us,
                     options.host_timeout_ms, false, false, cpu_packet,
-                    packet_rank_to_row.data(), cpu_rows);
+                    nullptr, 0, real_cpu_fill);
                 if (h.timeout_delta || h.stale_delta || h.mismatch_delta)
                     throw std::runtime_error(
                         "real-front warmup handshake failure");
@@ -1171,7 +1195,7 @@ int run_real_front_model(const Options& options) {
                 const Handoff h = service_replay(
                     ctx, executable, ring, expected_seq, cpu_us,
                     options.host_timeout_ms, false, false, cpu_packet,
-                    packet_rank_to_row.data(), cpu_rows);
+                    nullptr, 0, real_cpu_fill);
                 stats.launch_to_route.push_back(h.launch_to_route_us);
                 stats.route_to_flag.push_back(h.route_to_flag_us);
                 stats.route_to_done.push_back(h.route_to_done_us);
@@ -1186,7 +1210,7 @@ int run_real_front_model(const Options& options) {
             const Handoff stale = service_replay(
                 ctx, executable, ring, expected_seq, cpu_us,
                 options.host_timeout_ms, true, false, cpu_packet,
-                packet_rank_to_row.data(), cpu_rows);
+                nullptr, 0, real_cpu_fill);
             stats.stale_detected =
                 stale.timeout_delta == 0 && stale.stale_delta >= 1 &&
                 stale.mismatch_delta >= 1;
@@ -1204,7 +1228,6 @@ int run_real_front_model(const Options& options) {
     ctx.free_device(down_reference);
     ctx.free_device(h_reference);
     ctx.free_device(x_copy);
-    ctx.free_device(moe_test_ids_dev);
     ctx.free_device(selected_dev);
     ctx.free_device(resident_descriptors_dev);
     ctx.free_device(graph_route_weights);

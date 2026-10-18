@@ -999,6 +999,48 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
     } catch (...) { AbortResidentCold(); throw; }
 }
 
+int Qwen4ExpExpertExecutor::RunGraphColdPacket(
+    const Qwen4ExpHostArena& arena, int layer, const int* ids,
+    const int* ranks, int count, const bf16* x_host, int* rank_to_row,
+    float* packet_rows) {
+    if (!initialized_ || !cpu_worker_ || !ids || !ranks || !x_host ||
+        !rank_to_row || !packet_rows)
+        throw std::logic_error("Invalid graph CPU packet request");
+    if (count < 1 || count > 16 || count > max_cpu_credits_)
+        throw std::logic_error("Graph CPU packet count exceeds fixed capacity");
+    if (cold_count_ || async_route_pending_ || async_route_collected_ ||
+        arena_verify_pending_ || cpu_host_result_active_)
+        throw std::logic_error("Graph CPU packet requires an idle executor");
+
+    CpuWorker::Job job;
+    job.count = count;
+    job.hidden = hidden_size_;
+    job.intermediate = intermediate_size_;
+    job.tokens = 1;
+    job.x = x_host;
+    job.h = scratch_h_;
+    job.out = cpu_out_host_;
+    job.resident_prepared = true;
+    std::fill_n(rank_to_row, 16, -1);
+    for (int c = 0; c < count; ++c) {
+        const auto source = arena.GetExpertSlotHost(layer, ids[c]);
+        if (!source.gate_up_packed || !source.down_packed ||
+            ranks[c] < 0 || ranks[c] >= top_k_)
+            throw std::logic_error(
+                "Graph CPU expert has no native RAM owner or rank");
+        job.tasks[c] = {source, 0};
+        rank_to_row[ranks[c]] = c;
+    }
+    cpu_worker_->submit(job);
+    (void)cpu_worker_->finish();
+    for (int c = 0; c < count; ++c) {
+        std::memcpy(packet_rows + size_t(c) * hidden_size_,
+                    cpu_out_host_ + size_t(c) * hidden_size_,
+                    size_t(hidden_size_) * sizeof(float));
+    }
+    return count;
+}
+
 sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output, const sycl::event* order_dep) {
     cpu_result_packet_active_=false;
     if(!cold_count_ && !async_route_pending_)return {};

@@ -202,6 +202,14 @@ public:
     int StartArenaCold(const Qwen4ExpHostArena& arena, int layer, const int* ids,
                        const int* ranks, int count, const bf16* x_dev,
                        int row_token = 0, int tokens = 1);
+    // Graph-service path: x is already visible in uncached host memory and the
+    // caller owns the ring protocol. This runs one synchronous CPU batch and
+    // writes the existing 16-rank packet layout directly; it submits/waits no
+    // SYCL copy or event and never mutates adaptive residency.
+    int RunGraphColdPacket(const Qwen4ExpHostArena& arena, int layer,
+                           const int* ids, const int* ranks, int count,
+                           const bf16* x_host, int* rank_to_row,
+                           float* packet_rows);
     // Opt-in (AILA_Q4E_VERIFY_CPU_BATCH) single-call cold service for a 2..4
     // row verify window: the caller classifies every row first (GetSlot is a
     // pure lookup and ObserveRouting only updates counters) and passes the

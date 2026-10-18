@@ -137,3 +137,45 @@ arguments. The P3 shape should therefore be:
 
 The current P2 probe satisfies the resident dispatch and packet transport
 parts, but not the scalar table, PLE/QSA variants, or real `CpuWorker`.
+
+## 7. Real CPU pipeline integration
+
+The synthetic packet writer has now been replaced by the real existing CPU
+pipeline:
+
+```text
+device graph publishes x + real router route
+  -> host reads route from uncached ring
+  -> Qwen4ExpExpertExecutor::RunGraphColdPacket
+  -> existing CpuWorker + Qwen4ExpHostArena
+  -> real 16-rank CPU packet
+  -> graph mapped-copy kernel + ordered merge
+```
+
+`RunGraphColdPacket` uses one synchronous worker job, the existing pinned
+scratch/output banks and the native host arena. It submits/waits no SYCL copy
+and does not mutate adaptive residency. This is a service entry only; the
+production scheduler remains unchanged.
+
+Receipt: `gpu-real-cpu-p2.log`
+
+| item | result |
+|---|---:|
+| graph replays | 1,000 |
+| route source | real layer-0 router |
+| resident / CPU rows | 0 / 10 |
+| front / route / MoE down parity | bitwise / exact / bitwise |
+| real CPU packet merge parity | bitwise |
+| steady route-to-flag median | 345.7 us |
+| steady handoff median / p99 | 406.5 / 568.0 us |
+| steady replay wall median / p99 | 920.0 / 1,196.6 us |
+| first cold call handoff | 16.0 ms |
+| timeouts / stale / mismatch | 0 / 0 / 0 |
+
+The first call pays page/scale warm-up; 1,000 subsequent calls remain bounded.
+This is the first real end-to-end single-layer graph CPU handoff, not a full
+token graph and not yet an adoption result.
+
+Resident dispatch remains covered separately by the forced 5-resident /
+5-cold test and its packet merge receipt. The current real route happened to
+be all-cold for layer 0.

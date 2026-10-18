@@ -179,3 +179,27 @@ handoff_us_median=190.3 timeouts=0
 
 The CPU rows are still synthetic. Replacing them with a real `CpuWorker` job is
 the next gate before a full-layer graph claim.
+
+## Real CPU pipeline
+
+`--real-front-model` now publishes the real router route and the device
+activation row to the uncached ring, then the host calls
+`Qwen4ExpExpertExecutor::RunGraphColdPacket` using the existing `CpuWorker` and
+host arena. The graph copies the real packet into device memory and merges it.
+
+Receipt `gpu-real-cpu-p2.log`:
+
+```text
+resident_count=0 cpu_rows=10
+front_parity=1 route_parity=1
+moe_down_parity=1 packet_merge_parity=1
+replays=1000
+route_to_flag_us_median=345.7
+handoff_us_median=406.5 p99=568.0
+replay_wall_us_median=920.0
+first_cold_handoff_ms=16.0
+timeouts=0
+```
+
+The real route is all-cold for this fixture; mixed resident/CPU coverage is
+retained by the earlier forced mask receipt.
