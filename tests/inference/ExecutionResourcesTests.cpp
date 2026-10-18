@@ -167,6 +167,72 @@ void TestContextBudgetAndOrder() {
            "Releasing allocations must retain lifetime peaks");
 }
 
+void TestUncachedHostAllocation() {
+    Context context;
+#if !defined(AILA_HAS_LEVEL_ZERO)
+    ExpectThrows<std::runtime_error>(
+        [&] { context.alloc_host_uncached(64); },
+        "Uncached host allocation without Level Zero SDK support");
+    ExpectUsage(context, 0, 0, 0, 0,
+                "Unsupported uncached host allocation");
+    return;
+#else
+    if (context.queue().get_backend() !=
+        sycl::backend::ext_oneapi_level_zero) {
+        ExpectThrows<std::runtime_error>(
+            [&] { context.alloc_host_uncached(64); },
+            "Uncached host allocation on a non-Level-Zero backend");
+        ExpectUsage(context, 0, 0, 0, 0,
+                    "Rejected uncached host allocation");
+        return;
+    }
+
+    context.set_allocation_limits(0, 64);
+    UsmAllocation pinned(context, 16, true);
+    void* raw = nullptr;
+    try {
+        raw = context.alloc_host_uncached(48);
+        ExpectUsage(context, 0, 64, 0, 2,
+                    "Mixed pinned and uncached host allocations");
+        Expect(sycl::get_pointer_type(raw, context.queue().get_context()) ==
+                   sycl::usm::alloc::host,
+               "Uncached Level Zero allocation is not host USM");
+        ExpectThrows<std::invalid_argument>(
+            [&] { context.alloc_host_uncached(0); },
+            "Zero uncached allocation");
+        ExpectThrows<LimitExceeded>(
+            [&] { context.alloc_host_uncached(1); },
+            "Uncached host budget");
+        ExpectUsage(context, 0, 64, 0, 2,
+                    "Rejected uncached allocations changed the ledger");
+
+        auto* words = static_cast<int*>(raw);
+        words[0] = 41;
+        words[1] = 0;
+        context.queue()
+            .single_task([words] { words[1] = words[0] + 1; })
+            .wait_and_throw();
+        Expect(words[1] == 42,
+               "Device code could not access uncached host USM");
+        context.synchronize();
+        context.free_host(raw);
+        raw = nullptr;
+        ExpectUsage(context, 0, 16, 0, 1,
+                    "Uncached release preserved ordinary pinned allocation");
+    } catch (...) {
+        if (raw) {
+            try { context.synchronize(); } catch (...) {}
+            context.free_host(raw);
+        }
+        throw;
+    }
+    context.synchronize();
+    pinned.Reset();
+    ExpectUsage(context, 0, 0, 0, 0,
+                "Uncached and pinned host allocations released");
+#endif
+}
+
 struct ProbeWorkspace {
     explicit ProbeWorkspace(Context& context) : device(context, 96), pinned(context, 32, true) {}
     UsmAllocation device, pinned;
@@ -597,6 +663,7 @@ int main() {
 #endif
         const struct { const char* name; void (*run)(); } cases[] = {
             {"context-budget-and-order", TestContextBudgetAndOrder},
+            {"uncached-host-allocation", TestUncachedHostAllocation},
             {"typed-workspace-ownership", TestTypedWorkspaceOwnership},
             {"sampling-isolation-and-reuse", TestSamplingIsolationAndReuse},
             {"shared-scratch-budget", TestSharedScratchBudget},

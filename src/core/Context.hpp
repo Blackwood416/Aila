@@ -13,6 +13,7 @@
 #include "memory/LargePages.hpp"
 #include "core/AsyncErrorState.hpp"
 #include "core/ExecutionTrace.hpp"
+#include "core/UncachedHostAllocation.hpp"
 
 // ============================================================
 // SYCL + oneDNN 运行时上下文
@@ -67,6 +68,41 @@ public:
         return allocate(bytes, true);
     }
 
+    // Level Zero host USM with the uncached bias, required for device code that
+    // polls host-published doorbells. Counted against the pinned-host budget.
+    void* alloc_host_uncached(size_t bytes) {
+        async_errors_->Rethrow();
+        CheckTrace();
+        if (!bytes) {
+            throw std::invalid_argument(
+                "Uncached host allocation must have positive size");
+        }
+        host_budget_.Check(bytes, "Uncached host");
+        const auto allocation =
+            aila::memory::AllocateUncachedHost(q_.get_context(), bytes);
+        bool recorded = false;
+        try {
+            const auto inserted = alloc_bytes_.emplace(
+                allocation.ptr,
+                Allocation{bytes, AllocationKind::UncachedHost,
+                           allocation.native_context});
+            if (!inserted.second) {
+                throw std::runtime_error(
+                    "Uncached host allocation returned a duplicate pointer");
+            }
+            recorded = true;
+            host_budget_.Acquire(bytes, "Uncached host");
+            return allocation.ptr;
+        } catch (...) {
+            if (recorded) {
+                alloc_bytes_.erase(allocation.ptr);
+            }
+            aila::memory::FreeUncachedHost(
+                allocation.native_context, allocation.ptr);
+            throw;
+        }
+    }
+
     // Explicitly resident CPU storage. This pointer is not USM and must not be
     // dereferenced by a kernel. Account the rounded physical allocation.
     void* alloc_large_host(size_t bytes) {
@@ -76,7 +112,8 @@ public:
         host_budget_.Check(bytes, "Large-page host");
         void* ptr = aila::memory::AllocateLargePages(bytes);
         try {
-            alloc_bytes_.emplace(ptr, Allocation{bytes, true, true});
+            alloc_bytes_.emplace(
+                ptr, Allocation{bytes, AllocationKind::LargePageHost});
             host_budget_.Acquire(bytes, "Large-page host");
             return ptr;
         } catch (...) {
@@ -90,20 +127,34 @@ public:
         if (!ptr) return;
         auto it = alloc_bytes_.find(ptr);
         aila::diagnostics::ExecutionFields fields;
+        AllocationKind kind = AllocationKind::Device;
+        void* native_context = nullptr;
         if (it != alloc_bytes_.end()) {
             fields.bytes = it->second.bytes;
-            fields.memory = it->second.host ? aila::diagnostics::TraceMemory::PinnedHost
-                                            : aila::diagnostics::TraceMemory::Device;
+            fields.memory = it->second.IsHost()
+                                ? aila::diagnostics::TraceMemory::PinnedHost
+                                : aila::diagnostics::TraceMemory::Device;
+            kind = it->second.kind;
+            native_context = it->second.native_context;
         }
         TraceScope stage(trace_, TraceStage::UsmFree, fields);
-        const bool large_pages = it != alloc_bytes_.end() && it->second.large_pages;
         if (it != alloc_bytes_.end()) {
-            auto& budget = it->second.host ? host_budget_ : device_budget_;
+            auto& budget = it->second.IsHost() ? host_budget_ : device_budget_;
             budget.Release(it->second.bytes);
             alloc_bytes_.erase(it);
         }
-        if (large_pages) aila::memory::FreeLargePages(ptr);
-        else sycl::free(ptr, q_);
+        switch (kind) {
+        case AllocationKind::LargePageHost:
+            aila::memory::FreeLargePages(ptr);
+            break;
+        case AllocationKind::UncachedHost:
+            aila::memory::FreeUncachedHost(native_context, ptr);
+            break;
+        case AllocationKind::Device:
+        case AllocationKind::PinnedHost:
+            sycl::free(ptr, q_);
+            break;
+        }
         stage.Complete(); // Never throw a trace error from a resource free.
     }
 
@@ -228,7 +279,19 @@ private:
     sycl::queue q_;
     dnnl::engine eng_;
     dnnl::stream stream_;
-    struct Allocation { size_t bytes; bool host; bool large_pages = false; };
+    enum class AllocationKind : unsigned char {
+        Device,
+        PinnedHost,
+        UncachedHost,
+        LargePageHost,
+    };
+    struct Allocation {
+        size_t bytes;
+        AllocationKind kind;
+        void* native_context = nullptr;
+
+        bool IsHost() const noexcept { return kind != AllocationKind::Device; }
+    };
     std::unordered_map<void*, Allocation> alloc_bytes_;
     aila::memory::AllocationBudget device_budget_, host_budget_;
     std::unordered_map<std::type_index, std::shared_ptr<void>> workspaces_;
@@ -246,7 +309,9 @@ private:
         try {
             ptr = host ? sycl::malloc_host(bytes, q_) : sycl::malloc_device(bytes, q_);
             if (!ptr) throw std::runtime_error("USM allocation failed: " + std::to_string(bytes) + " bytes");
-            alloc_bytes_.emplace(ptr, Allocation{bytes, host});
+            alloc_bytes_.emplace(
+                ptr, Allocation{bytes, host ? AllocationKind::PinnedHost
+                                            : AllocationKind::Device});
             budget.Acquire(bytes, kind);
             return ptr;
         } catch (...) {

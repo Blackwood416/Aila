@@ -293,6 +293,45 @@ include_directories(${PROJECT_SOURCE_DIR}/src)
 include_directories(${PROJECT_SOURCE_DIR}/third_party/dr_libs)
 include_directories(${PROJECT_SOURCE_DIR}/src/templates/jinja)
 
+# Optional Level Zero SDK support for device-polled host USM. The Context API
+# fails closed at runtime when this is unavailable.
+set(AILA_LEVEL_ZERO_ROOT "" CACHE PATH "Level Zero SDK root")
+if(WIN32)
+    file(GLOB AILA_LEVEL_ZERO_SDK_CANDIDATES LIST_DIRECTORIES true
+        "C:/Program Files/LevelZeroSDK/*")
+    list(SORT AILA_LEVEL_ZERO_SDK_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+endif()
+find_path(AILA_LEVEL_ZERO_INCLUDE_DIR
+    NAMES level_zero/ze_api.h
+    HINTS
+        "${AILA_LEVEL_ZERO_ROOT}"
+        "$ENV{LEVEL_ZERO_ROOT}"
+        "$ENV{ZE_ROOT}"
+        ${AILA_LEVEL_ZERO_SDK_CANDIDATES}
+    PATH_SUFFIXES include
+)
+find_library(AILA_LEVEL_ZERO_LOADER_LIBRARY
+    NAMES ze_loader
+    HINTS
+        "${AILA_LEVEL_ZERO_ROOT}"
+        "$ENV{LEVEL_ZERO_ROOT}"
+        "$ENV{ZE_ROOT}"
+        ${AILA_LEVEL_ZERO_SDK_CANDIDATES}
+    PATH_SUFFIXES lib
+)
+if(AILA_LEVEL_ZERO_INCLUDE_DIR AND AILA_LEVEL_ZERO_LOADER_LIBRARY)
+    add_library(AilaLevelZero INTERFACE)
+    target_include_directories(AilaLevelZero INTERFACE
+        "${AILA_LEVEL_ZERO_INCLUDE_DIR}")
+    target_compile_definitions(AilaLevelZero INTERFACE AILA_HAS_LEVEL_ZERO=1)
+    target_link_libraries(AilaLevelZero INTERFACE
+        "${AILA_LEVEL_ZERO_LOADER_LIBRARY}")
+    message(STATUS "Level Zero SDK: ${AILA_LEVEL_ZERO_LOADER_LIBRARY}")
+else()
+    message(STATUS
+        "Level Zero SDK not found; alloc_host_uncached will fail closed")
+endif()
+
 # ============================================================
 # Dependencies
 # ============================================================
@@ -330,6 +369,9 @@ endif()
 add_library(AilaLib STATIC ${LIB_SOURCES})
 target_compile_definitions(AilaLib PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_link_libraries(AilaLib PUBLIC DNNL::dnnl simdjson soxr AilaSyclOptions)
+if(TARGET AilaLevelZero)
+    target_link_libraries(AilaLib PUBLIC AilaLevelZero)
+endif()
 if(WIN32)
     target_link_libraries(AilaLib PUBLIC windowscodecs ole32)
 endif()

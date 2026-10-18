@@ -60,12 +60,14 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         d_state.conv_head = cache.linear_conv_head;
         d_state.device_state_dirty = cache.device_state_dirty;
         const bool use_device_conv_head =
-            count == 1 && session.graph_gdn_state_enabled_ &&
-            cache.linear_conv_head_dev != nullptr;
+            count == 1 && session.graph_gdn_state_enabled_;
         if (use_device_conv_head) {
-            if (!cache.linear_conv_head_device_synced) {
+            // Device authority is sufficient for steady decode: the host
+            // mirror is intentionally stale until a checkpoint boundary.
+            if (!GdnDeviceHeadReadable(cache)) {
                 throw std::invalid_argument(
-                    "Qwen4Exp graph GDN head was not synchronized before decode");
+                    "Qwen4Exp graph GDN session has no readable device head "
+                    "before decode");
             }
             d_state.conv_head_dev = cache.linear_conv_head_dev;
         }

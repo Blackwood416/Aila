@@ -30,12 +30,18 @@ enum class TokenGraphPhase : std::uint8_t {
 struct TokenGraphKey {
     const void* backend = nullptr;
     const void* session = nullptr;
+    // Backend-assigned monotonic identity. Unlike the object address, this
+    // cannot alias a destroyed Session whose generation restarted at one.
+    std::uint64_t session_instance_id = 0;
     std::uint64_t session_generation = 0;
     std::uint64_t session_state_generation = 0;
     std::uint64_t runtime_generation = 0;
     std::int32_t runtime_capacity = 0;
     std::uint64_t residency_generation = 0;
     std::uint64_t descriptor_generation = 0;
+    // Shared PLE workspace layout and the Session-scoped fixed graph view.
+    std::uint64_t ple_workspace_generation = 0;
+    std::uint64_t ple_graph_view_generation = 0;
     std::uint64_t topology_generation = 0;
     std::uint64_t topology_flags = 0;
     TokenGraphBody body = TokenGraphBody::QsaLayerProof;

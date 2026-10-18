@@ -231,8 +231,9 @@ static thread_local std::array<int, 16> d1_stash_ranks{};
 Qwen4ExpBnb4Backend::Session::Session(
     Context& ctx, int capacity,
     std::shared_ptr<const SessionOwner> owner,
-    std::size_t maxSnapshots)
+    std::size_t maxSnapshots, uint64_t instanceId)
     : context_(&ctx), owner_(std::move(owner)),
+      session_instance_id_(instanceId),
       capacity_(capacity), snapshots_(maxSnapshots) {
     // INT8 KV is opt-in and default-off; both switches must be present.
     const bool int8_kv = aila::env::read_flag("AILA_KV_QUANT", false) &&
@@ -292,6 +293,13 @@ Qwen4ExpBnb4Backend::Session::~Session() {
     }
 }
 
+bool Qwen4ExpBnb4Backend::GdnDeviceHeadReadable(
+    const Qwen4ExpLayerCache& cache) noexcept {
+    return cache.linear_conv_head_dev != nullptr &&
+           (cache.linear_conv_head_device_authority ||
+            cache.linear_conv_head_device_synced);
+}
+
 void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
     const Session& session, int count) const {
     if (!session.graph_gdn_state_enabled_) return;
@@ -299,8 +307,9 @@ void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
         for (const auto& cache : session.layerCaches_) {
             if (cache.linear_conv_head_device_authority) {
                 throw std::invalid_argument(
-                    "Qwen4Exp graph GDN state cannot continue with a multi-row/"
-                    "prefill forward before an explicit head synchronization");
+                    "Qwen4Exp device-authoritative GDN state cannot switch to "
+                    "a multi-row/prefill forward before an explicit head "
+                    "synchronization");
             }
         }
         return;
@@ -2528,12 +2537,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
     static const bool ple_lookahead = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
     const bool reuse_ple = ple_lookahead && options.prefill_remaining >= 0 &&
-        ple_next_ticket_.session_ptr == &session && ple_next_ticket_.generation == session.generation() &&
+        PleTicketEpochMatches(session, ple_next_ticket_) &&
         ple_next_ticket_.start_pos == start_pos && ple_next_ticket_.prev_tokens_in == session.ple_state_.prev_tokens &&
         ple_.MatchesInput(ple_next_ticket_, ple_ids_ptr, count);
     if (reuse_ple) ple_ticket_ = ple_next_ticket_;
     else ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
-                                    &session, session.generation(), start_pos);
+                                    &session, session.generation(), start_pos,
+                                    session.ple_ticket_epoch());
     ple_next_ticket_.valid = false;
     if (ple_lookahead && options.prefill_remaining > 0 && options.next_prefill_count > 0) {
         if (!options.next_prefill_tokens || options.next_prefill_count > options.prefill_remaining ||
@@ -2545,7 +2555,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         Qwen4ExpPleState future;
         future.prev_tokens = ple_ticket_.prev_tokens_next;
         ple_next_ticket_ = ple_.prepare(ctx, future, options.next_prefill_tokens,
-            options.next_prefill_count, &session, session.generation(), cached_len);
+            options.next_prefill_count, &session, session.generation(), cached_len,
+            session.ple_ticket_epoch());
     }
 
     if (!session.embeddingOverridePositions_.empty() &&
@@ -2823,10 +2834,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (L == 1) {
             // PLE reads the residual stack before this layer's HC norm.
             pending_mlp.Materialize();
-            if (!ple_ticket_.valid || ple_ticket_.session_ptr != &session ||
-                ple_ticket_.generation != session.generation() || ple_ticket_.start_pos != start_pos) {
+            if (!PleTicketEpochMatches(session, ple_ticket_) ||
+                ple_ticket_.start_pos != start_pos) {
                 ple_ticket_ = ple_.prepare(ctx, session.ple_state_, ple_ids_ptr, count,
-                                           &session, session.generation(), start_pos);
+                                           &session, session.generation(), start_pos,
+                                           session.ple_ticket_epoch());
             }
             ple_.consume(ctx, ple_ticket_, session.ple_state_,
                          hidden4_ptr, nullptr, hidden4_ptr, checkpoint_after,
@@ -3810,6 +3822,10 @@ Qwen4ExpBnb4Backend::StateSnapshot& Qwen4ExpBnb4Backend::ReserveSnapshot(Session
 void Qwen4ExpBnb4Backend::CaptureSnapshot(
     Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
     if (session.snapshots_.empty()) return;
+    if (session.token_graph_poisoned()) {
+        throw std::logic_error(
+            "Qwen4Exp cannot checkpoint a poisoned token-graph session");
+    }
     int step = aila::env::read_int("AILA_Q4E_PREFILL_STEP", 64);
     if (step <= 0) step = 64;
     if (!force && tokenCount <= 1 && nextLength % step != 0) return;
@@ -3968,7 +3984,12 @@ void Qwen4ExpBnb4Backend::reset() {
 
 std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession(
     Context& ctx, std::size_t maxSnapshots) {
-    auto session = std::unique_ptr<Session>(new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots));
+    if (next_session_instance_id_ == 0) {
+        throw std::overflow_error("Qwen4Exp session instance id overflow");
+    }
+    const uint64_t instanceId = next_session_instance_id_++;
+    auto session = std::unique_ptr<Session>(
+        new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots, instanceId));
     ple_.init_state(ctx, session->ple_state_);
     // Exact device payload of the tensors this Session owns, matching
     // qwen4exp_session_memory's device reservation. Model weights, expert
@@ -4060,6 +4081,13 @@ void Qwen4ExpBnb4Backend::ValidateSession(const Session& session) const {
     }
 }
 
+bool Qwen4ExpBnb4Backend::PleTicketEpochMatches(
+    const Session& session, const PleTicket& ticket) const noexcept {
+    return ticket.valid && ticket.session_ptr == &session &&
+        ticket.generation == session.generation() &&
+        ticket.ticket_epoch == session.ple_ticket_epoch();
+}
+
 aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeTokenGraphKey(
     const Session& session, aila::TokenGraphBody body,
     aila::TokenGraphAttention attention, uint64_t topology_flags) const {
@@ -4068,15 +4096,31 @@ aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeTokenGraphKey(
         throw std::logic_error(
             "Qwen4Exp token graph is poisoned; recreate the session");
     }
+    ValidateGdnHeadPath(session, 1);
+    if (session.mropePosT_.valid() || session.mropePosH_.valid() ||
+        session.mropePosW_.valid() || session.mropePromptLength_ > 0 ||
+        session.mropeTextPositionDelta_ != 0) {
+        throw std::logic_error(
+            "Qwen4Exp token graph key rejects mRoPE position state");
+    }
+    if (!session.embeddingOverridePositions_.empty() ||
+        !session.embeddingOverrideValues_.empty() ||
+        session.embeddingOverrideHiddenSize_ != 0) {
+        throw std::logic_error(
+            "Qwen4Exp token graph key rejects embedding overrides");
+    }
     aila::TokenGraphKey key{};
     key.backend = this;
     key.session = &session;
+    key.session_instance_id = session.session_instance_id();
     key.session_generation = session.generation();
     key.session_state_generation = session.token_graph_generation();
     key.runtime_generation = runtime_generation_;
     key.runtime_capacity = runtime_seq_capacity_;
     key.residency_generation = adaptive_cache_.ResidencyGeneration();
     key.descriptor_generation = adaptive_cache_.DescriptorGeneration();
+    key.ple_workspace_generation = ple_.workspace_generation();
+    key.ple_graph_view_generation = session.ple_state_.graph_view_generation;
     key.topology_generation = topology_generation_;
     key.topology_flags = topology_flags;
     key.body = body;

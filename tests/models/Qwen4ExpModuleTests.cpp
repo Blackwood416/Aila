@@ -33,6 +33,10 @@ struct Qwen4ExpGenerationTestAccess {
                                 const Qwen4ExpBnb4Backend::Session& session, int count) {
         backend.ValidateGdnHeadPath(session, count);
     }
+    static bool GdnDeviceHeadReadable(
+        const Qwen4ExpBnb4Backend& backend, const Qwen4ExpLayerCache& cache) {
+        return backend.GdnDeviceHeadReadable(cache);
+    }
     static void MarkGdnGraphDirty(Qwen4ExpBnb4Backend& backend,
                                   Qwen4ExpBnb4Backend::Session& session) {
         backend.MarkGdnGraphStateDirty(session);
@@ -47,6 +51,34 @@ struct Qwen4ExpGenerationTestAccess {
         return backend.MakeTokenGraphKey(
             session, aila::TokenGraphBody::QsaLayerProof,
             aila::TokenGraphAttention::QsaSparse512BlockNative, 0);
+    }
+    static uint64_t PleWorkspaceGeneration(const Qwen4ExpBnb4Backend& backend) {
+        return backend.ple_.workspace_generation();
+    }
+    static void EnsurePleWorkspace(Qwen4ExpBnb4Backend& backend, Context& ctx, int rows) {
+        backend.ple_.ensure_compute_capacity(ctx, rows);
+    }
+    static void SetEmbeddingOverrideState(Qwen4ExpBnb4Backend::Session& session,
+                                          bool enabled) {
+        session.embeddingOverridePositions_.assign(enabled ? 1 : 0, 0);
+        session.embeddingOverrideValues_.clear();
+        session.embeddingOverrideHiddenSize_ = enabled ? 2560 : 0;
+    }
+    static void SetMropeState(Qwen4ExpBnb4Backend::Session& session, bool enabled) {
+        session.mropePromptLength_ = enabled ? 1 : 0;
+        session.mropeTextPositionDelta_ = enabled ? 1 : 0;
+    }
+    static uint64_t PleTicketEpoch(const Qwen4ExpBnb4Backend::Session& session) {
+        return session.ple_ticket_epoch();
+    }
+    static void InvalidateMtpRestoreState(Qwen4ExpBnb4Backend::Session& session) {
+        session.InvalidateMtpRestoreState();
+    }
+    static bool PleTicketEpochMatches(
+        const Qwen4ExpBnb4Backend& backend,
+        const Qwen4ExpBnb4Backend::Session& session,
+        const PleTicket& ticket) {
+        return backend.PleTicketEpochMatches(session, ticket);
     }
     static Qwen4ExpBuffers& HcFixture(Qwen4ExpBnb4Backend& backend, Context& ctx, int dim, int lowrank) {
         backend.context_ = &ctx;
@@ -2820,8 +2852,79 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
         Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
     expect(initial_graph_key.backend == &backend &&
                initial_graph_key.session == session.get() &&
+               initial_graph_key.session_instance_id ==
+                   session->session_instance_id() &&
+               initial_graph_key.session_instance_id != 0 &&
                !session->token_graph_poisoned(),
            "initial token graph key identity is invalid");
+    expect(initial_graph_key.ple_workspace_generation ==
+               Qwen4ExpGenerationTestAccess::PleWorkspaceGeneration(backend),
+           "token graph key must snapshot the PLE workspace generation");
+
+    PleTicket speculative_ticket;
+    speculative_ticket.session_ptr = session.get();
+    speculative_ticket.generation = session->generation();
+    speculative_ticket.ticket_epoch =
+        Qwen4ExpGenerationTestAccess::PleTicketEpoch(*session);
+    speculative_ticket.start_pos = 0;
+    speculative_ticket.valid = true;
+    expect(Qwen4ExpGenerationTestAccess::PleTicketEpochMatches(
+               backend, *session, speculative_ticket),
+           "current PLE ticket fixture must match its session epoch");
+    const uint64_t generation_before_mtp_restore = session->generation();
+    const uint64_t graph_generation_before_mtp_restore =
+        session->token_graph_generation();
+    Qwen4ExpGenerationTestAccess::InvalidateMtpRestoreState(*session);
+    expect(!Qwen4ExpGenerationTestAccess::PleTicketEpochMatches(
+               backend, *session, speculative_ticket),
+           "MTP restore must reject pre-restore PLE tickets");
+    expect(session->generation() == generation_before_mtp_restore,
+           "MTP restore must not bump the broader session generation");
+    expect(session->token_graph_generation() >
+               graph_generation_before_mtp_restore,
+           "MTP restore must still invalidate the token graph key");
+
+    Qwen4ExpGenerationTestAccess::EnsurePleWorkspace(backend, ctx, 1);
+    const auto grown_workspace_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    expect(grown_workspace_key.ple_workspace_generation >
+               initial_graph_key.ple_workspace_generation &&
+               grown_workspace_key.ple_workspace_generation ==
+                   Qwen4ExpGenerationTestAccess::PleWorkspaceGeneration(backend),
+           "PLE workspace growth must invalidate the token graph key");
+
+    auto& ple_state = session->ple_state_for_testing();
+    const uint64_t previous_view_generation = ple_state.graph_view_generation;
+    ++ple_state.graph_view_generation;
+    const auto graph_view_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    expect(graph_view_key.ple_graph_view_generation ==
+               previous_view_generation + 1 &&
+               graph_view_key.ple_graph_view_generation !=
+                   grown_workspace_key.ple_graph_view_generation,
+           "PLE graph view generation must participate in the token graph key");
+
+    bool unsafe_key_rejected = false;
+    Qwen4ExpGenerationTestAccess::SetEmbeddingOverrideState(*session, true);
+    try {
+        (void)Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    } catch (const std::logic_error&) {
+        unsafe_key_rejected = true;
+    }
+    expect(unsafe_key_rejected,
+           "token graph key must reject embedding override state");
+    Qwen4ExpGenerationTestAccess::SetEmbeddingOverrideState(*session, false);
+
+    unsafe_key_rejected = false;
+    Qwen4ExpGenerationTestAccess::SetMropeState(*session, true);
+    try {
+        (void)Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    } catch (const std::logic_error&) {
+        unsafe_key_rejected = true;
+    }
+    expect(unsafe_key_rejected,
+           "token graph key must reject mRoPE position state");
+    Qwen4ExpGenerationTestAccess::SetMropeState(*session, false);
 
     auto& caches = session->layer_caches_for_testing();
     expect(caches.size() == 48, "expected 48 layer caches allocated in session");
@@ -2875,6 +2978,8 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     // 3. Truncate to length 10 -> must restore snapshot 10
     const auto before_truncate_graph_key =
         Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    const uint64_t before_truncate_ple_epoch =
+        Qwen4ExpGenerationTestAccess::PleTicketEpoch(*session);
     int restored = backend.Truncate(*session, 10);
     expect(restored == 10, "Truncate must restore length 10");
     const auto after_truncate_graph_key =
@@ -2882,8 +2987,11 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     expect(after_truncate_graph_key.session_generation >
                before_truncate_graph_key.session_generation &&
                after_truncate_graph_key.session_state_generation >
-                   before_truncate_graph_key.session_state_generation,
-           "Truncate must invalidate token graph state generation");
+                    before_truncate_graph_key.session_state_generation,
+            "Truncate must invalidate token graph state generation");
+    expect(Qwen4ExpGenerationTestAccess::PleTicketEpoch(*session) >
+               before_truncate_ple_epoch,
+           "Truncate must invalidate pre-rollback PLE tickets");
     expect(session->CurrentLength() == 10, "CurrentLength must be 10");
     expect(caches[0].linear_conv_head == 42, "Layer 0 conv head must be restored to 42");
     expect(caches[1].linear_conv_head == 7, "Layer 1 conv head must be restored to 7");
@@ -2938,14 +3046,19 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     expect(backend.Truncate(*session, 13) == 13, "Single-token anchor must be restorable");
     const auto before_reset_graph_key =
         Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    const uint64_t before_reset_ple_epoch =
+        Qwen4ExpGenerationTestAccess::PleTicketEpoch(*session);
     backend.Reset(*session);
     const auto after_reset_graph_key =
         Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
     expect(after_reset_graph_key.session_generation >
                before_reset_graph_key.session_generation &&
                after_reset_graph_key.session_state_generation >
-                   before_reset_graph_key.session_state_generation,
-           "Reset must invalidate token graph state generation");
+                    before_reset_graph_key.session_state_generation,
+            "Reset must invalidate token graph state generation");
+    expect(Qwen4ExpGenerationTestAccess::PleTicketEpoch(*session) >
+               before_reset_ple_epoch,
+           "Reset must invalidate pre-reset PLE tickets");
     expect(initial_storage == storage_addresses(), "Anchor restore must preserve storage");
     for (const auto& slot : session->snapshot_slots_for_testing()) {
         expect(slot.length == -1, "Reset must invalidate every snapshot");
@@ -2967,6 +3080,14 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
            "poisoned session must reject token graph key creation");
     session.reset();
     auto no_snapshots = backend.CreateSession(ctx, 0);
+    const auto replacement_session_key =
+        Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *no_snapshots);
+    expect(no_snapshots->session_instance_id() != 0 &&
+               no_snapshots->session_instance_id() !=
+                   initial_graph_key.session_instance_id &&
+               replacement_session_key.session_instance_id !=
+                   initial_graph_key.session_instance_id,
+           "backend must monotonically identify recreated Session instances");
     backend.capture_snapshot_for_testing(ctx, *no_snapshots, 13, 1, true);
     expect(no_snapshots->snapshot_slots_for_testing().empty(), "Zero snapshot budget must remain empty");
     expect(backend.Truncate(*no_snapshots, 12) == 0, "Missing snapshot must fall back to reset");
@@ -2994,6 +3115,21 @@ void test_graph_gdn_device_head_state(Context& ctx) {
     expect(caches[0].linear_conv_head_dev != caches[1].linear_conv_head_dev,
            "linear layers must use distinct device-head rows");
 
+    bool rejected = false;
+    std::string rejection;
+    caches[0].linear_conv_head_device_authority = true;
+    caches[1].linear_conv_head_device_authority = false;
+    try {
+        (void)Qwen4ExpGenerationTestAccess::MakeTokenGraphKey(backend, *session);
+    } catch (const std::logic_error& e) {
+        rejected = true;
+        rejection = e.what();
+    }
+    expect(rejected &&
+               rejection.find("mixed host/device authority") != std::string::npos,
+           "token graph key must reject mixed GDN authority");
+    caches[0].linear_conv_head_device_authority = false;
+
     caches[0].linear_conv_head = 2;
     caches[1].linear_conv_head = 1;
     Qwen4ExpGenerationTestAccess::PublishGdnHeads(backend, ctx, *session);
@@ -3001,39 +3137,101 @@ void test_graph_gdn_device_head_state(Context& ctx) {
            caches[1].linear_conv_head_device_synced,
            "host heads must publish as synchronized");
 
-    Qwen4ExpGenerationTestAccess::MarkGdnGraphDirty(backend, *session);
+    caches[0].linear_conv_head_device_synced = false;
+    caches[1].linear_conv_head_device_synced = false;
+    bool launch_ran = false;
+    rejected = false;
+    try {
+        backend.SubmitTokenGraph(*session, [&] {
+            launch_ran = true;
+            return 0;
+        });
+    } catch (const std::invalid_argument& e) {
+        rejected = true;
+        rejection = e.what();
+    }
+    expect(rejected && !launch_ran &&
+               rejection.find("published to the device") !=
+                   std::string::npos,
+           "graph submission must reject stale unpublished host heads");
+    Qwen4ExpGenerationTestAccess::PublishGdnHeads(backend, ctx, *session);
+
+    const int launch_receipt = backend.SubmitTokenGraph(*session, [] { return 7; });
+    expect(launch_receipt == 7,
+           "token graph wrapper must preserve the launch return value");
     expect(caches[0].linear_conv_head_device_authority &&
            caches[1].linear_conv_head_device_authority,
            "graph replay must transfer authority to device heads");
     expect(caches[0].device_state_dirty && caches[1].device_state_dirty,
-           "graph replay must dirty the checkpoint state");
+           "graph submission wrapper must dirty the checkpoint state");
+    expect(Qwen4ExpGenerationTestAccess::GdnDeviceHeadReadable(backend, caches[0]),
+           "device-authority head with a stale host mirror must remain readable");
 
     caches[1].linear_conv_head_device_authority = false;
     caches[1].linear_conv_head_device_synced = true;
-    bool rejected = false;
     try {
         Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 1);
-    } catch (const std::invalid_argument&) {
+    } catch (const std::invalid_argument& e) {
         rejected = true;
+        rejection = e.what();
     }
     expect(rejected,
            "partially advanced device-authoritative state must fail closed");
+    expect(rejection.find("mixed host/device authority") != std::string::npos,
+           "mixed GDN authority must report a clear error");
     Qwen4ExpGenerationTestAccess::MarkGdnGraphDirty(backend, *session);
 
     rejected = false;
     try {
         Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 2);
-    } catch (const std::invalid_argument&) {
+    } catch (const std::invalid_argument& e) {
         rejected = true;
+        rejection = e.what();
     }
     expect(rejected,
            "device-authoritative heads must reject multi-row/prefill before sync");
+    expect(rejection.find("cannot switch to a multi-row/prefill") !=
+               std::string::npos,
+           "host-path fallback must report a clear error");
 
     Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 1);
-    Qwen4ExpGenerationTestAccess::PublishGdnHeads(backend, ctx, *session);
+    backend.capture_snapshot_for_testing(ctx, *session, 7, 1, true);
+    const auto* snapshot = session->snapshot_for_testing(7);
+    expect(snapshot != nullptr,
+           "graph replay state must produce a valid checkpoint");
+    expect(snapshot->layers[0].linear_conv_head == 2 &&
+               snapshot->layers[1].linear_conv_head == 1,
+           "checkpoint must synchronize the device-authoritative GDN heads");
+    expect(caches[0].linear_conv_head == 2 &&
+               caches[1].linear_conv_head == 1 &&
+               !caches[0].linear_conv_head_device_authority &&
+               !caches[1].linear_conv_head_device_authority &&
+               caches[0].linear_conv_head_device_synced &&
+               caches[1].linear_conv_head_device_synced,
+           "snapshot capture must return GDN state to a synchronized host mirror");
     expect(!caches[0].linear_conv_head_device_authority &&
-           !caches[1].linear_conv_head_device_authority,
-           "explicit boundary publish must return to host authority");
+           !caches[1].linear_conv_head_device_authority &&
+           !caches[0].device_state_dirty && !caches[1].device_state_dirty,
+           "snapshot capture must clear the graph dirty generation");
+
+    const int replayed_heads[2] = {0, 2};
+    ctx.memcpy_h2d(caches[0].linear_conv_head_dev, &replayed_heads[0],
+                   sizeof(replayed_heads[0]));
+    ctx.memcpy_h2d(caches[1].linear_conv_head_dev, &replayed_heads[1],
+                   sizeof(replayed_heads[1]));
+    backend.SubmitTokenGraph(*session, [] { return true; });
+    session->current_length_for_testing() = 9;
+    expect(backend.Truncate(*session, 7) == 7,
+           "checkpoint rollback after graph replay must succeed");
+    int restored_heads[2]{};
+    ctx.memcpy_d2h(&restored_heads[0], caches[0].linear_conv_head_dev,
+                   sizeof(restored_heads[0]));
+    ctx.memcpy_d2h(&restored_heads[1], caches[1].linear_conv_head_dev,
+                   sizeof(restored_heads[1]));
+    expect(caches[0].linear_conv_head == 2 &&
+               caches[1].linear_conv_head == 1 &&
+               restored_heads[0] == 2 && restored_heads[1] == 1,
+           "truncate must restore and republish the checkpoint GDN heads");
     Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 2);
 
     backend.Reset(*session);
@@ -3045,6 +3243,19 @@ void test_graph_gdn_device_head_state(Context& ctx) {
     expect(!caches[0].linear_conv_head_device_authority &&
            !caches[1].linear_conv_head_device_authority,
            "Reset must restore host authority");
+
+    session->PoisonTokenGraph();
+    rejected = false;
+    try {
+        backend.capture_snapshot_for_testing(ctx, *session, 8, 1, true);
+    } catch (const std::logic_error& e) {
+        rejected = true;
+        rejection = e.what();
+    }
+    expect(rejected &&
+               rejection.find("cannot checkpoint a poisoned") !=
+                   std::string::npos,
+           "poisoned graph session must reject checkpoint capture");
 
     _putenv("AILA_Q4E_GRAPH_GDN_STATE=");
     _putenv("AILA_Q4E_GDN_HISTORY_FUSED=");

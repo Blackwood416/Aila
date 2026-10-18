@@ -1,5 +1,6 @@
 #include "engine/Types.hpp"
 #include "models/Qwen4ExpTokenGraph.hpp"
+#include "models/Qwen4ExpTokenGraphRuntime.hpp"
 #include "utils/ModelSpec.hpp"
 
 #include <iostream>
@@ -220,9 +221,12 @@ void test_token_graph_pod_contract() {
     const aila::TokenGraphKey key{};
     expect(key.backend == nullptr && key.session == nullptr,
            "token graph key must not infer object identity");
-    expect(key.session_generation == 0 && key.session_state_generation == 0 &&
+    expect(key.session_instance_id == 0 && key.session_generation == 0 &&
+               key.session_state_generation == 0 &&
                key.runtime_generation == 0 && key.runtime_capacity == 0 &&
                key.residency_generation == 0 && key.descriptor_generation == 0 &&
+               key.ple_workspace_generation == 0 &&
+               key.ple_graph_view_generation == 0 &&
                key.topology_generation == 0 && key.topology_flags == 0,
            "token graph key defaults must be zero");
     expect(key.body == aila::TokenGraphBody::QsaLayerProof,
@@ -235,6 +239,180 @@ void test_token_graph_pod_contract() {
                lease.next_sequence == 0 && lease.last_completed_sequence == 0 &&
                !lease.executable_ready && !lease.abort_requested,
            "token graph lease defaults changed");
+}
+
+void test_token_graph_sequence_contract() {
+    using aila::TokenGraphSequenceStatus;
+
+    expect(aila::token_graph_sequence_status(7, 7) ==
+               TokenGraphSequenceStatus::Current,
+           "matching sequence should be current");
+    expect(aila::token_graph_sequence_status(7, 0) ==
+               TokenGraphSequenceStatus::NotPublished,
+           "zero sequence should be unpublished");
+    expect(aila::token_graph_sequence_status(7, 6) ==
+               TokenGraphSequenceStatus::Stale,
+           "older sequence should be stale");
+    expect(aila::token_graph_sequence_status(7, 8) ==
+               TokenGraphSequenceStatus::Ahead,
+           "newer sequence should be ahead");
+    expect(aila::token_graph_sequence_status(0xfffffffeu, 1u) ==
+               TokenGraphSequenceStatus::Ahead,
+           "sequence comparison should preserve wrap ordering");
+    expect(aila::token_graph_sequence_is_stale(1u, 0xfffffffeu),
+           "wrapped older sequence should be stale");
+    expect(!aila::token_graph_sequence_is_stale(7, 7),
+           "current sequence must not be stale");
+}
+
+void test_token_graph_ring_pod_contract() {
+    static_assert(alignof(aila::TokenGraphControlRing) == 64);
+    static_assert(alignof(aila::TokenGraphHostRing) == 64);
+    static_assert(alignof(aila::TokenGraphCpuPacketRing) == 64);
+    static_assert(alignof(aila::TokenGraphDeviceEpoch) == 64);
+    static_assert(sizeof(aila::TokenGraphHostRing) == 576);
+    static_assert(sizeof(aila::TokenGraphCpuPacketRing) == 169088);
+    static_assert(sizeof(aila::TokenGraphDeviceEpoch) == 64);
+
+    const aila::TokenGraphHostRing host{};
+    expect(host.control.route_sequence == 0 &&
+               host.control.cpu_flag == 0 &&
+               host.control.result_sequence == 0 &&
+               host.control.done_sequence == 0,
+           "host ring must zero initialize");
+
+    const aila::TokenGraphCpuPacketRing packet{};
+    expect(packet.ready_sequence == 0 && packet.rows == 0 &&
+               packet.rank_to_row[0] == 0,
+           "CPU packet must zero initialize");
+
+    aila::TokenGraphDeviceEpoch epoch{};
+    expect(!aila::token_graph_gate_is_valid(epoch),
+           "pending epoch must not be valid");
+    epoch.gate_state =
+        static_cast<std::uint32_t>(aila::TokenGraphGateState::Valid);
+    expect(aila::token_graph_gate_is_valid(epoch),
+           "valid epoch rejected");
+    epoch.sticky_abort =
+        static_cast<std::uint32_t>(aila::TokenGraphGateState::Stale);
+    expect(!aila::token_graph_gate_is_valid(epoch),
+           "sticky abort must invalidate epoch");
+}
+
+void test_token_graph_runtime_state_machine() {
+    static_assert(!std::is_copy_constructible<aila::TokenGraphRuntime>::value,
+                  "TokenGraphRuntime must not be copy constructible");
+    static_assert(!std::is_copy_assignable<aila::TokenGraphRuntime>::value,
+                  "TokenGraphRuntime must not be copy assignable");
+    static_assert(!std::is_move_constructible<aila::TokenGraphRuntime>::value,
+                  "TokenGraphRuntime must not be move constructible");
+    static_assert(!std::is_move_assignable<aila::TokenGraphRuntime>::value,
+                  "TokenGraphRuntime must not be move assignable");
+
+    aila::TokenGraphRuntime runtime;
+    expect(runtime.phase() == aila::TokenGraphPhase::Empty,
+           "runtime must start empty");
+    expect(!runtime.MarkExecutableReady(),
+           "empty runtime must reject executable publication");
+    expect(!runtime.Launch(1, sycl::event{}),
+           "launch outside Ready must fail");
+
+    aila::TokenGraphKey key{};
+    key.session_instance_id = 41;
+    expect(runtime.BeginCapture(key), "Empty -> Capturing must succeed");
+    expect(runtime.phase() == aila::TokenGraphPhase::Capturing,
+           "runtime did not enter Capturing");
+    expect(!runtime.Launch(1, sycl::event{}),
+           "launch from Capturing must fail");
+    expect(runtime.MarkExecutableReady(),
+           "Capturing -> Ready must succeed");
+    expect(runtime.executable_ready(), "Ready must expose executable");
+
+    const aila::TokenGraphLease ready_snapshot = runtime.Snapshot();
+    expect(ready_snapshot.phase == aila::TokenGraphPhase::Ready &&
+               ready_snapshot.executable_ready &&
+               ready_snapshot.next_sequence == 1 &&
+               ready_snapshot.last_completed_sequence == 0,
+           "Ready lease snapshot mismatch");
+    expect(ready_snapshot.key.session_instance_id == 41,
+           "lease snapshot lost graph key identity");
+
+    expect(runtime.Launch(1, sycl::event{}),
+           "Ready -> InFlight must succeed");
+    expect(runtime.phase() == aila::TokenGraphPhase::InFlight,
+           "runtime did not enter InFlight");
+    expect(!runtime.BeginCapture(key),
+           "recapture while InFlight must fail");
+    expect(!runtime.Launch(2, sycl::event{}),
+           "second in-flight launch must fail");
+    expect(runtime.Complete(1, true),
+           "matching successful completion must succeed");
+    expect(runtime.phase() == aila::TokenGraphPhase::Ready &&
+               runtime.gate_valid() &&
+               runtime.last_completed_sequence() == 1 &&
+               runtime.next_sequence() == 2,
+           "successful completion state mismatch");
+    expect(runtime.Snapshot().last_completed_sequence == 1,
+           "completion not reflected in lease snapshot");
+
+    expect(runtime.Launch(2, sycl::event{}),
+           "second replay launch must succeed");
+    expect(!runtime.Complete(2, false),
+           "rejected gate must not complete");
+    expect(runtime.phase() == aila::TokenGraphPhase::Aborting &&
+               runtime.abort_requested() && !runtime.gate_valid() &&
+               !runtime.executable_ready(),
+           "rejected gate must enter Aborting");
+    expect(!runtime.Launch(3, sycl::event{}),
+           "launch from Aborting must fail");
+    expect(runtime.Poison(), "Aborting -> Poisoned must succeed");
+    expect(!runtime.Poison(), "second Poison must not change state");
+    expect(!runtime.BeginCapture(key),
+           "Poisoned runtime must reject recapture");
+    expect(!runtime.MarkExecutableReady(),
+           "Poisoned runtime must reject executable publication");
+    expect(!runtime.Launch(3, sycl::event{}),
+           "Poisoned runtime must reject launch forever");
+    expect(runtime.phase() == aila::TokenGraphPhase::Poisoned,
+           "Poison must be permanent");
+
+    aila::TokenGraphRuntime mismatch;
+    expect(mismatch.BeginCapture(key) && mismatch.MarkExecutableReady(),
+           "mismatch fixture setup failed");
+    expect(mismatch.Launch(1, sycl::event{}),
+           "mismatch fixture launch failed");
+    expect(!mismatch.Complete(2, true),
+           "completion sequence mismatch must fail closed");
+    expect(mismatch.phase() == aila::TokenGraphPhase::Aborting,
+           "completion mismatch must enter Aborting");
+
+    aila::TokenGraphRuntime aborted;
+    expect(aborted.BeginCapture(key) && aborted.MarkExecutableReady(),
+           "abort fixture setup failed");
+    expect(aborted.Abort(), "Ready -> Aborting must succeed");
+    expect(aborted.phase() == aila::TokenGraphPhase::Aborting &&
+               aborted.abort_requested() &&
+               !aborted.executable_ready(),
+           "Abort must stop launch and mark the runtime dirty");
+    expect(!aborted.Abort(), "repeated Abort must not change state");
+    expect(aborted.Poison(), "Aborting -> Poisoned must succeed");
+
+    aila::TokenGraphRuntime recapture;
+    expect(recapture.BeginCapture(key) && recapture.MarkExecutableReady() &&
+               recapture.Launch(1, sycl::event{}) &&
+               recapture.Complete(1, true),
+           "recapture fixture setup failed");
+    aila::TokenGraphKey replacement = key;
+    replacement.session_instance_id = 99;
+    expect(recapture.BeginCapture(replacement),
+           "Ready -> Capturing recapture must succeed");
+    expect(recapture.phase() == aila::TokenGraphPhase::Capturing &&
+               !recapture.executable_ready() &&
+               recapture.next_sequence() == 1 &&
+               recapture.last_completed_sequence() == 0,
+           "recapture must reset executable and sequence state");
+    expect(recapture.Snapshot().key.session_instance_id == 99,
+           "recapture must replace the graph key");
 }
 
 static std::string resolve_qwen4exp_model_dir() {
@@ -284,6 +462,9 @@ int main() {
     try {
         test_synthetic_qwen4exp_modelspec();
         test_token_graph_pod_contract();
+        test_token_graph_sequence_contract();
+        test_token_graph_ring_pod_contract();
+        test_token_graph_runtime_state_machine();
         test_real_qwen4exp_modelspec_if_present();
         std::cout << "AilaQwen4ExpModelSpecTests: ALL PASSED\n";
         return 0;

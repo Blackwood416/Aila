@@ -92,10 +92,8 @@ than a fabricated contiguous block list.
 ## 4. Limits
 
 - The cache is seeded rather than produced by a real 2052-token prefill.
-- Fail-closed is not yet a whole-layer transaction. QGKV and QSA preparation
-  can write cache rows before a later stale-count check aborts the graph.
-- Compression still uses its independent invalid flag; the unified
-  `GraphControl.abort` repair is a separate source change.
+- P8 below closes the stale-count prewrite and compression-abort gaps found
+  after this receipt; fail-closed is still not a full transactional rollback.
 - There is no production `ForwardTokenGraph`, event lease, one-in-flight
   state machine or host commit/poison lifecycle yet.
 - The graph remains the sparse, exact head-dim 256 QSA topology.
@@ -113,6 +111,6 @@ prepare fixed runtime/PLE state before key construction
   -> poison and drain after any failure
 ```
 
-Do not capture `ForwardImpl`. Do not extend to multiple full-attention layers
-until the single global compressed-block counter is replaced by per-layer
-device counters.
+P8 adds the per-layer device counters required for multiple full-attention
+layers. Do not capture `ForwardImpl`; wire the proven body through the
+single-in-flight runtime described in P8 first.

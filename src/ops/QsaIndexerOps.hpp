@@ -52,7 +52,8 @@ void qsa_prepare_q_and_cache_k_graph(
     int text_pos_delta = 0,
     int mrope_section_t = 0,
     int mrope_section_h = 0,
-    int mrope_section_w = 0);
+    int mrope_section_w = 0,
+    int layer = 0);
 
 // Batched write of raw K into k_cache (prefill: count > 1).
 // indexer_qk: [count, 640]
@@ -204,18 +205,18 @@ void qsa_compress_key_blocks(
     int mrope_section_h = 0,
     int mrope_section_w = 0);
 
-// Graph-safe one-token block update. A fixed single workgroup reads position_dev
-// and num_compressed_blocks_dev. When visible_len/4 advances by exactly one it
-// compresses that block and publishes the incremented device count after the
-// compressed row is visible. A larger gap, stale count, or capacity overflow
-// sets invalid_dev (when provided) instead of silently skipping blocks.
+// Graph-safe one-token block update. A fixed single workgroup reads the unified
+// GraphControl start position, block count and sticky abort flag. When
+// visible_len/4 advances by exactly one it compresses that block and publishes
+// the incremented device count after the compressed row is visible. Abort,
+// stale count, inconsistent position, or capacity overflow is a no-op with a
+// sticky abort.
 void qsa_compress_one_completed_block_graph(
     Context& ctx,
     const Tensor& k_cache,
     const Tensor& k_norm_w,
     Tensor& compressed_k,
-    const int* position_dev,
-    int* num_compressed_blocks_dev,
+    GraphControl control,
     float theta,
     bool interleaved = false,
     const int* pos_t = nullptr,
@@ -226,7 +227,7 @@ void qsa_compress_one_completed_block_graph(
     int mrope_section_t = 0,
     int mrope_section_h = 0,
     int mrope_section_w = 0,
-    int* invalid_dev = nullptr);
+    int layer = 0);
 
 void qsa_compress_key_blocks_host(
     const bf16* k_cache,
@@ -255,7 +256,8 @@ void qsa_compute_block_scores_compressed(
     int num_complete_blocks);
 
 // Graph-safe variant with a fixed max_blocks*128 launch grid. The active
-// complete-block count is read from control[graph_control::compressed_blocks].
+// complete-block count is read from the selected full-attention layer slot
+// (layer 0 uses graph_control::compressed_blocks).
 // Workgroups beyond min(active_blocks, max_blocks) exit without touching output.
 void qsa_compute_block_scores_compressed_graph(
     Context& ctx,
@@ -263,7 +265,8 @@ void qsa_compute_block_scores_compressed_graph(
     const Tensor& compressed_k,
     Tensor& scores_out,
     GraphControl control,
-    int max_blocks);
+    int max_blocks,
+    int layer = 0);
 
 void qsa_compute_block_scores_compressed_host(
     const bf16* q,
@@ -329,7 +332,8 @@ void qsa_select_topk_blocks_graph(
     GraphControl control,
     int block_topk,
     int compress_ratio,
-    int max_blocks);
+    int max_blocks,
+    int layer = 0);
 
 int qsa_select_topk_blocks_host(
     const float* scores,

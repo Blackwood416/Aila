@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -29,6 +30,7 @@ Qwen4ExpPle& Qwen4ExpPle::operator=(Qwen4ExpPle&& other) noexcept {
     if (this == &other) return *this;
     cleanup();
 
+    const uint64_t previous_workspace_generation = workspace_generation_;
     ctx_ = other.ctx_;
     ple_layer_id_ = other.ple_layer_id_;
     max_tokens_ = other.max_tokens_;
@@ -59,6 +61,11 @@ Qwen4ExpPle& Qwen4ExpPle::operator=(Qwen4ExpPle&& other) noexcept {
     query_normed_ = std::move(other.query_normed_);
     gv_buf_ = std::move(other.gv_buf_);
     gv_normed_ = std::move(other.gv_normed_);
+    const uint64_t generation_max =
+        (std::numeric_limits<uint64_t>::max)();
+    workspace_generation_ =
+        std::max(previous_workspace_generation, other.workspace_generation_);
+    if (workspace_generation_ != generation_max) ++workspace_generation_;
     initialized_ = other.initialized_;
 
     other.cleanup();
@@ -66,6 +73,13 @@ Qwen4ExpPle& Qwen4ExpPle::operator=(Qwen4ExpPle&& other) noexcept {
 }
 
 void Qwen4ExpPle::cleanup() {
+    if ((compute_capacity_ > 0 || key_buf_.valid() || value_buf_.valid() ||
+         key_normed_.valid() || query_normed_.valid() || gv_buf_.valid() ||
+         gv_normed_.valid()) &&
+        workspace_generation_ !=
+            (std::numeric_limits<uint64_t>::max)()) {
+        ++workspace_generation_;
+    }
     if (worker_thread_.joinable()) {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
@@ -619,6 +633,11 @@ void Qwen4ExpPle::ensure_compute_capacity(Context& ctx, int rows) {
     if (rows <= 0 || rows > max_tokens_)
         throw std::invalid_argument("Qwen4ExpPle: forward exceeds PLE capacity");
     if (rows <= compute_capacity_) return;
+    if (workspace_generation_ ==
+        (std::numeric_limits<uint64_t>::max)()) {
+        throw std::overflow_error("Qwen4ExpPle workspace generation overflow");
+    }
+    ++workspace_generation_;
     // These tensors are read only by the compute queue. The background
     // gather/DMA worker owns separate staging banks which never move here.
     ctx.synchronize();
@@ -658,14 +677,15 @@ PleTicket Qwen4ExpPle::prepare(
     int num_tokens,
     const void* session_ptr,
     uint64_t generation,
-    int start_pos) {
+    int start_pos,
+    uint64_t ticket_epoch) {
     if (num_tokens <= 0) return PleTicket{};
     if (num_tokens > max_tokens_)
         throw std::invalid_argument("Qwen4ExpPle: prepare exceeds PLE capacity");
 
     int slot = (next_staging_slot_++) % kNumStagingSlots;
     return prepare_slot(ctx, state, input_ids, num_tokens, session_ptr,
-                        generation, start_pos, slot);
+                        generation, start_pos, slot, ticket_epoch);
 }
 
 PleTicket Qwen4ExpPle::prepare_fixed_slot(
@@ -675,13 +695,14 @@ PleTicket Qwen4ExpPle::prepare_fixed_slot(
     int num_tokens,
     const void* session_ptr,
     uint64_t generation,
-    int start_pos) {
+    int start_pos,
+    uint64_t ticket_epoch) {
     if (num_tokens <= 0) return PleTicket{};
     if (num_tokens > max_tokens_)
         throw std::invalid_argument("Qwen4ExpPle: fixed prepare exceeds PLE capacity");
     static constexpr int kGraphStagingSlot = 0;
     return prepare_slot(ctx, state, input_ids, num_tokens, session_ptr,
-                        generation, start_pos, kGraphStagingSlot);
+                        generation, start_pos, kGraphStagingSlot, ticket_epoch);
 }
 
 PleTicket Qwen4ExpPle::prepare_slot(
@@ -692,7 +713,8 @@ PleTicket Qwen4ExpPle::prepare_slot(
     const void* session_ptr,
     uint64_t generation,
     int start_pos,
-    int slot) {
+    int slot,
+    uint64_t ticket_epoch) {
     PleTicket ticket;
     if (num_tokens <= 0) return ticket;
     if (num_tokens > max_tokens_)
@@ -705,6 +727,7 @@ PleTicket Qwen4ExpPle::prepare_slot(
     ticket.staging_slot = slot;
     ticket.session_ptr = session_ptr;
     ticket.generation = generation;
+    ticket.ticket_epoch = ticket_epoch;
     ticket.start_pos = start_pos;
     ticket.num_tokens = num_tokens;
     ticket.prev_tokens_in = state.prev_tokens;
@@ -915,6 +938,11 @@ Qwen4ExpPleGraphView Qwen4ExpPle::create_graph_view(
         state.conv_head_dev.numel() < 1) {
         throw std::invalid_argument("Qwen4ExpPle: graph conv_head_dev must be s32");
     }
+    if (state.graph_view_generation ==
+        (std::numeric_limits<uint64_t>::max)()) {
+        throw std::overflow_error("Qwen4ExpPle graph view generation overflow");
+    }
+    ++state.graph_view_generation;
 
     Qwen4ExpPleGraphView view;
     view.dev_embed = dev_embed_slots_[0].data_as<bf16>();
@@ -933,6 +961,8 @@ Qwen4ExpPleGraphView Qwen4ExpPle::create_graph_view(
     view.norm_query_weight = norm_query_w_.data_as<float>();
     view.norm_conv_weight = norm_conv_w_.data_as<float>();
     view.conv_weight = conv1d_w_ptr_;
+    view.view_generation = state.graph_view_generation;
+    view.workspace_generation = workspace_generation_;
     return view;
 }
 

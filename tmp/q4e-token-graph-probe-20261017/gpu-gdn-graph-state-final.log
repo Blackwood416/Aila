@@ -1,0 +1,5 @@
+[RUN] test=gdn-graph-state
+[Test] Graph GDN device-head ownership and fail-closed transitions...
+[PASS] Graph GDN device-head ownership verified.
+AilaQwen4ExpModuleTests: GDN GRAPH STATE PASSED
+[RUN] test=gdn-graph-state exit=0 wall_s=0.6

@@ -1274,6 +1274,7 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              Tensor& k_cache, Tensor& v_cache,
                                              int start_pos,
                                              GraphControl control,
+                                             int layer,
                                              int num_heads_q, int num_kv_heads, int head_dim,
                                              float eps, int rotary_dim, float theta,
                                              bool interleaved,
@@ -1323,6 +1324,14 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 if (active_pos < 0 || active_pos >= max_seq_len) {
                     if (control) graph_control_mark_abort(control);
                     return;
+                }
+                if (control) {
+                    int visible_len = 0;
+                    int compressed_blocks = 0;
+                    if (!graph_control_pending_blocks(
+                            control, max_seq_len / 4, visible_len,
+                            compressed_blocks, layer))
+                        return;
                 }
                 int packed_base = head * packed_per_head;
                 int q_base = head * head_dim;
@@ -1516,7 +1525,7 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
     float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
     float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
     auto dispatch = [&](auto tag) {
-        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
+        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
     };
     if (k_cache.dtype() == dnnl::memory::data_type::s8) {
         dispatch(std::integral_constant<int, kKvFmtInt8>{});
@@ -1536,10 +1545,14 @@ void decode_prepare_qgkv_packed_partial_graph(
     bool interleaved, const int* pos_t, const int* pos_h,
     const int* pos_w, int prompt_pos_len, int text_pos_delta,
     int mrope_section_t, int mrope_section_h, int mrope_section_w,
-    Tensor* k_scale, Tensor* v_scale) {
+    Tensor* k_scale, Tensor* v_scale, int layer) {
     if (!control) {
         throw std::invalid_argument(
             "decode_prepare_qgkv_packed_partial_graph requires control");
+    }
+    if (graph_control_layer_blocks_slot(layer) < 0) {
+        throw std::invalid_argument(
+            "decode_prepare_qgkv_packed_partial_graph layer out of range");
     }
     float* k_scale_ptr =
         (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
@@ -1548,7 +1561,7 @@ void decode_prepare_qgkv_packed_partial_graph(
     auto dispatch = [&](auto tag) {
         decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(
             ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight,
-            k_norm_weight, k_cache, v_cache, -1, control, num_heads_q,
+            k_norm_weight, k_cache, v_cache, -1, control, layer, num_heads_q,
             num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved,
             pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
             mrope_section_t, mrope_section_h, mrope_section_w,

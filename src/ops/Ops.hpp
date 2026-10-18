@@ -354,7 +354,7 @@ namespace ops {
         int prompt_pos_len = 0, int text_pos_delta = 0,
         int mrope_section_t = 0, int mrope_section_h = 0,
         int mrope_section_w = 0, Tensor* k_scale = nullptr,
-        Tensor* v_scale = nullptr);
+        Tensor* v_scale = nullptr, int layer = 0);
 
     // GQA Attention (decode 模式, seq_len=1)
     // q:       [1, num_heads * head_dim]
@@ -378,8 +378,8 @@ namespace ops {
     // Graph-safe Qwen4Exp block-native sparse-QSA decode.
     //
     // control[graph_control::start_pos] is the absolute current position and
-    // control[graph_control::compressed_blocks] is the device complete-block
-    // count. The kernel derives:
+    // the selected full-attention layer slot is the device complete-block
+    // count (layer 0 uses graph_control::compressed_blocks). The kernel derives:
     //   visible_len     = start_pos + 1
     //   selected_blocks = min(compressed_blocks, 512)
     //   tail            = visible_len % 4
@@ -406,7 +406,8 @@ namespace ops {
         GraphControl control,
         int num_heads,
         int num_kv_heads,
-        const Tensor* gate_buf = nullptr);
+        const Tensor* gate_buf = nullptr,
+        int layer = 0);
 
 
     // Per-row decode geometry for the multi-row entry point below. Rows are

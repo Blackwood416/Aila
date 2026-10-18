@@ -1,0 +1,6 @@
+[RUN] test=attention-graph
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[JM] mode=1, supported=1, tile_id=0, decode_wg=512, decode_window=0, decode_window_start=512, decode_sink=0 -> enabled
+[PASS] block-native attention graph (start_pos=2052..2055, tiles=17/17/17/16, bitwise, abort + invalid-id no-op)
+Attention graph test PASSED; teardown USM zero
+[RUN] test=attention-graph exit=0 wall_s=15.4

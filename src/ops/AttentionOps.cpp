@@ -1,4 +1,5 @@
 #include "Ops.hpp"
+#include "AttentionOps.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include <algorithm>
@@ -128,6 +129,7 @@ constexpr int kVisionBidiExact64VUnrollDefault =
 
 struct QsaDecodeGraphGeometry {
   int visible_len = 0;
+  int compressed_blocks = 0;
   int selected_blocks = 0;
   int effective_len = 0;
   int actual_tiles = 0;
@@ -137,15 +139,17 @@ struct QsaDecodeGraphGeometry {
 // Every work-group derives the same geometry from the device control table.
 // No host scalar selecting the grid or token count enters the graph.
 inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
-    const int* control, int max_tiles) {
+    const int* control, int max_tiles, int layer) {
   QsaDecodeGraphGeometry geometry;
-  if (control == nullptr ||
+  const int blocks_slot = graph_control_layer_blocks_slot(layer);
+  if (control == nullptr || blocks_slot < 0 ||
       graph_control_aborted(const_cast<int*>(control))) {
+    graph_control_mark_abort(const_cast<int*>(control));
     return geometry;
   }
 
   const int start_pos = control[graph_control::start_pos];
-  const int compressed_blocks = control[graph_control::compressed_blocks];
+  const int compressed_blocks = control[blocks_slot];
   const long long visible_len_ll = static_cast<long long>(start_pos) + 1;
   if (start_pos < 0 || compressed_blocks < 0 || visible_len_ll <= 0 ||
       visible_len_ll > 0x7fffffffLL ||
@@ -155,6 +159,7 @@ inline QsaDecodeGraphGeometry qsa_decode_graph_geometry(
   }
 
   geometry.visible_len = static_cast<int>(visible_len_ll);
+  geometry.compressed_blocks = compressed_blocks;
   geometry.selected_blocks =
       compressed_blocks < kDecodeExact256QsaBlockTopk
           ? compressed_blocks
@@ -178,6 +183,24 @@ inline int qsa_decode_active_cache_token(
     return active_blocks[t / 4] * 4 + (t & 3);
   }
   return active_blocks[selected_blocks + (t - selected_blocks * 4)];
+}
+
+inline bool qsa_decode_active_cache_token_checked(
+    const int* active_blocks, int selected_blocks, int compressed_blocks,
+    int max_seq_len, int t, int& cache_t) {
+  if (active_blocks == nullptr || selected_blocks < 0 ||
+      compressed_blocks < 0 || selected_blocks > compressed_blocks ||
+      max_seq_len <= 0) {
+    return false;
+  }
+  if (t < selected_blocks * 4) {
+    const int block = active_blocks[t / 4];
+    if (block < 0 || block >= compressed_blocks) return false;
+    cache_t = block * 4 + (t & 3);
+  } else {
+    cache_t = active_blocks[selected_blocks + (t - selected_blocks * 4)];
+  }
+  return cache_t >= 0 && cache_t < max_seq_len;
 }
 
 template <int Quantized>
@@ -1293,7 +1316,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
     Context &ctx, const Tensor &q, const Tensor &k_cache,
     const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
     const Tensor &active_blocks, GraphControl control, int num_heads,
-    int num_kv_heads, const Tensor *gate_buf) {
+    int num_kv_heads, const Tensor *gate_buf, int layer) {
   static_assert(MaxTiles >= kDecodeExact256QsaMaxTiles,
                 "QSA block-native graph MaxTiles must cover the 512-block bound");
 
@@ -1390,7 +1413,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
             static_cast<size_t>(num_heads) * MaxTiles * tile_wg, tile_wg),
         [=](sycl::nd_item<1> item) {
           const QsaDecodeGraphGeometry geometry =
-              qsa_decode_graph_geometry(control_ptr, MaxTiles);
+              qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
           if (!geometry.valid) {
             return;
           }
@@ -1495,7 +1518,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
             static_cast<size_t>(num_heads) * merge_wg, merge_wg),
         [=](sycl::nd_item<1> item) {
           const QsaDecodeGraphGeometry geometry =
-              qsa_decode_graph_geometry(control_ptr, MaxTiles);
+              qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
           if (!geometry.valid) {
             return;
           }
@@ -1558,7 +1581,7 @@ template void attention_decode_exact_head256_block_native_graph_impl<
     Context &ctx, const Tensor &q, const Tensor &k_cache,
     const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
     const Tensor &active_blocks, GraphControl control, int num_heads,
-    int num_kv_heads, const Tensor *gate_buf);
+    int num_kv_heads, const Tensor *gate_buf, int layer);
 
 
 template <int Quantized>
@@ -2387,15 +2410,119 @@ void attention_decode_rows_exact_merge_impl(
 }
 } // namespace
 
+void attention_validate_qsa_active_blocks_graph(
+    Context &ctx, const Tensor &k_cache, const Tensor &v_cache,
+    const Tensor &active_blocks, GraphControl control, int num_kv_heads,
+    int layer) {
+  constexpr int head_dim = 256;
+  constexpr int max_tiles = kDecodeExact256QsaMaxTiles;
+  constexpr int validate_wg = 512;
+
+  if (graph_control_layer_blocks_slot(layer) < 0) {
+    throw std::invalid_argument(
+        "attention_validate_qsa_active_blocks_graph layer out of range");
+  }
+  if (control == nullptr) {
+    throw std::invalid_argument(
+        "attention_validate_qsa_active_blocks_graph: null control");
+  }
+  if (num_kv_heads <= 0) {
+    throw std::invalid_argument(
+        "attention_validate_qsa_active_blocks_graph: invalid KV head count");
+  }
+  if (!k_cache.valid() || !v_cache.valid() ||
+      k_cache.dtype() != dnnl::memory::data_type::bf16 ||
+      v_cache.dtype() != dnnl::memory::data_type::bf16 ||
+      k_cache.ndim() != 3 || v_cache.ndim() != 3 ||
+      k_cache.shape(0) != num_kv_heads ||
+      v_cache.shape(0) != num_kv_heads ||
+      k_cache.shape(2) != head_dim ||
+      v_cache.shape(2) != head_dim ||
+      k_cache.shape(1) != v_cache.shape(1) ||
+      k_cache.shape(1) <= 0 || k_cache.shape(1) > 0x7fffffffLL) {
+    throw std::invalid_argument(
+        "attention_validate_qsa_active_blocks_graph: unsupported BF16 KV layout");
+  }
+  if (!active_blocks.valid() ||
+      active_blocks.dtype() != dnnl::memory::data_type::s32 ||
+      active_blocks.ndim() != 1 ||
+      active_blocks.shape(0) <
+          kDecodeExact256QsaBlockTopk + 4) {
+    throw std::invalid_argument(
+        "attention_validate_qsa_active_blocks_graph: active_blocks must hold 512 ids plus 4 tail ids");
+  }
+
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const int *active_blocks_ptr = active_blocks.data_as<int>();
+  int *const control_ptr = control;
+
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<int, 1> geometry_words(
+        sycl::range<1>(6), cgh);
+    sycl::local_accessor<int, 1> invalid(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(validate_wg, validate_wg),
+        [=](sycl::nd_item<1> item) {
+          const int lid = item.get_local_id(0);
+          if (lid == 0) {
+            const QsaDecodeGraphGeometry geometry =
+                qsa_decode_graph_geometry(control_ptr, max_tiles, layer);
+            geometry_words[0] = geometry.visible_len;
+            geometry_words[1] = geometry.compressed_blocks;
+            geometry_words[2] = geometry.selected_blocks;
+            geometry_words[3] = geometry.effective_len;
+            geometry_words[4] = geometry.actual_tiles;
+            geometry_words[5] = geometry.valid ? 1 : 0;
+            invalid[0] = 0;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          int lane_invalid = geometry_words[5] != 0 ? 0 : 1;
+          if (lane_invalid == 0) {
+            const int effective_len = geometry_words[3];
+            const int compressed_blocks = geometry_words[1];
+            const int selected_blocks = geometry_words[2];
+            for (int t = lid; t < effective_len; t += validate_wg) {
+              int cache_t = 0;
+              if (!qsa_decode_active_cache_token_checked(
+                      active_blocks_ptr, selected_blocks, compressed_blocks,
+                      max_seq_len, t, cache_t)) {
+                lane_invalid = 1;
+                break;
+              }
+            }
+          }
+          if (lane_invalid != 0) {
+            sycl::atomic_ref<
+                int, sycl::memory_order::relaxed,
+                sycl::memory_scope::work_group,
+                sycl::access::address_space::local_space>
+                invalid_flag(invalid[0]);
+            invalid_flag.store(1, sycl::memory_order::relaxed);
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          if (lid == 0 && invalid[0] != 0) {
+            graph_control_mark_abort(control_ptr);
+          }
+        });
+  });
+}
+
 void attention_decode_exact_head256_block_native_graph(
     Context &ctx, const Tensor &q, const Tensor &k_cache,
     const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
     const Tensor &active_blocks, GraphControl control, int num_heads,
-    int num_kv_heads, const Tensor *gate_buf) {
+    int num_kv_heads, const Tensor *gate_buf, int layer) {
+  if (graph_control_layer_blocks_slot(layer) < 0) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph layer out of range");
+  }
   attention_decode_exact_head256_block_native_graph_impl<
       kDecodeExact256QsaMaxTiles>(
       ctx, q, k_cache, v_cache, output, partials_buf, active_blocks,
-      control, num_heads, num_kv_heads, gate_buf);
+      control, num_heads, num_kv_heads, gate_buf, layer);
 }
 
 // ============================================================

@@ -44,6 +44,15 @@ inline uint64_t MixScalar(uint64_t h, int64_t value) {
     return DigestBytes(h, &value, sizeof(value));
 }
 
+inline int DigestGdnHead(Context& ctx, const Qwen4ExpLayerCache& cache) {
+    int head = cache.linear_conv_head;
+    if (cache.linear_conv_head_dev != nullptr &&
+        cache.linear_conv_head_device_authority) {
+        ctx.memcpy_d2h(&head, cache.linear_conv_head_dev, sizeof(head));
+    }
+    return head;
+}
+
 // Hashes at most `rows` positions of a per-position tensor. A 3-D
 // {heads, rows, cols} KV tensor is hashed per head (the position axis is not
 // contiguous across heads). `rows <= 0` hashes the whole tensor.
@@ -121,16 +130,21 @@ inline SessionDigest DigestSession(Context& ctx, Qwen4ExpBnb4Backend::Session& s
         gdn = DigestTensorRows(ctx, buf, gdn, c.linear_state, -1);
         gdnc = DigestTensorRows(ctx, buf, gdnc, c.linear_conv_state, -1);
         out.gdnConv = DigestBytes(out.gdnConv, &gdnc, sizeof(gdnc));
-        out.gdnHead = MixScalar(out.gdnHead, c.linear_conv_head);
+        const int gdnHead = DigestGdnHead(ctx, c);
+        out.gdnHead = MixScalar(out.gdnHead, gdnHead);
         gdn = DigestBytes(gdn, &gdnc, sizeof(gdnc));
-        gdn = MixScalar(gdn, c.linear_conv_head);
+        gdn = MixScalar(gdn, gdnHead);
         out.gdnLayers[l] = gdn;
         out.gdn = DigestBytes(out.gdn, &gdn, sizeof(gdn));
     }
     auto& ple = s.ple_state_for_testing();
     uint64_t pleHash = 1469598103934665603ull;
     pleHash = DigestTensorRows(ctx, buf, pleHash, ple.conv_state, -1);
-    pleHash = MixScalar(pleHash, ple.conv_head);
+    int pleHead = ple.conv_head;
+    if (ple.conv_head_dev.valid()) {
+        ctx.memcpy_d2h(&pleHead, ple.conv_head_dev.data(), sizeof(pleHead));
+    }
+    pleHash = MixScalar(pleHash, pleHead);
     pleHash = MixScalar(pleHash, ple.prev_tokens[0]);
     pleHash = MixScalar(pleHash, ple.prev_tokens[1]);
     out.ple = pleHash;

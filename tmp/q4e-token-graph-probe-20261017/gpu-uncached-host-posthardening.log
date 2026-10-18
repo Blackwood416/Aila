@@ -1,0 +1,19 @@
+[RUN] 2026-10-18T17:18:02.5169562+08:00 test=uncached-host exe=E:\RiderProjects\Aila\build-refactor\AilaExecutionResourcesTests.exe args=
+[RUN] context-budget-and-order
+[PASS] context-budget-and-order
+[RUN] uncached-host-allocation
+[PASS] uncached-host-allocation
+[RUN] typed-workspace-ownership
+[PASS] typed-workspace-ownership
+[RUN] sampling-isolation-and-reuse
+[PASS] sampling-isolation-and-reuse
+[RUN] shared-scratch-budget
+[PASS] shared-scratch-budget
+[RUN] linear-scratch-rebinding
+[PASS] linear-scratch-rebinding
+[RUN] masked-attention-cache
+[PASS] masked-attention-cache
+[RUN] runtime-memory-snapshot
+[PASS] runtime-memory-snapshot
+Execution resource tests passed (tracked Context USM only).
+[RUN] test=uncached-host exit=0 wall_s=16.6

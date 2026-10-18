@@ -85,9 +85,17 @@ std::array<ops::GreedyResult, 2> Qwen4ExpMtpRuntime::Select(int rows) {
     return result;
 }
 void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
+    if (s.token_graph_poisoned()) {
+        throw std::logic_error(
+            "MTP cannot checkpoint a poisoned token-graph session");
+    }
     s.InvalidateTokenGraphState();
     length = s.currentLength_; noMiss = s.consecutive_no_miss_layers_;
     pleTokens = s.ple_state_.prev_tokens; pleHead = s.ple_state_.conv_head;
+    if (s.ple_state_.conv_head_dev.valid()) {
+        ctx.memcpy_d2h(&pleHead, s.ple_state_.conv_head_dev.data(),
+                       sizeof(pleHead));
+    }
     target.SynchronizeGdnDeviceHeadsToHost(ctx, s);
     size_t offset = 0;
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
@@ -100,7 +108,10 @@ void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
     ctx.queue().memcpy(checkpoint.data_as<uint8_t>() + offset, s.ple_state_.conv_state.data(), s.ple_state_.conv_state.size_bytes());
 }
 void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
-    s.InvalidateTokenGraphState();
+    // Roll back a rejected verification window without treating it as a new
+    // session generation. The dedicated epoch rejects prefetch tickets that
+    // were prepared against the speculative target state.
+    s.InvalidateMtpRestoreState();
     size_t offset = 0;
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
         auto& c = s.layerCaches_[l]; c.linear_conv_head = convHeads[l]; c.num_compressed_blocks = blocks[l];
@@ -112,6 +123,10 @@ void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
     ctx.queue().memcpy(s.ple_state_.conv_state.data(), checkpoint.data_as<uint8_t>() + offset, s.ple_state_.conv_state.size_bytes());
     target.PublishGdnHostHeadsToDevice(ctx, s);
     s.ple_state_.prev_tokens = pleTokens; s.ple_state_.conv_head = pleHead;
+    if (s.ple_state_.conv_head_dev.valid()) {
+        ctx.memcpy_h2d(s.ple_state_.conv_head_dev.data(), &pleHead,
+                       sizeof(pleHead));
+    }
     s.currentLength_ = length; s.consecutive_no_miss_layers_ = noMiss;
 }
 aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(

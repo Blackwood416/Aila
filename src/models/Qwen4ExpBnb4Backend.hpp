@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct Qwen4ExpHyperConnectionLayer {
@@ -102,6 +103,8 @@ struct Qwen4ExpLayerCache {
     // Host authority is the default and keeps linear_conv_head authoritative.
     int* linear_conv_head_dev = nullptr;
     bool linear_conv_head_device_authority = false;
+    // True when the host mirror matches the device row. False does not block
+    // reads while device authority owns the advancing head.
     bool linear_conv_head_device_synced = true;
 };
 
@@ -193,7 +196,9 @@ public:
 
         int CurrentLength() const { return currentLength_; }
         int Capacity() const { return capacity_; }
+        uint64_t session_instance_id() const { return session_instance_id_; }
         uint64_t generation() const { return generation_; }
+        uint64_t ple_ticket_epoch() const { return ple_ticket_epoch_; }
         uint64_t token_graph_generation() const { return token_graph_generation_; }
         bool token_graph_poisoned() const { return token_graph_poisoned_; }
         // Every host-side mutation that is visible to a captured graph must
@@ -207,6 +212,15 @@ public:
         }
         void bump_generation() {
             ++generation_;
+            InvalidatePleTickets();
+            InvalidateTokenGraphState();
+        }
+        void InvalidatePleTickets() noexcept { ++ple_ticket_epoch_; }
+        // MTP rollback changes device/host history without creating a new
+        // session identity. Invalidate speculative PLE tickets and any graph
+        // key, but leave generation() reserved for Reset/Truncate semantics.
+        void InvalidateMtpRestoreState() noexcept {
+            InvalidatePleTickets();
             InvalidateTokenGraphState();
         }
         // Exact device payload of the tensors this Session owns (Full K/V,
@@ -229,18 +243,21 @@ public:
 
     private:
         friend class Qwen4ExpBnb4Backend;
+        friend struct Qwen4ExpGenerationTestAccess;
         friend struct Qwen4ExpMtpProbe;
         friend class Qwen4ExpMtpRuntime;
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
-                std::size_t maxSnapshots);
+                std::size_t maxSnapshots, uint64_t instanceId);
 
         Context* context_ = nullptr;
         std::shared_ptr<const SessionOwner> owner_;
+        uint64_t session_instance_id_ = 0;
         int currentLength_ = 0;
         int capacity_ = 0;
         std::size_t cacheBytes_ = 0;
         uint64_t generation_ = 1;
+        uint64_t ple_ticket_epoch_ = 1;
         uint64_t token_graph_generation_ = 1;
         bool token_graph_poisoned_ = false;
         int consecutive_no_miss_layers_ = 0;
@@ -292,6 +309,30 @@ public:
     }
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
+    // All token-graph submissions must pass through this host wrapper.
+    // Host-only authority/dirty writes executed while recording do not run on
+    // replay, so mark the GDN state immediately after successful submission.
+    // If a later event-status check observes an abort, poison the session;
+    // checkpoint capture rejects poisoned state because rollback is partial.
+    template <typename Launch>
+    auto SubmitTokenGraph(Session& session, Launch&& launch)
+        -> decltype(std::forward<Launch>(launch)()) {
+        ValidateSession(session);
+        ValidateGdnHeadPath(session, 1);
+        if (session.graph_gdn_state_enabled_) {
+            for (const auto& cache : session.layerCaches_) {
+                if (cache.linear_state.valid() &&
+                    !GdnDeviceHeadReadable(cache)) {
+                    throw std::invalid_argument(
+                        "Qwen4Exp token graph cannot launch before the host "
+                        "GDN heads are published to the device");
+                }
+            }
+        }
+        auto result = std::forward<Launch>(launch)();
+        MarkGdnGraphStateDirty(session);
+        return result;
+    }
     // Qwen4Exp has no cross-session decode batch path; the Model session
     // backend also excludes ForwardDecodeBatch at compile time.
     bool SupportsDecodeBatch() const noexcept { return false; }
@@ -472,6 +513,8 @@ private:
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
     StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
     void ValidateGdnHeadPath(const Session& session, int count) const;
+    bool PleTicketEpochMatches(const Session& session, const PleTicket& ticket) const noexcept;
+    static bool GdnDeviceHeadReadable(const Qwen4ExpLayerCache& cache) noexcept;
     void SynchronizeGdnDeviceHeadsToHost(Context& ctx, Session& session);
     void PublishGdnHostHeadsToDevice(Context& ctx, Session& session);
     void PrepareGdnGraphState(Context& ctx, Session& session);
@@ -578,6 +621,8 @@ private:
 
     Context* context_ = nullptr;
     std::shared_ptr<const SessionOwner> sessionOwner_;
+    // CreateSession() and graph orchestration share the backend thread.
+    uint64_t next_session_instance_id_ = 1;
     std::unique_ptr<Session> defaultSession_;
 
     std::vector<Qwen4ExpLayer> layers_;

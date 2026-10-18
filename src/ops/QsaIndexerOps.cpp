@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace ops {
 
@@ -179,6 +180,7 @@ void qsa_prepare_q_and_cache_k_impl(
     Tensor& q_out,
     int pos,
     GraphControl control,
+    int layer,
     float theta,
     bool interleaved,
     const int* pos_t,
@@ -212,9 +214,16 @@ void qsa_prepare_q_and_cache_k_impl(
             [=](sycl::nd_item<1> item) {
                 const int head = item.get_group(0);
                 const int lid = item.get_local_id(0);
-                if (control && graph_control_aborted(control)) return;
-                const int active_pos =
-                    control ? control[graph_control::start_pos] : pos;
+                int active_pos = pos;
+                if (control) {
+                    int visible_len = 0;
+                    int compressed_blocks = 0;
+                    if (!graph_control_pending_blocks(
+                            control, capacity / 4, visible_len,
+                            compressed_blocks, layer))
+                        return;
+                    active_pos = visible_len - 1;
+                }
                 if (active_pos < 0 || active_pos >= capacity) {
                     if (control) graph_control_mark_abort(control);
                     return;
@@ -287,7 +296,7 @@ void qsa_prepare_q_and_cache_k(
     int mrope_section_h,
     int mrope_section_w) {
     qsa_prepare_q_and_cache_k_impl(
-        ctx, indexer_qk, q_norm_w, k_cache, q_out, pos, nullptr, theta,
+        ctx, indexer_qk, q_norm_w, k_cache, q_out, pos, nullptr, 0, theta,
         interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
         mrope_section_t, mrope_section_h, mrope_section_w);
 }
@@ -308,10 +317,14 @@ void qsa_prepare_q_and_cache_k_graph(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    int layer) {
     if (!control)
         throw std::invalid_argument(
             "qsa_prepare_q_and_cache_k_graph requires graph control");
+    if (graph_control_layer_blocks_slot(layer) < 0)
+        throw std::invalid_argument(
+            "qsa_prepare_q_and_cache_k_graph layer out of range");
     if (!indexer_qk.valid() ||
         indexer_qk.dtype() != dnnl::memory::data_type::bf16 ||
         indexer_qk.numel() < 5 * 128 ||
@@ -320,7 +333,10 @@ void qsa_prepare_q_and_cache_k_graph(
         q_norm_w.numel() < 128 ||
         !k_cache.valid() ||
         k_cache.dtype() != dnnl::memory::data_type::bf16 ||
-        k_cache.ndim() < 1 || k_cache.shape(0) <= 0 ||
+        k_cache.ndim() != 2 ||
+        k_cache.shape(0) <= 0 ||
+        k_cache.shape(0) > std::numeric_limits<int>::max() ||
+        k_cache.shape(1) != 128 ||
         !q_out.valid() ||
         q_out.dtype() != dnnl::memory::data_type::bf16 ||
         q_out.numel() < 4 * 128) {
@@ -328,7 +344,7 @@ void qsa_prepare_q_and_cache_k_graph(
             "qsa_prepare_q_and_cache_k_graph shape mismatch");
     }
     qsa_prepare_q_and_cache_k_impl(
-        ctx, indexer_qk, q_norm_w, k_cache, q_out, -1, control, theta,
+        ctx, indexer_qk, q_norm_w, k_cache, q_out, -1, control, layer, theta,
         interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
         mrope_section_t, mrope_section_h, mrope_section_w);
 }
@@ -1014,15 +1030,13 @@ void qsa_compress_key_blocks_impl(
     int mrope_section_t,
     int mrope_section_h,
     int mrope_section_w,
-    const int* position_dev,
-    int* num_compressed_blocks_dev,
-    int* invalid_dev) {
+    GraphControl control,
+    int layer) {
     (void)mrope_section_t;
     if (!GraphMode && num_blocks <= 0) return;
-    if (GraphMode &&
-        (!position_dev || !num_compressed_blocks_dev)) {
+    if (GraphMode && !control) {
         throw std::invalid_argument(
-            "graph QSA compression requires position and block-count slots");
+            "graph QSA compression requires GraphControl");
     }
     const bf16* k_cache_ptr = k_cache.data_as<bf16>();
     const bf16* kn_ptr = k_norm_w.data_as<bf16>();
@@ -1034,6 +1048,7 @@ void qsa_compress_key_blocks_impl(
     constexpr int kWgSize = 128;
     const int max_blocks =
         static_cast<int>(compressed_k.numel() / kHeadDim);
+    const int cache_capacity = static_cast<int>(k_cache.shape(0));
     if constexpr (!GraphMode) {
         if (start_block < 0 || num_blocks > max_blocks - start_block)
             throw std::invalid_argument("QSA compression block range is invalid");
@@ -1052,20 +1067,26 @@ void qsa_compress_key_blocks_impl(
                 int b = start_block + item.get_group(0);
                 bool active = true;
                 if constexpr (GraphMode) {
-                    const int visible_len = position_dev[0] + 1;
+                    int visible_len = 0;
+                    int current_blocks = 0;
+                    if (!graph_control_pending_blocks(
+                            control, max_blocks, visible_len,
+                            current_blocks, layer))
+                        return;
                     const int target_blocks = visible_len / 4;
-                    const int current_blocks =
-                        num_compressed_blocks_dev[0];
-                    if (visible_len <= 0 || current_blocks < 0 ||
-                        current_blocks > target_blocks ||
-                        current_blocks >= max_blocks ||
-                        target_blocks - current_blocks > 1) {
-                        active = false;
-                        if (lid == 0 && invalid_dev) invalid_dev[0] = 1;
-                    } else if (current_blocks == target_blocks) {
+                    if (current_blocks == target_blocks) {
                         active = false;
                     } else {
                         b = current_blocks;
+                    }
+                }
+                if constexpr (GraphMode) {
+                    if (active &&
+                        (b < 0 || b >= max_blocks ||
+                         static_cast<size_t>(b) * 4 + 3 >=
+                             static_cast<size_t>(cache_capacity))) {
+                        active = false;
+                        if (lid == 0) graph_control_mark_abort(control);
                     }
                 }
                 if (!active) return;
@@ -1121,7 +1142,7 @@ void qsa_compress_key_blocks_impl(
                     item.barrier(
                         sycl::access::fence_space::global_and_local);
                     if (lid == 0)
-                        num_compressed_blocks_dev[0] = b + 1;
+                        control[graph_control_layer_blocks_slot(layer)] = b + 1;
                 }
             });
     });
@@ -1150,7 +1171,7 @@ void qsa_compress_key_blocks(
         ctx, k_cache, k_norm_w, compressed_k, start_block, num_blocks,
         theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len,
         text_pos_delta, mrope_section_t, mrope_section_h,
-        mrope_section_w, nullptr, nullptr, nullptr);
+        mrope_section_w, nullptr, 0);
 }
 
 void qsa_compress_one_completed_block_graph(
@@ -1158,8 +1179,7 @@ void qsa_compress_one_completed_block_graph(
     const Tensor& k_cache,
     const Tensor& k_norm_w,
     Tensor& compressed_k,
-    const int* position_dev,
-    int* num_compressed_blocks_dev,
+    GraphControl control,
     float theta,
     bool interleaved,
     const int* pos_t,
@@ -1170,12 +1190,37 @@ void qsa_compress_one_completed_block_graph(
     int mrope_section_t,
     int mrope_section_h,
     int mrope_section_w,
-    int* invalid_dev) {
+    int layer) {
+    if (!control) {
+        throw std::invalid_argument(
+            "qsa_compress_one_completed_block_graph requires GraphControl");
+    }
+    if (graph_control_layer_blocks_slot(layer) < 0) {
+        throw std::invalid_argument(
+            "qsa_compress_one_completed_block_graph layer out of range");
+    }
+    if (!k_cache.valid() ||
+        k_cache.dtype() != dnnl::memory::data_type::bf16 ||
+        k_cache.ndim() != 2 ||
+        k_cache.shape(0) <= 0 ||
+        k_cache.shape(0) > std::numeric_limits<int>::max() ||
+        k_cache.shape(1) != 128 ||
+        !k_norm_w.valid() ||
+        k_norm_w.dtype() != dnnl::memory::data_type::bf16 ||
+        k_norm_w.numel() < 128 ||
+        !compressed_k.valid() ||
+        compressed_k.dtype() != dnnl::memory::data_type::bf16 ||
+        compressed_k.ndim() != 2 ||
+        compressed_k.shape(0) <= 0 ||
+        compressed_k.shape(0) > std::numeric_limits<int>::max() ||
+        compressed_k.shape(1) != 128) {
+        throw std::invalid_argument(
+            "qsa_compress_one_completed_block_graph shape mismatch");
+    }
     qsa_compress_key_blocks_impl<true>(
         ctx, k_cache, k_norm_w, compressed_k, 0, 1, theta, interleaved,
         pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
-        mrope_section_t, mrope_section_h, mrope_section_w, position_dev,
-        num_compressed_blocks_dev, invalid_dev);
+        mrope_section_t, mrope_section_h, mrope_section_w, control, layer);
 }
 
 void qsa_compress_key_blocks_host(
@@ -1290,10 +1335,12 @@ void qsa_compute_block_scores_compressed_graph(
     const Tensor& compressed_k,
     Tensor& scores_out,
     GraphControl control,
-    int max_blocks) {
-    if (!control || max_blocks <= 0)
+    int max_blocks,
+    int layer) {
+    if (!control || max_blocks <= 0 ||
+        graph_control_layer_blocks_slot(layer) < 0)
         throw std::invalid_argument(
-            "qsa_compute_block_scores_compressed_graph requires control and max_blocks");
+            "qsa_compute_block_scores_compressed_graph requires valid control, max_blocks and layer");
     if (!q.valid() || q.dtype() != dnnl::memory::data_type::bf16 ||
         q.numel() < 4 * 128 ||
         !compressed_k.valid() ||
@@ -1322,7 +1369,7 @@ void qsa_compute_block_scores_compressed_graph(
                 int active_blocks = 0;
                 if (!graph_control_consistent_blocks(
                         control_ptr, max_blocks, visible_len,
-                        active_blocks))
+                        active_blocks, layer))
                     return;
                 const int b = item.get_group(0);
                 if (b >= active_blocks) return;
@@ -1627,11 +1674,12 @@ void qsa_select_topk_blocks_graph(
     GraphControl control,
     int block_topk,
     int compress_ratio,
-    int max_blocks) {
+    int max_blocks,
+    int layer) {
     if (!control || block_topk <= 0 || compress_ratio <= 0 ||
-        max_blocks <= 0)
+        max_blocks <= 0 || graph_control_layer_blocks_slot(layer) < 0)
         throw std::invalid_argument(
-            "qsa_select_topk_blocks_graph requires valid graph geometry");
+            "qsa_select_topk_blocks_graph requires valid graph geometry and layer");
     if (!scores.valid() ||
         scores.dtype() != dnnl::memory::data_type::f32 ||
         scores.numel() < max_blocks ||
@@ -1665,7 +1713,7 @@ void qsa_select_topk_blocks_graph(
                 int active_blocks = 0;
                 if (!graph_control_consistent_blocks(
                         control_ptr, max_blocks, visible_len,
-                        active_blocks))
+                        active_blocks, layer))
                     return;
                 const int tail_start = active_blocks * compress_ratio;
                 const int tail_len = sycl::min(

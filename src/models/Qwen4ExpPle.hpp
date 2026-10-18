@@ -29,6 +29,9 @@ struct Qwen4ExpPleState {
     // Optional graph-only [1] s32 ring head. Allocated by create_graph_view();
     // once valid, graph consume is the authority and host consume must not run.
     Tensor conv_head_dev;
+    // Advances whenever create_graph_view() establishes a new fixed view,
+    // including changes to the caller-owned hidden/out/residual addresses.
+    uint64_t graph_view_generation = 0;
 };
 
 struct Qwen4ExpPleSnapshot {
@@ -45,10 +48,12 @@ struct PleShardRef {
     int64_t rows = 0;
 };
 
-// P0 Candidate R1: PleTicket tracking session, generation, staging slot, and async DMA event.
+// P0 Candidate R1: PleTicket tracking session generation, ticket epoch,
+// staging slot, and async DMA event.
 struct PleTicket {
     const void* session_ptr = nullptr;
     uint64_t generation = 0;
+    uint64_t ticket_epoch = 0;
     int start_pos = 0;
     int num_tokens = 0;
     std::array<int, 2> prev_tokens_in{248044, 248044};
@@ -79,9 +84,13 @@ struct Qwen4ExpPleGraphView {
     const float* norm_query_weight = nullptr;
     const float* norm_conv_weight = nullptr;
     const bf16* conv_weight = nullptr;
+    uint64_t view_generation = 0;
+    uint64_t workspace_generation = 0;
 };
 
 class Qwen4ExpPle {
+    friend struct Qwen4ExpGenerationTestAccess;
+
 public:
     static constexpr int EOS_TOKEN_ID = 248044;
     static constexpr int NGRAM_SIZE = 3;
@@ -160,7 +169,8 @@ public:
         int num_tokens,
         const void* session_ptr = nullptr,
         uint64_t generation = 0,
-        int start_pos = 0);
+        int start_pos = 0,
+        uint64_t ticket_epoch = 0);
 
     // Graph path: always uses staging slot 0. Call wait_prepared() on the host
     // before recording/launching; consume_graph never waits or advances any
@@ -172,7 +182,8 @@ public:
         int num_tokens,
         const void* session_ptr = nullptr,
         uint64_t generation = 0,
-        int start_pos = 0);
+        int start_pos = 0,
+        uint64_t ticket_epoch = 0);
     void wait_prepared(Context& ctx, PleTicket& ticket);
 
     // The two staging slots own their token copies. A cancelled/replaced
@@ -236,6 +247,7 @@ public:
         const std::array<int64_t, 16>& offsets);
 
     bool is_initialized() const { return initialized_; }
+    uint64_t workspace_generation() const noexcept { return workspace_generation_; }
 
     const std::array<int64_t, 3>& layer_multipliers() const { return layer_multipliers_; }
     const std::array<int64_t, 16>& ngram_heads_vocab_sizes() const { return ngram_heads_vocab_sizes_; }
@@ -261,7 +273,8 @@ private:
         const void* session_ptr,
         uint64_t generation,
         int start_pos,
-        int slot);
+        int slot,
+        uint64_t ticket_epoch);
 
     void cleanup();
     void ensure_compute_capacity(Context& ctx, int rows);
@@ -337,4 +350,5 @@ private:
     Bnb4BitLinearScratch scratch_val_;
 
     bool initialized_ = false;
+    uint64_t workspace_generation_ = 0;
 };

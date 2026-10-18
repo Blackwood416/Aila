@@ -1,0 +1,12 @@
+[RUN] probe=real-l3-posthardening
+[QSA L3 PROBE] model=C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 capacity=2060 first_pos=2052 steps=4 seeded_compressed_blocks=513
+[SafeTensors] Lazily indexing sharded weights from 131 shard(s)
+[SafeTensors] Lazy index complete: 4114 host tensors indexed across 131 shards
+[QSA L3 WEIGHTS] real=1 layer=3 qkv=2560x13312 index_qk=2560x640 graph_ready=1
+[JM] mode=1, supported=1, tile_id=0, decode_wg=512, decode_window=0, decode_window_start=512, decode_sink=0 -> enabled
+[QSA L3 STEP] pos=2052 visible=2053 blocks=513 active=512 abort=0 bitwise=1
+[QSA L3 STEP] pos=2053 visible=2054 blocks=513 active=512 abort=0 bitwise=1
+[QSA L3 STEP] pos=2054 visible=2055 blocks=513 active=512 abort=0 bitwise=1
+[QSA L3 STEP] pos=2055 visible=2056 blocks=514 active=512 abort=0 bitwise=1
+[QSA L3 RESULT] bit_exact=1 steps=4 start_pos=2052..2055 blocks=513..514 selector=complement_x3+cutoff_x1 tiles=17,17,17,16 nodes=qkv,index_qk,qgkv,qsa_prepare,compress,score,select,attention,o_proj
+[RUN] probe=real-l3 exit=0 wall_s=28.4

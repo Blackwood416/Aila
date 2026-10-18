@@ -6,6 +6,7 @@
 #include "ops/QsaIndexerOps.hpp"
 #include "ops/Bnb4BitLinear.hpp"
 #include "ops/Ops.hpp"
+#include "ops/AttentionOps.hpp"
 #include "ops/Qwen4ExpAttentionPair.hpp"
 #include "utils/EnvUtils.hpp"
 #include "../models/Qwen4ExpGreedyProbe.hpp"
@@ -33,6 +34,19 @@
 namespace {
 
 using bf16 = sycl::ext::oneapi::bfloat16;
+
+template <typename Fn>
+void expect_invalid_argument(const std::string& name, Fn&& fn) {
+    bool rejected = false;
+    try {
+        fn();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        throw std::runtime_error(name + ": expected invalid_argument");
+    }
+}
 
 void check_close(const std::vector<bf16>& actual, const std::vector<float>& expected,
                  const std::string& name, float tol = 2e-2f) {
@@ -773,6 +787,21 @@ void test_qsa_graph_position_and_block_advance(Context& ctx) {
                    control.size() * sizeof(int));
     ctx.synchronize();
 
+    Tensor narrow_k_cache = Tensor::allocate(
+        ctx, {capacity, head_dim - 64}, dnnl::memory::data_type::bf16);
+    Tensor narrow_compressed_k = Tensor::allocate(
+        ctx, {max_blocks, head_dim - 64}, dnnl::memory::data_type::bf16);
+    expect_invalid_argument("QSA prepare graph cache capacity", [&] {
+        ops::qsa_prepare_q_and_cache_k_graph(
+            ctx, qk_graph_dev, q_norm_dev, narrow_k_cache, q_graph_dev,
+            control_dev.data_as<int>(), 10000.0f);
+    });
+    expect_invalid_argument("QSA compress graph compressed capacity", [&] {
+        ops::qsa_compress_one_completed_block_graph(
+            ctx, k_graph_dev, k_norm_dev, narrow_compressed_k,
+            control_dev.data_as<int>(), 10000.0f);
+    });
+
     ExecutableGraph graph = [&]() {
         ex::command_graph<ex::graph_state::modifiable> recording(
             queue.get_context(), queue.get_device());
@@ -783,11 +812,25 @@ void test_qsa_graph_position_and_block_advance(Context& ctx) {
                 control_dev.data_as<int>(), 10000.0f);
             ops::qsa_compress_one_completed_block_graph(
                 ctx, k_graph_dev, k_norm_dev, compressed_graph_dev,
-                control_dev.data_as<int>() + ops::graph_control::start_pos,
-                control_dev.data_as<int>() +
-                    ops::graph_control::compressed_blocks,
-                10000.0f, false, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
-                control_dev.data_as<int>() + 3);
+                control_dev.data_as<int>(), 10000.0f);
+            ops::qsa_compute_block_scores_compressed_graph(
+                ctx, q_graph_dev, compressed_graph_dev, scores_graph_dev,
+                control_dev.data_as<int>(), max_blocks);
+            ops::qsa_select_topk_blocks_graph(
+                ctx, scores_graph_dev, active_graph_dev,
+                control_dev.data_as<int>(), 512, 4, max_blocks);
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    }();
+    ExecutableGraph scoring_guard_graph = [&]() {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
             ops::qsa_compute_block_scores_compressed_graph(
                 ctx, q_graph_dev, compressed_graph_dev, scores_graph_dev,
                 control_dev.data_as<int>(), max_blocks);
@@ -907,9 +950,368 @@ void test_qsa_graph_position_and_block_advance(Context& ctx) {
     if (graph_blocks != 514 || host_blocks != 514) {
         throw std::runtime_error("QSA graph test did not reach the 514-block boundary");
     }
+
+    std::vector<float> scores_before(max_blocks);
+    std::vector<int> active_before(512 + 4);
+    std::vector<bf16> q_before(4 * head_dim);
+    std::vector<bf16> k_row_before(head_dim);
+    ctx.memcpy_d2h(scores_before.data(), scores_graph_dev.data(),
+                   scores_before.size() * sizeof(float));
+    ctx.memcpy_d2h(active_before.data(), active_graph_dev.data(),
+                   active_before.size() * sizeof(int));
+    ctx.memcpy_d2h(q_before.data(), q_graph_dev.data(),
+                   q_before.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_row_before.data(),
+                   k_graph_dev.data_as<bf16>() +
+                       size_t(initial_pos + steps - 1) * head_dim,
+                   k_row_before.size() * sizeof(bf16));
+
+    std::vector<bf16> compressed_guard(head_dim, bf16(1.2345f));
+    ctx.memcpy_h2d(compressed_graph_dev.data_as<bf16>() +
+                       size_t(initial_blocks) * head_dim,
+                   compressed_guard.data(),
+                   compressed_guard.size() * sizeof(bf16));
+    control[ops::graph_control::start_pos] = initial_pos + steps - 1;
+    control[ops::graph_control::compressed_blocks] = initial_blocks;
+    control[ops::graph_control::abort] = 1;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    auto abort_event = queue.ext_oneapi_graph(graph);
+    abort_event.wait_and_throw();
+    ctx.synchronize();
+    ctx.memcpy_d2h(control.data(), control_dev.data(),
+                   control.size() * sizeof(int));
+    std::vector<bf16> q_abort(4 * head_dim);
+    std::vector<bf16> k_row_abort(head_dim);
+    std::vector<bf16> compressed_abort(head_dim);
+    ctx.memcpy_d2h(q_abort.data(), q_graph_dev.data(),
+                   q_abort.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_row_abort.data(),
+                   k_graph_dev.data_as<bf16>() +
+                       size_t(initial_pos + steps - 1) * head_dim,
+                   k_row_abort.size() * sizeof(bf16));
+    ctx.memcpy_d2h(compressed_abort.data(),
+                   compressed_graph_dev.data_as<bf16>() +
+                       size_t(initial_blocks) * head_dim,
+                   compressed_abort.size() * sizeof(bf16));
+    if (control[ops::graph_control::abort] == 0 ||
+        control[ops::graph_control::compressed_blocks] != initial_blocks ||
+        std::memcmp(q_before.data(), q_abort.data(),
+                    q_before.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(k_row_before.data(), k_row_abort.data(),
+                    k_row_before.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(compressed_guard.data(), compressed_abort.data(),
+                    compressed_guard.size() * sizeof(bf16)) != 0) {
+        throw std::runtime_error(
+            "QSA compression abort-only modified output/cache/count");
+    }
+
+    control[ops::graph_control::start_pos] = initial_pos + steps - 1;
+    control[ops::graph_control::compressed_blocks] = 512;
+    control[ops::graph_control::abort] = 0;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    auto scoring_guard_event = queue.ext_oneapi_graph(scoring_guard_graph);
+    scoring_guard_event.wait_and_throw();
+    ctx.synchronize();
+    ctx.memcpy_d2h(control.data(), control_dev.data(),
+                   control.size() * sizeof(int));
+    std::vector<float> scores_guard_abort(max_blocks);
+    std::vector<int> active_guard_abort(512 + 4);
+    ctx.memcpy_d2h(scores_guard_abort.data(), scores_graph_dev.data(),
+                   scores_guard_abort.size() * sizeof(float));
+    ctx.memcpy_d2h(active_guard_abort.data(), active_graph_dev.data(),
+                   active_guard_abort.size() * sizeof(int));
+    if (control[ops::graph_control::abort] == 0 ||
+        control[ops::graph_control::compressed_blocks] != 512 ||
+        std::memcmp(scores_before.data(), scores_guard_abort.data(),
+                    scores_before.size() * sizeof(float)) != 0 ||
+        std::memcmp(active_before.data(), active_guard_abort.data(),
+                    active_before.size() * sizeof(int)) != 0) {
+        throw std::runtime_error(
+            "QSA scoring graph accepted an inconsistent block count");
+    }
+
+    std::vector<bf16> poisoned_qk(total_dim);
+    for (int i = 0; i < total_dim; ++i) {
+        poisoned_qk[i] = bf16(float((i * 7) % 61 - 30) * 0.01f);
+    }
+    ctx.memcpy_h2d(qk_graph_dev.data(), poisoned_qk.data(),
+                   poisoned_qk.size() * sizeof(bf16));
+    control[ops::graph_control::start_pos] = initial_pos + steps - 1;
+    control[ops::graph_control::compressed_blocks] = 512;
+    control[ops::graph_control::abort] = 0;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    auto invalid_event = queue.ext_oneapi_graph(graph);
+    invalid_event.wait_and_throw();
+    ctx.synchronize();
+    ctx.memcpy_d2h(control.data(), control_dev.data(),
+                   control.size() * sizeof(int));
+    std::vector<float> scores_after(max_blocks);
+    std::vector<int> active_after(512 + 4);
+    std::vector<bf16> q_after(4 * head_dim);
+    std::vector<bf16> k_row_after(head_dim);
+    ctx.memcpy_d2h(scores_after.data(), scores_graph_dev.data(),
+                   scores_after.size() * sizeof(float));
+    ctx.memcpy_d2h(active_after.data(), active_graph_dev.data(),
+                   active_after.size() * sizeof(int));
+    ctx.memcpy_d2h(q_after.data(), q_graph_dev.data(),
+                   q_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_row_after.data(),
+                   k_graph_dev.data_as<bf16>() +
+                       size_t(initial_pos + steps - 1) * head_dim,
+                   k_row_after.size() * sizeof(bf16));
+    if (control[ops::graph_control::abort] == 0 ||
+        control[ops::graph_control::compressed_blocks] != 512 ||
+        std::memcmp(q_before.data(), q_after.data(),
+                    q_before.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(k_row_before.data(), k_row_after.data(),
+                    k_row_before.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(scores_before.data(), scores_after.data(),
+                    scores_before.size() * sizeof(float)) != 0 ||
+        std::memcmp(active_before.data(), active_after.data(),
+                    active_before.size() * sizeof(int)) != 0) {
+        throw std::runtime_error(
+            "QSA graph accepted an inconsistent compressed block count");
+    }
     std::cout << "[PASS] QSA graph device position + block advance + scoring/selector"
               << " (pos=" << initial_pos << ".." << initial_pos + steps - 1
-              << ", blocks=513..514, scores/active-blocks bitwise)\n";
+              << ", blocks=513..514, scores/active-blocks bitwise,"
+              << " abort-only + stale-count no-op)\n";
+}
+
+void test_qsa_graph_per_layer_block_advance(Context& ctx) {
+    constexpr int capacity = 2060;
+    constexpr int head_dim = 128;
+    constexpr int total_dim = 640;
+    constexpr int max_blocks = 516;
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int first_pos = 2054;
+    namespace ex = sycl::ext::oneapi::experimental;
+    using ExecutableGraph = ex::command_graph<ex::graph_state::executable>;
+    auto& queue = ctx.queue();
+    if (!queue.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !queue.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error(
+            "QSA per-layer graph test requires SYCL graph support");
+    }
+
+    const int layer1_slot = ops::graph_control_layer_blocks_slot(1);
+    if (layer1_slot <= ops::graph_control::abort ||
+        layer1_slot == ops::graph_control::compressed_blocks ||
+        layer1_slot >= ops::graph_control::words) {
+        throw std::runtime_error("QSA per-layer slot mapping is invalid");
+    }
+
+    std::vector<bf16> initial_k(capacity * head_dim);
+    std::vector<bf16> q_norm(head_dim);
+    std::vector<bf16> k_norm(head_dim);
+    for (int i = 0; i < capacity * head_dim; ++i) {
+        initial_k[i] =
+            bf16(float((i * 5 + 3) % 101 - 50) * 0.001f);
+    }
+    for (int d = 0; d < head_dim; ++d) {
+        q_norm[d] = bf16(0.9f + float(d % 17) * 0.01f);
+        k_norm[d] = bf16(0.95f + float((d * 7) % 19) * 0.01f);
+    }
+
+    Tensor qk0_dev = Tensor::allocate(
+        ctx, {1, total_dim}, dnnl::memory::data_type::bf16);
+    Tensor qk1_dev = Tensor::allocate(
+        ctx, {1, total_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_norm_dev = Tensor::allocate(
+        ctx, {head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_norm_dev = Tensor::allocate(
+        ctx, {head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k0_dev = Tensor::allocate(
+        ctx, {capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k1_dev = Tensor::allocate(
+        ctx, {capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q0_dev = Tensor::allocate(
+        ctx, {4, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q1_dev = Tensor::allocate(
+        ctx, {4, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor compressed0_dev = Tensor::allocate(
+        ctx, {max_blocks, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor compressed1_dev = Tensor::allocate(
+        ctx, {max_blocks, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores0_dev = Tensor::allocate(
+        ctx, {max_blocks}, dnnl::memory::data_type::f32);
+    Tensor scores1_dev = Tensor::allocate(
+        ctx, {max_blocks}, dnnl::memory::data_type::f32);
+    Tensor active0_dev = Tensor::allocate(
+        ctx, {block_topk + compress_ratio}, dnnl::memory::data_type::s32);
+    Tensor active1_dev = Tensor::allocate(
+        ctx, {block_topk + compress_ratio}, dnnl::memory::data_type::s32);
+    Tensor control_dev = Tensor::allocate(
+        ctx, {ops::graph_control::words}, dnnl::memory::data_type::s32);
+    expect_invalid_argument("QSA per-layer slot range", [&] {
+        ops::qsa_compute_block_scores_compressed_graph(
+            ctx, q0_dev, compressed0_dev, scores0_dev,
+            control_dev.data_as<int>(), max_blocks,
+            ops::graph_control::max_full_layers);
+    });
+
+    std::vector<bf16> compressed0(max_blocks * head_dim, bf16(0.25f));
+    std::vector<bf16> compressed1(max_blocks * head_dim, bf16(-0.25f));
+    const bf16 block512_guard0 = bf16(20.0f);
+    const bf16 block512_guard1 = bf16(-20.0f);
+    const bf16 block513_guard0 = bf16(21.0f);
+    const bf16 block513_guard1 = bf16(-21.0f);
+    std::fill_n(
+        compressed0.data() + size_t(512) * head_dim, head_dim,
+        block512_guard0);
+    std::fill_n(
+        compressed1.data() + size_t(512) * head_dim, head_dim,
+        block512_guard1);
+    std::fill_n(
+        compressed0.data() + size_t(513) * head_dim, head_dim,
+        block513_guard0);
+    std::fill_n(
+        compressed1.data() + size_t(513) * head_dim, head_dim,
+        block513_guard1);
+
+    ctx.memcpy_h2d(q_norm_dev.data(), q_norm.data(),
+                   q_norm.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_norm_dev.data(), k_norm.data(),
+                   k_norm.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k0_dev.data(), initial_k.data(),
+                   initial_k.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k1_dev.data(), initial_k.data(),
+                   initial_k.size() * sizeof(bf16));
+    ctx.memcpy_h2d(compressed0_dev.data(), compressed0.data(),
+                   compressed0.size() * sizeof(bf16));
+    ctx.memcpy_h2d(compressed1_dev.data(), compressed1.data(),
+                   compressed1.size() * sizeof(bf16));
+
+    std::array<int, ops::graph_control::words> control{};
+    control[ops::graph_control::start_pos] = first_pos;
+    control[ops::graph_control::compressed_blocks] = 513;
+    control[layer1_slot] = 512;
+    control[ops::graph_control::abort] = 0;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    ctx.synchronize();
+
+    auto record_lane = [&](int layer, Tensor& qk_dev, Tensor& k_dev,
+                           Tensor& q_dev, Tensor& compressed_dev,
+                           Tensor& scores_dev, Tensor& active_dev) {
+        ops::qsa_prepare_q_and_cache_k_graph(
+            ctx, qk_dev, q_norm_dev, k_dev, q_dev,
+            control_dev.data_as<int>(), 10000.0f, false, nullptr, nullptr,
+            nullptr, 0, 0, 0, 0, 0, layer);
+        ops::qsa_compress_one_completed_block_graph(
+            ctx, k_dev, k_norm_dev, compressed_dev,
+            control_dev.data_as<int>(), 10000.0f, false, nullptr, nullptr,
+            nullptr, 0, 0, 0, 0, 0, layer);
+        ops::qsa_compute_block_scores_compressed_graph(
+            ctx, q_dev, compressed_dev, scores_dev,
+            control_dev.data_as<int>(), max_blocks, layer);
+        ops::qsa_select_topk_blocks_graph(
+            ctx, scores_dev, active_dev, control_dev.data_as<int>(),
+            block_topk, compress_ratio, max_blocks, layer);
+    };
+
+    ExecutableGraph graph = [&]() {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
+            record_lane(
+                0, qk0_dev, k0_dev, q0_dev, compressed0_dev,
+                scores0_dev, active0_dev);
+            record_lane(
+                1, qk1_dev, k1_dev, q1_dev, compressed1_dev,
+                scores1_dev, active1_dev);
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    }();
+
+    auto read_block = [&](Tensor& compressed_dev, int block) {
+        std::vector<bf16> row(head_dim);
+        ctx.memcpy_d2h(
+            row.data(),
+            compressed_dev.data_as<bf16>() +
+                static_cast<size_t>(block) * head_dim,
+            row.size() * sizeof(bf16));
+        return row;
+    };
+    auto all_equal = [](const std::vector<bf16>& row, bf16 expected) {
+        for (bf16 value : row) {
+            if (static_cast<float>(value) != static_cast<float>(expected)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    for (int step = 0; step < 2; ++step) {
+        const int position = first_pos + step;
+        std::vector<bf16> qk0(total_dim);
+        std::vector<bf16> qk1(total_dim);
+        for (int i = 0; i < total_dim; ++i) {
+            qk0[i] = bf16(
+                float(((i + 7) * 17 + position * 11) % 251 - 125) *
+                0.004f);
+            qk1[i] = bf16(
+                float(((i + 29) * 13 + position * 19) % 257 - 128) *
+                0.003f);
+        }
+        ctx.memcpy_h2d(qk0_dev.data(), qk0.data(),
+                       qk0.size() * sizeof(bf16));
+        ctx.memcpy_h2d(qk1_dev.data(), qk1.data(),
+                       qk1.size() * sizeof(bf16));
+        control[ops::graph_control::start_pos] = position;
+        control[ops::graph_control::abort] = 0;
+        ctx.memcpy_h2d(control_dev.data(), control.data(),
+                       control.size() * sizeof(int));
+
+        auto event = queue.ext_oneapi_graph(graph);
+        event.wait_and_throw();
+        ctx.synchronize();
+        ctx.memcpy_d2h(control.data(), control_dev.data(),
+                       control.size() * sizeof(int));
+        if (control[ops::graph_control::abort] != 0) {
+            throw std::runtime_error(
+                "QSA per-layer graph aborted at pos=" +
+                std::to_string(position));
+        }
+        if (control[ops::graph_control::compressed_blocks] !=
+                513 + step ||
+            control[layer1_slot] != 512 + step + 1) {
+            throw std::runtime_error(
+                "QSA per-layer counters overlapped at pos=" +
+                std::to_string(position));
+        }
+
+        const std::vector<bf16> block512_l0 =
+            read_block(compressed0_dev, 512);
+        const std::vector<bf16> block512_l1 =
+            read_block(compressed1_dev, 512);
+        if (!all_equal(block512_l0, block512_guard0) ||
+            all_equal(block512_l1, block512_guard1)) {
+            throw std::runtime_error(
+                "QSA per-layer block 512 state crossed lanes");
+        }
+    }
+
+    const std::vector<bf16> block513_l0 = read_block(compressed0_dev, 513);
+    const std::vector<bf16> block513_l1 = read_block(compressed1_dev, 513);
+    if (all_equal(block513_l0, block513_guard0) ||
+        all_equal(block513_l1, block513_guard1)) {
+        throw std::runtime_error(
+            "QSA per-layer layers did not both advance block 513");
+    }
+
+    std::cout << "[PASS] QSA per-layer graph counters"
+              << " (pos=2054..2055, layer0=513..514, layer1=512..514,"
+              << " block output isolated)\n";
 }
 
 void test_attention_decode_block_native_graph(Context& ctx) {
@@ -968,6 +1370,9 @@ void test_attention_decode_block_native_graph(Context& ctx) {
             queue.get_context(), queue.get_device());
         recording.begin_recording(queue);
         try {
+            ops::attention_validate_qsa_active_blocks_graph(
+                ctx, k_dev, v_dev, active_blocks_dev,
+                control_dev.data_as<int>(), num_kv_heads);
             ops::attention_decode_exact_head256_block_native_graph(
                 ctx, q_dev, k_dev, v_dev, out_graph_dev,
                 partials_graph_dev, active_blocks_dev,
@@ -1060,8 +1465,52 @@ void test_attention_decode_block_native_graph(Context& ctx) {
             "block-native attention graph abort modified output/partials");
     }
 
+    auto replay_guard = [&](const std::string& label,
+                            std::array<int, block_topk + compress_ratio> active,
+                            int start_pos, int complete_blocks) {
+        ctx.memcpy_h2d(active_blocks_dev.data(), active.data(),
+                       active.size() * sizeof(int));
+        control[ops::graph_control::start_pos] = start_pos;
+        control[ops::graph_control::compressed_blocks] = complete_blocks;
+        control[ops::graph_control::abort] = 0;
+        ctx.memcpy_h2d(control_dev.data(), control.data(),
+                       control.size() * sizeof(int));
+        auto event = queue.ext_oneapi_graph(graph);
+        event.wait_and_throw();
+        ctx.synchronize();
+        ctx.memcpy_d2h(control.data(), control_dev.data(),
+                       control.size() * sizeof(int));
+        std::vector<uint8_t> output_guard(output_before.size());
+        std::vector<uint8_t> partials_guard(partials_before.size());
+        ctx.memcpy_d2h(output_guard.data(), out_graph_dev.data(),
+                       output_guard.size());
+        ctx.memcpy_d2h(partials_guard.data(), partials_graph_dev.data(),
+                       partials_guard.size());
+        if (control[ops::graph_control::abort] == 0 ||
+            std::memcmp(output_before.data(), output_guard.data(),
+                        output_guard.size()) != 0 ||
+            std::memcmp(partials_before.data(), partials_guard.data(),
+                        partials_guard.size()) != 0) {
+            throw std::runtime_error(
+                "block-native attention graph accepted " + label);
+        }
+    };
+
+    std::array<int, block_topk + compress_ratio> guarded_active{};
+    for (int b = 0; b < block_topk; ++b) guarded_active[b] = b;
+    guarded_active[block_topk] = 2052;
+    replay_guard("an inconsistent compressed block count", guarded_active, 2052, 512);
+
+    guarded_active[0] = 513;
+    replay_guard("an out-of-range sparse block id", guarded_active, 2052, 513);
+
+    guarded_active[0] = 0;
+    guarded_active[block_topk] = capacity;
+    replay_guard("an out-of-range tail token id", guarded_active, 2052, 513);
+
     std::cout << "[PASS] block-native attention graph"
-              << " (start_pos=2052..2055, tiles=17/17/17/16, bitwise, abort no-op)\n";
+              << " (start_pos=2052..2055, tiles=17/17/17/16, bitwise,"
+              << " abort + invalid-id no-op)\n";
 }
 
 void test_decode_prepare_qgkv_graph(Context& ctx) {
@@ -1245,6 +1694,69 @@ void test_decode_prepare_qgkv_graph(Context& ctx) {
         }
     }
 
+    std::vector<bf16> q_guard(num_heads * head_dim);
+    std::vector<bf16> gate_guard(num_heads * head_dim);
+    std::vector<bf16> k_guard(kv_dim);
+    std::vector<bf16> v_guard(kv_dim);
+    std::vector<bf16> kc_guard(initial_kv.size());
+    std::vector<bf16> vc_guard(initial_kv.size());
+    ctx.memcpy_d2h(q_guard.data(), q_graph_dev.data(),
+                   q_guard.size() * sizeof(bf16));
+    ctx.memcpy_d2h(gate_guard.data(), gate_graph_dev.data(),
+                   gate_guard.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_guard.data(), k_graph_dev.data(),
+                   k_guard.size() * sizeof(bf16));
+    ctx.memcpy_d2h(v_guard.data(), v_graph_dev.data(),
+                   v_guard.size() * sizeof(bf16));
+    ctx.memcpy_d2h(kc_guard.data(), k_cache_graph_dev.data(),
+                   kc_guard.size() * sizeof(bf16));
+    ctx.memcpy_d2h(vc_guard.data(), v_cache_graph_dev.data(),
+                   vc_guard.size() * sizeof(bf16));
+    control[ops::graph_control::start_pos] = 2055;
+    control[ops::graph_control::compressed_blocks] = 512;
+    control[ops::graph_control::abort] = 0;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    auto stale_event = queue.ext_oneapi_graph(graph);
+    stale_event.wait_and_throw();
+    ctx.synchronize();
+    ctx.memcpy_d2h(control.data(), control_dev.data(),
+                   control.size() * sizeof(int));
+    std::vector<bf16> q_after(num_heads * head_dim);
+    std::vector<bf16> gate_after(num_heads * head_dim);
+    std::vector<bf16> k_after(kv_dim);
+    std::vector<bf16> v_after(kv_dim);
+    std::vector<bf16> kc_after(initial_kv.size());
+    std::vector<bf16> vc_after(initial_kv.size());
+    ctx.memcpy_d2h(q_after.data(), q_graph_dev.data(),
+                   q_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(gate_after.data(), gate_graph_dev.data(),
+                   gate_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(k_after.data(), k_graph_dev.data(),
+                   k_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(v_after.data(), v_graph_dev.data(),
+                   v_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(kc_after.data(), k_cache_graph_dev.data(),
+                   kc_after.size() * sizeof(bf16));
+    ctx.memcpy_d2h(vc_after.data(), v_cache_graph_dev.data(),
+                   vc_after.size() * sizeof(bf16));
+    if (control[ops::graph_control::abort] == 0 ||
+        std::memcmp(q_guard.data(), q_after.data(),
+                    q_guard.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(gate_guard.data(), gate_after.data(),
+                    gate_guard.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(k_guard.data(), k_after.data(),
+                    k_guard.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(v_guard.data(), v_after.data(),
+                    v_guard.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(kc_guard.data(), kc_after.data(),
+                    kc_guard.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(vc_guard.data(), vc_after.data(),
+                    vc_guard.size() * sizeof(bf16)) != 0) {
+        throw std::runtime_error(
+            "QGKV graph accepted a stale compressed block count");
+    }
+
     const size_t cache_bytes =
         initial_kv.size() * sizeof(bf16);
     std::vector<uint8_t> cache_before(cache_bytes);
@@ -1266,7 +1778,8 @@ void test_decode_prepare_qgkv_graph(Context& ctx) {
     }
 
     std::cout << "[PASS] graph-safe decode_prepare_qgkv"
-              << " (pos=2052..2055, q/gate/K/V/cache bitwise, abort no-op)\n";
+              << " (pos=2052..2055, q/gate/K/V/cache bitwise,"
+              << " abort + stale-count no-op)\n";
 }
 
 void test_qsa_layer_graph_composite(Context& ctx) {
@@ -1464,11 +1977,7 @@ void test_qsa_layer_graph_composite(Context& ctx) {
                 qsa_q_graph_dev, control_dev.data_as<int>(), theta);
             ops::qsa_compress_one_completed_block_graph(
                 ctx, qsa_k_graph_dev, qsa_k_norm_dev, compressed_graph_dev,
-                control_dev.data_as<int>() + ops::graph_control::start_pos,
-                control_dev.data_as<int>() +
-                    ops::graph_control::compressed_blocks,
-                theta, false, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
-                control_dev.data_as<int>() + 3);
+                control_dev.data_as<int>(), theta);
             ops::qsa_compute_block_scores_compressed_graph(
                 ctx, qsa_q_graph_dev, compressed_graph_dev, scores_graph_dev,
                 control_dev.data_as<int>(), max_blocks);
@@ -1476,6 +1985,9 @@ void test_qsa_layer_graph_composite(Context& ctx) {
                 ctx, scores_graph_dev, active_graph_dev,
                 control_dev.data_as<int>(), block_topk, compress_ratio,
                 max_blocks);
+            ops::attention_validate_qsa_active_blocks_graph(
+                ctx, k_cache_graph_dev, v_cache_graph_dev, active_graph_dev,
+                control_dev.data_as<int>(), num_kv_heads);
             ops::attention_decode_exact_head256_block_native_graph(
                 ctx, q_graph_dev, k_cache_graph_dev, v_cache_graph_dev,
                 output_graph_dev, partials_graph_dev, active_graph_dev,
@@ -7017,6 +7529,14 @@ int main(int argc, char** argv) {
             std::cout << "QSA graph device-state test PASSED; teardown USM zero\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-per-layer-only") {
+            test_qsa_graph_per_layer_block_advance(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA per-layer test teardown USM leak");
+            std::cout << "QSA per-layer graph test PASSED; teardown USM zero\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--attention-graph-only") {
             test_attention_decode_block_native_graph(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
@@ -7156,6 +7676,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-tests") {
             test_qsa_graph_position_and_block_advance(ctx);
+            test_qsa_graph_per_layer_block_advance(ctx);
             test_attention_decode_block_native_graph(ctx);
             test_decode_prepare_qgkv_graph(ctx);
             test_qsa_layer_graph_composite(ctx);

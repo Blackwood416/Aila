@@ -1,0 +1,8 @@
+[RUN] 2026-10-18T17:30:42.0713686+08:00 structural-final free_gib=55.29 count=6
+[RESULT] test=qsa-per-layer exit=0 wall_s=2.7
+[RESULT] test=qsa-graph exit=0 wall_s=2.6
+[RESULT] test=attention-graph exit=0 wall_s=15.4
+[RESULT] test=qgkv-graph exit=0 wall_s=6.1
+[RESULT] test=gdn-graph-state exit=0 wall_s=0.6
+[RESULT] test=token-graph-key exit=0 wall_s=0.6
+[RESULT] probe=real-l3 exit=0 wall_s=28.4

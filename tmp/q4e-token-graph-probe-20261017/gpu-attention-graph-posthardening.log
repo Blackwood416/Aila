@@ -1,0 +1,4 @@
+[RUN] 2026-10-18T17:18:24.2800295+08:00 test=attention-graph exe=E:\RiderProjects\Aila\build-refactor\AilaQwen4ExpKernelTests.exe args=--attention-graph-only
+[JM] mode=1, supported=1, tile_id=0, decode_wg=512, decode_window=0, decode_window_start=512, decode_sink=0 -> enabled
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[RUN] test=attention-graph exit=-1 wall_s=167.7

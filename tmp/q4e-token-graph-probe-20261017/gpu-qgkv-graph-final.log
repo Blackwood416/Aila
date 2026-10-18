@@ -1,0 +1,5 @@
+[RUN] test=qgkv-graph
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[PASS] graph-safe decode_prepare_qgkv (pos=2052..2055, q/gate/K/V/cache bitwise, abort + stale-count no-op)
+QGKV graph test PASSED; teardown USM zero
+[RUN] test=qgkv-graph exit=0 wall_s=6.1

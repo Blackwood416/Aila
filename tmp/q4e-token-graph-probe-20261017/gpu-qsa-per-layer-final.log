@@ -1,0 +1,5 @@
+[RUN] test=qsa-per-layer
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[PASS] QSA per-layer graph counters (pos=2054..2055, layer0=513..514, layer1=512..514, block output isolated)
+QSA per-layer graph test PASSED; teardown USM zero
+[RUN] test=qsa-per-layer exit=0 wall_s=2.7

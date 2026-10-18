@@ -19,6 +19,7 @@
 #include "ops/Bnb4BitLinear.hpp"
 #include "ops/GraphControl.hpp"
 #include "ops/Ops.hpp"
+#include "ops/AttentionOps.hpp"
 #include "ops/QsaIndexerOps.hpp"
 #include "utils/ModelSpec.hpp"
 #include "utils/SafeTensors.hpp"
@@ -458,15 +459,12 @@ void capture_graph_body(Context& ctx, Lane& lane, RealL3Weights& real,
 
     ops::qsa_compress_one_completed_block_graph(
         ctx, lane.indexer_raw_k, real.index_k_norm,
-        lane.indexer_compressed_k,
-        control.data_as<int>() + ops::graph_control::start_pos,
-        control.data_as<int>() + ops::graph_control::compressed_blocks,
+        lane.indexer_compressed_k, control.data_as<int>(),
         real.cfg.rope.rope_theta, real.cfg.rope.mrope_interleaved,
         nullptr, nullptr, nullptr, 0, 0,
         real.cfg.rope.mrope_section[0],
         real.cfg.rope.mrope_section[1],
-        real.cfg.rope.mrope_section[2],
-        control.data_as<int>() + ops::graph_control::abort);
+        real.cfg.rope.mrope_section[2]);
 
     ops::qsa_compute_block_scores_compressed_graph(
         ctx, lane.qsa_q, lane.indexer_compressed_k, lane.scores,
@@ -474,6 +472,9 @@ void capture_graph_body(Context& ctx, Lane& lane, RealL3Weights& real,
     ops::qsa_select_topk_blocks_graph(
         ctx, lane.scores, lane.active_blocks, control.data_as<int>(),
         kBlockTopK, kCompressRatio, geometry.max_blocks);
+    ops::attention_validate_qsa_active_blocks_graph(
+        ctx, lane.k_cache, lane.v_cache, lane.active_blocks,
+        control.data_as<int>(), kKvHeads);
     ops::attention_decode_exact_head256_block_native_graph(
         ctx, lane.q, lane.k_cache, lane.v_cache, lane.attn_out,
         lane.partials, lane.active_blocks, control.data_as<int>(), kQHeads,
