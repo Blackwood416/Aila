@@ -6,6 +6,7 @@ param(
     [uint32]$SpinMax = 2000000,
     [int]$HostTimeoutMs = 2000,
     [int]$Warmup = 10,
+    [string]$Model = '',
     [string]$Log = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -29,6 +30,7 @@ $stack = Get-AilaOneApiStack -Config $config -Name 'oneapi-2026.1'
 Set-AilaProcessEnvironment -Environment (Get-AilaOneApiStackEnvironment -Stack $stack)
 
 $prod = @{
+    AILA_INIT_WARMUP = '0'
     UR_L0_USE_COPY_ENGINE = '1'
     SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE = '1'
     UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
@@ -53,6 +55,9 @@ $argsList = @(
     '--spin-max', "$SpinMax",
     '--host-timeout-ms', "$HostTimeoutMs"
 )
+if ($Model) {
+    $argsList += @('--real-front-model', $Model)
+}
 $envLine = ($prod.Keys | Sort-Object | ForEach-Object {
     "$_=" + [Environment]::GetEnvironmentVariable($_, 'Process')
 }) -join ' '

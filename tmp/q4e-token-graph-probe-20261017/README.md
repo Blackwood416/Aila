@@ -127,3 +127,23 @@ Fresh results are bit-exact and the stale negative control fires. Receipts:
 
 This opens the P1 real-layer capture gate. It does not yet prove an end-to-end
 performance win.
+
+## P1 real GDN front
+
+`--real-front-model DIR` loads the model and captures layer 0's real GDN front
+plus the route/result doorbell. Router ids and weights are written to device
+memory inside the graph, then republished to the uncached host ring.
+
+Receipt `gpu-real-front-p1-timed.log`:
+
+```text
+front_parity=1 route_parity=1
+handoff_us_median=28.8
+direct_front_us_median=538.2
+graph_replay_us_median=523.8
+replays=1000 timeouts=0
+```
+
+The one-layer graph is 2.7% faster than the direct front; the important result
+is correctness of real state/router traffic through the mid-graph ring. The
+next gate is a two-layer, then whole-token graph.

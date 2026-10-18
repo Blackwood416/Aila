@@ -100,3 +100,58 @@ before considering a whole-token graph.
 | end-to-end adoption | no claim | still unmeasured |
 
 No production default changed. Aila still uses the ordinary event/copy path.
+
+## 5. P1 real GDN front capture
+
+The first real-layer P1 now passes as well.
+
+Captured graph:
+
+```text
+layer-0 GDN front
+  -> HC
+  -> linear projections
+  -> DeltaNet decode
+  -> output projection
+  -> MLP HC
+  -> router
+  -> route publish to uncached ring
+  -> bounded device wait
+  -> mapped result copy
+  -> bitwise verification
+```
+
+The router writes its ids and weights to device buffers inside the graph, not
+ordinary host USM. A publish kernel reads those device buffers and writes the
+uncached host ring. This removes the last host-USM intermediate from the
+captured path.
+
+Receipt: `gpu-real-front-p1-timed.log`
+
+Results:
+
+| item | result |
+|---|---:|
+| measured graph replays | 1,000 |
+| front/state/output parity | bitwise |
+| router ids/weights parity | exact |
+| handoff median / p99 | 28.8 / 30.1 us |
+| direct front median | 538.2 us |
+| one-layer graph replay median | 523.8 us |
+| timeouts | 0 |
+| stale negative control | fired |
+
+The one-layer graph is only 2.7% faster than the direct front in isolation.
+That is not the adoption argument. The result proves that a real captured
+decode segment preserves state and routing while removing its per-kernel host
+submission path.
+
+The next step is a two-layer graph with the same fixed-address route/result
+ring, followed by a 48-layer whole-token graph. The main remaining engineering
+risks are now:
+
+- fixed-address parameter tables for token/layer-varying scalars;
+- CPU expert result publication and cancellation;
+- graph size/finalize time for 48 layers;
+- one in-flight graph per session slot;
+- correct drain before any control-ring or USM release.

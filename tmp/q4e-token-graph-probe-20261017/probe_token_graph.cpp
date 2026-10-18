@@ -9,6 +9,9 @@
 // No main-project source is modified. The GPU run is opt-in through run.ps1.
 
 #include "core/Context.hpp"
+#include "engine/Engine.hpp"
+#include "models/Qwen4ExpBnb4Backend.hpp"
+#include "ops/GatedDeltaNetOps.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/bit_cast.hpp>
@@ -21,8 +24,10 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +42,75 @@ namespace ex = sycl::ext::oneapi::experimental;
 namespace iex = sycl::ext::intel::experimental;
 namespace oex = sycl::ext::oneapi::experimental;
 using Clock = std::chrono::steady_clock;
+
+// The backend and engine friend this exact global type name.
+struct Qwen4ExpGenerationTestAccess {
+    static Context& Ctx(InferenceEngine& engine) { return *engine.ctx_; }
+    static Qwen4ExpBnb4Backend& Backend(InferenceEngine& engine) {
+        return dynamic_cast<Qwen4ExpBnb4Backend&>(*engine.backend_);
+    }
+    static const ops::DeltaNetGeometry& FrontGeometry(
+        Qwen4ExpBnb4Backend& b) {
+        return b.layers_.at(0).geom;
+    }
+    static size_t LayerCount(Qwen4ExpBnb4Backend& b) {
+        return b.layers_.size();
+    }
+    static Tensor& FrontHidden(Qwen4ExpBnb4Backend& b) {
+        return b.buf_.hidden4;
+    }
+    static Tensor& FrontX(Qwen4ExpBnb4Backend& b) { return b.buf_.x; }
+    static Tensor& FrontScores(Qwen4ExpBnb4Backend& b) {
+        return b.buf_.router_scores;
+    }
+    static Tensor& FrontInject(Qwen4ExpBnb4Backend& b) {
+        return b.buf_.hc_inject_f32;
+    }
+    static const int* FrontIds(Qwen4ExpBnb4Backend& b) {
+        return b.router_host_ids_;
+    }
+    static const float* FrontWeights(Qwen4ExpBnb4Backend& b) {
+        return b.router_host_weights_;
+    }
+    static void FrontRoute(Qwen4ExpBnb4Backend& b,
+                           ops::DeltaNetState& state,
+                           int* route_ids, float* route_weights) {
+        auto& ctx = *b.context_;
+        auto& layer = b.layers_.at(0);
+        if (!layer.is_linear)
+            throw std::runtime_error("P1 requires a linear layer 0");
+        b.RunHyperConnection(ctx, layer.attn_hc, 1, true);
+        layer.linear_all_proj.ForwardDecodeRows(
+            ctx, b.linear_scratch_, b.buf_.x, b.buf_.linear_all, 1);
+        const auto* p = b.buf_.linear_all.data_as<bf16>();
+        ops::DeltaNetWeights weights{
+            layer.linear_conv1d_weight->data_as<bf16>(),
+            layer.linear_norm_weight->data_as<float>(),
+            layer.linear_A_log->data_as<float>(),
+            layer.linear_dt_bias->data_as<bf16>()};
+        ops::run_linear_delta_decode_gpu(
+            ctx, layer.geom, weights, state, p, p + b.linear_qkv_dim_,
+            p + b.linear_qkv_dim_ + b.linear_z_dim_,
+            p + b.linear_qkv_dim_ + b.linear_z_dim_ + b.linear_kv_heads_,
+            b.buf_.attn_out.data_as<bf16>());
+        layer.linear_o_proj.ForwardDecodeRows(
+            ctx, b.linear_scratch_, b.buf_.attn_out, b.buf_.y, 1);
+        b.RunHyperConnectionCombined(
+            ctx, layer.mlp_hc, 1, true, b.buf_.y.data_as<bf16>(),
+            b.buf_.hc_inject_f32.data_as<float>());
+        b.DenseLinear(
+            ctx, layer.router_gate, layer.router_w,
+            b.buf_.x, b.buf_.router_scores, 1, b.cfg_.num_experts,
+            b.hidden_size_);
+        ops::router_softmax_topk_device(
+            ctx, b.buf_.router_scores.data_as<bf16>(), nullptr,
+            route_ids, route_weights, 1,
+            b.cfg_.num_experts, b.cfg_.num_experts_per_tok, true);
+    }
+    static void Front(Qwen4ExpBnb4Backend& b, ops::DeltaNetState& state) {
+        FrontRoute(b, state, b.router_host_ids_, b.router_host_weights_);
+    }
+};
 
 namespace {
 
@@ -112,6 +186,43 @@ static_assert(sizeof(ResultRing) == 384);
 static_assert(sizeof(HostRing) == 576);
 static_assert(sizeof(DeviceEpoch) == 64);
 
+struct PolledRing {
+    HostRing* ptr = nullptr;
+    ze_context_handle_t ze_ctx = nullptr;
+    bool ze_owned = false;
+};
+
+PolledRing allocate_polled_ring(Context& ctx) {
+    PolledRing out;
+    out.ze_ctx =
+        sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+            ctx.queue().get_context());
+    ze_host_mem_alloc_desc_t desc{
+        ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr,
+        ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED};
+    void* storage = nullptr;
+    const ze_result_t result = zeMemAllocHost(
+        out.ze_ctx, &desc, sizeof(HostRing), alignof(HostRing), &storage);
+    out.ze_owned = result == ZE_RESULT_SUCCESS && storage != nullptr;
+    out.ptr = out.ze_owned
+        ? static_cast<HostRing*>(storage)
+        : static_cast<HostRing*>(ctx.alloc_host(sizeof(HostRing)));
+    if (reinterpret_cast<uintptr_t>(out.ptr) % alignof(HostRing) != 0)
+        throw std::runtime_error("host ring is not 64-byte aligned");
+    std::memset(out.ptr, 0, sizeof(HostRing));
+    return out;
+}
+
+void free_polled_ring(Context& ctx, PolledRing& ring) {
+    if (!ring.ptr) return;
+    if (ring.ze_owned)
+        zeMemFree(ring.ze_ctx, ring.ptr);
+    else
+        ctx.free_host(ring.ptr);
+    ring.ptr = nullptr;
+    ring.ze_owned = false;
+}
+
 inline uint32_t expected_id(uint32_t seq, uint32_t k) {
     return (seq * 37u + k * 53u) & 511u;
 }
@@ -154,6 +265,25 @@ void submit_route_publish(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch) {
                                expected_weight(seq, k));
             }
             // Payload is uncached and ordered before the sequence publication.
+            sycl::atomic_fence(sycl::memory_order::release,
+                               sycl::memory_scope::system);
+            uncached_store(&ring->ctrl.route_seq, seq);
+        });
+    });
+}
+
+void submit_real_route_publish(sycl::queue& q, HostRing* ring,
+                               DeviceEpoch* epoch, const int* ids,
+                               const float* weights) {
+    q.submit([&](sycl::handler& h) {
+        h.single_task([=]() {
+            const uint32_t seq = epoch->seq + 1u;
+            epoch->seq = seq;
+            for (uint32_t k = 0; k < kTopK; ++k) {
+                uncached_store(&ring->route.ids[k],
+                               static_cast<int32_t>(ids[k]));
+                uncached_store(&ring->route.weights[k], weights[k]);
+            }
             sycl::atomic_fence(sycl::memory_order::release,
                                sycl::memory_scope::system);
             uncached_store(&ring->ctrl.route_seq, seq);
@@ -318,7 +448,8 @@ PollResult poll_host_word(sycl::queue& q, volatile uint32_t* word,
 }
 
 bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
-                        uint32_t seq, int timeout_ms, std::string& error) {
+                        uint32_t seq, int timeout_ms, bool synthetic_route,
+                        std::string& error) {
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
     uint32_t polls = 0;
     for (;;) {
@@ -336,8 +467,14 @@ bool host_route_matches(const sycl::event& graph_event, HostRing* ring,
         for (uint32_t k = 0; k < kTopK; ++k) {
             const int32_t got_id = ring->route.ids[k];
             const float got_weight = ring->route.weights[k];
-            if (got_id != static_cast<int32_t>(expected_id(seq, k)) ||
-                bit_u32(got_weight) != bit_u32(expected_weight(seq, k))) {
+            const bool bad = synthetic_route
+                ? got_id != static_cast<int32_t>(expected_id(seq, k)) ||
+                      bit_u32(got_weight) !=
+                          bit_u32(expected_weight(seq, k))
+                : got_id < 0 || got_id >= 512 ||
+                      !std::isfinite(got_weight) || got_weight < 0.0f ||
+                      got_weight > 1.0f;
+            if (bad) {
                 bad_k = k;
                 break;
             }
@@ -397,7 +534,8 @@ Handoff service_replay(Context& ctx,
                        uint32_t expected_seq,
                        int cpu_us,
                        int host_timeout_ms,
-                       bool stale_injection) {
+                       bool stale_injection,
+                       bool synthetic_route = true) {
     sycl::queue& q = ctx.queue();
     auto& ctrl = ring->ctrl;
     const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
@@ -418,7 +556,7 @@ Handoff service_replay(Context& ctx,
     }
     const auto t_route = Clock::now();
     if (!host_route_matches(graph_event, ring, expected_seq, host_timeout_ms,
-                            error)) {
+                            synthetic_route, error)) {
         *volatile_u32(&ctrl.host_route_error_count) =
             *volatile_u32(&ctrl.host_route_error_count) + 1u;
         try { graph_event.wait_and_throw(); } catch (...) {}
@@ -514,6 +652,7 @@ struct Options {
     uint32_t spin_max = kDefaultSpinMax;
     int host_timeout_ms = 2000;
     std::vector<int> cpu_sweep{0, 50, 200, 500};
+    std::string real_front_model;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -535,11 +674,13 @@ Options parse_options(int argc, char** argv) {
             o.host_timeout_ms = std::stoi(next("--host-timeout-ms"));
         } else if (arg == "--cpu-us") {
             o.cpu_sweep = parse_cpu_sweep(next("--cpu-us"));
+        } else if (arg == "--real-front-model") {
+            o.real_front_model = next("--real-front-model");
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "usage: probe_token_graph.exe [--replays N] [--warmup N]\n"
                    "       [--cpu-us 0,50,200,500] [--spin-max N]\n"
-                   "       [--host-timeout-ms N]\n";
+                   "       [--host-timeout-ms N] [--real-front-model DIR]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + arg);
@@ -554,11 +695,242 @@ Options parse_options(int argc, char** argv) {
     return o;
 }
 
+bool same_bytes(const std::vector<uint8_t>& a,
+                const std::vector<uint8_t>& b) {
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0);
+}
+
+std::vector<uint8_t> snapshot_front(Context& ctx,
+                                    Qwen4ExpBnb4Backend& b,
+                                    Tensor& state, Tensor& history) {
+    std::vector<uint8_t> bytes;
+    auto device = [&](const void* p, size_t n) {
+        const size_t offset = bytes.size();
+        bytes.resize(offset + n);
+        ctx.memcpy_d2h(bytes.data() + offset, p, n);
+    };
+    device(state.data(), state.size_bytes());
+    device(history.data(), history.size_bytes());
+    device(Qwen4ExpGenerationTestAccess::FrontHidden(b).data(), 4 * 2560 * 2);
+    device(Qwen4ExpGenerationTestAccess::FrontX(b).data(), 2560 * 2);
+    device(Qwen4ExpGenerationTestAccess::FrontScores(b).data(), 512 * 2);
+    device(Qwen4ExpGenerationTestAccess::FrontInject(b).data(),
+           4 * sizeof(float));
+    return bytes;
+}
+
+int run_real_front_model(const Options& options) {
+    InferenceEngine engine;
+    if (!engine.init(options.real_front_model, 512))
+        throw std::runtime_error("real-front model init failed");
+    Context& ctx = Qwen4ExpGenerationTestAccess::Ctx(engine);
+    sycl::queue& q = ctx.queue();
+    auto& b = Qwen4ExpGenerationTestAccess::Backend(engine);
+    const auto& geom = Qwen4ExpGenerationTestAccess::FrontGeometry(b);
+    const bool limited =
+        q.get_device().has(sycl::aspect::ext_oneapi_limited_graph);
+    const bool full = q.get_device().has(sycl::aspect::ext_oneapi_graph);
+    if (!limited && !full)
+        throw std::runtime_error("static graph unsupported");
+
+    auto state = Tensor::allocate(
+        ctx, {int64_t(geom.v_heads) * geom.head_k_dim * geom.head_v_dim},
+        dnnl::memory::data_type::f32);
+    auto history = Tensor::allocate(
+        ctx, {int64_t(geom.conv_rows) * geom.qkv_dim},
+        dnnl::memory::data_type::f32);
+    std::vector<float> initial_state(state.numel());
+    std::vector<float> initial_history(history.numel());
+    std::vector<bf16> input(4 * 2560);
+
+    auto reset = [&](int seed) {
+        for (size_t j = 0; j < initial_state.size(); ++j) {
+            initial_state[j] =
+                float(int((j * 17 + seed * 31) % 101) - 50) * .0002f;
+        }
+        for (size_t j = 0; j < initial_history.size(); ++j) {
+            initial_history[j] =
+                float(int((j * 7 + seed * 13) % 101) - 50) * .002f;
+        }
+        for (size_t j = 0; j < input.size(); ++j) {
+            input[j] =
+                bf16(float(int((j * 11 + seed * 3) % 103) - 51) * .015f);
+        }
+        ctx.memcpy_h2d(state.data(), initial_state.data(), state.size_bytes());
+        ctx.memcpy_h2d(history.data(), initial_history.data(),
+                       history.size_bytes());
+        ctx.memcpy_h2d(
+            Qwen4ExpGenerationTestAccess::FrontHidden(b).data(),
+            input.data(), input.size() * sizeof(bf16));
+        return ops::DeltaNetState{state.data_as<float>(),
+                                  history.data_as<float>(), seed % 3, false};
+    };
+
+    // Warm every lazy allocation/path outside the capture.
+    auto ds = reset(0);
+    Qwen4ExpGenerationTestAccess::Front(b, ds);
+    ctx.synchronize();
+
+    ds = reset(0);
+    Qwen4ExpGenerationTestAccess::Front(b, ds);
+    ctx.synchronize();
+    const auto reference = snapshot_front(ctx, b, state, history);
+    std::array<int, kTopK> reference_ids{};
+    std::array<float, kTopK> reference_weights{};
+    for (int k = 0; k < kTopK; ++k) {
+        reference_ids[k] =
+            Qwen4ExpGenerationTestAccess::FrontIds(b)[k];
+        reference_weights[k] =
+            Qwen4ExpGenerationTestAccess::FrontWeights(b)[k];
+    }
+
+    ds = reset(0);
+    ctx.synchronize();
+    for (int warm = 0; warm < 4; ++warm) {
+        Qwen4ExpGenerationTestAccess::Front(b, ds);
+        ctx.synchronize();
+    }
+    std::vector<double> direct_us;
+    direct_us.reserve(30);
+    for (int repeat = 0; repeat < 30; ++repeat) {
+        const auto start = Clock::now();
+        Qwen4ExpGenerationTestAccess::Front(b, ds);
+        ctx.synchronize();
+        direct_us.push_back(us_between(start, Clock::now()));
+    }
+    std::cout << "[REAL FRONT DIRECT] median_us="
+              << percentile(direct_us, 0.50)
+              << " p10_us=" << percentile(direct_us, 0.10)
+              << " p90_us=" << percentile(direct_us, 0.90) << '\n';
+
+    ds = reset(0);
+    ctx.synchronize();
+    PolledRing polled = allocate_polled_ring(ctx);
+    HostRing* ring = polled.ptr;
+    DeviceEpoch* epoch =
+        static_cast<DeviceEpoch*>(ctx.alloc_device(sizeof(DeviceEpoch)));
+    float* device_result =
+        static_cast<float*>(ctx.alloc_device(sizeof(float) * kResultCount));
+    int* graph_route_ids = static_cast<int*>(
+        ctx.alloc_device(sizeof(int) * kTopK));
+    float* graph_route_weights = static_cast<float*>(
+        ctx.alloc_device(sizeof(float) * kTopK));
+    q.memset(epoch, 0, sizeof(DeviceEpoch)).wait_and_throw();
+    q.memset(device_result, 0, sizeof(float) * kResultCount).wait_and_throw();
+    q.memset(graph_route_ids, 0, sizeof(int) * kTopK).wait_and_throw();
+    q.memset(graph_route_weights, 0, sizeof(float) * kTopK).wait_and_throw();
+
+    std::cout << "[REAL FRONT GRAPH] model=" << options.real_front_model
+              << " layers=" << Qwen4ExpGenerationTestAccess::LayerCount(b)
+              << " allocation="
+              << (polled.ze_owned ? "zeMemAllocHost_uncached_bias"
+                                  : "malloc_host_fallback")
+              << '\n';
+
+    bool all_ok = true;
+    {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            q.get_context(), q.get_device());
+        recording.begin_recording(q);
+        try {
+            Qwen4ExpGenerationTestAccess::FrontRoute(
+                b, ds, graph_route_ids, graph_route_weights);
+            submit_real_route_publish(
+                q, ring, epoch, graph_route_ids, graph_route_weights);
+            submit_device_wait(q, ring, epoch, options.spin_max);
+            submit_copy_from_mapped(q, ring, device_result);
+            submit_bitwise_verify(q, ring, epoch, device_result);
+            recording.end_recording(q);
+        } catch (...) {
+            recording.end_recording(q);
+            throw;
+        }
+        auto executable = recording.finalize();
+        std::cout << "[REAL FRONT GRAPH] capture=ok\n";
+
+        uint32_t expected_seq = 1;
+        const Handoff first = service_replay(
+            ctx, executable, ring, expected_seq, 0, options.host_timeout_ms,
+            false, false);
+        if (first.timeout_delta || first.stale_delta ||
+            first.mismatch_delta) {
+            throw std::runtime_error("real-front handshake failed");
+        }
+        ctx.synchronize();
+        const auto actual = snapshot_front(ctx, b, state, history);
+        const bool front_parity = same_bytes(reference, actual);
+        bool route_parity = true;
+        for (int k = 0; k < kTopK; ++k) {
+            route_parity &=
+                ring->route.ids[k] == reference_ids[k] &&
+                bit_u32(ring->route.weights[k]) ==
+                    bit_u32(reference_weights[k]);
+        }
+        std::cout << "[REAL FRONT GRAPH] front_parity="
+                  << (front_parity ? 1 : 0)
+                  << " route_parity=" << (route_parity ? 1 : 0)
+                  << " handoff_us=" << first.route_to_done_us << '\n';
+        all_ok &= front_parity && route_parity;
+
+        for (int cpu_us : options.cpu_sweep) {
+            ArmStats stats;
+            stats.cpu_us = cpu_us;
+            for (int w = 0; w < options.warmup; ++w) {
+                ++expected_seq;
+                const Handoff h = service_replay(
+                    ctx, executable, ring, expected_seq, cpu_us,
+                    options.host_timeout_ms, false, false);
+                if (h.timeout_delta || h.stale_delta || h.mismatch_delta)
+                    throw std::runtime_error(
+                        "real-front warmup handshake failure");
+            }
+            for (uint32_t r = 0; r < options.replays; ++r) {
+                ++expected_seq;
+                const Handoff h = service_replay(
+                    ctx, executable, ring, expected_seq, cpu_us,
+                    options.host_timeout_ms, false, false);
+                stats.launch_to_route.push_back(h.launch_to_route_us);
+                stats.route_to_flag.push_back(h.route_to_flag_us);
+                stats.route_to_done.push_back(h.route_to_done_us);
+                stats.wall.push_back(h.replay_wall_us);
+                if (h.timeout_delta || h.stale_delta || h.mismatch_delta) {
+                    stats.fresh_ok = false;
+                    break;
+                }
+            }
+            stats.measured = stats.route_to_done.size();
+            ++expected_seq;
+            const Handoff stale = service_replay(
+                ctx, executable, ring, expected_seq, cpu_us,
+                options.host_timeout_ms, true, false);
+            stats.stale_detected =
+                stale.timeout_delta == 0 && stale.stale_delta >= 1 &&
+                stale.mismatch_delta >= 1;
+            print_arm(stats);
+            all_ok &= stats.fresh_ok && stats.stale_detected &&
+                      stats.measured >= 1000;
+        }
+        ctx.synchronize();
+    }
+
+    ctx.free_device(graph_route_weights);
+    ctx.free_device(graph_route_ids);
+    ctx.free_device(device_result);
+    ctx.free_device(epoch);
+    free_polled_ring(ctx, polled);
+    std::cout << "[REAL FRONT GRAPH] verdict all_ok=" << (all_ok ? 1 : 0)
+              << '\n';
+    return all_ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        if (!options.real_front_model.empty())
+            return run_real_front_model(options);
         Context ctx;
         sycl::queue& q = ctx.queue();
         const sycl::device dev = q.get_device();
