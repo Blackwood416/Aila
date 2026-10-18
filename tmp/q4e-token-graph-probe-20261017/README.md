@@ -163,3 +163,19 @@ handoff_us_median=155.1 timeouts=0
 
 This proves the graph-safe masked dispatch. It does not yet contain the real
 CPU worker, real packet, merge, shared expert or residual.
+
+## P2 packet bridge
+
+The probe now allocates a 163,968-byte uncached packet ring with a 16-rank map
+and up to 16 x 2,560 FP32 rows. A graph copy kernel transfers it to a fixed
+device packet, then the existing ordered merge consumes it.
+
+```text
+resident_count=5 cpu_rows=5
+moe_down_parity=1 packet_merge_parity=1
+replays=1000 replay_wall_us_median=712.6
+handoff_us_median=190.3 timeouts=0
+```
+
+The CPU rows are still synthetic. Replacing them with a real `CpuWorker` job is
+the next gate before a full-layer graph claim.

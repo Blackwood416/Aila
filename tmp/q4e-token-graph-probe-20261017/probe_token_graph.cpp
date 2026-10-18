@@ -142,6 +142,8 @@ namespace {
 constexpr int kTopK = 10;
 constexpr int kResultWidth = 8;
 constexpr int kResultCount = kTopK * kResultWidth;
+constexpr int kHidden = 2560;
+constexpr int kMaxPacketRows = 16;
 constexpr uint32_t kDefaultSpinMax = 20000;
 constexpr uint32_t kPollFlushEvery = 1024;
 
@@ -200,6 +202,14 @@ struct alignas(64) HostRing {
     ResultRing result;
 };
 
+struct alignas(64) CpuPacketRing {
+    uint32_t ready_seq;
+    uint32_t rows;
+    uint32_t reserved[14];
+    int32_t rank_to_row[kMaxPacketRows];
+    float values[kMaxPacketRows * kHidden];
+};
+
 struct alignas(64) DeviceEpoch {
     uint32_t seq;
     uint32_t reserved[15];
@@ -209,6 +219,7 @@ static_assert(sizeof(ControlRing) == 64);
 static_assert(sizeof(RouteRing) == 128);
 static_assert(sizeof(ResultRing) == 384);
 static_assert(sizeof(HostRing) == 576);
+static_assert(sizeof(CpuPacketRing) == 163968);
 static_assert(sizeof(DeviceEpoch) == 64);
 
 struct PolledRing {
@@ -394,6 +405,24 @@ void submit_copy_from_mapped(sycl::queue& q, HostRing* ring, float* device_resul
     });
 }
 
+void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
+                            int* packet_dev) {
+    q.parallel_for(
+        sycl::range<1>(kMaxPacketRows +
+                       size_t(kMaxPacketRows) * kHidden),
+        [=](sycl::id<1> id) {
+            const size_t i = id[0];
+            if (i < kMaxPacketRows) {
+                packet_dev[i] = uncached_load(&packet->rank_to_row[i]);
+            } else {
+                auto* values = reinterpret_cast<float*>(
+                    packet_dev + kMaxPacketRows);
+                values[i - kMaxPacketRows] =
+                    uncached_load(&packet->values[i - kMaxPacketRows]);
+            }
+        });
+}
+
 void submit_bitwise_verify(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                            const float* device_result) {
     q.submit([&](sycl::handler& h) {
@@ -535,6 +564,28 @@ bool host_route_matches(HostRing* ring, uint32_t seq, int timeout_ms,
     }
 }
 
+void write_host_packet(CpuPacketRing* packet, uint32_t value_seq,
+                       uint32_t publish_seq, const int* rank_to_row,
+                       int rows) {
+    if (!packet || !rank_to_row) return;
+    for (int rank = 0; rank < kMaxPacketRows; ++rank)
+        packet->rank_to_row[rank] = rank_to_row[rank];
+    volatile float* values =
+        reinterpret_cast<volatile float*>(packet->values);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < kHidden; ++col) {
+            values[row * kHidden + col] =
+                float((value_seq * 131u + uint32_t(row * kHidden + col)) %
+                      8191u) *
+                0.0001f;
+        }
+    }
+    packet->rows = static_cast<uint32_t>(rows);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    *volatile_u32(&packet->ready_seq) = publish_seq;
+}
+
 void write_host_result(HostRing* ring, uint32_t value_seq, uint32_t publish_seq) {
     volatile float* values = volatile_float(ring->result.values);
     for (uint32_t k = 0; k < kTopK; ++k) {
@@ -568,7 +619,10 @@ Handoff service_replay(Context& ctx,
                        int cpu_us,
                        int host_timeout_ms,
                        bool stale_injection,
-                       bool synthetic_route = true) {
+                       bool synthetic_route = true,
+                       CpuPacketRing* cpu_packet = nullptr,
+                       const int* cpu_packet_ranks = nullptr,
+                       int cpu_packet_rows = 0) {
     sycl::queue& q = ctx.queue();
     auto& ctrl = ring->ctrl;
     const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
@@ -599,6 +653,9 @@ Handoff service_replay(Context& ctx,
     const uint32_t value_seq =
         stale_injection ? expected_seq - 1u : expected_seq;
     burn_cpu_us(cpu_us);
+    if (cpu_packet)
+        write_host_packet(cpu_packet, value_seq, expected_seq,
+                          cpu_packet_ranks, cpu_packet_rows);
     write_host_result(ring, value_seq, expected_seq);
     const auto t_flag = Clock::now();
 
@@ -841,6 +898,18 @@ int run_real_front_model(const Options& options) {
     ctx.synchronize();
     PolledRing polled = allocate_polled_ring(ctx);
     HostRing* ring = polled.ptr;
+    void* packet_storage = nullptr;
+    ze_host_mem_alloc_desc_t packet_desc{
+        ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr,
+        ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED};
+    if (zeMemAllocHost(polled.ze_ctx, &packet_desc,
+                       sizeof(CpuPacketRing),
+                       alignof(CpuPacketRing), &packet_storage) !=
+            ZE_RESULT_SUCCESS ||
+        !packet_storage)
+        throw std::runtime_error("uncached CPU packet ring allocation failed");
+    auto* cpu_packet = static_cast<CpuPacketRing*>(packet_storage);
+    std::memset(cpu_packet, 0, sizeof(CpuPacketRing));
     DeviceEpoch* epoch =
         static_cast<DeviceEpoch*>(ctx.alloc_device(sizeof(DeviceEpoch)));
     float* device_result =
@@ -875,6 +944,17 @@ int run_real_front_model(const Options& options) {
         static_cast<int*>(ctx.alloc_device(sizeof(int) * 16));
     int* moe_test_ids_dev =
         static_cast<int*>(ctx.alloc_device(sizeof(int) * top_k));
+    const size_t cpu_packet_bytes =
+        sizeof(int) * kMaxPacketRows +
+        sizeof(float) * kMaxPacketRows * kHidden;
+    int* graph_packet_dev =
+        static_cast<int*>(ctx.alloc_device(cpu_packet_bytes));
+    int* direct_packet_dev =
+        static_cast<int*>(ctx.alloc_device(cpu_packet_bytes));
+    bf16* merge_y =
+        static_cast<bf16*>(ctx.alloc_device(sizeof(bf16) * hidden));
+    bf16* merge_y_reference =
+        static_cast<bf16*>(ctx.alloc_device(sizeof(bf16) * hidden));
     bf16* x_copy =
         static_cast<bf16*>(ctx.alloc_device(sizeof(bf16) * hidden));
     bf16* h_reference =
@@ -914,11 +994,20 @@ int run_real_front_model(const Options& options) {
     }
     ctx.memcpy_h2d(moe_test_ids_dev, moe_test_ids.data(),
                    sizeof(int) * top_k);
+    std::array<int, kMaxPacketRows> packet_rank_to_row{};
+    packet_rank_to_row.fill(-1);
+    int cpu_rows = 0;
+    for (int rank = 0; rank < top_k; ++rank) {
+        if (adaptive.GetSlot(0, moe_test_ids[rank]) < 0)
+            packet_rank_to_row[rank] = cpu_rows++;
+    }
     q.memset(epoch, 0, sizeof(DeviceEpoch)).wait_and_throw();
     q.memset(device_result, 0, sizeof(float) * kResultCount).wait_and_throw();
     q.memset(graph_route_ids, 0, sizeof(int) * kTopK).wait_and_throw();
     q.memset(graph_route_weights, 0, sizeof(float) * kTopK).wait_and_throw();
     q.memset(selected_dev, -1, sizeof(int) * 16).wait_and_throw();
+    q.memset(merge_y, 0, sizeof(bf16) * hidden).wait_and_throw();
+    q.memset(merge_y_reference, 0, sizeof(bf16) * hidden).wait_and_throw();
 
     std::cout << "[REAL FRONT GRAPH] model=" << options.real_front_model
               << " layers=" << Qwen4ExpGenerationTestAccess::LayerCount(b)
@@ -964,6 +1053,13 @@ int run_real_front_model(const Options& options) {
                     .data_as<float>(),
                 top_k, hidden, intermediate, true, true);
             submit_device_wait(q, ring, epoch, options.spin_max);
+            submit_copy_cpu_packet(q, cpu_packet, graph_packet_dev);
+            ops::moe_ordered_accumulate_down_rows(
+                ctx,
+                Qwen4ExpGenerationTestAccess::ResidentDown(b)
+                    .data_as<float>(),
+                graph_route_weights, merge_y, 1, top_k, hidden,
+                nullptr, nullptr, nullptr, graph_packet_dev);
             submit_copy_from_mapped(q, ring, device_result);
             submit_bitwise_verify(q, ring, epoch, device_result);
             recording.end_recording(q);
@@ -977,7 +1073,7 @@ int run_real_front_model(const Options& options) {
         uint32_t expected_seq = 1;
         const Handoff first = service_replay(
             ctx, executable, ring, expected_seq, 0, options.host_timeout_ms,
-            false, false);
+            false, false, cpu_packet, packet_rank_to_row.data(), cpu_rows);
         if (first.timeout_delta || first.stale_delta ||
             first.mismatch_delta) {
             throw std::runtime_error("real-front handshake failed");
@@ -1020,14 +1116,42 @@ int run_real_front_model(const Options& options) {
         const bool moe_down_parity =
             std::memcmp(graph_down.data(), direct_down.data(),
                         down_graph_bytes) == 0;
+        q.memcpy(direct_packet_dev, cpu_packet->rank_to_row,
+                 sizeof(int) * kMaxPacketRows)
+            .wait_and_throw();
+        q.memcpy(reinterpret_cast<uint8_t*>(direct_packet_dev) +
+                     sizeof(int) * kMaxPacketRows,
+                 cpu_packet->values,
+                 sizeof(float) * kMaxPacketRows * kHidden)
+            .wait_and_throw();
+        ops::moe_ordered_accumulate_down_rows(
+            ctx,
+            Qwen4ExpGenerationTestAccess::ResidentDown(b)
+                .data_as<float>(),
+            graph_route_weights, merge_y_reference, 1, top_k, hidden,
+            nullptr, nullptr, nullptr, direct_packet_dev);
+        ctx.synchronize();
+        std::vector<bf16> graph_merge_y(hidden);
+        std::vector<bf16> direct_merge_y(hidden);
+        ctx.memcpy_d2h(graph_merge_y.data(), merge_y,
+                       sizeof(bf16) * hidden);
+        ctx.memcpy_d2h(direct_merge_y.data(), merge_y_reference,
+                       sizeof(bf16) * hidden);
+        const bool packet_merge_parity =
+            std::memcmp(graph_merge_y.data(), direct_merge_y.data(),
+                        sizeof(bf16) * hidden) == 0;
         std::cout << "[REAL FRONT GRAPH] front_parity="
                   << (front_parity ? 1 : 0)
                   << " route_parity=" << (route_parity ? 1 : 0)
                   << " resident_count=" << resident_count
+                  << " cpu_rows=" << cpu_rows
                   << " moe_down_parity=" << (moe_down_parity ? 1 : 0)
+                  << " packet_merge_parity="
+                  << (packet_merge_parity ? 1 : 0)
                   << " handoff_us=" << first.route_to_done_us << '\n';
         all_ok &= front_parity && route_parity && moe_down_parity &&
-                  resident_count > 0;
+                  packet_merge_parity && resident_count > 0 &&
+                  cpu_rows > 0;
 
         for (int cpu_us : options.cpu_sweep) {
             ArmStats stats;
@@ -1036,7 +1160,8 @@ int run_real_front_model(const Options& options) {
                 ++expected_seq;
                 const Handoff h = service_replay(
                     ctx, executable, ring, expected_seq, cpu_us,
-                    options.host_timeout_ms, false, false);
+                    options.host_timeout_ms, false, false, cpu_packet,
+                    packet_rank_to_row.data(), cpu_rows);
                 if (h.timeout_delta || h.stale_delta || h.mismatch_delta)
                     throw std::runtime_error(
                         "real-front warmup handshake failure");
@@ -1045,7 +1170,8 @@ int run_real_front_model(const Options& options) {
                 ++expected_seq;
                 const Handoff h = service_replay(
                     ctx, executable, ring, expected_seq, cpu_us,
-                    options.host_timeout_ms, false, false);
+                    options.host_timeout_ms, false, false, cpu_packet,
+                    packet_rank_to_row.data(), cpu_rows);
                 stats.launch_to_route.push_back(h.launch_to_route_us);
                 stats.route_to_flag.push_back(h.route_to_flag_us);
                 stats.route_to_done.push_back(h.route_to_done_us);
@@ -1059,7 +1185,8 @@ int run_real_front_model(const Options& options) {
             ++expected_seq;
             const Handoff stale = service_replay(
                 ctx, executable, ring, expected_seq, cpu_us,
-                options.host_timeout_ms, true, false);
+                options.host_timeout_ms, true, false, cpu_packet,
+                packet_rank_to_row.data(), cpu_rows);
             stats.stale_detected =
                 stale.timeout_delta == 0 && stale.stale_delta >= 1 &&
                 stale.mismatch_delta >= 1;
@@ -1070,6 +1197,10 @@ int run_real_front_model(const Options& options) {
         ctx.synchronize();
     }
 
+    ctx.free_device(merge_y_reference);
+    ctx.free_device(merge_y);
+    ctx.free_device(direct_packet_dev);
+    ctx.free_device(graph_packet_dev);
     ctx.free_device(down_reference);
     ctx.free_device(h_reference);
     ctx.free_device(x_copy);
@@ -1080,6 +1211,7 @@ int run_real_front_model(const Options& options) {
     ctx.free_device(graph_route_ids);
     ctx.free_device(device_result);
     ctx.free_device(epoch);
+    zeMemFree(polled.ze_ctx, cpu_packet);
     free_polled_ring(ctx, polled);
     std::cout << "[REAL FRONT GRAPH] verdict all_ok=" << (all_ok ? 1 : 0)
               << '\n';
