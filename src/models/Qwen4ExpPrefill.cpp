@@ -59,6 +59,16 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         d_state.conv_state = static_cast<float*>(cache.linear_conv_state.data());
         d_state.conv_head = cache.linear_conv_head;
         d_state.device_state_dirty = cache.device_state_dirty;
+        const bool use_device_conv_head =
+            count == 1 && session.graph_gdn_state_enabled_ &&
+            cache.linear_conv_head_dev != nullptr;
+        if (use_device_conv_head) {
+            if (!cache.linear_conv_head_device_synced) {
+                throw std::invalid_argument(
+                    "Qwen4Exp graph GDN head was not synchronized before decode");
+            }
+            d_state.conv_head_dev = cache.linear_conv_head_dev;
+        }
 
         if (count == 1) {
             project_decode(layer.linear_all_proj, input, buf_.linear_all, 0);
@@ -137,8 +147,18 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             project_prefill(layer.linear_o_proj, buf_.attn_out, output);
             component_end(2,component_start);
         }
-        cache.linear_conv_head = d_state.conv_head;
-        cache.device_state_dirty = d_state.device_state_dirty;
+        if (use_device_conv_head) {
+            cache.linear_conv_head_device_authority = true;
+            cache.linear_conv_head_device_synced = false;
+            cache.device_state_dirty = true;
+        } else {
+            cache.linear_conv_head = d_state.conv_head;
+            if (cache.linear_conv_head_dev != nullptr) {
+                cache.linear_conv_head_device_authority = false;
+                cache.linear_conv_head_device_synced = false;
+            }
+            cache.device_state_dirty = d_state.device_state_dirty;
+        }
     } else {
         if (count == 1) {
             project_decode(layer.qkv_proj, input, buf_.full_qkv, 2);

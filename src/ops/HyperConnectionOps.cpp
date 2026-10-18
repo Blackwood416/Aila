@@ -919,4 +919,67 @@ void ple_dilated_conv_silu_add(
     conv_head = (initial_conv_head + rows) % state_len;
 }
 
+void ple_dilated_conv_silu_add_device_head(
+    Context& ctx, const bf16* gv_normed, const bf16* gv,
+    float* conv_state, int* conv_head_dev, const bf16* conv_w, bf16* out,
+    int rows, int channels, int kernel_size, int dilation,
+    bf16* residual) {
+    if (rows != 1) {
+        throw std::invalid_argument(
+            "ple_dilated_conv_silu_add_device_head supports exactly one row");
+    }
+    if (!gv_normed || !gv || !conv_state || !conv_head_dev || !conv_w ||
+        channels <= 0 || kernel_size < 2 || dilation <= 0) {
+        throw std::invalid_argument(
+            "ple_dilated_conv_silu_add_device_head: invalid arguments");
+    }
+
+    const int state_len = (kernel_size - 1) * dilation;
+    constexpr int wg = 256;
+    const size_t num_wgs = (static_cast<size_t>(channels) + wg - 1) / wg;
+
+    auto silu_dev = [](float x) {
+        return x / (1.0f + sycl::native::exp(-x));
+    };
+
+    // Every work-item observes the same device head because no work-item or
+    // later queue node writes it until this kernel has completed.
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int head = conv_head_dev[0];
+                const int row0 = head;
+                const int row1 = (head + 3) % state_len;
+                const int row2 = (head + 6) % state_len;
+                const int c = static_cast<int>(item.get_global_id(0));
+                if (c < channels) {
+                    const bf16* w = conv_w + static_cast<size_t>(c) * kernel_size;
+                    const float tap0 = conv_state[static_cast<size_t>(row0) * channels + c];
+                    const float tap1 = conv_state[static_cast<size_t>(row1) * channels + c];
+                    const float tap2 = conv_state[static_cast<size_t>(row2) * channels + c];
+                    const float tap3 = static_cast<float>(gv_normed[c]);
+                    const float conv_val = tap0 * static_cast<float>(w[0]) +
+                                           tap1 * static_cast<float>(w[1]) +
+                                           tap2 * static_cast<float>(w[2]) +
+                                           tap3 * static_cast<float>(w[3]);
+                    const bf16 ple_elem = bf16(static_cast<float>(gv[c]) + silu_dev(conv_val));
+                    if (out) out[c] = ple_elem;
+                    if (residual) {
+                        residual[c] = bf16(static_cast<float>(residual[c]) +
+                                           static_cast<float>(ple_elem));
+                    }
+                    conv_state[static_cast<size_t>(head) * channels + c] = tap3;
+                }
+            });
+    });
+
+    // Separate one-work-item kernel: no convolution work-item can observe a
+    // partially advanced head, and the next replay starts from the next row.
+    ctx.queue().single_task([=]() {
+        const int head = conv_head_dev[0];
+        conv_head_dev[0] = (head + 1) % state_len;
+    });
+}
+
 } // namespace ops

@@ -129,6 +129,15 @@ void ple_dilated_conv_silu_add(
     int rows, int channels = 10240, int kernel_size = 4, int dilation = 3,
     bf16* residual = nullptr);
 
+// Graph-safe single-token variant. The convolution reads conv_head_dev[0] but
+// never writes it; a separate queue-ordered kernel advances the head after all
+// channels have observed the same value. The host mirror is not updated.
+void ple_dilated_conv_silu_add_device_head(
+    Context& ctx, const bf16* gv_normed, const bf16* gv,
+    float* conv_state, int* conv_head_dev, const bf16* conv_w, bf16* out,
+    int rows, int channels = 10240, int kernel_size = 4, int dilation = 3,
+    bf16* residual = nullptr);
+
 // ---------------------------------------------------------------------------
 // HC decode submit timing (diagnostic, AILA_Q4E_HC_SUBMIT_TIMING, default off)
 // ---------------------------------------------------------------------------

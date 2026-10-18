@@ -105,6 +105,9 @@ public:
     // normalized NF4 codebook rounded to signed Q8; dequant weights do not
     // pass through the original BF16 rounding boundary. This is approximate.
     bool SupportsDecodeQ8() const;
+    // True when one fixed one-row launch can use the packed GEMV path without
+    // primitive/descriptor setup, dequant synchronization, or LoRA scratch.
+    bool supports_decode_graph() const;
     // xq[K], xs[K/64], output[M] are caller-owned, disjoint raw USM spans in
     // this Context. Their lifetime and the weights extend until compute work
     // drains. Input quantization is separate; no allocation or descriptor
@@ -381,4 +384,3 @@ void run_fused_softmax_soft_embed_xmx(
     const sycl::ext::oneapi::bfloat16* embed_weight,
     sycl::ext::oneapi::bfloat16* output,
     int canvas_len, int hidden, int vocab, float embed_scale = 1.0f);
-

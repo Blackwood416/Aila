@@ -301,6 +301,7 @@ compact u8 absmax codes (default for compatible nested checkpoints) or expanded 
 | `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from the host mmap instead of keeping the 1.3 GB table in VRAM (the auto expert cache grows by ~460 slots). `0` uploads the table |
 | `AILA_Q4E_DENSE_GEMV` | bool | `true` | Single-row bf16 projections (hyper-connection, router, shared-expert gate) use the native GEMV instead of oneDNN |
 | `AILA_Q4E_HC_FUSED` | bool | `true` | Decode hyper-connection runs as two fused kernels (down + inject, up + mix) |
+| `AILA_Q4E_GRAPH_GDN_STATE` | bool | `false` | Allocate a stable per-layer `[head, previous_head, arrivals]` device table and use device-owned GDN conv-ring state for captured single-token decode. Host prefill, mixed host/device authority, and GDN history fusion fail closed. Snapshot/truncate/MTP synchronize the head at explicit boundaries; hot decode does not read it back. |
 | `AILA_Q4E_MOE_SHARED_FUSED` | bool | `false` | Phase G4 (Experimental): Gated shared-expert add fused directly inside MoE down projection accumulate kernel. Kept opt-in to preserve exact separated kernel execution |
 | `AILA_Q4E_PREFILL_STEP` | int | `64` | Decode positions between recurrent-state snapshots used for context rollback |
 

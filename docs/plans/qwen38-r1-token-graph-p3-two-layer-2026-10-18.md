@@ -5,7 +5,11 @@ Scope: A770 Windows, oneAPI 2026.1, Level Zero 1.28.2, real
 
 Probe: `tmp/q4e-token-graph-probe-20261017/probe_token_graph.cpp`
 
-Receipt: `gpu-two-layer-p3.log`
+Receipts:
+
+- `gpu-two-layer-p3.log`
+- `gpu-two-layer-p3-final.log` (final abort-gate build)
+- `gpu-two-layer-p3-postmerge.log` (full merged runtime)
 
 ## 0. Verdict
 
@@ -41,10 +45,10 @@ host arena=native large pages
 
 | token | L4 CPU rows | L5 CPU rows | L4 handoff | L5 handoff | replay |
 |---:|---:|---:|---:|---:|---:|
-| 0 | 9 | 10 | 4,970.6 us | 5,461.9 us | 12,417.9 us |
-| 1 | 7 | 10 | 4,095.8 us | 5,499.1 us | 11,304.9 us |
-| 2 | 7 | 9 | 3,957.0 us | 4,936.5 us | 10,339.9 us |
-| 3 | 7 | 9 | 3,967.5 us | 5,113.0 us | 10,744.1 us |
+| 0 | 9 | 10 | 4,994.2 us | 5,481.9 us | 48,557.3 us |
+| 1 | 7 | 10 | 4,001.1 us | 5,727.3 us | 47,507.6 us |
+| 2 | 7 | 9 | 3,983.7 us | 4,992.1 us | 46,341.2 us |
+| 3 | 7 | 9 | 4,050.4 us | 4,973.5 us | 46,623.0 us |
 
 Parity:
 
@@ -66,8 +70,25 @@ all_ok=1 bit_exact=1 head_sequence=1 service_ok=1 ring_ok=1
 ```
 
 The timings are correctness-run observations only. This run used the
-generic CPU worker configuration and is not comparable to the earlier tuned
-P2 latency receipt.
+generic CPU worker configuration plus system-scope gate checks and is not
+comparable to the earlier tuned P2 latency receipt.
+
+## 1.1 Abort negative control
+
+The final executable also performs one deliberate stale-result replay after
+the four valid tokens:
+
+```text
+gate_aborts=1 mismatches=1
+front_committed=1 standalone_final_gate=1
+session_poisoned=1
+```
+
+The attention residual is already committed by the MLP-HC portion of the
+front before the host packet is available, so a rejected token cannot restore
+the entire pre-token state. The gate prevents routed merge, shared add and the
+final residual bridge from committing further writes. Production must poison
+the session or restore a pre-token checkpoint after this class of failure.
 
 ## 2. Device GDN conv head
 
@@ -134,9 +155,10 @@ graph, so L5 cannot overwrite L4 verification data.
 - The backend still does not own per-layer device head slots or synchronize
   them into snapshot/truncate/MTP state.
 - Residency and the descriptor table are frozen for the replay.
-- A post-GDN abort currently prevents merge but cannot undo recurrent/conv
-  writes already performed by the graph. Production needs session poison or a
-  pre-token state restore before another token is admitted.
+- A post-GDN abort prevents the remaining routed/shared/final writes, but
+  cannot undo recurrent/conv or attention-residual writes already performed
+  by the graph. Production needs session poison or a pre-token state restore
+  before another token is admitted.
 - The graph is not a performance claim. A whole-token graph must still show
   an e2e gain after PLE/QSA support is present.
 
@@ -147,4 +169,3 @@ QSA enable threshold (`prompt_tokens >= 2052`). It must add fixed device scalar
 state for position, QSA block counts and fixed-grid masked scan/selector work.
 Dense and sparse QSA topologies remain separate executables; do not branch
 between them on the host during replay.
-

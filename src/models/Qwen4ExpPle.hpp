@@ -26,6 +26,9 @@ struct Qwen4ExpPleState {
     std::array<int, NGRAM_CONTEXT_LEN> prev_tokens = {248044, 248044}; // eos initialized
     int conv_head = 0;
     Tensor conv_state; // [9, 10240] f32 on GPU
+    // Optional graph-only [1] s32 ring head. Allocated by create_graph_view();
+    // once valid, graph consume is the authority and host consume must not run.
+    Tensor conv_head_dev;
 };
 
 struct Qwen4ExpPleSnapshot {
@@ -54,6 +57,28 @@ struct PleTicket {
     uint64_t task_id = 0;
     sycl::event h2d_event{};
     bool valid = false;
+};
+
+// Fixed-address view for one-token PLE graph replay. It deliberately contains
+// only device pointers: preparation, waits, commit, tickets and host state stay
+// outside the captured graph.
+struct Qwen4ExpPleGraphView {
+    bf16* dev_embed = nullptr;
+    const bf16* hidden_states = nullptr;
+    bf16* out = nullptr;
+    bf16* residual = nullptr;
+    bf16* key_buf = nullptr;
+    bf16* value_buf = nullptr;
+    bf16* key_normed = nullptr;
+    bf16* query_normed = nullptr;
+    bf16* gv_buf = nullptr;
+    bf16* gv_normed = nullptr;
+    float* conv_state = nullptr;
+    int* conv_head_dev = nullptr;
+    const float* norm_key_weight = nullptr;
+    const float* norm_query_weight = nullptr;
+    const float* norm_conv_weight = nullptr;
+    const bf16* conv_weight = nullptr;
 };
 
 class Qwen4ExpPle {
@@ -137,6 +162,19 @@ public:
         uint64_t generation = 0,
         int start_pos = 0);
 
+    // Graph path: always uses staging slot 0. Call wait_prepared() on the host
+    // before recording/launching; consume_graph never waits or advances any
+    // host-side ticket/state.
+    PleTicket prepare_fixed_slot(
+        Context& ctx,
+        const Qwen4ExpPleState& state,
+        const int* input_ids,
+        int num_tokens,
+        const void* session_ptr = nullptr,
+        uint64_t generation = 0,
+        int start_pos = 0);
+    void wait_prepared(Context& ctx, PleTicket& ticket);
+
     // The two staging slots own their token copies. A cancelled/replaced
     // request must not reuse a ticket merely because its position matches.
     bool MatchesInput(const PleTicket& ticket, const int* tokens, int count) const;
@@ -151,6 +189,19 @@ public:
         sycl::ext::oneapi::bfloat16* residual = nullptr,
         int checkpoint_after = 0,
         Qwen4ExpPleSnapshot* checkpoint = nullptr);
+
+    // Builds a fixed-address one-token view. This may allocate/grow workspace
+    // and initialize state.conv_head_dev, so call it outside graph recording.
+    Qwen4ExpPleGraphView create_graph_view(
+        Context& ctx,
+        Qwen4ExpPleState& state,
+        const bf16* hidden_states,
+        bf16* out,
+        bf16* residual = nullptr);
+
+    // Queues only fixed one-row kernels. No wait, capacity growth, ticket
+    // validation, host-head update or commit occurs here.
+    void consume_graph(Context& ctx, const Qwen4ExpPleGraphView& view);
 
     // Commit: updates state.prev_tokens only after successful execution.
     void commit(
@@ -200,6 +251,16 @@ public:
     void set_rows_decode(bool value) { rows_decode_ = value; }
 
 private:
+    PleTicket prepare_slot(
+        Context& ctx,
+        const Qwen4ExpPleState& state,
+        const int* input_ids,
+        int num_tokens,
+        const void* session_ptr,
+        uint64_t generation,
+        int start_pos,
+        int slot);
+
     void cleanup();
     void ensure_compute_capacity(Context& ctx, int rows);
     void prefetch_gather_pages(const int64_t* ids, int num_tokens) const;

@@ -32,6 +32,27 @@ void qsa_prepare_q_and_cache_k(
     int mrope_section_h = 0,
     int mrope_section_w = 0);
 
+// Graph-safe decode variant. position_dev points to one device int32 slot.
+// The fixed 4-head grid reads the current position and writes that token's raw
+// K without requiring a new host scalar during graph replay.
+void qsa_prepare_q_and_cache_k_graph(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    const int* position_dev,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0);
+
 // Batched write of raw K into k_cache (prefill: count > 1).
 // indexer_qk: [count, 640]
 // k_cache:    [capacity, 128]
@@ -181,6 +202,30 @@ void qsa_compress_key_blocks(
     int mrope_section_t = 0,
     int mrope_section_h = 0,
     int mrope_section_w = 0);
+
+// Graph-safe one-token block update. A fixed single workgroup reads position_dev
+// and num_compressed_blocks_dev. When visible_len/4 advances by exactly one it
+// compresses that block and publishes the incremented device count after the
+// compressed row is visible. A larger gap, stale count, or capacity overflow
+// sets invalid_dev (when provided) instead of silently skipping blocks.
+void qsa_compress_one_completed_block_graph(
+    Context& ctx,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& compressed_k,
+    const int* position_dev,
+    int* num_compressed_blocks_dev,
+    float theta,
+    bool interleaved = false,
+    const int* pos_t = nullptr,
+    const int* pos_h = nullptr,
+    const int* pos_w = nullptr,
+    int prompt_pos_len = 0,
+    int text_pos_delta = 0,
+    int mrope_section_t = 0,
+    int mrope_section_h = 0,
+    int mrope_section_w = 0,
+    int* invalid_dev = nullptr);
 
 void qsa_compress_key_blocks_host(
     const bf16* k_cache,
@@ -445,4 +490,3 @@ void qsa_pre_indexer_batched_host(
     int mrope_section_w = 0);
 
 } // namespace ops
-

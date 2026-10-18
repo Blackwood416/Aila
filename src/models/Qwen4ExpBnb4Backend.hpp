@@ -96,6 +96,12 @@ struct Qwen4ExpLayerCache {
     std::vector<float> host_linear_conv_state;
     int linear_conv_head = 0;
     bool device_state_dirty = false;
+    // Opt-in device-authoritative GDN ring head. The pointer addresses one
+    // [head, previous_head, arrivals] row in the Session-owned table below.
+    // Host authority is the default and keeps linear_conv_head authoritative.
+    int* linear_conv_head_dev = nullptr;
+    bool linear_conv_head_device_authority = false;
+    bool linear_conv_head_device_synced = true;
 };
 
 struct Qwen4ExpBuffers {
@@ -225,6 +231,11 @@ public:
         std::vector<Qwen4ExpLayerCache> layerCaches_;
         Qwen4ExpPleState ple_state_;
         std::vector<StateSnapshot> snapshots_;
+        // Allocated only by AILA_Q4E_GRAPH_GDN_STATE=1. One row per layer
+        // keeps addresses stable for a future whole-token graph capture.
+        Tensor gdn_conv_heads_dev_;
+        std::vector<int> gdn_conv_heads_host_;
+        bool graph_gdn_state_enabled_ = false;
 
         Tensor mropePosT_, mropePosH_, mropePosW_;
         int mropePromptLength_ = 0;
@@ -430,6 +441,13 @@ private:
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
     StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
+    void ValidateGdnHeadPath(const Session& session, int count) const;
+    void SynchronizeGdnDeviceHeadsToHost(Context& ctx, Session& session);
+    void PublishGdnHostHeadsToDevice(Context& ctx, Session& session);
+    void PrepareGdnGraphState(Context& ctx, Session& session);
+    // Whole-token graph replay must call this after every launch: authority and
+    // dirty-bit writes executed during capture do not run again on replay.
+    void MarkGdnGraphStateDirty(Session& session);
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     friend struct Qwen4ExpMtpProbe;

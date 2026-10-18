@@ -29,6 +29,18 @@ struct Qwen4ExpGenerationTestAccess {
                            const Qwen4ExpBnb4Backend::Session& session, int count, int anchor) {
         return backend.CanCaptureInteriorCheckpoint(session, count, anchor);
     }
+    static void ValidateGdnPath(const Qwen4ExpBnb4Backend& backend,
+                                const Qwen4ExpBnb4Backend::Session& session, int count) {
+        backend.ValidateGdnHeadPath(session, count);
+    }
+    static void MarkGdnGraphDirty(Qwen4ExpBnb4Backend& backend,
+                                  Qwen4ExpBnb4Backend::Session& session) {
+        backend.MarkGdnGraphStateDirty(session);
+    }
+    static void PublishGdnHeads(Qwen4ExpBnb4Backend& backend, Context& ctx,
+                                Qwen4ExpBnb4Backend::Session& session) {
+        backend.PublishGdnHostHeadsToDevice(ctx, session);
+    }
     static Qwen4ExpBuffers& HcFixture(Qwen4ExpBnb4Backend& backend, Context& ctx, int dim, int lowrank) {
         backend.context_ = &ctx;
         backend.hidden_size_ = dim;
@@ -1138,6 +1150,33 @@ void test_ple_ticket_pipeline(Context& ctx) {
 
         expect(s_rapid.prev_tokens[0] == 3 && s_rapid.prev_tokens[1] == 4,
                "rapid sequential prepare/commit must chain cleanly");
+    }
+
+    // 9. Graph staging slot is fixed at zero and host waits are explicit.
+    {
+        Qwen4ExpPleState s_fixed;
+        ple.init_state(ctx, s_fixed);
+        s_fixed.prev_tokens = {700, 701};
+
+        int fixed_token_a = 702;
+        PleTicket fixed_a = ple.prepare_fixed_slot(
+            ctx, s_fixed, &fixed_token_a, 1, &s_fixed, 3, 20);
+        expect(fixed_a.valid && fixed_a.staging_slot == 0,
+               "fixed PLE prepare must use staging slot zero");
+        ple.wait_prepared(ctx, fixed_a);
+        expect(ple.MatchesInput(fixed_a, &fixed_token_a, 1),
+               "fixed PLE ticket must retain its owned input");
+
+        int fixed_token_b = 703;
+        PleTicket fixed_b = ple.prepare_fixed_slot(
+            ctx, s_fixed, &fixed_token_b, 1, &s_fixed, 3, 21);
+        expect(fixed_b.valid && fixed_b.staging_slot == 0,
+               "fixed PLE prepare must not rotate back to the other bank");
+        ple.wait_prepared(ctx, fixed_b);
+        expect(ple.MatchesInput(fixed_b, &fixed_token_b, 1),
+               "fixed PLE replacement ticket must match its input");
+        fixed_a.valid = false;
+        fixed_b.valid = false;
     }
 
     std::cout << "[PASS] PLE Ticket Pipeline tests passed.\n";
@@ -2887,6 +2926,83 @@ void test_snapshot_capture_and_truncate(Context& ctx) {
     expect(backend.Truncate(*no_snapshots, 12) == 0, "Missing snapshot must fall back to reset");
 
     std::cout << "[PASS] Phase S5 batched async snapshot capture & truncate verified successfully.\n";
+}
+
+void test_graph_gdn_device_head_state(Context& ctx) {
+    std::cout << "[Test] Graph GDN device-head ownership and fail-closed transitions...\n";
+    _putenv("AILA_Q4E_GRAPH_GDN_STATE=1");
+    _putenv("AILA_Q4E_GDN_HISTORY_FUSED=0");
+
+    Qwen4ExpBnb4Backend backend;
+    backend.init_for_testing(ctx, 4);
+    auto session = backend.CreateSession(ctx, /*maxSnapshots=*/2);
+    expect(session != nullptr, "graph GDN session creation failed");
+
+    auto& caches = session->layer_caches_for_testing();
+    expect(caches[0].linear_conv_head_dev != nullptr,
+           "linear layer must own a device-head row when the gate is enabled");
+    expect(caches[1].linear_conv_head_dev != nullptr,
+           "second linear layer must own an independent device-head row");
+    expect(caches[3].linear_conv_head_dev == nullptr,
+           "full-attention layer must not own a GDN device-head row");
+    expect(caches[0].linear_conv_head_dev != caches[1].linear_conv_head_dev,
+           "linear layers must use distinct device-head rows");
+
+    caches[0].linear_conv_head = 2;
+    caches[1].linear_conv_head = 1;
+    Qwen4ExpGenerationTestAccess::PublishGdnHeads(backend, ctx, *session);
+    expect(caches[0].linear_conv_head_device_synced &&
+           caches[1].linear_conv_head_device_synced,
+           "host heads must publish as synchronized");
+
+    Qwen4ExpGenerationTestAccess::MarkGdnGraphDirty(backend, *session);
+    expect(caches[0].linear_conv_head_device_authority &&
+           caches[1].linear_conv_head_device_authority,
+           "graph replay must transfer authority to device heads");
+    expect(caches[0].device_state_dirty && caches[1].device_state_dirty,
+           "graph replay must dirty the checkpoint state");
+
+    caches[1].linear_conv_head_device_authority = false;
+    caches[1].linear_conv_head_device_synced = true;
+    bool rejected = false;
+    try {
+        Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 1);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    expect(rejected,
+           "partially advanced device-authoritative state must fail closed");
+    Qwen4ExpGenerationTestAccess::MarkGdnGraphDirty(backend, *session);
+
+    rejected = false;
+    try {
+        Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 2);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    expect(rejected,
+           "device-authoritative heads must reject multi-row/prefill before sync");
+
+    Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 1);
+    Qwen4ExpGenerationTestAccess::PublishGdnHeads(backend, ctx, *session);
+    expect(!caches[0].linear_conv_head_device_authority &&
+           !caches[1].linear_conv_head_device_authority,
+           "explicit boundary publish must return to host authority");
+    Qwen4ExpGenerationTestAccess::ValidateGdnPath(backend, *session, 2);
+
+    backend.Reset(*session);
+    expect(caches[0].linear_conv_head == 0 && caches[1].linear_conv_head == 0,
+           "Reset must restore zero host heads");
+    expect(caches[0].linear_conv_head_device_synced &&
+           caches[1].linear_conv_head_device_synced,
+           "Reset must republish synchronized device heads");
+    expect(!caches[0].linear_conv_head_device_authority &&
+           !caches[1].linear_conv_head_device_authority,
+           "Reset must restore host authority");
+
+    _putenv("AILA_Q4E_GRAPH_GDN_STATE=");
+    _putenv("AILA_Q4E_GDN_HISTORY_FUSED=");
+    std::cout << "[PASS] Graph GDN device-head ownership verified.\n";
 }
 
 void test_supports_interior_checkpoint_whitelist(Context& ctx) {
@@ -5895,6 +6011,11 @@ int main(int argc, char** argv) {
     aila::env::enable_l0_copy_engine();
     try {
         Context ctx;
+        if (argc == 2 && std::string(argv[1]) == "--gdn-graph-state-only") {
+            test_graph_gdn_device_head_state(ctx);
+            std::cout << "AilaQwen4ExpModuleTests: GDN GRAPH STATE PASSED\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--ple-only") {
             test_real_model_ple_and_cache_if_present(ctx, true);
             std::cout << "AilaQwen4ExpModuleTests: PLE PASSED\n";
@@ -5927,6 +6048,7 @@ int main(int argc, char** argv) {
         test_b6_demand_microbatch_pipeline(ctx);
         test_prefill_weight_reuse_backend_alignment(ctx);
         test_snapshot_capture_and_truncate(ctx);
+        test_graph_gdn_device_head_state(ctx);
         test_supports_interior_checkpoint_whitelist(ctx);
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);

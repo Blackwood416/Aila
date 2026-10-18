@@ -169,13 +169,16 @@ inline float calculate_rotary_position(
 
 } // anonymous namespace
 
-void qsa_prepare_q_and_cache_k(
+namespace {
+
+void qsa_prepare_q_and_cache_k_impl(
     Context& ctx,
     const Tensor& indexer_qk,
     const Tensor& q_norm_w,
     Tensor& k_cache,
     Tensor& q_out,
     int pos,
+    const int* position_dev,
     float theta,
     bool interleaved,
     const int* pos_t,
@@ -187,7 +190,7 @@ void qsa_prepare_q_and_cache_k(
     int mrope_section_h,
     int mrope_section_w) {
     (void)mrope_section_t;
-    if (pos < 0) return;
+    if (!position_dev && pos < 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
     const bf16* qn_ptr = q_norm_w.data_as<bf16>();
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
@@ -199,8 +202,6 @@ void qsa_prepare_q_and_cache_k(
     constexpr int kWgSize = 128;
     constexpr int kNumHeads = 4;
 
-    const float pos_scalar = static_cast<float>(pos >= prompt_pos_len ? pos + text_pos_delta : pos);
-
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<float, 1> local_q(sycl::range<1>(kHeadDim), cgh);
@@ -210,6 +211,12 @@ void qsa_prepare_q_and_cache_k(
             [=](sycl::nd_item<1> item) {
                 const int head = item.get_group(0);
                 const int lid = item.get_local_id(0);
+                const int active_pos = position_dev ? position_dev[0] : pos;
+                if (active_pos < 0) return;
+                const float pos_scalar = static_cast<float>(
+                    active_pos >= prompt_pos_len
+                        ? active_pos + text_pos_delta
+                        : active_pos);
                 const int q_offset = head * kHeadDim + lid;
 
                 const float qv = static_cast<float>(qk_ptr[q_offset]);
@@ -230,7 +237,8 @@ void qsa_prepare_q_and_cache_k(
 
                 if (lid < kHalfDim) {
                     const float pos_val = calculate_rotary_position(
-                        pos, lid, pos_scalar, interleaved, pos_t, pos_h, pos_w,
+                        active_pos, lid, pos_scalar, interleaved, pos_t,
+                        pos_h, pos_w,
                         prompt_pos_len, mrope_section_h, mrope_section_w);
                     const float freq = 1.0f / sycl::pow(theta, (2.0f * lid) / static_cast<float>(kRotaryDim));
                     const float angle = pos_val * freq;
@@ -246,10 +254,62 @@ void qsa_prepare_q_and_cache_k(
 
                 // If head 0, copy raw token_k into k_cache
                 if (head == 0) {
-                    k_cache_ptr[static_cast<size_t>(pos) * kHeadDim + lid] = qk_ptr[kNumHeads * kHeadDim + lid];
+                    k_cache_ptr[static_cast<size_t>(active_pos) * kHeadDim + lid] =
+                        qk_ptr[kNumHeads * kHeadDim + lid];
                 }
             });
     });
+}
+
+} // namespace
+
+void qsa_prepare_q_and_cache_k(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    int pos,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    qsa_prepare_q_and_cache_k_impl(
+        ctx, indexer_qk, q_norm_w, k_cache, q_out, pos, nullptr, theta,
+        interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
+}
+
+void qsa_prepare_q_and_cache_k_graph(
+    Context& ctx,
+    const Tensor& indexer_qk,
+    const Tensor& q_norm_w,
+    Tensor& k_cache,
+    Tensor& q_out,
+    const int* position_dev,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    if (!position_dev)
+        throw std::invalid_argument(
+            "qsa_prepare_q_and_cache_k_graph requires a device position");
+    qsa_prepare_q_and_cache_k_impl(
+        ctx, indexer_qk, q_norm_w, k_cache, q_out, -1, position_dev, theta,
+        interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w);
 }
 
 void qsa_cache_k_batched(
@@ -913,7 +973,10 @@ void qsa_compute_block_scores_upstream_ref(
     }
 }
 
-void qsa_compress_key_blocks(
+namespace {
+
+template <bool GraphMode>
+void qsa_compress_key_blocks_impl(
     Context& ctx,
     const Tensor& k_cache,
     const Tensor& k_norm_w,
@@ -929,9 +992,17 @@ void qsa_compress_key_blocks(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    const int* position_dev,
+    int* num_compressed_blocks_dev,
+    int* invalid_dev) {
     (void)mrope_section_t;
-    if (num_blocks <= 0) return;
+    if (!GraphMode && num_blocks <= 0) return;
+    if (GraphMode &&
+        (!position_dev || !num_compressed_blocks_dev)) {
+        throw std::invalid_argument(
+            "graph QSA compression requires position and block-count slots");
+    }
     const bf16* k_cache_ptr = k_cache.data_as<bf16>();
     const bf16* kn_ptr = k_norm_w.data_as<bf16>();
     bf16* comp_k_ptr = compressed_k.data_as<bf16>();
@@ -940,16 +1011,43 @@ void qsa_compress_key_blocks(
     constexpr int kRotaryDim = 64;
     constexpr int kHalfDim = 32;
     constexpr int kWgSize = 128;
+    const int max_blocks =
+        static_cast<int>(compressed_k.numel() / kHeadDim);
+    if constexpr (!GraphMode) {
+        if (start_block < 0 || num_blocks > max_blocks - start_block)
+            throw std::invalid_argument("QSA compression block range is invalid");
+    }
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(kWgSize), cgh);
         sycl::local_accessor<float, 1> local_k(sycl::range<1>(kHeadDim), cgh);
 
         cgh.parallel_for(
-            sycl::nd_range<1>(num_blocks * kWgSize, kWgSize),
+            sycl::nd_range<1>(
+                static_cast<size_t>(GraphMode ? 1 : num_blocks) * kWgSize,
+                kWgSize),
             [=](sycl::nd_item<1> item) {
-                const int b = start_block + item.get_group(0);
                 const int lid = item.get_local_id(0);
+                int b = start_block + item.get_group(0);
+                bool active = true;
+                if constexpr (GraphMode) {
+                    const int visible_len = position_dev[0] + 1;
+                    const int target_blocks = visible_len / 4;
+                    const int current_blocks =
+                        num_compressed_blocks_dev[0];
+                    if (visible_len <= 0 || current_blocks < 0 ||
+                        current_blocks > target_blocks ||
+                        current_blocks >= max_blocks ||
+                        target_blocks - current_blocks > 1) {
+                        active = false;
+                        if (lid == 0 && invalid_dev) invalid_dev[0] = 1;
+                    } else if (current_blocks == target_blocks) {
+                        active = false;
+                    } else {
+                        b = current_blocks;
+                    }
+                }
+                if (!active) return;
 
                 // 1. Mean-pool 4 tokens
                 const size_t b0 = (static_cast<size_t>(4 * b + 0) * kHeadDim) + lid;
@@ -998,8 +1096,65 @@ void qsa_compress_key_blocks(
                 } else if (lid >= kRotaryDim) {
                     comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid] = bf16(local_k[lid]);
                 }
+                if constexpr (GraphMode) {
+                    item.barrier(
+                        sycl::access::fence_space::global_and_local);
+                    if (lid == 0)
+                        num_compressed_blocks_dev[0] = b + 1;
+                }
             });
     });
+}
+
+} // namespace
+
+void qsa_compress_key_blocks(
+    Context& ctx,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& compressed_k,
+    int start_block,
+    int num_blocks,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w) {
+    qsa_compress_key_blocks_impl<false>(
+        ctx, k_cache, k_norm_w, compressed_k, start_block, num_blocks,
+        theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len,
+        text_pos_delta, mrope_section_t, mrope_section_h,
+        mrope_section_w, nullptr, nullptr, nullptr);
+}
+
+void qsa_compress_one_completed_block_graph(
+    Context& ctx,
+    const Tensor& k_cache,
+    const Tensor& k_norm_w,
+    Tensor& compressed_k,
+    const int* position_dev,
+    int* num_compressed_blocks_dev,
+    float theta,
+    bool interleaved,
+    const int* pos_t,
+    const int* pos_h,
+    const int* pos_w,
+    int prompt_pos_len,
+    int text_pos_delta,
+    int mrope_section_t,
+    int mrope_section_h,
+    int mrope_section_w,
+    int* invalid_dev) {
+    qsa_compress_key_blocks_impl<true>(
+        ctx, k_cache, k_norm_w, compressed_k, 0, 1, theta, interleaved,
+        pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
+        mrope_section_t, mrope_section_h, mrope_section_w, position_dev,
+        num_compressed_blocks_dev, invalid_dev);
 }
 
 void qsa_compress_key_blocks_host(

@@ -2379,6 +2379,11 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
     }
 }
 
+bool Bnb4BitLinear::supports_decode_graph() const {
+    return in_features_ > 0 && out_features_ > 0 && !has_lora() &&
+           can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1);
+}
+
 bool Bnb4BitLinear::TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, Tensor& output,
     const bf16* historyInput, float* history, int channels, int ringRow) {
     if (!can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1) ||
@@ -4099,4 +4104,3 @@ void Bnb4BitLinear::reset_prefill_dispatch_stats() {
     g_prefill_dispatch_stats.sync_wait.store(0, std::memory_order_relaxed);
     g_prefill_dispatch_stats.direct_io.store(0, std::memory_order_relaxed);
 }
-

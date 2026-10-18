@@ -10,6 +10,7 @@
 #include "utils/EnvUtils.hpp"
 #include "../models/Qwen4ExpGreedyProbe.hpp"
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 #include "Qwen4ExpEsimdDpasProbe.hpp"
 
 #include <algorithm>
@@ -588,6 +589,278 @@ void test_ple_dilated_conv_silu_add(Context& ctx) {
                                      " ref=" + std::to_string(conv_head_ref));
         }
     }
+}
+
+void test_ple_dilated_conv_silu_add_device_head_graph(Context& ctx) {
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int dilation = 3;
+    constexpr int state_len = 9;
+    constexpr int steps = 11;
+    constexpr int initial_head = 5;
+    namespace ex = sycl::ext::oneapi::experimental;
+    using ExecutableGraph = ex::command_graph<ex::graph_state::executable>;
+
+    auto& queue = ctx.queue();
+    if (!queue.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !queue.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error("PLE device-head test requires SYCL graph support");
+    }
+
+    std::mt19937 rng(8038);
+    std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+    std::vector<bf16> conv_w(channels * kernel_size);
+    std::vector<float> initial_conv_state(state_len * channels);
+    for (auto& value : conv_w) value = bf16(dist(rng) * 0.1f);
+    for (auto& value : initial_conv_state) value = dist(rng);
+
+    Tensor conv_w_dev = Tensor::allocate(ctx, {channels, kernel_size}, dnnl::memory::data_type::bf16);
+    Tensor state_host_dev = Tensor::allocate(ctx, {state_len, channels}, dnnl::memory::data_type::f32);
+    Tensor state_graph_dev = Tensor::allocate(ctx, {state_len, channels}, dnnl::memory::data_type::f32);
+    Tensor head_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+    Tensor gv_normed_dev = Tensor::allocate(ctx, {1, channels}, dnnl::memory::data_type::bf16);
+    Tensor gv_dev = Tensor::allocate(ctx, {1, channels}, dnnl::memory::data_type::bf16);
+    Tensor out_host_dev = Tensor::allocate(ctx, {1, channels}, dnnl::memory::data_type::bf16);
+    Tensor out_graph_dev = Tensor::allocate(ctx, {1, channels}, dnnl::memory::data_type::bf16);
+
+    ctx.memcpy_h2d(conv_w_dev.data(), conv_w.data(), conv_w.size() * sizeof(bf16));
+    ctx.memcpy_h2d(state_host_dev.data(), initial_conv_state.data(),
+                   initial_conv_state.size() * sizeof(float));
+    ctx.memcpy_h2d(state_graph_dev.data(), initial_conv_state.data(),
+                   initial_conv_state.size() * sizeof(float));
+    ctx.memcpy_h2d(head_dev.data(), &initial_head, sizeof(int));
+
+    ExecutableGraph graph = [&]() {
+        ex::command_graph<ex::graph_state::modifiable> recording(queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
+            ops::ple_dilated_conv_silu_add_device_head(
+                ctx, gv_normed_dev.data_as<bf16>(), gv_dev.data_as<bf16>(),
+                state_graph_dev.data_as<float>(), head_dev.data_as<int>(),
+                conv_w_dev.data_as<bf16>(), out_graph_dev.data_as<bf16>(),
+                1, channels, kernel_size, dilation);
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    }();
+
+    int host_head = initial_head;
+    std::vector<bf16> host_out(channels);
+    std::vector<bf16> graph_out(channels);
+    std::vector<float> host_state(state_len * channels);
+    std::vector<float> graph_state(state_len * channels);
+    int graph_head = -1;
+
+    for (int step = 0; step < steps; ++step) {
+        std::vector<bf16> gv_normed(channels);
+        std::vector<bf16> gv(channels);
+        for (int c = 0; c < channels; ++c) {
+            gv_normed[c] = bf16(dist(rng));
+            gv[c] = bf16(dist(rng));
+        }
+        ctx.memcpy_h2d(gv_normed_dev.data(), gv_normed.data(), channels * sizeof(bf16));
+        ctx.memcpy_h2d(gv_dev.data(), gv.data(), channels * sizeof(bf16));
+
+        ops::ple_dilated_conv_silu_add(
+            ctx, gv_normed_dev.data_as<bf16>(), gv_dev.data_as<bf16>(),
+            state_host_dev.data_as<float>(), host_head,
+            conv_w_dev.data_as<bf16>(), out_host_dev.data_as<bf16>(),
+            1, channels, kernel_size, dilation);
+        queue.ext_oneapi_graph(graph);
+        ctx.synchronize();
+
+        ctx.memcpy_d2h(host_out.data(), out_host_dev.data(), channels * sizeof(bf16));
+        ctx.memcpy_d2h(graph_out.data(), out_graph_dev.data(), channels * sizeof(bf16));
+        ctx.memcpy_d2h(host_state.data(), state_host_dev.data(), host_state.size() * sizeof(float));
+        ctx.memcpy_d2h(graph_state.data(), state_graph_dev.data(), graph_state.size() * sizeof(float));
+        ctx.memcpy_d2h(&graph_head, head_dev.data(), sizeof(int));
+
+        if (std::memcmp(host_out.data(), graph_out.data(), channels * sizeof(bf16)) != 0 ||
+            std::memcmp(host_state.data(), graph_state.data(),
+                        host_state.size() * sizeof(float)) != 0 ||
+            graph_head != host_head) {
+            throw std::runtime_error(
+                "PLE graph device-head mismatch at replay " + std::to_string(step) +
+                ": host_head=" + std::to_string(host_head) +
+                " graph_head=" + std::to_string(graph_head));
+        }
+    }
+
+    std::cout << "[PASS] PLE graph device conv head (replays=" << steps
+              << ", ring wrap, output/state/head bitwise)\n";
+}
+
+void test_qsa_graph_position_and_block_advance(Context& ctx) {
+    constexpr int capacity = 2060;
+    constexpr int head_dim = 128;
+    constexpr int total_dim = 640;
+    constexpr int max_blocks = 516;
+    constexpr int initial_pos = 2051;
+    constexpr int initial_blocks = (initial_pos + 1) / 4;
+    constexpr int steps = 5;
+    namespace ex = sycl::ext::oneapi::experimental;
+    using ExecutableGraph = ex::command_graph<ex::graph_state::executable>;
+    auto& queue = ctx.queue();
+    if (!queue.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !queue.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error("QSA graph test requires SYCL graph support");
+    }
+
+    std::vector<bf16> initial_k(capacity * head_dim);
+    std::vector<bf16> q_norm(head_dim);
+    std::vector<bf16> k_norm(head_dim);
+    for (int i = 0; i < capacity * head_dim; ++i) {
+        initial_k[i] = bf16(float((i * 13 + 7) % 127 - 63) * 0.002f);
+    }
+    for (int d = 0; d < head_dim; ++d) {
+        q_norm[d] = bf16(0.9f + float(d % 19) * 0.01f);
+        k_norm[d] = bf16(0.95f + float((d * 3) % 17) * 0.01f);
+    }
+
+    Tensor qk_host_dev = Tensor::allocate(
+        ctx, {1, total_dim}, dnnl::memory::data_type::bf16);
+    Tensor qk_graph_dev = Tensor::allocate(
+        ctx, {1, total_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_norm_dev = Tensor::allocate(
+        ctx, {head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_norm_dev = Tensor::allocate(
+        ctx, {head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_host_dev = Tensor::allocate(
+        ctx, {capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_graph_dev = Tensor::allocate(
+        ctx, {capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_host_dev = Tensor::allocate(
+        ctx, {4, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor q_graph_dev = Tensor::allocate(
+        ctx, {4, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor compressed_host_dev = Tensor::allocate(
+        ctx, {max_blocks, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor compressed_graph_dev = Tensor::allocate(
+        ctx, {max_blocks, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor position_dev = Tensor::allocate(
+        ctx, {1}, dnnl::memory::data_type::s32);
+    Tensor graph_blocks_dev = Tensor::allocate(
+        ctx, {1}, dnnl::memory::data_type::s32);
+    Tensor invalid_dev = Tensor::allocate(
+        ctx, {1}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(q_norm_dev.data(), q_norm.data(), q_norm.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_norm_dev.data(), k_norm.data(), k_norm.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_host_dev.data(), initial_k.data(), initial_k.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_graph_dev.data(), initial_k.data(), initial_k.size() * sizeof(bf16));
+    queue.memset(compressed_host_dev.data(), 0, compressed_host_dev.size_bytes());
+    queue.memset(compressed_graph_dev.data(), 0, compressed_graph_dev.size_bytes());
+    ops::qsa_compress_key_blocks(
+        ctx, k_host_dev, k_norm_dev, compressed_host_dev,
+        0, initial_blocks, 10000.0f);
+    ctx.synchronize();
+    queue.memcpy(compressed_graph_dev.data(), compressed_host_dev.data(),
+                 size_t(initial_blocks) * head_dim * sizeof(bf16));
+    int graph_blocks = initial_blocks;
+    int position = initial_pos;
+    int invalid = 0;
+    ctx.memcpy_h2d(position_dev.data(), &position, sizeof(int));
+    ctx.memcpy_h2d(graph_blocks_dev.data(), &graph_blocks, sizeof(int));
+    ctx.memcpy_h2d(invalid_dev.data(), &invalid, sizeof(int));
+    ctx.synchronize();
+
+    ExecutableGraph graph = [&]() {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
+            ops::qsa_prepare_q_and_cache_k_graph(
+                ctx, qk_graph_dev, q_norm_dev, k_graph_dev, q_graph_dev,
+                position_dev.data_as<int>(), 10000.0f);
+            ops::qsa_compress_one_completed_block_graph(
+                ctx, k_graph_dev, k_norm_dev, compressed_graph_dev,
+                position_dev.data_as<int>(), graph_blocks_dev.data_as<int>(),
+                10000.0f, false, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0,
+                invalid_dev.data_as<int>());
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    }();
+
+    int host_blocks = initial_blocks;
+    for (int step = 0; step < steps; ++step) {
+        position = initial_pos + step;
+        std::vector<bf16> qk(total_dim);
+        for (int i = 0; i < total_dim; ++i) {
+            qk[i] = bf16(float(((i + 3) * 17 + position * 11) % 251 - 125) *
+                         0.006f);
+        }
+        ctx.memcpy_h2d(qk_host_dev.data(), qk.data(), qk.size() * sizeof(bf16));
+        ctx.memcpy_h2d(qk_graph_dev.data(), qk.data(), qk.size() * sizeof(bf16));
+        ctx.memcpy_h2d(position_dev.data(), &position, sizeof(int));
+        invalid = 0;
+        ctx.memcpy_h2d(invalid_dev.data(), &invalid, sizeof(int));
+
+        ops::qsa_prepare_q_and_cache_k(
+            ctx, qk_host_dev, q_norm_dev, k_host_dev, q_host_dev,
+            position, 10000.0f);
+        const int target_blocks = (position + 1) / 4;
+        if (target_blocks > host_blocks) {
+            if (target_blocks != host_blocks + 1) {
+                throw std::runtime_error("QSA direct test skipped more than one block");
+            }
+            ops::qsa_compress_key_blocks(
+                ctx, k_host_dev, k_norm_dev, compressed_host_dev,
+                host_blocks, 1, 10000.0f);
+            host_blocks = target_blocks;
+        }
+
+        auto event = queue.ext_oneapi_graph(graph);
+        event.wait_and_throw();
+        ctx.synchronize();
+        ctx.memcpy_d2h(&graph_blocks, graph_blocks_dev.data(), sizeof(int));
+        ctx.memcpy_d2h(&invalid, invalid_dev.data(), sizeof(int));
+        if (invalid != 0) {
+            throw std::runtime_error("QSA graph reported an invalid block gap");
+        }
+        if (graph_blocks != host_blocks) {
+            throw std::runtime_error(
+                "QSA graph block count mismatch at pos=" +
+                std::to_string(position) + ": graph=" +
+                std::to_string(graph_blocks) + " host=" +
+                std::to_string(host_blocks));
+        }
+
+        std::vector<bf16> q_host(4 * head_dim), q_graph(4 * head_dim);
+        std::vector<bf16> k_host(capacity * head_dim);
+        std::vector<bf16> k_graph(capacity * head_dim);
+        std::vector<bf16> comp_host(max_blocks * head_dim);
+        std::vector<bf16> comp_graph(max_blocks * head_dim);
+        ctx.memcpy_d2h(q_host.data(), q_host_dev.data(), q_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(q_graph.data(), q_graph_dev.data(), q_graph.size() * sizeof(bf16));
+        ctx.memcpy_d2h(k_host.data(), k_host_dev.data(), k_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(k_graph.data(), k_graph_dev.data(), k_graph.size() * sizeof(bf16));
+        ctx.memcpy_d2h(comp_host.data(), compressed_host_dev.data(),
+                       comp_host.size() * sizeof(bf16));
+        ctx.memcpy_d2h(comp_graph.data(), compressed_graph_dev.data(),
+                       comp_graph.size() * sizeof(bf16));
+        if (std::memcmp(q_host.data(), q_graph.data(), q_host.size() * sizeof(bf16)) != 0 ||
+            std::memcmp(k_host.data(), k_graph.data(), k_host.size() * sizeof(bf16)) != 0 ||
+            std::memcmp(comp_host.data(), comp_graph.data(),
+                        comp_host.size() * sizeof(bf16)) != 0) {
+            throw std::runtime_error(
+                "QSA graph position/block output mismatch at pos=" +
+                std::to_string(position));
+        }
+    }
+
+    if (graph_blocks != 514 || host_blocks != 514) {
+        throw std::runtime_error("QSA graph test did not reach the 514-block boundary");
+    }
+    std::cout << "[PASS] QSA graph device position + block advance"
+              << " (pos=" << initial_pos << ".." << initial_pos + steps - 1
+              << ", blocks=513..514, bitwise)\n";
 }
 
 static void run_router_softmax_topk_test(Context& ctx, int tokens) {
@@ -5767,6 +6040,22 @@ int main(int argc, char** argv) {
             std::cout << "HC-only tests PASSED; teardown USM zero\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--ple-device-head-only") {
+            test_ple_dilated_conv_silu_add_device_head_graph(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("PLE device-head test teardown USM leak");
+            std::cout << "PLE device-head graph test PASSED; teardown USM zero\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-graph-only") {
+            test_qsa_graph_position_and_block_advance(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA graph test teardown USM leak");
+            std::cout << "QSA graph device-state test PASSED; teardown USM zero\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--gdn-order-only") {
             test_gated_delta_net_sigmoid(ctx);
             test_gdn_device_conv_head(ctx);
@@ -5889,6 +6178,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--qsa-tests") {
+            test_qsa_graph_position_and_block_advance(ctx);
             test_qsa_selector_adversarial(ctx);
             test_qsa_select_topk_blocks(ctx);
             test_qsa_batched_scoring_and_selection(ctx);
@@ -5917,6 +6207,7 @@ int main(int argc, char** argv) {
         test_ple_gate_value(ctx);
         test_ple_dilated_conv_silu_add(ctx);
         test_ple_dilated_conv_silu_add_residual(ctx);
+        test_ple_dilated_conv_silu_add_device_head_graph(ctx);
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
         test_q4e_w4a8_adaptive_decode(ctx, false);

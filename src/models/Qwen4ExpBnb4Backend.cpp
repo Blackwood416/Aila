@@ -241,6 +241,15 @@ Qwen4ExpBnb4Backend::Session::Session(
         AILA_LOG_INFO("[Q4E KV] AILA_KV_QUANT=1 format=%s",
                       int8_kv ? "int8" : "fp8(ignored: Qwen4Exp keeps bf16 KV)");
     }
+    graph_gdn_state_enabled_ = aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false);
+    if (graph_gdn_state_enabled_) {
+        gdn_conv_heads_dev_ = Tensor::allocate(
+            ctx, {48, ops::delta_net_conv_head_device_slots},
+            dnnl::memory::data_type::s32);
+        gdn_conv_heads_host_.assign(48 * ops::delta_net_conv_head_device_slots, 0);
+        ctx.queue().memset(gdn_conv_heads_dev_.data(), 0,
+                           gdn_conv_heads_dev_.size_bytes());
+    }
     layerCaches_.resize(48);
     for (int i = 0; i < 48; ++i) {
         bool is_linear = ((i + 1) % 4 != 0);
@@ -255,6 +264,11 @@ Qwen4ExpBnb4Backend::Session::Session(
             cache.host_linear_conv_state.assign(3 * 10240, 0.0f);
             cache.linear_conv_head = 0;
             cache.device_state_dirty = false;
+            if (graph_gdn_state_enabled_) {
+                cache.linear_conv_head_dev =
+                    gdn_conv_heads_dev_.data_as<int>() +
+                    i * ops::delta_net_conv_head_device_slots;
+            }
         } else {
             const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8
                                           : dnnl::memory::data_type::bf16;
@@ -275,6 +289,120 @@ Qwen4ExpBnb4Backend::Session::Session(
 Qwen4ExpBnb4Backend::Session::~Session() {
     if (context_) {
         context_->synchronize();
+    }
+}
+
+void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
+    const Session& session, int count) const {
+    if (!session.graph_gdn_state_enabled_) return;
+    if (count != 1) {
+        for (const auto& cache : session.layerCaches_) {
+            if (cache.linear_conv_head_device_authority) {
+                throw std::invalid_argument(
+                    "Qwen4Exp graph GDN state cannot continue with a multi-row/"
+                    "prefill forward before an explicit head synchronization");
+            }
+        }
+        return;
+    }
+    int linear_rows = 0;
+    int device_authority_rows = 0;
+    for (const auto& cache : session.layerCaches_) {
+        if (cache.linear_conv_head_dev == nullptr) continue;
+        ++linear_rows;
+        device_authority_rows += cache.linear_conv_head_device_authority ? 1 : 0;
+    }
+    if (device_authority_rows != 0 &&
+        device_authority_rows != linear_rows) {
+        throw std::invalid_argument(
+            "Qwen4Exp graph GDN state has mixed host/device authority");
+    }
+    if (aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", false)) {
+        throw std::invalid_argument(
+            "Qwen4Exp graph GDN state is incompatible with "
+            "AILA_Q4E_GDN_HISTORY_FUSED=1");
+    }
+}
+
+void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
+    Context& ctx, Session& session) {
+    if (!session.gdn_conv_heads_dev_.valid()) return;
+    sycl::event last_d2h{};
+    for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
+        auto& cache = session.layerCaches_[i];
+        if (cache.linear_conv_head_dev == nullptr ||
+            !cache.linear_conv_head_device_authority) {
+            continue;
+        }
+        int* host_row = session.gdn_conv_heads_host_.data() +
+            i * ops::delta_net_conv_head_device_slots;
+        last_d2h = ctx.memcpy_d2h_async(
+            host_row, cache.linear_conv_head_dev, sizeof(int));
+    }
+    if (last_d2h != sycl::event{}) last_d2h.wait_and_throw();
+    for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
+        auto& cache = session.layerCaches_[i];
+        if (cache.linear_conv_head_dev == nullptr ||
+            !cache.linear_conv_head_device_authority) {
+            continue;
+        }
+        int* host_row = session.gdn_conv_heads_host_.data() +
+            i * ops::delta_net_conv_head_device_slots;
+        cache.linear_conv_head = host_row[0];
+        cache.device_state_dirty = true;
+        cache.linear_conv_head_device_authority = false;
+        cache.linear_conv_head_device_synced = true;
+    }
+}
+
+void Qwen4ExpBnb4Backend::PublishGdnHostHeadsToDevice(
+    Context& ctx, Session& session) {
+    if (!session.gdn_conv_heads_dev_.valid()) return;
+    std::fill(session.gdn_conv_heads_host_.begin(),
+              session.gdn_conv_heads_host_.end(), 0);
+    for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
+        auto& cache = session.layerCaches_[i];
+        if (cache.linear_conv_head_dev == nullptr) continue;
+        int* host_row = session.gdn_conv_heads_host_.data() +
+            i * ops::delta_net_conv_head_device_slots;
+        host_row[ops::delta_net_conv_head_device_head_slot] =
+            cache.linear_conv_head;
+        host_row[ops::delta_net_conv_head_device_previous_slot] =
+            cache.linear_conv_head;
+        host_row[ops::delta_net_conv_head_device_arrivals_slot] = 0;
+    }
+    ctx.memcpy_h2d(session.gdn_conv_heads_dev_.data(),
+                   session.gdn_conv_heads_host_.data(),
+                   session.gdn_conv_heads_dev_.size_bytes());
+    for (auto& cache : session.layerCaches_) {
+        if (cache.linear_conv_head_dev == nullptr) continue;
+        cache.linear_conv_head_device_authority = false;
+        cache.linear_conv_head_device_synced = true;
+    }
+}
+
+void Qwen4ExpBnb4Backend::PrepareGdnGraphState(
+    Context& ctx, Session& session) {
+    if (!session.gdn_conv_heads_dev_.valid()) {
+        throw std::invalid_argument(
+            "Qwen4Exp graph GDN state was not enabled for this session");
+    }
+    for (const auto& cache : session.layerCaches_) {
+        if (cache.linear_conv_head_device_authority) {
+            throw std::invalid_argument(
+                "Qwen4Exp graph GDN capture requires host head authority; "
+                "synchronize the device heads first");
+        }
+    }
+    PublishGdnHostHeadsToDevice(ctx, session);
+}
+
+void Qwen4ExpBnb4Backend::MarkGdnGraphStateDirty(Session& session) {
+    for (auto& cache : session.layerCaches_) {
+        if (cache.linear_conv_head_dev == nullptr) continue;
+        cache.linear_conv_head_device_authority = true;
+        cache.linear_conv_head_device_synced = false;
+        cache.device_state_dirty = true;
     }
 }
 
@@ -2303,6 +2431,23 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const ForwardOptions& options) {
     ValidateSession(session);
     if (count <= 0) return buf_.logits;
+    ValidateGdnHeadPath(session, count);
+    if (count == 1 && session.graph_gdn_state_enabled_) {
+        int linear_rows = 0;
+        int device_authority_rows = 0;
+        bool any_host_authority_unsynced = false;
+        for (const auto& cache : session.layerCaches_) {
+            if (cache.linear_conv_head_dev == nullptr) continue;
+            ++linear_rows;
+            device_authority_rows += cache.linear_conv_head_device_authority ? 1 : 0;
+            any_host_authority_unsynced |=
+                !cache.linear_conv_head_device_authority &&
+                !cache.linear_conv_head_device_synced;
+        }
+        if (device_authority_rows == 0 && any_host_authority_unsynced) {
+            PrepareGdnGraphState(ctx, session);
+        }
+    }
     static const int s_cold_split_num =
         std::clamp(aila::env::read_int_raw("AILA_Q4E_COLD_SPLIT_NUM", 0), 0, 256);
     static const bool s_direct_arena_stage =
@@ -3664,6 +3809,7 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
     if (!force && tokenCount <= 1 && nextLength % step != 0) return;
 
     ctx.synchronize();
+    SynchronizeGdnDeviceHeadsToHost(ctx, session);
     auto& snapshot = ReserveSnapshot(session, nextLength);
     try {
         sycl::event last_d2h_event{};
@@ -3754,6 +3900,7 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
     if (last_h2d_event != sycl::event{}) {
         last_h2d_event.wait_and_throw();
     }
+    PublishGdnHostHeadsToDevice(*session.context_, session);
     ple_.restore_snapshot(*session.context_, session.ple_state_, snapshot.ple_snapshot);
     session.bump_generation();
     ple_ticket_.valid = false;
@@ -3791,6 +3938,7 @@ void Qwen4ExpBnb4Backend::Reset(Session& session) {
             cache.num_compressed_blocks = 0;
         }
     }
+    PublishGdnHostHeadsToDevice(*session.context_, session);
     ple_.init_state(*session.context_, session.ple_state_);
     session.bump_generation();
     ple_ticket_.valid = false;
@@ -3828,8 +3976,12 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
         }
     }
+    cacheBytes = aila::memory::checked_memory_sum(
+        cacheBytes, session->gdn_conv_heads_dev_.size_bytes());
     session->cacheBytes_ = aila::memory::checked_memory_sum(
         cacheBytes, session->ple_state_.conv_state.size_bytes());
+    session->cacheBytes_ = aila::memory::checked_memory_sum(
+        session->cacheBytes_, session->ple_state_.conv_head_dev.size_bytes());
     for (auto& snapshot : session->snapshots_) {
         snapshot.layers.resize(layers_.size());
         for (size_t i = 0; i < layers_.size(); ++i) {

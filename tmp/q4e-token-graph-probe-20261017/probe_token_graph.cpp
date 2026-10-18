@@ -343,6 +343,30 @@ static_assert(sizeof(HostRing) == 576);
 static_assert(sizeof(CpuPacketRing) == 169088);
 static_assert(sizeof(DeviceEpoch) == 64);
 
+inline uint32_t device_load_u32(const uint32_t* ptr) {
+    sycl::atomic_ref<
+        uint32_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::system,
+        sycl::access::address_space::global_space>
+        value(*const_cast<uint32_t*>(ptr));
+    return value.load(sycl::memory_order::acquire);
+}
+
+inline void device_store_u32(uint32_t* ptr, uint32_t value) {
+    sycl::atomic_ref<
+        uint32_t, sycl::memory_order::relaxed,
+        sycl::memory_scope::system,
+        sycl::access::address_space::global_space>
+        target(*ptr);
+    target.store(value, sycl::memory_order::release);
+}
+
+inline bool epoch_gate_valid(const DeviceEpoch* epoch) {
+    return !epoch ||
+        (device_load_u32(&epoch->gate_state) == kGateValid &&
+         device_load_u32(&epoch->sticky_abort) == 0);
+}
+
 bool validate_cpu_packet_shape(const int* rank_to_row, int rows, int top_k,
                                std::string& error) {
     if (top_k < 1 || top_k > kMaxPacketRows) {
@@ -463,9 +487,10 @@ void submit_route_publish(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                           bool clear_abort = true) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
-            const uint32_t seq = epoch->seq + 1u;
-            epoch->seq = seq;
-            if (clear_abort) epoch->sticky_abort = 0;
+            const uint32_t seq = device_load_u32(&epoch->seq) + 1u;
+            device_store_u32(&epoch->seq, seq);
+            if (clear_abort)
+                device_store_u32(&epoch->sticky_abort, 0);
             for (uint32_t k = 0; k < kTopK; ++k) {
                 uncached_store(&ring->route.ids[k],
                                static_cast<int32_t>(expected_id(seq, k)));
@@ -486,9 +511,10 @@ void submit_real_route_publish(sycl::queue& q, HostRing* ring,
                                bool clear_abort = true) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
-            const uint32_t seq = epoch->seq + 1u;
-            epoch->seq = seq;
-            if (clear_abort) epoch->sticky_abort = 0;
+            const uint32_t seq = device_load_u32(&epoch->seq) + 1u;
+            device_store_u32(&epoch->seq, seq);
+            if (clear_abort)
+                device_store_u32(&epoch->sticky_abort, 0);
             for (uint32_t k = 0; k < kTopK; ++k) {
                 uncached_store(&ring->route.ids[k],
                                static_cast<int32_t>(ids[k]));
@@ -523,12 +549,14 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                         uint32_t spin_max) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
-            const uint32_t seq = epoch->seq;
-            if (epoch->sticky_abort != 0) {
-                epoch->gate_state = epoch->sticky_abort;
+            const uint32_t seq = device_load_u32(&epoch->seq);
+            const uint32_t sticky =
+                device_load_u32(&epoch->sticky_abort);
+            if (sticky != 0) {
+                device_store_u32(&epoch->gate_state, sticky);
                 return;
             }
-            epoch->gate_state = kGatePending;
+            device_store_u32(&epoch->gate_state, kGatePending);
 
             uint32_t flag = 0;
             uint32_t spins = 0;
@@ -544,10 +572,12 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                 if (++spins >= spin_max) break;
             }
             if (flag != seq) {
-                uint32_t* reason = flag > seq
+                uint32_t* reason_counter = flag > seq
                     ? &ring->ctrl.channel_mismatch_count
                     : &ring->ctrl.timeout_count;
-                uncached_store(reason, uncached_load(reason) + 1u);
+                uncached_store(
+                    reason_counter,
+                    uncached_load(reason_counter) + 1u);
                 if (flag <= seq) {
                     uncached_store(&ring->ctrl.timeout_spins,
                                    static_cast<uint64_t>(spins));
@@ -555,10 +585,12 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                 uncached_store(
                     &ring->ctrl.gate_abort_count,
                     uncached_load(&ring->ctrl.gate_abort_count) + 1u);
-                epoch->sticky_abort =
+                const uint32_t abort_reason =
                     flag > seq ? kGateChannelMismatch : kGateTimeout;
-                epoch->gate_state =
-                    flag > seq ? kGateChannelMismatch : kGateTimeout;
+                device_store_u32(
+                    &epoch->sticky_abort, abort_reason);
+                device_store_u32(
+                    &epoch->gate_state, abort_reason);
                 return;
             }
             // The matching flag establishes publication of result_seq/result.
@@ -574,8 +606,10 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                 uncached_store(
                     &ring->ctrl.gate_abort_count,
                     uncached_load(&ring->ctrl.gate_abort_count) + 1u);
-                epoch->sticky_abort = kGateChannelMismatch;
-                epoch->gate_state = kGateChannelMismatch;
+                device_store_u32(
+                    &epoch->sticky_abort, kGateChannelMismatch);
+                device_store_u32(
+                    &epoch->gate_state, kGateChannelMismatch);
                 return;
             }
 
@@ -601,8 +635,8 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                 uncached_store(
                     &ring->ctrl.gate_abort_count,
                     uncached_load(&ring->ctrl.gate_abort_count) + 1u);
-                epoch->sticky_abort = kGateStale;
-                epoch->gate_state = kGateStale;
+                device_store_u32(&epoch->sticky_abort, kGateStale);
+                device_store_u32(&epoch->gate_state, kGateStale);
                 return;
             }
 
@@ -618,8 +652,10 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                     uncached_store(
                         &ring->ctrl.gate_abort_count,
                         uncached_load(&ring->ctrl.gate_abort_count) + 1u);
-                    epoch->sticky_abort = kGatePacketMismatch;
-                    epoch->gate_state = kGatePacketMismatch;
+                    device_store_u32(
+                        &epoch->sticky_abort, kGatePacketMismatch);
+                    device_store_u32(
+                        &epoch->gate_state, kGatePacketMismatch);
                     return;
                 }
 
@@ -655,15 +691,17 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                     uncached_store(
                         &ring->ctrl.gate_abort_count,
                         uncached_load(&ring->ctrl.gate_abort_count) + 1u);
-                    epoch->sticky_abort = kGatePacketShape;
-                    epoch->gate_state = kGatePacketShape;
+                    device_store_u32(
+                        &epoch->sticky_abort, kGatePacketShape);
+                    device_store_u32(
+                        &epoch->gate_state, kGatePacketShape);
                     return;
                 }
             }
 
             sycl::atomic_fence(sycl::memory_order::release,
                                sycl::memory_scope::device);
-            epoch->gate_state = kGateValid;
+            device_store_u32(&epoch->gate_state, kGateValid);
         });
     });
 }
@@ -674,7 +712,7 @@ void submit_copy_from_mapped(sycl::queue& q, HostRing* ring,
                              DeviceEpoch* epoch, float* device_result) {
     q.parallel_for(sycl::range<1>(kResultCount), [=](sycl::id<1> id) {
         const size_t i = id[0];
-        device_result[i] = epoch->gate_state == kGateValid
+        device_result[i] = device_load_u32(&epoch->gate_state) == kGateValid
             ? uncached_load(&ring->result.values[i])
             : 0.0f;
     });
@@ -687,7 +725,8 @@ void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
                        size_t(kMaxPacketRows) * kHidden),
         [=](sycl::id<1> id) {
             const size_t i = id[0];
-            const bool valid = epoch->gate_state == kGateValid;
+            const bool valid =
+                device_load_u32(&epoch->gate_state) == kGateValid;
             if (i < kMaxPacketRows) {
                 packet_dev[i] =
                     valid && static_cast<int>(i) < top_k
@@ -718,7 +757,7 @@ void submit_gated_ordered_merge(sycl::queue& q, const float* down_acc,
         [=](sycl::nd_item<1> item) {
             // A failed gate is a hard no-op: never read the CPU packet and
             // never overwrite the previous layer output.
-            if (epoch && epoch->gate_state != kGateValid) return;
+            if (!epoch_gate_valid(epoch)) return;
             const size_t row = item.get_global_id(0);
             if (row >= static_cast<size_t>(out_features)) return;
 
@@ -752,7 +791,8 @@ void submit_copy_bytes(sycl::queue& q, void* dst, const void* src,
 // Keeping the vec8 BF16 store order preserves the production rounding.
 void submit_add_shared_expert_to_y(sycl::queue& q, bf16* y,
                                    const bf16* shared_out,
-                                   const bf16* shared_gate) {
+                                   const bf16* shared_gate,
+                                   const DeviceEpoch* epoch = nullptr) {
     using vec8 = sycl::vec<bf16, 8>;
     constexpr int dim8 = kHidden / 8;
     constexpr int wg = 64;
@@ -760,6 +800,7 @@ void submit_add_shared_expert_to_y(sycl::queue& q, bf16* y,
     q.parallel_for(
         sycl::nd_range<1>(num_wgs * wg, wg),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            if (!epoch_gate_valid(epoch)) return;
             const size_t d8 = item.get_global_id(0);
             if (d8 >= static_cast<size_t>(dim8)) return;
             const float g = static_cast<float>(shared_gate[0]);
@@ -777,12 +818,49 @@ void submit_add_shared_expert_to_y(sycl::queue& q, bf16* y,
         });
 }
 
+void submit_gated_final_bridge(sycl::queue& q,
+                               Qwen4ExpBnb4Backend& b,
+                               const DeviceEpoch* epoch) {
+    auto& buf = Qwen4ExpGenerationTestAccess::Buffers(b);
+    auto* hidden = buf.hidden4.data_as<bf16>();
+    const auto* y = buf.y.data_as<bf16>();
+    const auto* inj = buf.hc_inject_f32.data_as<float>();
+    using vec8 = sycl::vec<bf16, 8>;
+    constexpr int group_dim = kHidden;
+    constexpr int groups = 4;
+    constexpr size_t wg = 64;
+    constexpr size_t dim8 = group_dim / 8;
+    constexpr size_t wgs_per_group = (dim8 + wg - 1) / wg;
+    const size_t total_groups = groups;
+    q.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(total_groups, wgs_per_group * wg),
+            sycl::range<2>(1, wg)),
+        [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+            if (!epoch_gate_valid(epoch)) return;
+            const size_t rg = item.get_group(0);
+            const size_t i = item.get_global_id(1);
+            if (i >= dim8) return;
+            const float inj_val = static_cast<float>(inj[rg]);
+            const size_t offset = rg * group_dim + i * 8;
+            vec8 vh = *reinterpret_cast<const vec8*>(hidden + offset);
+            const vec8 vy = *reinterpret_cast<const vec8*>(y + i * 8);
+#pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                vh[v] = bf16(static_cast<float>(vh[v]) +
+                              inj_val * static_cast<float>(vy[v]));
+            }
+            *reinterpret_cast<vec8*>(hidden + offset) = vh;
+        });
+}
+
 void submit_bitwise_verify(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                            const float* device_result) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
-            const uint32_t seq = epoch->seq;
-            bool mismatch = epoch->gate_state != kGateValid ||
+            const uint32_t seq = device_load_u32(&epoch->seq);
+            bool mismatch =
+                device_load_u32(&epoch->gate_state) != kGateValid ||
                 uncached_load(&ring->ctrl.result_seq) != seq;
             if (!mismatch) {
                 for (uint32_t k = 0; k < kTopK; ++k) {
@@ -1622,8 +1700,8 @@ void submit_graph_layer(
         sizeof(bf16) * kHidden);
     submit_add_shared_expert_to_y(
         q, buf.y.data_as<bf16>(), buf.shared_out_buf.data_as<bf16>(),
-        buf.shared_gate_buf.data_as<bf16>());
-    Qwen4ExpGenerationTestAccess::FinalBridge(b);
+        buf.shared_gate_buf.data_as<bf16>(), epoch);
+    submit_gated_final_bridge(q, b, epoch);
     submit_capture_layer_tail(
         q, lane, b, top_k, intermediate);
 }
@@ -1717,7 +1795,8 @@ TwoLayerServiceResult service_two_layer_replay(
     CpuPacketRing* cpu_packet, int top_k,
     aila::Qwen4ExpExpertExecutor& executor,
     const aila::Qwen4ExpHostArena& arena,
-    aila::Qwen4ExpAdaptiveCache& adaptive) {
+    aila::Qwen4ExpAdaptiveCache& adaptive,
+    bool stale_first_handoff = false) {
     sycl::queue& q = ctx.queue();
     auto& ctrl = ring->ctrl;
     const uint32_t timeout_before = *volatile_u32(&ctrl.timeout_count);
@@ -1769,7 +1848,9 @@ TwoLayerServiceResult service_two_layer_replay(
             top_k, cpu_packet);
         out.cpu_rows[index] = service.cpu_rows;
         publish_cpu_packet(cpu_packet, seq);
-        write_host_result(ring, seq, seq);
+        write_host_result(ring,
+                          index == 0 && stale_first_handoff ? seq - 1u : seq,
+                          seq);
         const auto t_flag = Clock::now();
         out.route_to_flag_us[index] = us_between(t_route, t_flag);
     }
@@ -2122,8 +2203,6 @@ int run_two_layer_model(const Options& options) {
         *volatile_u32(&ring->ctrl.packet_shape_error_count) == 0 &&
         *volatile_u32(&ring->ctrl.gate_abort_count) == 0 &&
         *volatile_u32(&ring->ctrl.host_route_error_count) == 0;
-    const bool all_ok =
-        all_parity && head_sequence_ok && service_ok && ring_ok;
 
     std::cout << "[TWO LAYER GRAPH PARITY]"
               << " hidden_l4=" << (layer4_parity.hidden ? 1 : 0)
@@ -2186,12 +2265,53 @@ int run_two_layer_model(const Options& options) {
               << " graph_cpu_rows=" << graph_cpu_rows
               << " direct_cpu_rows=" << direct_cpu_rows
               << " heads=" << head_path.str() << '\n';
+
+    auto read_current_hidden = [&]() {
+        std::vector<uint8_t> bytes(sizeof(bf16) * kHidden4);
+        ctx.memcpy_d2h(
+            bytes.data(),
+            Qwen4ExpGenerationTestAccess::FrontHidden(b).data(),
+            bytes.size());
+        return bytes;
+    };
+    const auto hidden_before_abort = read_current_hidden();
+    const TwoLayerServiceResult abort_probe =
+        service_two_layer_replay(
+            ctx, executable, ring, expected_first_seq,
+            options.cpu_sweep.empty() ? 0 : options.cpu_sweep.front(),
+            options.host_timeout_ms, options.layers, cpu_packet, top_k,
+            executor, arena, adaptive, true);
+    const auto hidden_after_abort = read_current_hidden();
+    submit_gated_final_bridge(q, b, epoch);
+    ctx.synchronize();
+    const auto hidden_after_standalone_final =
+        read_current_hidden();
+    const bool standalone_final_gate_ok =
+        same_bytes(hidden_after_abort, hidden_after_standalone_final);
+    const bool abort_write_gate_ok =
+        abort_probe.gate_abort_delta >= 1 &&
+        abort_probe.mismatch_delta >= 1 &&
+        standalone_final_gate_ok;
+    std::cout << "[TWO LAYER ABORT GATE]"
+              << " gate_aborts=" << abort_probe.gate_abort_delta
+              << " mismatches=" << abort_probe.mismatch_delta
+              << " front_committed="
+              << (same_bytes(hidden_before_abort, hidden_after_abort) ? 0 : 1)
+              << " standalone_final_gate="
+              << (standalone_final_gate_ok ? 1 : 0)
+              << " session_poisoned=1\n";
+
+    const bool all_ok =
+        all_parity && head_sequence_ok && service_ok && ring_ok &&
+        abort_write_gate_ok;
     std::cout << "[TWO LAYER GRAPH] verdict all_ok="
               << (all_ok ? 1 : 0)
               << " bit_exact=" << (all_parity ? 1 : 0)
               << " head_sequence=" << (head_sequence_ok ? 1 : 0)
               << " service_ok=" << (service_ok ? 1 : 0)
-              << " ring_ok=" << (ring_ok ? 1 : 0) << '\n';
+              << " ring_ok=" << (ring_ok ? 1 : 0)
+              << " abort_write_gate=" << (abort_write_gate_ok ? 1 : 0)
+              << '\n';
 
     ctx.synchronize();
     ctx.free_device(device_result);

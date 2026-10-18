@@ -87,6 +87,7 @@ std::array<ops::GreedyResult, 2> Qwen4ExpMtpRuntime::Select(int rows) {
 void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
     length = s.currentLength_; noMiss = s.consecutive_no_miss_layers_;
     pleTokens = s.ple_state_.prev_tokens; pleHead = s.ple_state_.conv_head;
+    target.SynchronizeGdnDeviceHeadsToHost(ctx, s);
     size_t offset = 0;
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
         auto& c = s.layerCaches_[l]; convHeads[l] = c.linear_conv_head; blocks[l] = c.num_compressed_blocks;
@@ -107,6 +108,7 @@ void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
         if (c.linear_state.valid()) c.device_state_dirty = true;
     }
     ctx.queue().memcpy(s.ple_state_.conv_state.data(), checkpoint.data_as<uint8_t>() + offset, s.ple_state_.conv_state.size_bytes());
+    target.PublishGdnHostHeadsToDevice(ctx, s);
     s.ple_state_.prev_tokens = pleTokens; s.ple_state_.conv_head = pleHead;
     s.currentLength_ = length; s.consecutive_no_miss_layers_ = noMiss;
 }
@@ -146,6 +148,10 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
             ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, weights, stateView,
                 linearInputs.data_as<bf16>() + l * 4 * 16480, target.buf_.attn_out.data_as<bf16>(), 1, verifyOrder);
             c.linear_conv_head = stateView.conv_head; c.device_state_dirty = stateView.device_state_dirty;
+            if (c.linear_conv_head_dev != nullptr) {
+                c.linear_conv_head_device_authority = false;
+                c.linear_conv_head_device_synced = false;
+            }
         }
         ctx.queue().memcpy(s.ple_state_.conv_state.data_as<float>() + size_t(pleHead) * 10240, plePrefix.data(), 10240 * sizeof(float));
         s.ple_state_.conv_head = (pleHead + 1) % 9;

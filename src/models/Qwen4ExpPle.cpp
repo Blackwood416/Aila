@@ -659,12 +659,49 @@ PleTicket Qwen4ExpPle::prepare(
     const void* session_ptr,
     uint64_t generation,
     int start_pos) {
-    PleTicket ticket;
-    if (num_tokens <= 0) return ticket;
+    if (num_tokens <= 0) return PleTicket{};
     if (num_tokens > max_tokens_)
         throw std::invalid_argument("Qwen4ExpPle: prepare exceeds PLE capacity");
 
     int slot = (next_staging_slot_++) % kNumStagingSlots;
+    return prepare_slot(ctx, state, input_ids, num_tokens, session_ptr,
+                        generation, start_pos, slot);
+}
+
+PleTicket Qwen4ExpPle::prepare_fixed_slot(
+    Context& ctx,
+    const Qwen4ExpPleState& state,
+    const int* input_ids,
+    int num_tokens,
+    const void* session_ptr,
+    uint64_t generation,
+    int start_pos) {
+    if (num_tokens <= 0) return PleTicket{};
+    if (num_tokens > max_tokens_)
+        throw std::invalid_argument("Qwen4ExpPle: fixed prepare exceeds PLE capacity");
+    static constexpr int kGraphStagingSlot = 0;
+    return prepare_slot(ctx, state, input_ids, num_tokens, session_ptr,
+                        generation, start_pos, kGraphStagingSlot);
+}
+
+PleTicket Qwen4ExpPle::prepare_slot(
+    Context& ctx,
+    const Qwen4ExpPleState& state,
+    const int* input_ids,
+    int num_tokens,
+    const void* session_ptr,
+    uint64_t generation,
+    int start_pos,
+    int slot) {
+    PleTicket ticket;
+    if (num_tokens <= 0) return ticket;
+    if (num_tokens > max_tokens_)
+        throw std::invalid_argument("Qwen4ExpPle: prepare exceeds PLE capacity");
+    if (!input_ids)
+        throw std::invalid_argument("Qwen4ExpPle: prepare requires input_ids");
+    if (slot < 0 || slot >= kNumStagingSlots)
+        throw std::invalid_argument("Qwen4ExpPle: prepare slot is out of range");
+
     ticket.staging_slot = slot;
     ticket.session_ptr = session_ptr;
     ticket.generation = generation;
@@ -726,6 +763,25 @@ PleTicket Qwen4ExpPle::prepare(
     return ticket;
 }
 
+void Qwen4ExpPle::wait_prepared(Context& ctx, PleTicket& ticket) {
+    if (!ticket.valid) return;
+    if (!ctx_ || ctx_ != &ctx)
+        throw std::invalid_argument("Qwen4ExpPle: wait_prepared context mismatch");
+    const int slot = ticket.staging_slot;
+    if (slot < 0 || slot >= kNumStagingSlots)
+        throw std::invalid_argument("Qwen4ExpPle: ticket slot is out of range");
+
+    if (ticket.task_id > 0) {
+        if (slot_task_ids_[slot] != ticket.task_id)
+            throw std::logic_error("Qwen4ExpPle: ticket was replaced before wait_prepared");
+        wait_task(ticket.task_id);
+        ticket.h2d_event = slot_h2d_events_[slot];
+    }
+    if (ticket.h2d_event != sycl::event{}) {
+        ticket.h2d_event.wait_and_throw();
+    }
+}
+
 bool Qwen4ExpPle::MatchesInput(const PleTicket& ticket, const int* tokens, int count) const {
     const int slot = ticket.staging_slot;
     return ticket.valid && tokens && count > 0 && ticket.num_tokens == count &&
@@ -744,6 +800,10 @@ void Qwen4ExpPle::consume(
     int checkpoint_after,
     Qwen4ExpPleSnapshot* checkpoint) {
     if (!ticket.valid || ticket.num_tokens <= 0) return;
+    if (state.conv_head_dev.valid()) {
+        throw std::logic_error(
+            "Qwen4ExpPle: host consume cannot follow graph-managed PLE state");
+    }
     if (checkpoint_after < 0 || checkpoint_after >= ticket.num_tokens ||
         (checkpoint_after > 0 && !checkpoint)) {
         throw std::invalid_argument("Qwen4ExpPle: invalid interior checkpoint");
@@ -825,6 +885,91 @@ void Qwen4ExpPle::consume(
                                   residual);
 }
 
+Qwen4ExpPleGraphView Qwen4ExpPle::create_graph_view(
+    Context& ctx,
+    Qwen4ExpPleState& state,
+    const bf16* hidden_states,
+    bf16* out,
+    bf16* residual) {
+    if (!initialized_ || ctx_ != &ctx)
+        throw std::invalid_argument("Qwen4ExpPle: graph view requires an initialized context");
+    if (!hidden_states)
+        throw std::invalid_argument("Qwen4ExpPle: graph view requires hidden_states");
+    if (!state.conv_state.valid())
+        throw std::invalid_argument("Qwen4ExpPle: graph view requires initialized conv_state");
+    if (!key_proj_.supports_decode_graph() || !value_proj_.supports_decode_graph()) {
+        throw std::invalid_argument(
+            "Qwen4ExpPle: graph view requires packed NF4 decode without LoRA");
+    }
+
+    // Workspace growth and head initialization are host-side preparation and
+    // must complete before the returned addresses are captured.
+    ensure_compute_capacity(ctx, 1);
+    if (!state.conv_head_dev.valid()) {
+        if (state.conv_head < 0 || state.conv_head >= CONV_STATE_LEN)
+            throw std::invalid_argument("Qwen4ExpPle: conv_head is out of range");
+        state.conv_head_dev = Tensor::allocate(ctx, {1}, dnnl::memory::data_type::s32);
+        ctx.memcpy_h2d(state.conv_head_dev.data(), &state.conv_head, sizeof(int));
+    }
+    if (state.conv_head_dev.dtype() != dnnl::memory::data_type::s32 ||
+        state.conv_head_dev.numel() < 1) {
+        throw std::invalid_argument("Qwen4ExpPle: graph conv_head_dev must be s32");
+    }
+
+    Qwen4ExpPleGraphView view;
+    view.dev_embed = dev_embed_slots_[0].data_as<bf16>();
+    view.hidden_states = hidden_states;
+    view.out = out;
+    view.residual = residual;
+    view.key_buf = key_buf_.data_as<bf16>();
+    view.value_buf = value_buf_.data_as<bf16>();
+    view.key_normed = key_normed_.data_as<bf16>();
+    view.query_normed = query_normed_.data_as<bf16>();
+    view.gv_buf = gv_buf_.data_as<bf16>();
+    view.gv_normed = gv_normed_.data_as<bf16>();
+    view.conv_state = state.conv_state.data_as<float>();
+    view.conv_head_dev = state.conv_head_dev.data_as<int>();
+    view.norm_key_weight = norm_key_w_.data_as<float>();
+    view.norm_query_weight = norm_query_w_.data_as<float>();
+    view.norm_conv_weight = norm_conv_w_.data_as<float>();
+    view.conv_weight = conv1d_w_ptr_;
+    return view;
+}
+
+void Qwen4ExpPle::consume_graph(Context& ctx, const Qwen4ExpPleGraphView& view) {
+    if (!initialized_ || ctx_ != &ctx)
+        throw std::invalid_argument("Qwen4ExpPle: consume_graph context mismatch");
+    if (!view.dev_embed || !view.hidden_states || !view.key_buf || !view.value_buf ||
+        !view.key_normed || !view.query_normed || !view.gv_buf || !view.gv_normed ||
+        !view.conv_state || !view.conv_head_dev || !view.norm_key_weight ||
+        !view.norm_query_weight || !view.norm_conv_weight || !view.conv_weight) {
+        throw std::invalid_argument("Qwen4ExpPle: graph view has a null device pointer");
+    }
+
+    Tensor dev_embed = Tensor::view(
+        ctx, view.dev_embed, {1, EMBED_DIM}, dnnl::memory::data_type::bf16);
+    Tensor key_buf = Tensor::view(
+        ctx, view.key_buf, {1, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    Tensor value_buf = Tensor::view(
+        ctx, view.value_buf, {1, EMBED_DIM}, dnnl::memory::data_type::bf16);
+
+    key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf, 1);
+    value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf, 1);
+
+    ops::grouped_rms_norm(ctx, view.key_buf, view.norm_key_weight, eps_,
+                          view.key_normed, 1, HC_COUNT, EMBED_DIM, true);
+    ops::grouped_rms_norm(ctx, view.hidden_states, view.norm_query_weight, eps_,
+                          view.query_normed, 1, HC_COUNT, EMBED_DIM, true);
+    ops::ple_gate_value(ctx, view.key_normed, view.query_normed, view.value_buf,
+                        view.gv_buf, 1, HC_COUNT, EMBED_DIM);
+    ops::grouped_rms_norm(ctx, view.gv_buf, view.norm_conv_weight, eps_,
+                          view.gv_normed, 1, HC_COUNT, EMBED_DIM, true);
+    ops::ple_dilated_conv_silu_add_device_head(
+        ctx, view.gv_normed, view.gv_buf, view.conv_state, view.conv_head_dev,
+        view.conv_weight, view.out, 1, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE,
+        CONV_DILATION, view.residual);
+}
+
 void Qwen4ExpPle::commit(
     PleTicket& ticket,
     Qwen4ExpPleState& state) {
@@ -853,6 +998,9 @@ void Qwen4ExpPle::init_state(Context& ctx, Qwen4ExpPleState& state) const {
         state.conv_state = Tensor::allocate(ctx, {CONV_STATE_LEN, HC_HIDDEN_SIZE}, dnnl::memory::data_type::f32);
     }
     ctx.queue().memset(state.conv_state.data(), 0, state.conv_state.size_bytes()).wait_and_throw();
+    if (state.conv_head_dev.valid()) {
+        ctx.memcpy_h2d(state.conv_head_dev.data(), &state.conv_head, sizeof(int));
+    }
 }
 
 void Qwen4ExpPle::capture_snapshot(Context& ctx, const Qwen4ExpPleState& state, Qwen4ExpPleSnapshot& snapshot) const {
@@ -860,7 +1008,11 @@ void Qwen4ExpPle::capture_snapshot(Context& ctx, const Qwen4ExpPleState& state, 
         throw std::invalid_argument("Qwen4ExpPle: snapshot storage is not initialized");
     }
     snapshot.prev_tokens = state.prev_tokens;
-    snapshot.conv_head = state.conv_head;
+    if (state.conv_head_dev.valid()) {
+        ctx.memcpy_d2h(&snapshot.conv_head, state.conv_head_dev.data(), sizeof(int));
+    } else {
+        snapshot.conv_head = state.conv_head;
+    }
     if (state.conv_state.valid()) {
         ctx.memcpy_d2h(snapshot.conv_state.data(), state.conv_state.data(), snapshot.conv_state.size() * sizeof(float));
     } else {
@@ -878,5 +1030,8 @@ void Qwen4ExpPle::restore_snapshot(Context& ctx, Qwen4ExpPleState& state, const 
         ctx.memcpy_h2d(state.conv_state.data(), snapshot.conv_state.data(), snapshot.conv_state.size() * sizeof(float));
     } else {
         ctx.queue().memset(state.conv_state.data(), 0, state.conv_state.size_bytes()).wait_and_throw();
+    }
+    if (state.conv_head_dev.valid()) {
+        ctx.memcpy_h2d(state.conv_head_dev.data(), &state.conv_head, sizeof(int));
     }
 }

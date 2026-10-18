@@ -210,7 +210,7 @@ retained by the earlier forced mask receipt.
 use the real router, resident/CPU classification, `RunGraphColdPacket`, shared
 expert, routed merge and final hidden residual bridge.
 
-Receipt `gpu-two-layer-p3.log`:
+Receipt `gpu-two-layer-p3-final.log`:
 
 ```text
 tokens=4
@@ -221,8 +221,36 @@ selected=1 moe_h=1 resident_down=1 packet=1
 routed_merge=1 shared=1 y_shared=1
 timeouts=0 stale=0 gate_aborts=0
 verdict all_ok=1 bit_exact=1
+abort_gate: gate_aborts=1 mismatches=1
+            standalone_final_gate=1 session_poisoned=1
 ```
 
 Run with `AILA_Q4E_COLD_MODE=2` and
 `AILA_Q4E_CPU_MAX_EXPERTS=16`. This is a correctness gate, not a performance
-comparison.
+comparison. A failed handoff poisons the session; pre-handoff attention
+residual writes are not rolled back by the probe.
+
+## P4 replayable state foundation
+
+The merged runtime now has opt-in fixed-state primitives for a future
+whole-token graph:
+
+- `AILA_Q4E_GRAPH_GDN_STATE=1`: per-layer device GDN
+  `[head, previous_head, arrivals]`, with explicit snapshot/truncate/MTP
+  synchronization.
+- PLE fixed slot 0 prepare/wait plus a graph view whose consume path has no
+  host waits and advances a device 9-row conv head.
+- QSA device position and fixed one-workgroup 4-token block compression.
+
+Focused receipts:
+
+```text
+AilaQwen4ExpKernelTests --gdn-order-only
+AilaQwen4ExpKernelTests --ple-device-head-only
+AilaQwen4ExpKernelTests --qsa-graph-only
+AilaQwen4ExpModuleTests --gdn-graph-state-only
+AilaQwen4ExpModuleTests --ple-only
+```
+
+These cover state replay only. QSA block scoring, selector and attention still
+need fixed-grid graph variants before a full-token graph can be captured.

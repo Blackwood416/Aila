@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/Types.hpp"
+#include "utils/EnvUtils.hpp"
 
 #include <cstddef>
 #include <limits>
@@ -200,12 +201,18 @@ inline SessionMemoryReservation qwen4exp_session_memory(
         checked_memory_product(static_cast<size_t>(kPleConvStateLen),
                                static_cast<size_t>(kPleConvChannels)), sizeof(float));
 
-    const size_t deviceBytes = checked_memory_sum(
+    size_t deviceBytes = checked_memory_sum(
         checked_memory_sum(fullBytes, indexerBytes),
         checked_memory_sum(recurrentBytes, pleBytes));
-    const size_t hostBytes = checked_memory_sum(
+    size_t hostBytes = checked_memory_sum(
         checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots)),
         checked_memory_product(pleBytes, maxSnapshots));
+    if (aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false)) {
+        const size_t headBytes = checked_memory_product(
+            checked_memory_product(layers, size_t{3}), sizeof(int));
+        deviceBytes = checked_memory_sum(deviceBytes, headBytes);
+        hostBytes = checked_memory_sum(hostBytes, headBytes);
+    }
     return {deviceBytes, hostBytes};
 }
 
