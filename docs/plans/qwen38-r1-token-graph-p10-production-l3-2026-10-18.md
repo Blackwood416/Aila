@@ -73,6 +73,9 @@ token-graph-runtime-only    PASS  0.6 s
 token-graph-key-only        PASS  0.5 s
 ```
 
+The post-build runtime check passed again at `d9c49b2` in 0.7 s after the
+full 291-target runtime/Worker build.
+
 The review pass found and fixed:
 
 - production norms wrongly required F32 instead of their real BF16 layout;
@@ -83,6 +86,7 @@ The review pass found and fixed:
 Receipts:
 
 - `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-runtime-p10.log`
+- `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-runtime-p10-final.log`
 - `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-key-p10.log`
 
 ## 5. Limits

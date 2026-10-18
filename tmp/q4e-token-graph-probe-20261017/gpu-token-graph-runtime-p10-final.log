@@ -1,0 +1,5 @@
+[RUN] 2026-10-18T18:28:45.1486800+08:00 runtime-final free_gib=56.39
+[Test] Token graph backend lifecycle and direct-path abort...
+[PASS] Token graph backend lifecycle verified.
+AilaQwen4ExpModuleTests: TOKEN GRAPH RUNTIME PASSED
+[RUN] exit=0 wall_s=0.7
