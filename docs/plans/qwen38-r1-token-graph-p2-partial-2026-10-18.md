@@ -179,3 +179,10 @@ token graph and not yet an adoption result.
 Resident dispatch remains covered separately by the forced 5-resident /
 5-cold test and its packet merge receipt. The current real route happened to
 be all-cold for layer 0.
+
+The single-layer graph is not the adoption shape. Direct front median was
+538.1 us and the real CPU service was about 346 us; the complete graph replay
+was 920 us. A graph boundary per layer therefore provides no standalone win on
+this shape. The measured case supports the whole-token graph: its value is
+removing the approximately 984-kernel host submission loop across all 48
+layers, not wrapping each layer separately.
