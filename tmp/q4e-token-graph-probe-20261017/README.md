@@ -275,3 +275,39 @@ are bitwise equal to the direct path, and `abort=1` is a no-op.
 
 This is still a synthetic composite layer. It does not include real L3 model
 projections or the production graph lease.
+
+## P7 real-weight L3 QSA layer
+
+`probe_qsa_layer.cpp` loads the real L3 packed QKV, indexer and o-projection
+weights from `Qwen3.8-Flash-Next-BNB-NF4-v2`. It captures the full sparse-QSA
+attention sublayer in one executable and compares every intermediate against
+the direct path for `start_pos=2052..2055`.
+
+Build:
+
+```powershell
+pwsh -NoProfile -File tmp/q4e-token-graph-probe-20261017/build_qsa_layer.ps1
+```
+
+Run only under the global GPU mutex, after `wsl.exe --shutdown`, with at least
+54 GiB free:
+
+```powershell
+tmp/q4e-token-graph-probe-20261017/probe_qsa_layer.exe `
+  --model C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2 `
+  --capacity 2060
+```
+
+Receipt `gpu-qsa-real-l3.log`:
+
+```text
+real=1 layer=3 qkv=2560x13312 index_qk=2560x640 graph_ready=1
+pos=2052..2055 visible=2053..2056 blocks=513..514
+active=512 bitwise=1 tiles=17,17,17,16
+[QSA L3 RESULT] bit_exact=1
+```
+
+The initial hidden/cache data is deterministic seeded data rather than a real
+2052-token prefill checkpoint. This proves the real-weight sublayer and graph
+topology, not whole-token integration. See
+`docs/plans/qwen38-r1-token-graph-p7-real-l3-2026-10-18.md`.
