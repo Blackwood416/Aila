@@ -41,6 +41,9 @@ blocks=8192 tail=2 selected=512 legacy=exact radix=exact
 legacy_us=2244.3 radix_us=233.8 speedup=9.59923 exact=1
 ```
 
+After the full 291-target rebuild at `383c142`, the post-build smoke repeated
+the exactness and measured `2225.5 us -> 234.7 us` (`9.48x`).
+
 ### Graph lifecycle hardening
 
 - `TokenGraphRuntime::event_status()` adds non-throwing
@@ -115,3 +118,4 @@ replace `TokenGraphRuntime` with XeStrata's raw graph pointer or pair key.
 - `tmp/q4e-token-graph-probe-20261017/gpu-token-graph-runtime-xestrata.log`
 - `tmp/q4e-token-graph-probe-20261017/gpu-qsa-real-l3-xestrata.log`
 - `tmp/q4e-token-graph-probe-20261017/gpu-xestrata-transfer-suite.log`
+- `tmp/q4e-token-graph-probe-20261017/gpu-p11-postbuild-smoke.log`
