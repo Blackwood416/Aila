@@ -245,8 +245,29 @@ constexpr int kResultWidth = 8;
 constexpr int kResultCount = kTopK * kResultWidth;
 constexpr int kHidden = 2560;
 constexpr int kMaxPacketRows = 16;
+constexpr int kPacketVectorElements = 4;
+constexpr size_t kPacketValueCount =
+    static_cast<size_t>(kMaxPacketRows) * kHidden;
+constexpr size_t kPacketRowVectors =
+    kHidden / kPacketVectorElements;
+constexpr size_t kPacketRankBytes = sizeof(int) * kMaxPacketRows;
+constexpr uint32_t kPacketTailSentinel = 0xCDCDCDCDu;
 constexpr uint32_t kDefaultSpinMax = 20000;
 constexpr uint32_t kPollFlushEvery = 1024;
+static_assert(kHidden % kPacketVectorElements == 0);
+
+enum class PacketCopyMode {
+    Scalar,
+    WgStride,
+};
+
+inline const char* packet_copy_mode_name(PacketCopyMode mode) {
+    switch (mode) {
+    case PacketCopyMode::Scalar: return "scalar";
+    case PacketCopyMode::WgStride: return "wg_stride";
+    }
+    return "unknown";
+}
 
 // Consumed by packet copy and merge; only kGateValid permits data movement.
 enum : uint32_t {
@@ -271,6 +292,8 @@ using UncachedWrite = decltype(oex::properties(
         iex::cache_mode::uncached,
         oex::cache_level::L1,
         oex::cache_level::L3>>));
+using Vec4U32 = sycl::vec<uint32_t, kPacketVectorElements>;
+static_assert(sizeof(Vec4U32) == 16);
 
 template <class T>
 inline T uncached_load(const T* p) {
@@ -333,7 +356,10 @@ struct alignas(64) DeviceEpoch {
     // First fail-closed reason in a multi-handoff replay. The first route
     // publication clears it; later handoffs never turn a failed epoch valid.
     uint32_t sticky_abort;
-    uint32_t reserved[13];
+    // Published by the device wait after packet validation. The wg_stride
+    // copy uses this instead of rereading packet->rows from host memory.
+    uint32_t packet_rows;
+    uint32_t reserved[12];
 };
 
 static_assert(sizeof(ControlRing) == 64);
@@ -546,7 +572,7 @@ void submit_resident_classify(Context& ctx, const int* ids,
 
 void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                         CpuPacketRing* packet, int top_k,
-                        uint32_t spin_max) {
+                        uint32_t spin_max, bool store_packet_rows = false) {
     q.submit([&](sycl::handler& h) {
         h.single_task([=]() {
             const uint32_t seq = device_load_u32(&epoch->seq);
@@ -697,6 +723,8 @@ void submit_device_wait(sycl::queue& q, HostRing* ring, DeviceEpoch* epoch,
                         &epoch->gate_state, kGatePacketShape);
                     return;
                 }
+                if (store_packet_rows)
+                    device_store_u32(&epoch->packet_rows, rows);
             }
 
             sycl::atomic_fence(sycl::memory_order::release,
@@ -718,8 +746,9 @@ void submit_copy_from_mapped(sycl::queue& q, HostRing* ring,
     });
 }
 
-void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
-                            DeviceEpoch* epoch, int* packet_dev, int top_k) {
+void submit_copy_cpu_packet_scalar(sycl::queue& q, CpuPacketRing* packet,
+                                   DeviceEpoch* epoch, int* packet_dev,
+                                   int top_k) {
     q.parallel_for(
         sycl::range<1>(kMaxPacketRows +
                        size_t(kMaxPacketRows) * kHidden),
@@ -739,6 +768,69 @@ void submit_copy_cpu_packet(sycl::queue& q, CpuPacketRing* packet,
                     uncached_load(&packet->values[i - kMaxPacketRows]);
             }
         });
+}
+
+// One work-group owns one destination row. The rank map remains scalar; only
+// the active payload rows are read from uncached host memory. The inactive
+// rows are restored to a device-side sentinel without touching host payload.
+void submit_copy_cpu_packet_wg_stride(
+    sycl::queue& q, CpuPacketRing* packet, DeviceEpoch* epoch,
+    int* packet_dev, int top_k, size_t packet_wg) {
+    q.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(size_t(kMaxPacketRows) * packet_wg),
+            sycl::range<1>(packet_wg)),
+        [=](sycl::nd_item<1> item) {
+            const size_t global = item.get_global_id(0);
+            const bool valid = epoch_gate_valid(epoch);
+            if (global < kMaxPacketRows) {
+                packet_dev[global] =
+                    valid && static_cast<int>(global) < top_k
+                    ? uncached_load(&packet->rank_to_row[global])
+                    : -1;
+            }
+            if (!valid) return;
+
+            const size_t group = item.get_group(0);
+            const size_t local = item.get_local_id(0);
+            const auto* src =
+                reinterpret_cast<const Vec4U32*>(packet->values);
+            auto* dst =
+                reinterpret_cast<Vec4U32*>(packet_dev + kMaxPacketRows);
+            const size_t row_base = group * kPacketRowVectors;
+            const uint32_t active_rows =
+                device_load_u32(&epoch->packet_rows);
+            if (group < active_rows) {
+                for (size_t vec = local; vec < kPacketRowVectors;
+                     vec += packet_wg) {
+                    dst[row_base + vec] =
+                        uncached_load(src + row_base + vec);
+                }
+            } else {
+                Vec4U32 sentinel;
+#pragma unroll
+                for (int lane = 0; lane < kPacketVectorElements; ++lane)
+                    sentinel[lane] = kPacketTailSentinel;
+                for (size_t vec = local; vec < kPacketRowVectors;
+                     vec += packet_wg) {
+                    dst[row_base + vec] = sentinel;
+                }
+            }
+        });
+}
+
+void submit_copy_cpu_packet(
+    sycl::queue& q, CpuPacketRing* packet, DeviceEpoch* epoch,
+    int* packet_dev, int top_k,
+    PacketCopyMode mode = PacketCopyMode::Scalar,
+    size_t packet_wg = 256) {
+    if (mode == PacketCopyMode::WgStride) {
+        submit_copy_cpu_packet_wg_stride(
+            q, packet, epoch, packet_dev, top_k, packet_wg);
+    } else {
+        submit_copy_cpu_packet_scalar(
+            q, packet, epoch, packet_dev, top_k);
+    }
 }
 
 void submit_gated_ordered_merge(sycl::queue& q, const float* down_acc,
@@ -1217,6 +1309,13 @@ std::array<int, 2> parse_layer_pair(const std::string& text) {
     return out;
 }
 
+PacketCopyMode parse_packet_copy_mode(const std::string& text) {
+    if (text == "scalar") return PacketCopyMode::Scalar;
+    if (text == "wg_stride") return PacketCopyMode::WgStride;
+    throw std::runtime_error(
+        "--packet-copy-mode must be scalar or wg_stride");
+}
+
 struct Options {
     uint32_t replays = 1000;
     int warmup = 10;
@@ -1226,6 +1325,8 @@ struct Options {
     std::string real_front_model;
     bool two_layer = false;
     std::array<int, 2> layers{4, 5};
+    PacketCopyMode packet_copy_mode = PacketCopyMode::Scalar;
+    size_t packet_wg = 256;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -1255,12 +1356,20 @@ Options parse_options(int argc, char** argv) {
             o.two_layer = true;
         } else if (arg == "--layers") {
             o.layers = parse_layer_pair(next("--layers"));
+        } else if (arg == "--packet-copy-mode") {
+            o.packet_copy_mode =
+                parse_packet_copy_mode(next("--packet-copy-mode"));
+        } else if (arg == "--packet-wg") {
+            o.packet_wg = static_cast<size_t>(
+                std::stoul(next("--packet-wg")));
         } else if (arg == "--help" || arg == "-h") {
             std::cout
                 << "usage: probe_token_graph.exe [--replays N] [--warmup N]\n"
                    "       [--cpu-us 0,50,200,500] [--spin-max N]\n"
                    "       [--host-timeout-ms N] [--real-front-model DIR]\n"
-                   "       [--two-layer] [--layers 4,5]\n";
+                   "       [--two-layer] [--layers 4,5]\n"
+                   "       [--packet-copy-mode scalar|wg_stride]\n"
+                   "       [--packet-wg N] (wg_stride only, default 256)\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown argument: " + arg);
@@ -1279,6 +1388,12 @@ Options parse_options(int argc, char** argv) {
     if (!o.spin_max) throw std::runtime_error("--spin-max must be > 0");
     if (o.host_timeout_ms <= 0)
         throw std::runtime_error("--host-timeout-ms must be > 0");
+    if (o.packet_wg < 32 || o.packet_wg > 1024)
+        throw std::runtime_error("--packet-wg must be in [32, 1024]");
+    if (!o.two_layer &&
+        o.packet_copy_mode != PacketCopyMode::Scalar)
+        throw std::runtime_error(
+            "--packet-copy-mode wg_stride requires --two-layer");
     return o;
 }
 
@@ -1515,10 +1630,127 @@ struct LayerParity {
     bool cpu_rows = true;
 };
 
+bool packet_snapshots_match_wg_stride(
+    const HostLayerSnapshot& direct,
+    const HostLayerSnapshot& graph, std::string& detail) {
+    if (direct.cpu_rows != graph.cpu_rows) {
+        detail = "region=active_rows direct_rows=" +
+            std::to_string(direct.cpu_rows) +
+            " graph_rows=" + std::to_string(graph.cpu_rows);
+        return false;
+    }
+    if (direct.cpu_rows < 0 || direct.cpu_rows > kMaxPacketRows) {
+        detail = "region=active_rows invalid_rows=" +
+            std::to_string(direct.cpu_rows);
+        return false;
+    }
+
+    const size_t active_values =
+        static_cast<size_t>(direct.cpu_rows) * kHidden;
+    const size_t active_bytes = active_values * sizeof(float);
+    const size_t required_bytes = kPacketRankBytes + active_bytes;
+    const size_t full_packet_bytes =
+        kPacketRankBytes + kPacketValueCount * sizeof(float);
+    if (direct.packet.size() < required_bytes ||
+        graph.packet.size() < full_packet_bytes ||
+        direct.packet.size() < full_packet_bytes) {
+        detail = "region=buffer_size direct_bytes=" +
+            std::to_string(direct.packet.size()) +
+            " graph_bytes=" + std::to_string(graph.packet.size()) +
+            " active_required_bytes=" +
+            std::to_string(required_bytes) +
+            " full_required_bytes=" +
+            std::to_string(full_packet_bytes);
+        return false;
+    }
+
+    for (size_t rank = 0; rank < kMaxPacketRows; ++rank) {
+        int32_t direct_rank = 0;
+        int32_t graph_rank = 0;
+        std::memcpy(
+            &direct_rank, direct.packet.data() +
+                rank * sizeof(int32_t), sizeof(direct_rank));
+        std::memcpy(
+            &graph_rank, graph.packet.data() +
+                rank * sizeof(int32_t), sizeof(graph_rank));
+        if (direct_rank != graph_rank) {
+            detail = "region=rank_map rank=" +
+                std::to_string(rank) +
+                " byte_offset=" +
+                std::to_string(rank * sizeof(int32_t)) +
+                " direct=" + std::to_string(direct_rank) +
+                " graph=" + std::to_string(graph_rank);
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < active_values; ++i) {
+        uint32_t direct_bits = 0;
+        uint32_t graph_bits = 0;
+        const size_t value_offset = kPacketRankBytes + i * sizeof(float);
+        std::memcpy(
+            &direct_bits, direct.packet.data() + value_offset,
+            sizeof(direct_bits));
+        std::memcpy(
+            &graph_bits, graph.packet.data() + value_offset,
+            sizeof(graph_bits));
+        if (direct_bits != graph_bits) {
+            const size_t row = i / kHidden;
+            const size_t column = i % kHidden;
+            std::ostringstream msg;
+            msg << "region=active_row row=" << row
+                << " column=" << column
+                << " byte_offset=" << value_offset
+                << " direct_bits=0x" << std::hex
+                << std::setw(8) << std::setfill('0') << direct_bits
+                << " graph_bits=0x" << std::setw(8)
+                << std::setfill('0') << graph_bits;
+            detail = msg.str();
+            return false;
+        }
+    }
+
+    // Inactive rows are not copied from host memory. They must instead retain
+    // the device sentinel; this catches any out-of-bounds payload write.
+    for (size_t i = active_values; i < kPacketValueCount; ++i) {
+        uint32_t graph_bits = 0;
+        const size_t value_offset = kPacketRankBytes + i * sizeof(float);
+        std::memcpy(
+            &graph_bits, graph.packet.data() + value_offset,
+            sizeof(graph_bits));
+        if (graph_bits != kPacketTailSentinel) {
+            const size_t row = i / kHidden;
+            const size_t column = i % kHidden;
+            std::ostringstream msg;
+            msg << "region=inactive_tail row=" << row
+                << " column=" << column
+                << " byte_offset=" << value_offset
+                << " expected_sentinel=0x" << std::hex
+                << std::setw(8) << std::setfill('0')
+                << kPacketTailSentinel << " graph_bits=0x"
+                << std::setw(8) << std::setfill('0') << graph_bits;
+            detail = msg.str();
+            return false;
+        }
+    }
+
+    std::ostringstream msg;
+    msg << "rank_map=exact active_rows=" << direct.cpu_rows
+        << " active_values=" << active_values
+        << " active_bytes=" << active_bytes
+        << " inactive_bytes="
+        << (kPacketValueCount - active_values) * sizeof(float)
+        << " tail_sentinel=exact";
+    detail = msg.str();
+    return true;
+}
+
 void compare_layer_snapshots(int token, int layer,
                              const HostLayerSnapshot& direct,
                              const HostLayerSnapshot& graph,
-                             LayerParity& parity) {
+                             LayerParity& parity,
+                             PacketCopyMode packet_copy_mode =
+                                 PacketCopyMode::Scalar) {
     compare_field(parity.hidden, "hidden4", token, layer,
                   direct.hidden, graph.hidden);
     compare_field(parity.state, "linear_state", token, layer,
@@ -1537,8 +1769,23 @@ void compare_layer_snapshots(int token, int layer,
                   direct.moe_h, graph.moe_h);
     compare_field(parity.resident_down, "resident_down", token, layer,
                   direct.resident_down, graph.resident_down);
-    compare_field(parity.packet, "cpu_packet", token, layer,
-                  direct.packet, graph.packet);
+    if (packet_copy_mode == PacketCopyMode::Scalar) {
+        compare_field(parity.packet, "cpu_packet", token, layer,
+                      direct.packet, graph.packet);
+    } else {
+        std::string packet_detail;
+        if (!packet_snapshots_match_wg_stride(
+                direct, graph, packet_detail)) {
+            parity.packet = false;
+            std::cerr << "[TWO LAYER PARITY FAIL] token=" << token
+                      << " layer=" << layer << " field=cpu_packet "
+                      << packet_detail << '\n';
+        } else {
+            std::cout << "[TWO LAYER PACKET PARITY] token=" << token
+                      << " layer=" << layer << ' ' << packet_detail
+                      << '\n';
+        }
+    }
     compare_field(parity.routed_y, "routed_merge", token, layer,
                   direct.routed_y, graph.routed_y);
     compare_field(parity.shared, "shared_gate", token, layer,
@@ -1662,7 +1909,8 @@ void submit_graph_layer(
     HostRing* ring, DeviceEpoch* epoch, CpuPacketRing* cpu_packet,
     const ops::MoeExpertSlotDev* resident_descriptors,
     const int* layer_slot_table, int top_k, int intermediate,
-    int experts, uint32_t spin_max, bool clear_abort) {
+    int experts, uint32_t spin_max, bool clear_abort,
+    PacketCopyMode packet_copy_mode, size_t packet_wg) {
     sycl::queue& q = ctx.queue();
     auto& buf = Qwen4ExpGenerationTestAccess::Buffers(b);
     auto state = layer_state(lane, 2);
@@ -1687,9 +1935,11 @@ void submit_graph_layer(
         Qwen4ExpGenerationTestAccess::ResidentDown(b).data_as<float>());
     Qwen4ExpGenerationTestAccess::SharedExpert(b, lane.layer);
     submit_device_wait(
-        q, ring, epoch, cpu_packet, top_k, spin_max);
+        q, ring, epoch, cpu_packet, top_k, spin_max,
+        packet_copy_mode == PacketCopyMode::WgStride);
     submit_copy_cpu_packet(
-        q, cpu_packet, epoch, lane.packet.data_as<int>(), top_k);
+        q, cpu_packet, epoch, lane.packet.data_as<int>(), top_k,
+        packet_copy_mode, packet_wg);
     submit_gated_ordered_merge(
         q, Qwen4ExpGenerationTestAccess::ResidentDown(b)
                .data_as<float>(),
@@ -2028,6 +2278,11 @@ int run_two_layer_model(const Options& options) {
                       ? "zeMemAllocHost_uncached_bias"
                       : "malloc_host_fallback")
               << '\n';
+    if (options.packet_copy_mode == PacketCopyMode::WgStride) {
+        std::cout << "[TWO LAYER PACKET COPY] mode="
+                  << packet_copy_mode_name(options.packet_copy_mode)
+                  << " wg=" << options.packet_wg << '\n';
+    }
 
     // Warm BNB4 decode scratch and the CPU worker outside capture.
     for (int index = 0; index < 2; ++index) {
@@ -2076,7 +2331,8 @@ int run_two_layer_model(const Options& options) {
                     adaptive.DeviceSlotTable() +
                         graph_lanes[index].layer * experts,
                     top_k, intermediate, experts, options.spin_max,
-                    index == 0);
+                    index == 0, options.packet_copy_mode,
+                    options.packet_wg);
             }
             submit_copy_from_mapped(
                 q, ring, epoch, device_result);
@@ -2131,11 +2387,11 @@ int run_two_layer_model(const Options& options) {
         compare_layer_snapshots(
             static_cast<int>(token), options.layers[0],
             direct_snapshots[token][0], graph_snapshots[token][0],
-            layer4_parity);
+            layer4_parity, options.packet_copy_mode);
         compare_layer_snapshots(
             static_cast<int>(token), options.layers[1],
             direct_snapshots[token][1], graph_snapshots[token][1],
-            layer5_parity);
+            layer5_parity, options.packet_copy_mode);
 
         int actual_head = -1;
         for (int index = 0; index < 2; ++index) {

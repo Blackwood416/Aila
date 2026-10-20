@@ -1,4 +1,4 @@
-# Runs the P0 device-doorbell probe under Aila's production Level Zero knobs.
+# Runs the P0/P3 device-doorbell probe under Aila's production Level Zero knobs.
 # This is opt-in and is not invoked by the build script.
 param(
     [uint32]$Replays = 1000,
@@ -7,6 +7,11 @@ param(
     [int]$HostTimeoutMs = 2000,
     [int]$Warmup = 10,
     [string]$Model = '',
+    [switch]$TwoLayer,
+    [ValidateSet('scalar', 'wg_stride')]
+    [string]$PacketCopyMode = 'scalar',
+    [ValidateRange(32, 1024)]
+    [int]$PacketWg = 256,
     [string]$Log = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -57,6 +62,16 @@ $argsList = @(
 )
 if ($Model) {
     $argsList += @('--real-front-model', $Model)
+}
+if ($TwoLayer) {
+    $argsList += '--two-layer'
+}
+if ($PacketCopyMode -ne 'scalar' -and -not $TwoLayer) {
+    throw "-PacketCopyMode wg_stride requires -TwoLayer"
+}
+if ($PacketCopyMode -ne 'scalar') {
+    $argsList += @('--packet-copy-mode', $PacketCopyMode,
+                   '--packet-wg', "$PacketWg")
 }
 $envLine = ($prod.Keys | Sort-Object | ForEach-Object {
     "$_=" + [Environment]::GetEnvironmentVariable($_, 'Process')

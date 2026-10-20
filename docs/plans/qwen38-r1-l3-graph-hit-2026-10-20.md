@@ -1,13 +1,15 @@
 # Qwen4Exp L3 graph hit and host visibility receipts (2026-10-20)
 
-Scope: A770 production Qwen4Exp path and token-graph probes. This note only
-consolidates existing logs and receipts; it changes no source and runs no GPU.
+Scope: A770 production Qwen4Exp path and token-graph probes. This note
+consolidates the corresponding source, GPU, and A/A receipts.
 
 ## 0. Verdict
 
 - The production Session now reaches the L3 QSA graph: the 2082-token run logged
   `eligible=1`, a `nodes=10` capture, and replay `gate=1`.
 - The runner receipt records `output_exact=true`.
+- P3 two-layer active-row `wg_stride` is bitwise and cuts replay from
+  46.57-49.03 ms to 25.65-27.55 ms, a 1.77-1.83x improvement.
 - The cached-pinned host-ring design is NO-GO for graph handoff: device-to-host
   payload visibility failed on the first round.
 - The production 2052..2055 probe did hit and replay the graph, but its
@@ -120,6 +122,27 @@ bytes at ten rows and `30720` bytes at three rows. All three
 `wg_stride_vec4` runs beat the scalar and linear/grid-stride alternatives under
 the same logged configuration.
 
+### 3.1 P3 whole-token integration
+
+The opt-in P3 packet copy now uses one work-group per active row with a
+`uint4`/vec4 stride loop. Rank maps remain scalar and all 16 slots are exact.
+Inactive tail bytes are rejected unless they retain the sentinel.
+
+| token | scalar replay | wg_stride replay | speedup | active bytes (L4/L5) |
+|---:|---:|---:|---:|---|
+| 0 | 49028.4 us | 27554.7 us | 1.779x | 92160 / 102400 |
+| 1 | 47035.7 us | 25682.7 us | 1.831x | 71680 / 102400 |
+| 2 | 46569.9 us | 26259.0 us | 1.773x | 71680 / 92160 |
+| 3 | 46716.3 us | 25654.3 us | 1.821x | 71680 / 92160 |
+
+Both arms report `all_ok=1 bit_exact=1`; the wg arm also reports
+`packet=1`, zero service errors, and exact active-row plus tail-sentinel parity.
+Receipts:
+
+- `tmp/q4e-token-graph-probe-20261017/p3-packet-ab-fixed-20261020/gpu-p3-packet-scalar.log`
+- `tmp/q4e-token-graph-probe-20261017/p3-packet-ab-fixed-20261020/gpu-p3-packet-wg-stride.log`
+- `tmp/q4e-token-graph-probe-20261017/p3-packet-ab-fixed-20261020/receipt.json`
+
 ## 4. Host-ring visibility NO-GO
 
 Sources: [`host-ring.log`](../../tmp/q4e-token-graph-probe-20261017/visibility-20261020/host-ring.log)
@@ -200,9 +223,9 @@ Receipts:
 1. Build a same-process (or frozen deterministic) L3 boundary oracle. Do not
    repeat cross-process cache-row bitwise runs under the asynchronous
    production environment.
-2. Integrate the validated `wg_stride_vec4` active-row packet copy as an opt-in
-   experiment; keep the small control block separate from the bulk payload and
-   preserve the scalar rank map.
+2. Promote the validated `wg_stride_vec4` active-row packet copy for the P3
+   whole-token experiment; keep the scalar rank map and uncached reusable
+   payload.
 3. Keep the reusable bulk payload uncached. Integrate the validated
    `wg_stride_vec4` active-row copy into the P3 packet path and test the full
    1000/1000 ring again; do not retry cached-pinned slot reuse without a new
