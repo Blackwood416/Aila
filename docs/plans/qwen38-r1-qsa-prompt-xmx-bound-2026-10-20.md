@@ -1,11 +1,12 @@
 # Qwen4Exp QSA prompt attention: 12+4-row XMX bound (2026-10-20)
 
 Scope: A770, production Qwen4Exp BF16 KV, sparse QSA prompt path. This note
-uses existing receipts and source only; it runs no GPU and changes no source.
+started from existing receipts and source, then closed with one standalone A/B
+probe.
 
 ## 0. Verdict
-**Conditional GO for one bounded kernel probe; NO-GO for productization until
-that probe clears the numeric and speed gates below.**
+**NO-GO. The bounded probe measured the 12+4 XMX prototype as 7.1x slower at
+2052 and 8.0x slower at 4096, and it also failed the first numeric bound.**
 
 The candidate has a real structural distinction from Aila's current prompt
 kernel: 12 query heads plus 4 zero rows can cover one KV head in one
@@ -19,10 +20,18 @@ to 13.4 vs 5.5 ms, still about 2x slower, and remained gather-bound with only
 [`INTEL.md:362`](../../tmp/Strata/docs/INTEL.md#L362)). The K8V4 form was 0.84x
 ([`qsa_prompt_attn.cpp:1113`](../../tmp/XeStrata/src/kernels/xe/qsa_prompt_attn.cpp#L1113)).
 
-Those receipts do not close the Aila candidate because Strata's fallback already
-shares one K/V stream across 12 heads, whereas Aila's 4-head/WG fallback performs
-three streams per KV head. The only justified next step is to measure whether a
-one-stream 12+4 XMX kernel beats Aila's three-stream FP32 baseline.
+The implementation was measured once with production-shaped 64-row tiles:
+
+```text
+case=2052 A=8.434167 ms B=59.719792 ms speedup=0.141229
+  numeric bound1=0 exact=99.771881% one_ulp=99.982198%
+case=4096 A=6.961250 ms B=55.576563 ms speedup=0.125255
+  numeric bound1=0 exact=99.777985% one_ulp=99.980418%
+summary numeric_gate=fail speed_gate_40pct_both=fail probe_go=no
+```
+
+The one-stream geometry did not overcome gather/tile overhead on A770. This
+candidate is closed; do not integrate it into the production dispatcher.
 
 ## 1. Current shape and evidence
 Existing model/kernel facts ([`qwen38-r1-kernel-2026-10-14.md:4`](qwen38-r1-kernel-2026-10-14.md#L4)):
@@ -175,6 +184,6 @@ invalid for sparse QSA.
 - Rationale: `5% end-to-end / 14.3% stage share ~= 35%`; 40% leaves margin for
   the unmeasured non-attention part of the full-attention stage.
 
-A probe GO is kernel-level only. Production default still requires model quality
-and the existing end-to-end `+5%` gate. Given the strong Intel negative prior,
-do not build broader infrastructure before this single measurement wins.
+The measured probe hit the hard NO-GO branch. Receipt:
+`tmp/q4e-qsa-prompt-xmx-20261020/probe-fixed.log`. No production integration
+or further kernel work is justified.
