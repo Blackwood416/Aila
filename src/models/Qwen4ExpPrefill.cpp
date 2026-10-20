@@ -30,6 +30,12 @@ bool qsa_layer_graph_enabled() {
     return enabled;
 }
 
+bool qsa_layer_graph_trace_enabled() {
+    static const bool enabled =
+        aila::env::read_flag("AILA_Q4E_QSA_LAYER_GRAPH_TRACE", false);
+    return enabled;
+}
+
 bool same_token_graph_key(const aila::TokenGraphKey& left,
                           const aila::TokenGraphKey& right) {
     return left.backend == right.backend &&
@@ -207,7 +213,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         }
     } else {
         if (count == 1) {
-            if (qsa_layer_graph_enabled() &&
+            if (L == kQsaGraphLayer && qsa_layer_graph_enabled() &&
                 ForwardQsaLayerGraph(ctx, session, input, output, start_pos)) {
                 return;
             }
@@ -635,17 +641,28 @@ bool Qwen4ExpBnb4Backend::QsaLayerBlockStateEligible(
 bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
     Context& ctx, const Session& session, const Tensor& input,
     const Tensor& output, int count, int start_pos, bool allowQ8) const {
+    const bool trace = qsa_layer_graph_trace_enabled();
+    const auto reject = [&](const char* reason) {
+        if (trace) {
+            AILA_LOG_INFO(
+                "[Q4E QsaGraph] reject=%s start_pos=%d current=%d "
+                "count=%d q8=%d",
+                reason, start_pos, session.CurrentLength(), count,
+                allowQ8 ? 1 : 0);
+        }
+        return false;
+    };
     const auto device = ctx.queue().get_device();
     if (!device.has(sycl::aspect::ext_oneapi_limited_graph) &&
         !device.has(sycl::aspect::ext_oneapi_graph)) {
-        return false;
+        return reject("device_graph");
     }
     if (count != 1 || start_pos != session.CurrentLength() ||
         start_pos < 0 || allowQ8 || verify_rows_alignment_ ||
         gpuNf4Q8ReferenceForTest_ || decodeHcReferenceForTest_ ||
         layers_.size() <= kQsaGraphLayer ||
         layers_[kQsaGraphLayer].is_linear) {
-        return false;
+        return reject("base");
     }
     if (session.mropePosT_.valid() || session.mropePosH_.valid() ||
         session.mropePosW_.valid() || session.mropePromptLength_ != 0 ||
@@ -653,11 +670,12 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         !session.embeddingOverridePositions_.empty() ||
         !session.embeddingOverrideValues_.empty() ||
         session.embeddingOverrideHiddenSize_ != 0) {
-        return false;
+        return reject("mrope");
     }
     if (hidden_size_ != 2560 || full_q_heads_ != 24 ||
         full_kv_heads_ != 2 || full_head_dim_ != kQsaGraphHeadDim ||
-        full_q_proj_dim_ != 24 * kQsaGraphHeadDim ||
+        full_q_dim_ != 24 * kQsaGraphHeadDim ||
+        full_q_proj_dim_ != 2 * 24 * kQsaGraphHeadDim ||
         full_kv_dim_ != 2 * kQsaGraphHeadDim ||
         full_fused_qkv_dim_ != 13312 ||
         cfg_.indexer_n_heads != kQsaGraphIndexerQHeads ||
@@ -665,7 +683,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         cfg_.indexer_head_dim != kQsaGraphIndexerHeadDim ||
         (cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4) !=
             kQsaGraphCompressRatio) {
-        return false;
+        return reject("geometry");
     }
     static const bool compressed_k_enabled =
         aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
@@ -675,12 +693,12 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
     if (!compressed_k_enabled || !block_native_enabled ||
         !dense_gemv_enabled || attentionNf4Q8Enabled_) {
-        return false;
+        return reject("features");
     }
     const int block_topk =
         (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) /
         kQsaGraphCompressRatio;
-    if (block_topk != kQsaGraphBlockTopK) return false;
+    if (block_topk != kQsaGraphBlockTopK) return reject("block_topk");
 
     const auto& layer = layers_[kQsaGraphLayer];
     const auto& cache = session.layerCaches_[kQsaGraphLayer];
@@ -708,7 +726,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         layer.index_k_norm_weight->dtype() != dnnl::memory::data_type::bf16 ||
         layer.index_k_norm_weight->ndim() != 1 ||
         layer.index_k_norm_weight->shape(0) != kQsaGraphIndexerHeadDim) {
-        return false;
+        return reject("layer_weights");
     }
     if (!cache.k.valid() || !cache.v.valid() ||
         cache.k.dtype() != dnnl::memory::data_type::bf16 ||
@@ -730,7 +748,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         cache.indexer_compressed_k.dtype() != dnnl::memory::data_type::bf16 ||
         cache.indexer_compressed_k.ndim() != 2 ||
         cache.indexer_compressed_k.shape(1) != kQsaGraphIndexerHeadDim) {
-        return false;
+        return reject("cache_layout");
     }
 
     const int visible_len = start_pos + 1;
@@ -741,7 +759,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         complete_blocks > max_blocks || visible_len > session.Capacity() ||
         !QsaLayerBlockStateEligible(
             cache.num_compressed_blocks, complete_blocks)) {
-        return false;
+        return reject("block_state");
     }
     if (input.data() != buf_.x.data() || output.data() != buf_.y.data() ||
         input.dtype() != dnnl::memory::data_type::bf16 ||
@@ -752,16 +770,16 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         !buf_.indexer_q.valid() || !buf_.indexer_block_scores.valid() ||
         !buf_.indexer_active_blocks.valid() ||
         !buf_.decode_attn_partials.valid()) {
-        return false;
+        return reject("io_identity");
     }
     if (buf_.full_qkv.dtype() != dnnl::memory::data_type::bf16 ||
         buf_.full_qkv.shape(1) < full_fused_qkv_dim_ ||
         buf_.q.dtype() != dnnl::memory::data_type::bf16 ||
-        buf_.q.shape(1) < full_q_proj_dim_ ||
+        buf_.q.shape(1) < full_q_dim_ ||
         buf_.z.dtype() != dnnl::memory::data_type::bf16 ||
-        buf_.z.shape(1) < full_q_proj_dim_ ||
+        buf_.z.shape(1) < full_q_dim_ ||
         buf_.attn_out.dtype() != dnnl::memory::data_type::bf16 ||
-        buf_.attn_out.shape(1) < full_q_proj_dim_ ||
+        buf_.attn_out.shape(1) < full_q_dim_ ||
         buf_.indexer_qk.dtype() != dnnl::memory::data_type::bf16 ||
         buf_.indexer_qk.shape(1) < 640 ||
         buf_.indexer_q.dtype() != dnnl::memory::data_type::bf16 ||
@@ -778,7 +796,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         buf_.decode_attn_partials.shape(0) != full_q_heads_ ||
         buf_.decode_attn_partials.shape(1) < 17 ||
         buf_.decode_attn_partials.shape(2) < 272) {
-        return false;
+        return reject("buffer_shape");
     }
     return true;
 }
@@ -803,13 +821,27 @@ aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeQsaLayerGraphKey(
 bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
     Context& ctx, Session& session, Tensor& input, Tensor& output,
     int start_pos) {
+    const bool trace = qsa_layer_graph_trace_enabled();
     if (session.token_graph_poisoned()) {
         throw std::logic_error(
             "Qwen4Exp L3 graph session is poisoned; recreate the session");
     }
     if (!QsaLayerGraphEligible(
             ctx, session, input, output, 1, start_pos, false)) {
+        if (trace) {
+            AILA_LOG_INFO(
+                "[Q4E QsaGraph] eligible=0 start_pos=%d current=%d "
+                "blocks=%d",
+                start_pos, session.CurrentLength(),
+                session.layerCaches_[kQsaGraphLayer].num_compressed_blocks);
+        }
         return false;
+    }
+    if (trace) {
+        AILA_LOG_INFO(
+            "[Q4E QsaGraph] eligible=1 start_pos=%d current=%d blocks=%d",
+            start_pos, session.CurrentLength(),
+            session.layerCaches_[kQsaGraphLayer].num_compressed_blocks);
     }
     ensure_runtime_buffers(ctx, 1);
     const auto runtime_phase = token_graph_runtime_.phase();
@@ -979,6 +1011,11 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                 throw std::runtime_error(
                     "Qwen4Exp L3 graph failed to publish its executable");
             }
+            if (trace) {
+                AILA_LOG_INFO(
+                    "[Q4E QsaGraph] capture_ready start_pos=%d nodes=%zu",
+                    start_pos, captured_nodes);
+            }
         } catch (...) {
             (void)AbortAndPoisonTokenGraph(session);
             (void)ReleaseQsaLayerGraph(&ctx, false);
@@ -1025,6 +1062,13 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
             qsa_layer_graph_.control_host[ops::graph_control::start_pos] ==
                 start_pos &&
             qsa_layer_graph_.control_host[blocks_slot] == target_blocks;
+        if (trace) {
+            AILA_LOG_INFO(
+                "[Q4E QsaGraph] replay start_pos=%d blocks=%d target=%d "
+                "gate=%d",
+                start_pos, qsa_layer_graph_.control_host[blocks_slot],
+                target_blocks, gate_valid ? 1 : 0);
+        }
         if (!Complete(sequence, gate_valid)) {
             throw std::runtime_error(
                 "Qwen4Exp L3 graph completion gate rejected");
