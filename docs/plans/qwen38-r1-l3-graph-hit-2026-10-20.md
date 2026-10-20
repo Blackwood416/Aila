@@ -147,11 +147,22 @@ host_pub=1 device_done_seq=1 host_ack=1
 device_visibility=1 host_visibility=0"
 ```
 
-Therefore the current cached-pinned payload design cannot publish D2H results
-to the host service loop. The handoff gate is correctly fail-closed. This
-receipt establishes NO-GO for the tested cached-pinned visibility sequence; it
-does not invalidate an uncached result/control lane or another explicitly
-validated cache-management sequence.
+The first correction split D2H into its own uncached allocation and changed
+the device result write to `uncached_store(L1+L3)`. That passed four rounds,
+then failed when the cached-pinned H2D slot wrapped:
+
+```text
+reason=device_payload_bitwise round=5
+host_pub=5 device_done_seq=4 host_ack=4
+device_visibility=4 host_visibility=4
+```
+
+Changing the device-side H2D check to `uncached_load(L1+L3)` did not remove the
+stale-slot failure. Although a one-shot cached-pinned H2D copy is bitwise, it
+cannot be reused in the mid-graph ring after the four-slot wrap. The 64-byte
+uncached control split remains valid, but the reusable bulk payload must stay
+uncached. The structural gain should therefore come from `wg_stride_vec4` and
+active-row copying, not from cached-pinned payload residency.
 
 ## 5. Production 2052..2055 probe and A/A noise
 
@@ -192,9 +203,10 @@ Receipts:
 2. Integrate the validated `wg_stride_vec4` active-row packet copy as an opt-in
    experiment; keep the small control block separate from the bulk payload and
    preserve the scalar rank map.
-3. Resolve the host-ring D2H visibility failure with an uncached control/result
-   lane or an explicitly validated cache-management protocol; keep handoff
-   disabled until both directions pass the full visibility run.
+3. Keep the reusable bulk payload uncached. Integrate the validated
+   `wg_stride_vec4` active-row copy into the P3 packet path and test the full
+   1000/1000 ring again; do not retry cached-pinned slot reuse without a new
+   coherence mechanism.
 4. Only after those gates pass, advance the production async service and
    whole-token graph. The bounded QSA prompt XMX candidate remains subordinate
    to this structural path; use [`qwen38-r1-qsa-prompt-xmx-bound-2026-10-20.md`](qwen38-r1-qsa-prompt-xmx-bound-2026-10-20.md)
