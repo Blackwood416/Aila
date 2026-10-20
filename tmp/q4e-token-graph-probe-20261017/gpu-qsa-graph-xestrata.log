@@ -1,0 +1,5 @@
+[RUN] test=qsa-graph arg=--qsa-graph-only
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[PASS] QSA graph device position + block advance + scoring/selector (pos=2051..2055, blocks=513..514, scores/active-blocks bitwise, abort-only + stale-count no-op)
+QSA graph device-state test PASSED; teardown USM zero
+[RESULT] test=qsa-graph exit=0 wall_s=2.8

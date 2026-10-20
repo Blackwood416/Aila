@@ -1,0 +1,8 @@
+[RUN] test=attention arg=--attention-graph-only
+[JM] mode=1, supported=1, tile_id=0, decode_wg=512, decode_window=0, decode_window_start=512, decode_sink=0 -> enabled
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[ATTENTION GRAPH A/B] start_pos=2052..2055 old_replay_wall_ms=0.4301 cached_replay_wall_ms=0.5016
+[PASS] block-native attention graph (start_pos=2052..2055, tiles=17/17/17/16, bitwise, abort + invalid-id no-op)
+[PASS] block-native attention graph long capacity (max_seq=32768, start_pos=32760, selected_blocks=512, tail=1, non-contiguous ids, bitwise)
+Attention graph test PASSED; teardown USM zero
+[RESULT] test=attention exit=0 wall_s=15.8

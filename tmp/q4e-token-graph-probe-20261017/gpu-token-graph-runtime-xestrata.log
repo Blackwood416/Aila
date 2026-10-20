@@ -1,0 +1,5 @@
+[RUN] test=runtime arg=--token-graph-runtime-only
+[Test] Token graph backend lifecycle and direct-path abort...
+[PASS] Token graph backend lifecycle verified.
+AilaQwen4ExpModuleTests: TOKEN GRAPH RUNTIME PASSED
+[RESULT] test=runtime exit=0 wall_s=0.6

@@ -37,6 +37,13 @@ enum class TokenGraphSequenceStatus : std::uint8_t {
     Ahead = 3,
 };
 
+enum class TokenGraphEventStatus : std::uint8_t {
+    NoEvent = 0,
+    Pending = 1,
+    Done = 2,
+    Failed = 3,
+};
+
 // Sequence zero is the reset value. Runtime launch refuses to wrap, so a
 // non-zero expected sequence remains unambiguous for the whole graph lifetime.
 constexpr TokenGraphSequenceStatus token_graph_sequence_status(
@@ -188,6 +195,9 @@ public:
     const sycl::event& in_flight_event() const noexcept {
         return inFlightEvent_;
     }
+    // Non-throwing diagnostic query. Query failures are reported as Failed,
+    // never as Pending; only an actual in-flight SYCL event can be Pending.
+    TokenGraphEventStatus event_status() const noexcept;
     bool executable_ready() const noexcept { return executableReady_; }
     bool gate_valid() const noexcept { return gateValid_; }
     bool abort_requested() const noexcept { return abortRequested_; }
@@ -203,6 +213,7 @@ private:
     bool gateValid_ = false;
     bool abortRequested_ = false;
     bool executableReady_ = false;
+    bool hasInFlightEvent_ = false;
 };
 
 static_assert(!std::is_copy_constructible<TokenGraphRuntime>::value);
@@ -219,6 +230,7 @@ inline bool TokenGraphRuntime::BeginCapture(const TokenGraphKey& key) noexcept {
     key_ = key;
     phase_ = TokenGraphPhase::Capturing;
     inFlightEvent_ = sycl::event{};
+    hasInFlightEvent_ = false;
     nextSequence_ = 1;
     lastCompletedSequence_ = 0;
     gateValid_ = false;
@@ -243,10 +255,33 @@ inline bool TokenGraphRuntime::Launch(
         return false;
     }
     inFlightEvent_ = std::move(event);
+    hasInFlightEvent_ = true;
     phase_ = TokenGraphPhase::InFlight;
     gateValid_ = false;
     ++nextSequence_;
     return true;
+}
+
+inline TokenGraphEventStatus TokenGraphRuntime::event_status() const noexcept {
+    if (!hasInFlightEvent_) {
+        return TokenGraphEventStatus::NoEvent;
+    }
+    try {
+        const auto status =
+            inFlightEvent_
+                .get_info<sycl::info::event::command_execution_status>();
+        switch (status) {
+            case sycl::info::event_command_status::submitted:
+            case sycl::info::event_command_status::running:
+                return TokenGraphEventStatus::Pending;
+            case sycl::info::event_command_status::complete:
+                return TokenGraphEventStatus::Done;
+            default:
+                return TokenGraphEventStatus::Failed;
+        }
+    } catch (...) {
+        return TokenGraphEventStatus::Failed;
+    }
 }
 
 inline bool TokenGraphRuntime::Complete(
@@ -259,6 +294,7 @@ inline bool TokenGraphRuntime::Complete(
     }
     phase_ = TokenGraphPhase::Ready;
     inFlightEvent_ = sycl::event{};
+    hasInFlightEvent_ = false;
     lastCompletedSequence_ = sequence;
     gateValid_ = true;
     return true;

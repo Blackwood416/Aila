@@ -308,10 +308,20 @@ void test_token_graph_runtime_state_machine() {
                   "TokenGraphRuntime must not be move constructible");
     static_assert(!std::is_move_assignable<aila::TokenGraphRuntime>::value,
                   "TokenGraphRuntime must not be move assignable");
+    static_assert(
+        aila::TokenGraphEventStatus::NoEvent !=
+            aila::TokenGraphEventStatus::Pending &&
+        aila::TokenGraphEventStatus::Pending !=
+            aila::TokenGraphEventStatus::Done &&
+        aila::TokenGraphEventStatus::Done !=
+            aila::TokenGraphEventStatus::Failed,
+        "token graph event statuses must remain distinguishable");
 
     aila::TokenGraphRuntime runtime;
     expect(runtime.phase() == aila::TokenGraphPhase::Empty,
            "runtime must start empty");
+    expect(runtime.event_status() == aila::TokenGraphEventStatus::NoEvent,
+           "empty runtime must report no event");
     expect(!runtime.MarkExecutableReady(),
            "empty runtime must reject executable publication");
     expect(!runtime.Launch(1, sycl::event{}),
@@ -327,6 +337,8 @@ void test_token_graph_runtime_state_machine() {
     expect(runtime.MarkExecutableReady(),
            "Capturing -> Ready must succeed");
     expect(runtime.executable_ready(), "Ready must expose executable");
+    expect(runtime.event_status() == aila::TokenGraphEventStatus::NoEvent,
+           "Ready runtime must report no event");
 
     const aila::TokenGraphLease ready_snapshot = runtime.Snapshot();
     expect(ready_snapshot.phase == aila::TokenGraphPhase::Ready &&
@@ -341,6 +353,10 @@ void test_token_graph_runtime_state_machine() {
            "Ready -> InFlight must succeed");
     expect(runtime.phase() == aila::TokenGraphPhase::InFlight,
            "runtime did not enter InFlight");
+    const auto default_event_status = runtime.event_status();
+    expect(default_event_status == aila::TokenGraphEventStatus::Done ||
+               default_event_status == aila::TokenGraphEventStatus::Failed,
+           "default event must not be reported as Pending");
     expect(!runtime.BeginCapture(key),
            "recapture while InFlight must fail");
     expect(!runtime.Launch(2, sycl::event{}),
@@ -352,6 +368,8 @@ void test_token_graph_runtime_state_machine() {
                runtime.last_completed_sequence() == 1 &&
                runtime.next_sequence() == 2,
            "successful completion state mismatch");
+    expect(runtime.event_status() == aila::TokenGraphEventStatus::NoEvent,
+           "completed runtime must clear its event");
     expect(runtime.Snapshot().last_completed_sequence == 1,
            "completion not reflected in lease snapshot");
 
@@ -385,6 +403,10 @@ void test_token_graph_runtime_state_machine() {
            "completion sequence mismatch must fail closed");
     expect(mismatch.phase() == aila::TokenGraphPhase::Aborting,
            "completion mismatch must enter Aborting");
+    const auto aborted_event_status = mismatch.event_status();
+    expect(aborted_event_status == aila::TokenGraphEventStatus::Done ||
+               aborted_event_status == aila::TokenGraphEventStatus::Failed,
+           "Aborting must retain a launched event for status queries");
 
     aila::TokenGraphRuntime aborted;
     expect(aborted.BeginCapture(key) && aborted.MarkExecutableReady(),
@@ -394,6 +416,8 @@ void test_token_graph_runtime_state_machine() {
                aborted.abort_requested() &&
                !aborted.executable_ready(),
            "Abort must stop launch and mark the runtime dirty");
+    expect(aborted.event_status() == aila::TokenGraphEventStatus::NoEvent,
+           "Abort without a launch must report no event");
     expect(!aborted.Abort(), "repeated Abort must not change state");
     expect(aborted.Poison(), "Aborting -> Poisoned must succeed");
 

@@ -1,0 +1,8 @@
+[RUN] test=selector arg=--qsa-selector-graph-only
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[QSA GRAPH SELECTOR PASS] blocks=513 tail=0 selected=512 legacy=exact radix=exact
+[QSA GRAPH SELECTOR PASS] blocks=514 tail=3 selected=512 legacy=exact radix=exact
+[QSA GRAPH SELECTOR PASS] blocks=8192 tail=2 selected=512 legacy=exact radix=exact
+[QSA GRAPH SELECTOR COST] blocks=8192 legacy_us=2244.3 radix_us=233.8 speedup=9.59923 runs=1 exact=1
+QSA graph selector test PASSED; teardown USM zero
+[RESULT] test=selector exit=0 wall_s=3.4

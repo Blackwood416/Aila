@@ -1,0 +1,6 @@
+[RUN] test=qsa-layer arg=--qsa-layer-graph-only
+Starting Qwen4Exp Kernel Tests on device: Intel(R) Arc(TM) A770 Graphics
+[JM] mode=1, supported=1, tile_id=0, decode_wg=512, decode_window=0, decode_window_start=512, decode_sink=0 -> enabled
+[PASS] QSA layer graph composite (six nodes, pos=2052..2055, blocks=513..514, bitwise, abort=1 no-op)
+QSA layer graph checks PASSED; teardown USM zero
+[RESULT] test=qsa-layer exit=0 wall_s=24.1

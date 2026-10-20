@@ -815,17 +815,11 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
     const auto runtime_phase = token_graph_runtime_.phase();
     if (runtime_phase == aila::TokenGraphPhase::Capturing ||
         runtime_phase == aila::TokenGraphPhase::InFlight) {
-        std::exception_ptr drain_error;
-        bool drained = false;
-        try {
-            ctx.synchronize();
-            drained = true;
-        } catch (...) {
-            drain_error = std::current_exception();
-        }
         (void)AbortAndPoisonTokenGraph(session);
-        if (drained) qsa_layer_graph_.executable.reset();
-        if (drain_error) std::rethrow_exception(drain_error);
+        if (!ReleaseQsaLayerGraph(&ctx, false)) {
+            throw std::runtime_error(
+                "Qwen4Exp L3 graph could not drain its previous executable");
+        }
         throw std::runtime_error(
             "Qwen4Exp L3 graph cannot capture while another graph owns the backend");
     }
@@ -836,7 +830,11 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
         same_token_graph_key(token_graph_runtime_.key(), key);
     if (!reuse) {
         ctx.synchronize();
-        qsa_layer_graph_.executable.reset();
+        if (!ReleaseQsaLayerGraph(&ctx, true)) {
+            (void)AbortAndPoisonTokenGraph(session);
+            throw std::runtime_error(
+                "Qwen4Exp L3 graph could not release its previous executable");
+        }
         if (!token_graph_runtime_.BeginCapture(key)) {
             (void)AbortAndPoisonTokenGraph(session);
             throw std::runtime_error(
@@ -875,13 +873,19 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                 sycl::ext::oneapi::experimental::graph_state::modifiable>
                 recording(ctx.queue().get_context(), ctx.queue().get_device());
             recording.begin_recording(ctx.queue());
+            std::size_t captured_nodes = 0;
+            auto captured_node = [&captured_nodes]() noexcept {
+                ++captured_nodes;
+            };
             try {
                 layer.qkv_proj.ForwardDecodeRows(
                     ctx, linear_scratch_, input, buf_.full_qkv, 1);
+                captured_node();
                 ops::bf16_gemv_bf16(
                     ctx, *layer.index_qk_weight, input.data_as<bf16>(),
                     buf_.indexer_qk.data_as<bf16>(), indexer_out_dim,
                     hidden_size_);
+                captured_node();
 
                 bf16* fused_ptr = buf_.full_qkv.data_as<bf16>();
                 Tensor q_gate_view = Tensor::view(
@@ -910,6 +914,7 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                     cfg_.rope.mrope_section[1],
                     cfg_.rope.mrope_section[2], nullptr, nullptr,
                     kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::qsa_prepare_q_and_cache_k_graph(
                     ctx, indexer_qk_row, *layer.index_q_norm_weight,
                     cache.indexer_k, indexer_q_row,
@@ -919,6 +924,7 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                     cfg_.rope.mrope_section[1],
                     cfg_.rope.mrope_section[2],
                     kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::qsa_compress_one_completed_block_graph(
                     ctx, cache.indexer_k, *layer.index_k_norm_weight,
                     cache.indexer_compressed_k, const_cast<int*>(control),
@@ -928,44 +934,54 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                     cfg_.rope.mrope_section[1],
                     cfg_.rope.mrope_section[2],
                     kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::qsa_compute_block_scores_compressed_graph(
                     ctx, indexer_q_row, cache.indexer_compressed_k,
                     buf_.indexer_block_scores, const_cast<int*>(control),
                     max_blocks, kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::qsa_select_topk_blocks_graph(
                     ctx, buf_.indexer_block_scores,
                     buf_.indexer_active_blocks, const_cast<int*>(control),
                     kQsaGraphBlockTopK, kQsaGraphCompressRatio, max_blocks,
                     kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::attention_validate_qsa_active_blocks_graph(
                     ctx, cache.k, cache.v, buf_.indexer_active_blocks,
                     const_cast<int*>(control), full_kv_heads_,
                     kQsaGraphLayerOrdinal);
+                captured_node();
                 ops::attention_decode_exact_head256_block_native_graph(
                     ctx, buf_.q, cache.k, cache.v, buf_.attn_out,
                     buf_.decode_attn_partials, buf_.indexer_active_blocks,
                     const_cast<int*>(control), full_q_heads_,
                     full_kv_heads_, &buf_.z, kQsaGraphLayerOrdinal);
+                captured_node();
                 layer.o_proj.ForwardDecodeRows(
                     ctx, linear_scratch_, buf_.attn_out, output, 1);
+                captured_node();
+                if (captured_nodes == 0) {
+                    throw std::runtime_error(
+                        "Qwen4Exp L3 graph capture recorded no nodes");
+                }
                 recording.end_recording(ctx.queue());
             } catch (...) {
-                recording.end_recording(ctx.queue());
+                try {
+                    recording.end_recording(ctx.queue());
+                } catch (...) {
+                }
                 throw;
             }
             qsa_layer_graph_.executable = std::make_unique<
                 QsaLayerGraphState::Executable>(recording.finalize());
+            qsa_layer_graph_.node_count = captured_nodes;
             if (!MarkReady()) {
                 throw std::runtime_error(
                     "Qwen4Exp L3 graph failed to publish its executable");
             }
         } catch (...) {
-            try {
-                ctx.synchronize();
-            } catch (...) {
-            }
-            qsa_layer_graph_.executable.reset();
             (void)AbortAndPoisonTokenGraph(session);
+            (void)ReleaseQsaLayerGraph(&ctx, false);
             throw;
         }
     }
@@ -1017,12 +1033,8 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
             qsa_layer_graph_.control_host[blocks_slot];
         return true;
     } catch (...) {
-        try {
-            ctx.synchronize();
-        } catch (...) {
-        }
-        qsa_layer_graph_.executable.reset();
         (void)AbortAndPoisonTokenGraph(session);
+        (void)ReleaseQsaLayerGraph(&ctx, false);
         throw;
     }
 }

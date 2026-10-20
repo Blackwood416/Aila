@@ -1667,7 +1667,9 @@ int qsa_select_topk_blocks(
     return block_topk;
 }
 
-void qsa_select_topk_blocks_graph(
+namespace {
+
+void qsa_select_topk_blocks_graph_legacy_impl(
     Context& ctx,
     const Tensor& scores,
     Tensor& active_blocks_out,
@@ -1830,6 +1832,278 @@ void qsa_select_topk_blocks_graph(
                 }
             });
     });
+}
+
+void qsa_select_topk_blocks_graph_radix_impl(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    GraphControl control,
+    int block_topk,
+    int compress_ratio,
+    int max_blocks,
+    int layer) {
+    if (!control || block_topk <= 0 || compress_ratio <= 0 ||
+        max_blocks <= 0 || graph_control_layer_blocks_slot(layer) < 0)
+        throw std::invalid_argument(
+            "qsa_select_topk_blocks_graph requires valid graph geometry and layer");
+    if (!scores.valid() ||
+        scores.dtype() != dnnl::memory::data_type::f32 ||
+        scores.numel() < max_blocks ||
+        !active_blocks_out.valid() ||
+        active_blocks_out.dtype() != dnnl::memory::data_type::s32 ||
+        active_blocks_out.numel() < block_topk + compress_ratio) {
+        throw std::invalid_argument(
+            "qsa_select_topk_blocks_graph shape mismatch");
+    }
+
+    const float* scores_ptr = scores.data_as<float>();
+    int* out_ptr = active_blocks_out.data_as<int>();
+    int* const control_ptr = control;
+    constexpr int kWgSize = 256;
+    constexpr int kBits = 8;
+    constexpr int kBins = 1 << kBits;
+    constexpr int kSubgroups = kWgSize / 16;
+    constexpr int kLoadWidth = 4;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> geometry(
+            sycl::range<1>(4), cgh);
+        sycl::local_accessor<int, 1> hist(
+            sycl::range<1>(kSubgroups * kBins), cgh);
+        sycl::local_accessor<std::uint32_t, 1> local_worst_key(
+            sycl::range<1>(kWgSize), cgh);
+        sycl::local_accessor<int, 1> local_worst_id(
+            sycl::range<1>(kWgSize), cgh);
+
+        cgh.parallel_for(
+            sycl::nd_range<1>(kWgSize, kWgSize),
+            [=](sycl::nd_item<1> item)
+                [[sycl::reqd_sub_group_size(16)]] {
+                const int lid = item.get_local_id(0);
+                if (lid == 0) {
+                    int visible_len = 0;
+                    int active_blocks = 0;
+                    const bool valid = graph_control_consistent_blocks(
+                        control_ptr, max_blocks, visible_len,
+                        active_blocks, layer);
+                    geometry[0] = valid ? 1 : 0;
+                    geometry[1] = visible_len;
+                    geometry[2] = active_blocks;
+                    geometry[3] = valid
+                        ? sycl::min(
+                              compress_ratio,
+                              sycl::max(
+                                  0, visible_len -
+                                         active_blocks * compress_ratio))
+                        : 0;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (geometry[0] == 0) return;
+
+                const int active_blocks = geometry[2];
+                const int tail_len = geometry[3];
+                const int tail_start = active_blocks * compress_ratio;
+
+                if (active_blocks <= block_topk) {
+                    for (int b = lid; b < active_blocks; b += kWgSize) {
+                        out_ptr[b] = b;
+                    }
+                    if (lid < tail_len) {
+                        out_ptr[active_blocks + lid] = tail_start + lid;
+                    }
+                    return;
+                }
+
+                if (active_blocks == block_topk + 1) {
+                    std::uint32_t my_worst_key = 0xffffffffU;
+                    int my_worst_id = -1;
+                    for (int b = lid; b < active_blocks; b += kWgSize) {
+                        const std::uint32_t key =
+                            qsa_score_order_key(scores_ptr[b]);
+                        if (my_worst_id < 0 ||
+                            qsa_candidate_is_worse(
+                                key, b, my_worst_key, my_worst_id)) {
+                            my_worst_key = key;
+                            my_worst_id = b;
+                        }
+                    }
+                    local_worst_key[lid] = my_worst_key;
+                    local_worst_id[lid] = my_worst_id;
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    for (int stride = kWgSize / 2; stride > 0; stride >>= 1) {
+                        if (lid < stride) {
+                            const std::uint32_t other_key =
+                                local_worst_key[lid + stride];
+                            const int other_id =
+                                local_worst_id[lid + stride];
+                            if (other_id >= 0 &&
+                                (local_worst_id[lid] < 0 ||
+                                 qsa_candidate_is_worse(
+                                     other_key, other_id,
+                                     local_worst_key[lid],
+                                     local_worst_id[lid]))) {
+                                local_worst_key[lid] = other_key;
+                                local_worst_id[lid] = other_id;
+                            }
+                        }
+                        item.barrier(
+                            sycl::access::fence_space::local_space);
+                    }
+
+                    const int worst_id = local_worst_id[0];
+                    for (int idx = lid; idx < block_topk;
+                         idx += kWgSize) {
+                        out_ptr[idx] =
+                            (idx < worst_id) ? idx : (idx + 1);
+                    }
+                    if (lid < tail_len) {
+                        out_ptr[block_topk + lid] = tail_start + lid;
+                    }
+                    return;
+                }
+
+                if (lid < tail_len) {
+                    out_ptr[block_topk + lid] = tail_start + lid;
+                }
+
+                std::uint32_t prefix = 0;
+                std::uint32_t mask = 0;
+                int rank = block_topk;
+                const auto group = item.get_group();
+                for (int shift = 32 - kBits; shift >= 0;
+                     shift -= kBits) {
+                    for (int i = lid; i < kSubgroups * kBins;
+                         i += kWgSize) {
+                        hist[i] = 0;
+                    }
+                    item.barrier(
+                        sycl::access::fence_space::local_space);
+
+                    for (int b = lid * kLoadWidth; b < active_blocks;
+                         b += kWgSize * kLoadWidth) {
+                        sycl::vec<float, kLoadWidth> values;
+                        if (b + kLoadWidth <= active_blocks) {
+                            values.load(
+                                0,
+                                sycl::address_space_cast<
+                                    sycl::access::address_space::
+                                        global_space,
+                                    sycl::access::decorated::no>(
+                                    scores_ptr + b));
+                        } else {
+                            for (int j = 0; j < kLoadWidth; ++j) {
+                                values[j] = b + j < active_blocks
+                                    ? scores_ptr[b + j]
+                                    : 0.0f;
+                            }
+                        }
+                        for (int j = 0; j < kLoadWidth; ++j) {
+                            if (b + j >= active_blocks) continue;
+                            const std::uint32_t key =
+                                qsa_score_order_key(values[j]);
+                            if ((key & mask) != prefix) continue;
+                            const int bin =
+                                (key >> shift) & (kBins - 1);
+                            sycl::atomic_ref<
+                                int, sycl::memory_order::relaxed,
+                                sycl::memory_scope::work_group,
+                                sycl::access::address_space::
+                                    local_space>
+                                count(
+                                    hist[(lid / 16) * kBins + bin]);
+                            count.fetch_add(1);
+                        }
+                    }
+                    item.barrier(
+                        sycl::access::fence_space::local_space);
+
+                    int count = 0;
+                    if (lid < kBins) {
+                        for (int sg = 0; sg < kSubgroups; ++sg) {
+                            count += hist[
+                                sg * kBins + (kBins - 1 - lid)];
+                        }
+                    }
+                    const int inclusive =
+                        sycl::inclusive_scan_over_group(
+                            group, count, sycl::plus<int>());
+                    const int before = inclusive - count;
+                    const bool cutoff =
+                        lid < kBins && before < rank &&
+                        inclusive >= rank;
+                    const int digit = sycl::reduce_over_group(
+                        group, cutoff ? kBins - 1 - lid : 0,
+                        sycl::maximum<int>());
+                    const int above = sycl::reduce_over_group(
+                        group, cutoff ? before : 0,
+                        sycl::plus<int>());
+                    prefix |=
+                        std::uint32_t(digit) << shift;
+                    mask |= std::uint32_t(kBins - 1) << shift;
+                    rank -= above;
+                    item.barrier(
+                        sycl::access::fence_space::local_space);
+                }
+
+                const int per =
+                    (active_blocks + kWgSize - 1) / kWgSize;
+                const int begin = lid * per;
+                const int end =
+                    sycl::min(begin + per, active_blocks);
+                int greater = 0;
+                int equal = 0;
+                for (int b = begin; b < end; ++b) {
+                    const auto key = qsa_score_order_key(scores_ptr[b]);
+                    greater += key > prefix;
+                    equal += key == prefix;
+                }
+                const int eq_before =
+                    sycl::exclusive_scan_over_group(
+                        group, equal, sycl::plus<int>());
+                int ties = sycl::min(
+                    equal, sycl::max(0, rank - eq_before));
+                int offset = sycl::exclusive_scan_over_group(
+                    group, greater + ties, sycl::plus<int>());
+                for (int b = begin; b < end; ++b) {
+                    const auto key = qsa_score_order_key(scores_ptr[b]);
+                    if (key > prefix ||
+                        (key == prefix && ties > 0)) {
+                        out_ptr[offset++] = b;
+                        if (key == prefix) --ties;
+                    }
+                }
+            });
+    });
+}
+
+} // anonymous namespace
+
+void qsa_select_topk_blocks_graph(
+    Context& ctx,
+    const Tensor& scores,
+    Tensor& active_blocks_out,
+    GraphControl control,
+    int block_topk,
+    int compress_ratio,
+    int max_blocks,
+    int layer,
+    int selector_mode) {
+    if (selector_mode == 0) {
+        qsa_select_topk_blocks_graph_legacy_impl(
+            ctx, scores, active_blocks_out, control, block_topk,
+            compress_ratio, max_blocks, layer);
+        return;
+    }
+    if (selector_mode == 1) {
+        qsa_select_topk_blocks_graph_radix_impl(
+            ctx, scores, active_blocks_out, control, block_topk,
+            compress_ratio, max_blocks, layer);
+        return;
+    }
+    throw std::invalid_argument(
+        "qsa_select_topk_blocks_graph selector_mode must be 0 or 1");
 }
 
 int qsa_select_topk_blocks_host(

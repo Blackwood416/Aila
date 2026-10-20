@@ -433,6 +433,10 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
+    if (!ReleaseQsaLayerGraph(context_, false)) {
+        AILA_LOG_ERROR(
+            "[Q4E Graph] P10 executable drain failed during backend teardown");
+    }
     // V3 (G3): drain the layer stage first (its worker joins and its arena is
     // freed through the still-valid Context before the caches tear down).
     layer_stage_.Release();
@@ -4126,6 +4130,31 @@ void Qwen4ExpBnb4Backend::ValidateTokenGraphLaunch(Session& session) {
                 "GDN heads are published to the device");
         }
     }
+}
+
+bool Qwen4ExpBnb4Backend::ReleaseQsaLayerGraph(
+    Context* ctx, bool idle_confirmed) noexcept {
+    if (!qsa_layer_graph_.executable) {
+        qsa_layer_graph_.node_count = 0;
+        return true;
+    }
+
+    bool safe = idle_confirmed ||
+        token_graph_runtime_.event_status() ==
+            aila::TokenGraphEventStatus::Done;
+    if (!safe && ctx) {
+        try {
+            ctx->synchronize();
+            safe = true;
+        } catch (...) {
+            safe = false;
+        }
+    }
+    if (!safe) return false;
+
+    qsa_layer_graph_.executable.reset();
+    qsa_layer_graph_.node_count = 0;
+    return true;
 }
 
 bool Qwen4ExpBnb4Backend::BeginCapture(

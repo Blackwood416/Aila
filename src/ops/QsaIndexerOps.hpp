@@ -325,6 +325,9 @@ int qsa_select_topk_blocks(
 // exact cutoff selection above that. Equal scores prefer lower block IDs.
 // Selected block IDs are ascending followed by trailing token IDs in the
 // existing dense/block layout.
+// selector_mode 1 (default) uses four 8-bit radix passes with subgroup-local
+// histograms and vec4 loads. selector_mode 0 keeps the legacy 32-pass selector
+// for an in-process A/B benchmark; it is not selected dynamically inside a graph.
 void qsa_select_topk_blocks_graph(
     Context& ctx,
     const Tensor& scores,
@@ -333,7 +336,8 @@ void qsa_select_topk_blocks_graph(
     int block_topk,
     int compress_ratio,
     int max_blocks,
-    int layer = 0);
+    int layer = 0,
+    int selector_mode = 1);
 
 int qsa_select_topk_blocks_host(
     const float* scores,

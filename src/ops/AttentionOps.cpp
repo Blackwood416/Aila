@@ -1311,7 +1311,7 @@ void attention_decode_exact_head256_partial_merge(
   else run(std::integral_constant<int, kKvFmtBf16>{});
 }
 
-template <int MaxTiles>
+template <int MaxTiles, bool CacheActiveTokens>
 void attention_decode_exact_head256_block_native_graph_impl(
     Context &ctx, const Tensor &q, const Tensor &k_cache,
     const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
@@ -1405,6 +1405,8 @@ void attention_decode_exact_head256_block_native_graph_impl(
 
   ctx.queue().submit([&](sycl::handler &cgh) {
     sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<int, 1> cache_tokens(
+        sycl::range<1>(CacheActiveTokens ? tile_t : 1), cgh);
     sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
     sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
 
@@ -1438,13 +1440,24 @@ void attention_decode_exact_head256_block_native_graph_impl(
           for (int d = lid; d < head_dim; d += tile_wg) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
           }
+          if constexpr (CacheActiveTokens) {
+            if (lid < tile_len) {
+              cache_tokens[lid] = qsa_decode_active_cache_token(
+                  active_blocks_ptr, geometry.selected_blocks, tile_start + lid);
+            }
+          }
           item.barrier(sycl::access::fence_space::local_space);
 
           float score = -1e30f;
           if (lid < tile_len) {
             const int t = tile_start + lid;
-            const int cache_t = qsa_decode_active_cache_token(
-                active_blocks_ptr, geometry.selected_blocks, t);
+            int cache_t = 0;
+            if constexpr (CacheActiveTokens) {
+              cache_t = cache_tokens[lid];
+            } else {
+              cache_t = qsa_decode_active_cache_token(
+                  active_blocks_ptr, geometry.selected_blocks, t);
+            }
             using vec8 = sycl::vec<bf16, 8>;
             const bf16 *k_tok =
                 k_ptr +
@@ -1492,9 +1505,13 @@ void attention_decode_exact_head256_block_native_graph_impl(
           for (int d = lid; d < head_dim; d += tile_wg) {
             float acc = 0.0f;
             for (int i = 0; i < tile_len; ++i) {
-              const int t = tile_start + i;
-              const int cache_t = qsa_decode_active_cache_token(
-                  active_blocks_ptr, geometry.selected_blocks, t);
+              int cache_t = 0;
+              if constexpr (CacheActiveTokens) {
+                cache_t = cache_tokens[i];
+              } else {
+                cache_t = qsa_decode_active_cache_token(
+                    active_blocks_ptr, geometry.selected_blocks, tile_start + i);
+              }
               acc += logits[i] *
                      static_cast<float>(
                          v_ptr[(static_cast<size_t>(kv_head) *
@@ -1577,7 +1594,13 @@ void attention_decode_exact_head256_block_native_graph_impl(
 }
 
 template void attention_decode_exact_head256_block_native_graph_impl<
-    kDecodeExact256QsaMaxTiles>(
+    kDecodeExact256QsaMaxTiles, false>(
+    Context &ctx, const Tensor &q, const Tensor &k_cache,
+    const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
+    const Tensor &active_blocks, GraphControl control, int num_heads,
+    int num_kv_heads, const Tensor *gate_buf, int layer);
+template void attention_decode_exact_head256_block_native_graph_impl<
+    kDecodeExact256QsaMaxTiles, true>(
     Context &ctx, const Tensor &q, const Tensor &k_cache,
     const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
     const Tensor &active_blocks, GraphControl control, int num_heads,
@@ -2520,7 +2543,22 @@ void attention_decode_exact_head256_block_native_graph(
         "attention_decode_exact_head256_block_native_graph layer out of range");
   }
   attention_decode_exact_head256_block_native_graph_impl<
-      kDecodeExact256QsaMaxTiles>(
+      kDecodeExact256QsaMaxTiles, false>(
+      ctx, q, k_cache, v_cache, output, partials_buf, active_blocks,
+      control, num_heads, num_kv_heads, gate_buf, layer);
+}
+
+void attention_decode_exact_head256_block_native_graph_token_cache(
+    Context &ctx, const Tensor &q, const Tensor &k_cache,
+    const Tensor &v_cache, Tensor &output, Tensor &partials_buf,
+    const Tensor &active_blocks, GraphControl control, int num_heads,
+    int num_kv_heads, const Tensor *gate_buf, int layer) {
+  if (graph_control_layer_blocks_slot(layer) < 0) {
+    throw std::invalid_argument(
+        "attention_decode_exact_head256_block_native_graph_token_cache layer out of range");
+  }
+  attention_decode_exact_head256_block_native_graph_impl<
+      kDecodeExact256QsaMaxTiles, true>(
       ctx, q, k_cache, v_cache, output, partials_buf, active_blocks,
       control, num_heads, num_kv_heads, gate_buf, layer);
 }

@@ -1350,11 +1350,15 @@ void test_attention_decode_block_native_graph(Context& ctx) {
         ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
     Tensor out_graph_dev = Tensor::allocate(
         ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor out_cached_dev = Tensor::allocate(
+        ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
     Tensor scores_dev = Tensor::allocate(
         ctx, {num_heads, capacity}, dnnl::memory::data_type::f32);
     Tensor partials_host_dev = Tensor::allocate(
         ctx, {num_heads, max_tiles, partial_stride}, dnnl::memory::data_type::f32);
     Tensor partials_graph_dev = Tensor::allocate(
+        ctx, {num_heads, max_tiles, partial_stride}, dnnl::memory::data_type::f32);
+    Tensor partials_cached_dev = Tensor::allocate(
         ctx, {num_heads, max_tiles, partial_stride}, dnnl::memory::data_type::f32);
     Tensor active_blocks_dev = Tensor::allocate(
         ctx, {block_topk + compress_ratio}, dnnl::memory::data_type::s32);
@@ -1365,7 +1369,7 @@ void test_attention_decode_block_native_graph(Context& ctx) {
     ctx.memcpy_h2d(k_dev.data(), k_host.data(), k_host.size() * sizeof(bf16));
     ctx.memcpy_h2d(v_dev.data(), v_host.data(), v_host.size() * sizeof(bf16));
 
-    ExecutableGraph graph = [&]() {
+    auto capture_graph = [&](bool cache_active_tokens) -> ExecutableGraph {
         ex::command_graph<ex::graph_state::modifiable> recording(
             queue.get_context(), queue.get_device());
         recording.begin_recording(queue);
@@ -1373,19 +1377,48 @@ void test_attention_decode_block_native_graph(Context& ctx) {
             ops::attention_validate_qsa_active_blocks_graph(
                 ctx, k_dev, v_dev, active_blocks_dev,
                 control_dev.data_as<int>(), num_kv_heads);
-            ops::attention_decode_exact_head256_block_native_graph(
-                ctx, q_dev, k_dev, v_dev, out_graph_dev,
-                partials_graph_dev, active_blocks_dev,
-                control_dev.data_as<int>(), num_heads, num_kv_heads);
+            if (cache_active_tokens) {
+                ops::attention_decode_exact_head256_block_native_graph_token_cache(
+                    ctx, q_dev, k_dev, v_dev, out_cached_dev,
+                    partials_cached_dev, active_blocks_dev,
+                    control_dev.data_as<int>(), num_heads, num_kv_heads);
+            } else {
+                ops::attention_decode_exact_head256_block_native_graph(
+                    ctx, q_dev, k_dev, v_dev, out_graph_dev,
+                    partials_graph_dev, active_blocks_dev,
+                    control_dev.data_as<int>(), num_heads, num_kv_heads);
+            }
             recording.end_recording(queue);
         } catch (...) {
             recording.end_recording(queue);
             throw;
         }
         return recording.finalize();
-    }();
+    };
+    ExecutableGraph graph = capture_graph(false);
+    ExecutableGraph graph_cached = capture_graph(true);
 
     std::array<int, ops::graph_control::words> control{};
+    control[ops::graph_control::abort] = 1;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    auto warm_old = queue.ext_oneapi_graph(graph);
+    auto warm_cached = queue.ext_oneapi_graph(graph_cached);
+    warm_old.wait_and_throw();
+    warm_cached.wait_and_throw();
+    ctx.synchronize();
+
+    double old_replay_wall_ms = 0.0;
+    double cached_replay_wall_ms = 0.0;
+    auto timed_replay = [&](auto& executable) {
+        const auto start = std::chrono::steady_clock::now();
+        auto event = queue.ext_oneapi_graph(executable);
+        event.wait_and_throw();
+        ctx.synchronize();
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - start)
+            .count();
+    };
     for (int step = 0; step < 4; ++step) {
         const int pos = 2052 + step;
         const int visible_len = pos + 1;
@@ -1410,57 +1443,89 @@ void test_attention_decode_block_native_graph(Context& ctx) {
             num_heads, num_kv_heads, head_dim, visible_len,
             &partials_host_dev, nullptr, nullptr, 0,
             active_blocks_dev.data_as<int>(), block_topk);
-        auto event = queue.ext_oneapi_graph(graph);
-        event.wait_and_throw();
         ctx.synchronize();
+        old_replay_wall_ms += timed_replay(graph);
+        cached_replay_wall_ms += timed_replay(graph_cached);
 
         std::vector<bf16> out_host(num_heads * head_dim);
         std::vector<bf16> out_graph(num_heads * head_dim);
+        std::vector<bf16> out_cached(num_heads * head_dim);
         std::vector<float> partial_host(
             size_t(num_heads) * max_tiles * partial_stride);
         std::vector<float> partial_graph(partial_host.size());
+        std::vector<float> partial_cached(partial_host.size());
         ctx.memcpy_d2h(out_host.data(), out_host_dev.data(),
                        out_host.size() * sizeof(bf16));
         ctx.memcpy_d2h(out_graph.data(), out_graph_dev.data(),
                        out_graph.size() * sizeof(bf16));
+        ctx.memcpy_d2h(out_cached.data(), out_cached_dev.data(),
+                       out_cached.size() * sizeof(bf16));
         ctx.memcpy_d2h(partial_host.data(), partials_host_dev.data(),
                        partial_host.size() * sizeof(float));
         ctx.memcpy_d2h(partial_graph.data(), partials_graph_dev.data(),
                        partial_graph.size() * sizeof(float));
+        ctx.memcpy_d2h(partial_cached.data(), partials_cached_dev.data(),
+                       partial_cached.size() * sizeof(float));
         if (std::memcmp(out_host.data(), out_graph.data(),
                         out_host.size() * sizeof(bf16)) != 0 ||
             std::memcmp(partial_host.data(), partial_graph.data(),
+                        partial_host.size() * sizeof(float)) != 0 ||
+            std::memcmp(out_host.data(), out_cached.data(),
+                        out_host.size() * sizeof(bf16)) != 0 ||
+            std::memcmp(partial_host.data(), partial_cached.data(),
                         partial_host.size() * sizeof(float)) != 0) {
             throw std::runtime_error(
                 "block-native attention graph mismatch at start_pos=" +
                 std::to_string(pos));
         }
     }
+    std::cout << "[ATTENTION GRAPH A/B] start_pos=2052..2055"
+              << " old_replay_wall_ms=" << old_replay_wall_ms / 4.0
+              << " cached_replay_wall_ms=" << cached_replay_wall_ms / 4.0
+              << "\n";
 
     std::vector<uint8_t> output_before(
         size_t(num_heads) * head_dim * sizeof(bf16));
     std::vector<uint8_t> partials_before(
         size_t(num_heads) * max_tiles * partial_stride * sizeof(float));
+    std::vector<uint8_t> cached_output_before(output_before.size());
+    std::vector<uint8_t> cached_partials_before(partials_before.size());
     ctx.memcpy_d2h(output_before.data(), out_graph_dev.data(),
                    output_before.size());
     ctx.memcpy_d2h(partials_before.data(), partials_graph_dev.data(),
                    partials_before.size());
+    ctx.memcpy_d2h(cached_output_before.data(), out_cached_dev.data(),
+                   cached_output_before.size());
+    ctx.memcpy_d2h(cached_partials_before.data(), partials_cached_dev.data(),
+                   cached_partials_before.size());
     control[ops::graph_control::abort] = 1;
     ctx.memcpy_h2d(control_dev.data(), control.data(),
                    control.size() * sizeof(int));
     auto abort_event = queue.ext_oneapi_graph(graph);
+    auto cached_abort_event = queue.ext_oneapi_graph(graph_cached);
     abort_event.wait_and_throw();
+    cached_abort_event.wait_and_throw();
     ctx.synchronize();
     std::vector<uint8_t> output_after(output_before.size());
     std::vector<uint8_t> partials_after(partials_before.size());
+    std::vector<uint8_t> cached_output_after(cached_output_before.size());
+    std::vector<uint8_t> cached_partials_after(cached_partials_before.size());
     ctx.memcpy_d2h(output_after.data(), out_graph_dev.data(),
                    output_after.size());
     ctx.memcpy_d2h(partials_after.data(), partials_graph_dev.data(),
                    partials_after.size());
+    ctx.memcpy_d2h(cached_output_after.data(), out_cached_dev.data(),
+                   cached_output_after.size());
+    ctx.memcpy_d2h(cached_partials_after.data(), partials_cached_dev.data(),
+                   cached_partials_after.size());
     if (std::memcmp(output_before.data(), output_after.data(),
                     output_before.size()) != 0 ||
         std::memcmp(partials_before.data(), partials_after.data(),
-                    partials_before.size()) != 0) {
+                    partials_before.size()) != 0 ||
+        std::memcmp(cached_output_before.data(), cached_output_after.data(),
+                    cached_output_before.size()) != 0 ||
+        std::memcmp(cached_partials_before.data(), cached_partials_after.data(),
+                    cached_partials_before.size()) != 0) {
         throw std::runtime_error(
             "block-native attention graph abort modified output/partials");
     }
@@ -1470,30 +1535,41 @@ void test_attention_decode_block_native_graph(Context& ctx) {
                             int start_pos, int complete_blocks) {
         ctx.memcpy_h2d(active_blocks_dev.data(), active.data(),
                        active.size() * sizeof(int));
-        control[ops::graph_control::start_pos] = start_pos;
-        control[ops::graph_control::compressed_blocks] = complete_blocks;
-        control[ops::graph_control::abort] = 0;
-        ctx.memcpy_h2d(control_dev.data(), control.data(),
-                       control.size() * sizeof(int));
-        auto event = queue.ext_oneapi_graph(graph);
-        event.wait_and_throw();
-        ctx.synchronize();
-        ctx.memcpy_d2h(control.data(), control_dev.data(),
-                       control.size() * sizeof(int));
-        std::vector<uint8_t> output_guard(output_before.size());
-        std::vector<uint8_t> partials_guard(partials_before.size());
-        ctx.memcpy_d2h(output_guard.data(), out_graph_dev.data(),
-                       output_guard.size());
-        ctx.memcpy_d2h(partials_guard.data(), partials_graph_dev.data(),
-                       partials_guard.size());
-        if (control[ops::graph_control::abort] == 0 ||
-            std::memcmp(output_before.data(), output_guard.data(),
-                        output_guard.size()) != 0 ||
-            std::memcmp(partials_before.data(), partials_guard.data(),
-                        partials_guard.size()) != 0) {
-            throw std::runtime_error(
-                "block-native attention graph accepted " + label);
-        }
+        auto run_variant = [&](auto& executable, Tensor& output_tensor,
+                               Tensor& partials_tensor,
+                               const std::vector<uint8_t>& expected_output,
+                               const std::vector<uint8_t>& expected_partials,
+                               const char* variant) {
+            control[ops::graph_control::start_pos] = start_pos;
+            control[ops::graph_control::compressed_blocks] = complete_blocks;
+            control[ops::graph_control::abort] = 0;
+            ctx.memcpy_h2d(control_dev.data(), control.data(),
+                           control.size() * sizeof(int));
+            auto event = queue.ext_oneapi_graph(executable);
+            event.wait_and_throw();
+            ctx.synchronize();
+            ctx.memcpy_d2h(control.data(), control_dev.data(),
+                           control.size() * sizeof(int));
+            std::vector<uint8_t> output_guard(expected_output.size());
+            std::vector<uint8_t> partials_guard(expected_partials.size());
+            ctx.memcpy_d2h(output_guard.data(), output_tensor.data(),
+                           output_guard.size());
+            ctx.memcpy_d2h(partials_guard.data(), partials_tensor.data(),
+                           partials_guard.size());
+            if (control[ops::graph_control::abort] == 0 ||
+                std::memcmp(expected_output.data(), output_guard.data(),
+                            output_guard.size()) != 0 ||
+                std::memcmp(expected_partials.data(), partials_guard.data(),
+                            partials_guard.size()) != 0) {
+                throw std::runtime_error(
+                    std::string("block-native attention graph ") + variant +
+                    " accepted " + label);
+            }
+        };
+        run_variant(graph, out_graph_dev, partials_graph_dev,
+                    output_before, partials_before, "old");
+        run_variant(graph_cached, out_cached_dev, partials_cached_dev,
+                    cached_output_before, cached_partials_before, "cached");
     };
 
     std::array<int, block_topk + compress_ratio> guarded_active{};
@@ -1511,6 +1587,187 @@ void test_attention_decode_block_native_graph(Context& ctx) {
     std::cout << "[PASS] block-native attention graph"
               << " (start_pos=2052..2055, tiles=17/17/17/16, bitwise,"
               << " abort + invalid-id no-op)\n";
+}
+
+void test_attention_decode_block_native_graph_long_capacity(Context& ctx) {
+    constexpr int num_heads = 24;
+    constexpr int num_kv_heads = 2;
+    constexpr int head_dim = 256;
+    constexpr int capacity = 32768;
+    constexpr int max_tiles = 17;
+    constexpr int partial_stride = 272;
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int start_pos = 32760;
+    constexpr int visible_len = start_pos + 1;
+    constexpr int compressed_blocks = visible_len / compress_ratio;
+    constexpr int tail_len = visible_len % compress_ratio;
+    constexpr int effective_len = block_topk * compress_ratio + tail_len;
+    namespace ex = sycl::ext::oneapi::experimental;
+    using ExecutableGraph = ex::command_graph<ex::graph_state::executable>;
+    auto& queue = ctx.queue();
+    if (!queue.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !queue.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error(
+            "long-capacity attention graph test requires SYCL graph support");
+    }
+
+    std::array<int, block_topk + compress_ratio> active{};
+    for (int i = 0; i < block_topk; ++i) {
+        active[i] = (i * 37 + 19) % compressed_blocks;
+    }
+    std::sort(active.begin(), active.begin() + block_topk);
+    active[block_topk] = start_pos;
+    auto cache_token = [&](int t) {
+        if (t < block_topk * compress_ratio) {
+            return active[t / compress_ratio] * compress_ratio +
+                   (t % compress_ratio);
+        }
+        return active[block_topk + (t - block_topk * compress_ratio)];
+    };
+
+    std::mt19937 rng(917);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    std::vector<bf16> q_host(num_heads * head_dim);
+    for (auto& value : q_host) value = bf16(dist(rng));
+    const size_t kv_elements =
+        size_t(num_kv_heads) * capacity * head_dim;
+    std::vector<bf16> k_host(kv_elements, bf16(0.0f));
+    std::vector<bf16> v_host(kv_elements, bf16(0.0f));
+    for (int t = 0; t < effective_len; ++t) {
+        const int row = cache_token(t);
+        for (int kv = 0; kv < num_kv_heads; ++kv) {
+            for (int d = 0; d < head_dim; ++d) {
+                const int k_code =
+                    ((row * 131 + d * 17 + kv * 29) & 255) - 128;
+                const int v_code =
+                    ((row * 97 + d * 31 + kv * 13) & 255) - 128;
+                const size_t offset =
+                    (size_t(kv) * capacity + row) * head_dim + d;
+                k_host[offset] = bf16(float(k_code) * (1.0f / 512.0f));
+                v_host[offset] = bf16(float(v_code) * (1.0f / 512.0f));
+            }
+        }
+    }
+
+    Tensor q_dev = Tensor::allocate(
+        ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor k_dev = Tensor::allocate(
+        ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor v_dev = Tensor::allocate(
+        ctx, {num_kv_heads, capacity, head_dim}, dnnl::memory::data_type::bf16);
+    Tensor direct_dev = Tensor::allocate(
+        ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor old_dev = Tensor::allocate(
+        ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor cached_dev = Tensor::allocate(
+        ctx, {1, num_heads * head_dim}, dnnl::memory::data_type::bf16);
+    Tensor scores_dev = Tensor::allocate(
+        ctx, {num_heads, capacity}, dnnl::memory::data_type::f32);
+    Tensor direct_partials_dev = Tensor::allocate(
+        ctx, {num_heads, max_tiles, partial_stride},
+        dnnl::memory::data_type::f32);
+    Tensor old_partials_dev = Tensor::allocate(
+        ctx, {num_heads, max_tiles, partial_stride},
+        dnnl::memory::data_type::f32);
+    Tensor cached_partials_dev = Tensor::allocate(
+        ctx, {num_heads, max_tiles, partial_stride},
+        dnnl::memory::data_type::f32);
+    Tensor active_dev = Tensor::allocate(
+        ctx, {block_topk + compress_ratio}, dnnl::memory::data_type::s32);
+    Tensor control_dev = Tensor::allocate(
+        ctx, {ops::graph_control::words}, dnnl::memory::data_type::s32);
+
+    ctx.memcpy_h2d(q_dev.data(), q_host.data(),
+                   q_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k_dev.data(), k_host.data(),
+                   k_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v_dev.data(), v_host.data(),
+                   v_host.size() * sizeof(bf16));
+    ctx.memcpy_h2d(active_dev.data(), active.data(),
+                   active.size() * sizeof(int));
+    std::array<int, ops::graph_control::words> control{};
+    control[ops::graph_control::start_pos] = start_pos;
+    control[ops::graph_control::compressed_blocks] = compressed_blocks;
+    control[ops::graph_control::abort] = 0;
+    ctx.memcpy_h2d(control_dev.data(), control.data(),
+                   control.size() * sizeof(int));
+    ctx.synchronize();
+
+    auto capture_graph = [&](bool cache_active_tokens) -> ExecutableGraph {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
+            ops::attention_validate_qsa_active_blocks_graph(
+                ctx, k_dev, v_dev, active_dev, control_dev.data_as<int>(),
+                num_kv_heads);
+            if (cache_active_tokens) {
+                ops::attention_decode_exact_head256_block_native_graph_token_cache(
+                    ctx, q_dev, k_dev, v_dev, cached_dev,
+                    cached_partials_dev, active_dev, control_dev.data_as<int>(),
+                    num_heads, num_kv_heads);
+            } else {
+                ops::attention_decode_exact_head256_block_native_graph(
+                    ctx, q_dev, k_dev, v_dev, old_dev,
+                    old_partials_dev, active_dev, control_dev.data_as<int>(),
+                    num_heads, num_kv_heads);
+            }
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    };
+    ExecutableGraph old_graph = capture_graph(false);
+    ExecutableGraph cached_graph = capture_graph(true);
+
+    ops::attention_decode(
+        ctx, q_dev, k_dev, v_dev, direct_dev, scores_dev,
+        num_heads, num_kv_heads, head_dim, visible_len,
+        &direct_partials_dev, nullptr, nullptr, 0,
+        active_dev.data_as<int>(), block_topk);
+    auto old_event = queue.ext_oneapi_graph(old_graph);
+    auto cached_event = queue.ext_oneapi_graph(cached_graph);
+    old_event.wait_and_throw();
+    cached_event.wait_and_throw();
+    ctx.synchronize();
+
+    std::vector<bf16> direct_out(num_heads * head_dim);
+    std::vector<bf16> old_out(direct_out.size());
+    std::vector<bf16> cached_out(direct_out.size());
+    std::vector<float> direct_partials(
+        size_t(num_heads) * max_tiles * partial_stride);
+    std::vector<float> old_partials(direct_partials.size());
+    std::vector<float> cached_partials(direct_partials.size());
+    ctx.memcpy_d2h(direct_out.data(), direct_dev.data(),
+                   direct_out.size() * sizeof(bf16));
+    ctx.memcpy_d2h(old_out.data(), old_dev.data(),
+                   old_out.size() * sizeof(bf16));
+    ctx.memcpy_d2h(cached_out.data(), cached_dev.data(),
+                   cached_out.size() * sizeof(bf16));
+    ctx.memcpy_d2h(direct_partials.data(), direct_partials_dev.data(),
+                   direct_partials.size() * sizeof(float));
+    ctx.memcpy_d2h(old_partials.data(), old_partials_dev.data(),
+                   old_partials.size() * sizeof(float));
+    ctx.memcpy_d2h(cached_partials.data(), cached_partials_dev.data(),
+                   cached_partials.size() * sizeof(float));
+    if (std::memcmp(direct_out.data(), old_out.data(),
+                    direct_out.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(direct_out.data(), cached_out.data(),
+                    direct_out.size() * sizeof(bf16)) != 0 ||
+        std::memcmp(direct_partials.data(), old_partials.data(),
+                    direct_partials.size() * sizeof(float)) != 0 ||
+        std::memcmp(direct_partials.data(), cached_partials.data(),
+                    direct_partials.size() * sizeof(float)) != 0) {
+        throw std::runtime_error(
+            "long-capacity block-native attention graph mismatch");
+    }
+
+    std::cout << "[PASS] block-native attention graph long capacity"
+              << " (max_seq=32768, start_pos=32760, selected_blocks=512,"
+              << " tail=1, non-contiguous ids, bitwise)\n";
 }
 
 void test_decode_prepare_qgkv_graph(Context& ctx) {
@@ -5324,6 +5581,168 @@ static void test_qsa_select_topk_blocks(Context& ctx) {
     }
 }
 
+static void test_qsa_graph_selector_radix(Context& ctx) {
+    namespace ex = sycl::ext::oneapi::experimental;
+    using ExecutableGraph = ex::command_graph<ex::graph_state::executable>;
+
+    constexpr int block_topk = 512;
+    constexpr int compress_ratio = 4;
+    constexpr int max_blocks = 8192;
+    auto& queue = ctx.queue();
+    if (!queue.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+        !queue.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+        throw std::runtime_error(
+            "QSA graph selector test requires SYCL graph support");
+    }
+
+    Tensor scores = Tensor::allocate(
+        ctx, {max_blocks}, dnnl::memory::data_type::f32);
+    Tensor control = Tensor::allocate(
+        ctx, {ops::graph_control::words}, dnnl::memory::data_type::s32);
+    Tensor active_legacy = Tensor::allocate(
+        ctx, {block_topk + compress_ratio},
+        dnnl::memory::data_type::s32);
+    Tensor active_radix = Tensor::allocate(
+        ctx, {block_topk + compress_ratio},
+        dnnl::memory::data_type::s32);
+    Tensor active_direct = Tensor::allocate(
+        ctx, {block_topk + compress_ratio},
+        dnnl::memory::data_type::s32);
+
+    auto capture_selector = [&](Tensor& output, int selector_mode) {
+        ex::command_graph<ex::graph_state::modifiable> recording(
+            queue.get_context(), queue.get_device());
+        recording.begin_recording(queue);
+        try {
+            ops::qsa_select_topk_blocks_graph(
+                ctx, scores, output, control.data_as<int>(),
+                block_topk, compress_ratio, max_blocks, 0,
+                selector_mode);
+            recording.end_recording(queue);
+        } catch (...) {
+            recording.end_recording(queue);
+            throw;
+        }
+        return recording.finalize();
+    };
+    ExecutableGraph legacy_graph = capture_selector(active_legacy, 0);
+    ExecutableGraph radix_graph = capture_selector(active_radix, 1);
+
+    constexpr int sentinel = -777;
+    auto run_case = [&](int blocks, int tail, int pattern) {
+        const int visible_len = blocks * compress_ratio + tail;
+        std::vector<float> host_scores(blocks);
+        if (pattern == 0) {
+            std::fill(host_scores.begin(), host_scores.end(), 1.0f);
+            host_scores[100] = 0.25f;
+        } else if (pattern == 1) {
+            std::fill(host_scores.begin(), host_scores.end(), 1.0f);
+            host_scores[0] = 2.0f;
+            host_scores[1] = sycl::bit_cast<float>(0x7fc00001U);
+        } else {
+            std::mt19937 rng(81000 + blocks);
+            for (auto& score : host_scores) {
+                score = float(rng() % 100003) * 0.001f;
+            }
+            host_scores[3] = sycl::bit_cast<float>(0x7fc00002U);
+            host_scores[blocks / 2] = host_scores[blocks / 2 + 1];
+            host_scores[blocks - 1] = host_scores[blocks - 2];
+        }
+
+        std::array<int, ops::graph_control::words> control_host{};
+        control_host[ops::graph_control::start_pos] = visible_len - 1;
+        control_host[ops::graph_control::compressed_blocks] = blocks;
+        control_host[ops::graph_control::abort] = 0;
+        ctx.memcpy_h2d(
+            scores.data(), host_scores.data(),
+            host_scores.size() * sizeof(float));
+        ctx.memcpy_h2d(
+            control.data(), control_host.data(),
+            control_host.size() * sizeof(int));
+
+        std::vector<int> initial(block_topk + compress_ratio, sentinel);
+        for (Tensor* output : {&active_legacy, &active_radix, &active_direct}) {
+            ctx.memcpy_h2d(
+                output->data(), initial.data(),
+                initial.size() * sizeof(int));
+        }
+
+        auto legacy_event = queue.ext_oneapi_graph(legacy_graph);
+        auto radix_event = queue.ext_oneapi_graph(radix_graph);
+        const int direct_count = ops::qsa_select_topk_blocks(
+            ctx, scores, blocks, block_topk, visible_len,
+            compress_ratio, active_direct);
+        legacy_event.wait_and_throw();
+        radix_event.wait_and_throw();
+
+        std::vector<int> legacy(initial);
+        std::vector<int> radix(initial);
+        std::vector<int> direct(initial);
+        std::vector<int> expected(initial);
+        ctx.memcpy_d2h(
+            legacy.data(), active_legacy.data(),
+            legacy.size() * sizeof(int));
+        ctx.memcpy_d2h(
+            radix.data(), active_radix.data(),
+            radix.size() * sizeof(int));
+        ctx.memcpy_d2h(
+            direct.data(), active_direct.data(),
+            direct.size() * sizeof(int));
+        const int expected_count = ops::qsa_select_topk_blocks_host(
+            host_scores.data(), blocks, block_topk, visible_len,
+            compress_ratio, expected.data());
+        const int used = block_topk + tail;
+        if (direct_count != expected_count ||
+            std::memcmp(
+                direct.data(), expected.data(),
+                used * sizeof(int)) != 0) {
+            throw std::runtime_error(
+                "QSA graph selector direct oracle mismatch at blocks=" +
+                std::to_string(blocks) +
+                " tail=" + std::to_string(tail));
+        }
+        if (std::memcmp(
+                legacy.data(), expected.data(),
+                used * sizeof(int)) != 0) {
+            throw std::runtime_error(
+                "QSA graph selector legacy mismatch at blocks=" +
+                std::to_string(blocks) +
+                " tail=" + std::to_string(tail));
+        }
+        if (std::memcmp(
+                radix.data(), expected.data(),
+                used * sizeof(int)) != 0) {
+            throw std::runtime_error(
+                "QSA graph selector radix mismatch at blocks=" +
+                std::to_string(blocks) +
+                " tail=" + std::to_string(tail));
+        }
+        std::cout << "[QSA GRAPH SELECTOR PASS] blocks=" << blocks
+                  << " tail=" << tail << " selected=" << expected_count
+                  << " legacy=exact radix=exact\n";
+    };
+
+    run_case(513, 0, 0);
+    run_case(514, 3, 1);
+    run_case(max_blocks, 2, 2);
+
+    auto measure = [&](ExecutableGraph& graph) {
+        const auto begin = std::chrono::steady_clock::now();
+        auto event = queue.ext_oneapi_graph(graph);
+        event.wait_and_throw();
+        return std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now() - begin)
+            .count();
+    };
+    const double legacy_us = measure(legacy_graph);
+    const double radix_us = measure(radix_graph);
+    std::cout << "[QSA GRAPH SELECTOR COST] blocks=" << max_blocks
+              << " legacy_us=" << legacy_us
+              << " radix_us=" << radix_us
+              << " speedup=" << (legacy_us / radix_us)
+              << " runs=1 exact=1\n";
+}
+
 static void test_qsa_prepare_q_batched(Context& ctx) {
     std::cout << "[Test] Running QSA Batched Query Preparation (A4) tests...\n";
     constexpr int count = 8;
@@ -7529,6 +7948,14 @@ int main(int argc, char** argv) {
             std::cout << "QSA graph device-state test PASSED; teardown USM zero\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-selector-graph-only") {
+            test_qsa_graph_selector_radix(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA graph selector test teardown USM leak");
+            std::cout << "QSA graph selector test PASSED; teardown USM zero\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--qsa-per-layer-only") {
             test_qsa_graph_per_layer_block_advance(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
@@ -7539,6 +7966,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--attention-graph-only") {
             test_attention_decode_block_native_graph(ctx);
+            test_attention_decode_block_native_graph_long_capacity(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("Attention graph test teardown USM leak");
@@ -7678,6 +8106,7 @@ int main(int argc, char** argv) {
             test_qsa_graph_position_and_block_advance(ctx);
             test_qsa_graph_per_layer_block_advance(ctx);
             test_attention_decode_block_native_graph(ctx);
+            test_attention_decode_block_native_graph_long_capacity(ctx);
             test_decode_prepare_qgkv_graph(ctx);
             test_qsa_layer_graph_composite(ctx);
             test_qsa_selector_adversarial(ctx);

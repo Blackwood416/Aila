@@ -191,6 +191,7 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         std::unique_ptr<Executable> executable;
         Tensor control;
         std::array<int, ops::graph_control::words> control_host{};
+        std::size_t node_count = 0;
     };
 
 public:
@@ -334,6 +335,9 @@ public:
     }
     aila::TokenGraphLease token_graph_lease() const noexcept {
         return token_graph_runtime_.Snapshot();
+    }
+    std::size_t qsa_layer_graph_node_count() const noexcept {
+        return qsa_layer_graph_.node_count;
     }
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
@@ -567,6 +571,9 @@ private:
     aila::TokenGraphKey MakeQsaLayerGraphKey(const Session& session) const;
     bool ForwardQsaLayerGraph(Context& ctx, Session& session, Tensor& input,
                               Tensor& output, int start_pos);
+    // The only path that may destroy the P10 executable. idle_confirmed is
+    // true only after the caller has drained the in-order queue.
+    bool ReleaseQsaLayerGraph(Context* ctx, bool idle_confirmed) noexcept;
     bool CanCaptureInteriorCheckpoint(const Session& session, int count, int checkpointAfter) const;
     friend struct Qwen4ExpGenerationTestAccess;
     friend struct Qwen4ExpMtpProbe;
