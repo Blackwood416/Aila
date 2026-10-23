@@ -1097,3 +1097,39 @@ calls per token the ceiling on that change is about 0.9 ms.
 `packed_nf4_gemv_bf16_impl` already uses one work-group per output row (`grid = out_features x
 wg_size`), so it has no equivalent remap available and its 31 us has to be attacked differently
 or left alone.
+
+## 26. The overlapped window is bigger than 25.3 assumed
+
+Section 25.4 predicted that re-mapping the shared expert gate/up kernel to one work-group per row
+(40 -> 640 work-groups) would be worth about 0.9 ms. It was implemented and measured neutral:
+
+```text
+AILA_Q4E_SHARED_GU_WGROW=0 : route_wait 25.14   decode p50 46.61
+AILA_Q4E_SHARED_GU_WGROW=1 : route_wait 25.03   decode p50 47.19
+```
+
+The prediction failed for a reason worth recording: that kernel runs **after** the doorbell and
+**before** the packet wait, i.e. in the same window as the resident experts, so it is already
+hidden behind the host's cold-expert computation. It never appears in `route_wait`, exactly like
+`launch_moe_decode_gate_up_swiglu_grouped` and `launch_moe_decode_down_to_rank_f32` in 25.1.
+The variant stays in the tree behind `AILA_Q4E_SHARED_GU_WGROW=1` but is off by default because
+it changes the reduction order for no gain.
+
+The corrected structural rule for this pipeline:
+
+```text
+critical path (route_wait):  packet consume -> merge/add/bridge -> HC_attn
+                             -> attention -> HC_mlp -> router -> doorbell publish
+overlapped with host cold:   resident experts, shared expert
+```
+
+So the only kernels worth optimising are the ones in the first list. Measured against the
+observer-free trace, the remaining critical-path budget is roughly:
+
+| item | ms/token | state |
+|---|---:|---|
+| HC (norm + down + up, 96 calls) | ~5.3 | down GEMM now at the 327 GB/s ceiling after the work-group-per-row change; up already at the same ceiling; norm is 1.4 ms of it |
+| QSA body (12 layers, 10 stages) | ~4.4 | every stage is a small standalone launch |
+| GDN attention (36 layers) | ~1.5 | |
+| router (front + topk + publish + classify) | ~1.5 | topk 0.82 of it |
+| tail (merge/add/bridge fused + packet wait) | ~2 | |

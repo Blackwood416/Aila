@@ -1214,6 +1214,136 @@ void packed_nf4_gemm_bf16(Context& ctx,
 // Fused gate+up gemv with SiLU activation for decode (seq_len == 1).
 // Computes out[i] = silu(dot(input, gate_weight[i,:])) * dot(input, up_weight[i,:])
 // using NF4 packed weights with per-block float absmax.
+// Same arithmetic as packed_nf4_gemv_gate_up_swiglu, but one work-group per
+// output row instead of one sub-group per row.
+//
+// The production mapping puts sixteen rows in each 256-thread work-group
+// (rows_per_group = wg_size / sub_group_size), so the shared expert's
+// intermediate_size of 640 launches only 40 work-groups. This variant gives
+// each row a whole work-group, i.e. 640 of them, and reduces the row
+// cooperatively. Per-lane element order inside the row changes, so the result
+// is not bit-identical; the operator is unchanged.
+void packed_nf4_gemv_gate_up_swiglu_wgrow(
+    Context& ctx, const uint8_t* gate_packed, const float* gate_absmax,
+    const uint8_t* up_packed, const float* up_absmax,
+    const float* quant_map_ptr, const bf16* input_ptr, bf16* output_ptr,
+    int in_features, int intermediate_size, int blocksize) {
+    const int packed_bytes_per_row = in_features / 2;
+    const int blocks_per_row = in_features / blocksize;
+    constexpr int wg_size = 256;
+    constexpr int sub_group_size = 16;
+    constexpr int kSubGroups = wg_size / sub_group_size;
+    const int chunk = wg_size * 4;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> qmap(sycl::range<1>(16), cgh);
+        sycl::local_accessor<float, 2> red(
+            sycl::range<2>(kSubGroups, 2), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(intermediate_size) *
+                               wg_size),
+                sycl::range<1>(wg_size)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                using vec8 = sycl::vec<bf16, 8>;
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const int sg_id = lid / sub_group_size;
+                const int lane = lid % sub_group_size;
+                const int row = static_cast<int>(item.get_group(0));
+
+                if (lid < 16) qmap[lid] = quant_map_ptr[lid];
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int row_byte_base = row * packed_bytes_per_row;
+                const int row_block_base = row * blocks_per_row;
+                float gate_acc = 0.0f;
+                float up_acc = 0.0f;
+
+                int byte_offset = lid * 4;
+                for (; byte_offset + 3 < packed_bytes_per_row;
+                     byte_offset += chunk) {
+                    const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
+                        gate_packed + row_byte_base + byte_offset);
+                    const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
+                        up_packed + row_byte_base + byte_offset);
+                    const float ga = gate_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const float ua = up_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const int ib = byte_offset * 2;
+                    const vec8 in_v =
+                        *reinterpret_cast<const vec8*>(input_ptr + ib);
+                    const uint8_t gb0 = static_cast<uint8_t>(g4);
+                    const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
+                    const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
+                    const uint8_t gb3 = static_cast<uint8_t>(g4 >> 24);
+                    const uint8_t ub0 = static_cast<uint8_t>(u4);
+                    const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
+                    const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
+                    const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[gb0 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[gb0 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[gb1 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[gb1 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[gb2 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[gb2 & 0xF] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[gb3 >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[gb3 & 0xF] * ga, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[ub0 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[ub0 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[ub1 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[ub1 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[ub2 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[ub2 & 0xF] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[ub3 >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[ub3 & 0xF] * ua, up_acc);
+                }
+                for (; byte_offset < packed_bytes_per_row;
+                     byte_offset += wg_size) {
+                    const uint8_t gb = gate_packed[row_byte_base + byte_offset];
+                    const uint8_t ub = up_packed[row_byte_base + byte_offset];
+                    const float ga = gate_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const float ua = up_absmax[row_block_base +
+                        (byte_offset / (blocksize / 2))];
+                    const int ii = byte_offset * 2;
+                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        qmap[gb >> 4] * ga, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        qmap[gb & 0xF] * ga, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
+                        qmap[ub >> 4] * ua, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                        qmap[ub & 0xF] * ua, up_acc);
+                }
+
+                auto sg = item.get_sub_group();
+                const float g_part =
+                    sycl::reduce_over_group(sg, gate_acc, sycl::plus<>());
+                const float u_part =
+                    sycl::reduce_over_group(sg, up_acc, sycl::plus<>());
+                if (lane == 0) {
+                    red[sg_id][0] = g_part;
+                    red[sg_id][1] = u_part;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (sg_id == 0) {
+                    const float gv = lane < kSubGroups ? red[lane][0] : 0.0f;
+                    const float uv = lane < kSubGroups ? red[lane][1] : 0.0f;
+                    const float gate_sum =
+                        sycl::reduce_over_group(sg, gv, sycl::plus<>());
+                    const float up_sum =
+                        sycl::reduce_over_group(sg, uv, sycl::plus<>());
+                    if (lane == 0) {
+                        const float silu_gate =
+                            gate_sum / (1.0f + sycl::native::exp(-gate_sum));
+                        output_ptr[row] = bf16(silu_gate * up_sum);
+                    }
+                }
+            });
+    });
+}
+
 void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                                     const uint8_t* gate_packed,
                                     const float* gate_absmax,
@@ -1225,6 +1355,23 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                                     int in_features,
                                     int intermediate_size,
                                     int blocksize) {
+    // AILA_Q4E_SHARED_GU_WGROW=1 opts into one work-group per output row.
+    // Measured neutral (route_wait 25.14 -> 25.03, i.e. inside the noise) and
+    // it changes the reduction order, so it is off by default: the shared
+    // expert gate/up runs between the doorbell and the packet wait, i.e. inside
+    // the window where the host is computing cold experts, so it is already
+    // off the critical path.
+    static const bool gu_wgrow = [] {
+        const char* raw = std::getenv("AILA_Q4E_SHARED_GU_WGROW");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    if (gu_wgrow) {
+        packed_nf4_gemv_gate_up_swiglu_wgrow(
+            ctx, gate_packed, gate_absmax, up_packed, up_absmax,
+            quant_map_ptr, input_ptr, output_ptr, in_features,
+            intermediate_size, blocksize);
+        return;
+    }
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     const size_t wg_size = 256;
