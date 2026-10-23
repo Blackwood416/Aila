@@ -3,6 +3,7 @@
 #include "../ops/GraphControl.hpp"
 #include "../profile/Profiling.hpp"
 #include "Qwen4ExpTokenGraphKernels.hpp"
+#include "Qwen4ExpTokenGraphStageProf.hpp"
 #include "../utils/EnvUtils.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -11,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -256,12 +258,30 @@ enum WholeTokenNodeLabel : int {
     kNodeResident,
     kNodeShared,
     kNodeTail,
+    // QSA layer-body sub-stages, declared in Qwen4ExpTokenGraphStageProf.hpp so
+    // the body in Qwen4ExpPrefill.cpp can mark them too. Keep contiguous.
+    kNodeQkvProj,
+    kNodeIndexerQk,
+    kNodePrepareQkv,
+    kNodePrepareIndexerQ,
+    kNodeCompressBlock,
+    kNodeBlockScores,
+    kNodeSelectBlocks,
+    kNodeValidateBlocks,
+    kNodeSparseAttend,
+    kNodeOProj,
     kNodeLabelCount,
 };
 
+static_assert(static_cast<int>(aila::token_graph_stage_prof::kQsaStageEnd) ==
+                  static_cast<int>(kNodeLabelCount),
+              "QSA stage labels drifted from the whole-token profiler labels");
+
 constexpr const char* kNodeLabelNames[kNodeLabelCount] = {
     "anchor", "attn_hc", "attention", "mlp_hc",
-    "route", "resident", "shared", "tail"};
+    "route", "resident", "shared", "tail",
+    "qkv_proj", "indexer_qk", "prepare_qkv", "prepare_idx_q", "compress",
+    "blk_scores", "select", "validate", "attend", "o_proj"};
 
 struct WholeTokenNodeProfiler {
     bool enabled = false;
@@ -305,13 +325,13 @@ struct WholeTokenNodeProfiler {
         double total = 0.0;
         for (int i = 0; i < kNodeLabelCount; ++i) total += span[i];
         std::string line;
+        char cell[40];
         for (int i = 0; i < kNodeLabelCount; ++i) {
-            line += " ";
-            line += kNodeLabelNames[i];
-            line += "=";
-            line += std::to_string(static_cast<int>(span[i] * 100.0) / 100);
-            line += "/";
-            line += std::to_string(count[i]);
+            // Keep two decimals: QSA sub-stages are far below 1 ms each and an
+            // integer format silently reads as zero.
+            std::snprintf(cell, sizeof(cell), " %s=%.2f/%d",
+                          kNodeLabelNames[i], span[i], count[i]);
+            line += cell;
         }
         AILA_LOG_INFO("[Q4E NodeProf] %s marks=%zu total_ms=%.2f%s",
                       where, marks.size(), total, line.c_str());
@@ -350,6 +370,12 @@ bool whole_token_unrolled_requested() {
 }
 
 }  // namespace
+
+namespace aila::token_graph_stage_prof {
+
+void mark(int stage) { whole_token_node_profiler().mark(stage); }
+
+}  // namespace aila::token_graph_stage_prof
 
 std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
     Context& ctx, Session& session, int* control) {
@@ -844,9 +870,20 @@ Tensor& Qwen4ExpBnb4Backend::ForwardWholeTokenGraph(
                 node_profiler.enabled = true;
             }
             node_profiler.drain_and_log("prev");
-            (void)RecordWholeTokenGraphBody(
+            const auto submit_begin = std::chrono::steady_clock::now();
+            const std::size_t submitted_nodes = RecordWholeTokenGraphBody(
                 ctx, session, graph.control.data_as<int>());
             event = ctx.queue().ext_oneapi_submit_barrier();
+            const double submit_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - submit_begin)
+                    .count();
+            if (whole_token_graph_trace_requested()) {
+                AILA_LOG_INFO(
+                    "[Q4E TokenGraph] submit pos=%d nodes=%zu "
+                    "submit_ms=%.3f",
+                    start_pos, submitted_nodes, submit_ms);
+            }
         } else {
             event = ctx.queue().ext_oneapi_graph(*graph.executable);
         }

@@ -1,4 +1,5 @@
 #include "Qwen4ExpBnb4Backend.hpp"
+#include "Qwen4ExpTokenGraphStageProf.hpp"
 #include "../ops/AttentionOps.hpp"
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
@@ -848,11 +849,15 @@ std::size_t Qwen4ExpBnb4Backend::RecordQsaLayerGraphBody(
     layer.qkv_proj.ForwardDecodeRows(
         ctx, linear_scratch_, input, buf_.full_qkv, 1);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kQkvProj);
     ops::bf16_gemv_bf16(
         ctx, *layer.index_qk_weight, input.data_as<bf16>(),
         buf_.indexer_qk.data_as<bf16>(), indexer_out_dim,
         hidden_size_);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kIndexerQk);
 
     bf16* fused_ptr = buf_.full_qkv.data_as<bf16>();
     Tensor q_gate_view = Tensor::view(
@@ -882,6 +887,8 @@ std::size_t Qwen4ExpBnb4Backend::RecordQsaLayerGraphBody(
         cfg_.rope.mrope_section[2], nullptr, nullptr,
         layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kPrepareQkv);
     ops::qsa_prepare_q_and_cache_k_graph(
         ctx, indexer_qk_row, *layer.index_q_norm_weight,
         cache.indexer_k, indexer_q_row,
@@ -892,6 +899,8 @@ std::size_t Qwen4ExpBnb4Backend::RecordQsaLayerGraphBody(
         cfg_.rope.mrope_section[2],
         layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kPrepareIndexerQ);
     ops::qsa_compress_one_completed_block_graph(
         ctx, cache.indexer_k, *layer.index_k_norm_weight,
         cache.indexer_compressed_k, control,
@@ -902,31 +911,43 @@ std::size_t Qwen4ExpBnb4Backend::RecordQsaLayerGraphBody(
         cfg_.rope.mrope_section[2],
         layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kCompressBlock);
     ops::qsa_compute_block_scores_compressed_graph(
         ctx, indexer_q_row, cache.indexer_compressed_k,
         buf_.indexer_block_scores, control,
         max_blocks, layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kBlockScores);
     ops::qsa_select_topk_blocks_graph(
         ctx, buf_.indexer_block_scores,
         buf_.indexer_active_blocks, control,
         kQsaGraphBlockTopK, kQsaGraphCompressRatio, max_blocks,
         layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kSelectBlocks);
     ops::attention_validate_qsa_active_blocks_graph(
         ctx, cache.k, cache.v, buf_.indexer_active_blocks,
         control, full_kv_heads_,
         layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kValidateBlocks);
     ops::attention_decode_exact_head256_block_native_graph(
         ctx, buf_.q, cache.k, cache.v, buf_.attn_out,
         buf_.decode_attn_partials, buf_.indexer_active_blocks,
         control, full_q_heads_,
         full_kv_heads_, &buf_.z, layer_ordinal);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kSparseAttend);
     layer.o_proj.ForwardDecodeRows(
         ctx, linear_scratch_, buf_.attn_out, output, 1);
     captured_node();
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kOProj);
     return captured_nodes;
 }
 
