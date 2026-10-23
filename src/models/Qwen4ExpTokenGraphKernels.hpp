@@ -230,5 +230,122 @@ inline void submit_gated_final_bridge(
     });
 }
 
+// Fused tail: ordered merge + shared-expert add + final bridge in one launch.
+//
+// All three stages are element-wise over the same hidden row and each one only
+// consumes the value the previous stage produced for that same element, so a
+// single work-item can carry the element through all three phases with no
+// cross-item dependency and no barrier between them. The three original
+// kernels cost three launches per layer; at the measured 21 us launch floor on
+// this stack that is about 2 ms of every token's device budget.
+//
+// Bit-exactness: the original path rounds through bf16 memory between stages
+// (merge stores y, add_shared reads it back and stores again, the bridge reads
+// it once more). This version reproduces each of those rounding points
+// explicitly, so the result is identical rather than merely close.
+inline void submit_gated_fused_tail(
+    sycl::queue& queue, const float* resident_down,
+    const float* route_weights, const std::int32_t* selected,
+    const std::int32_t* packet_dev, const bf16* shared_out,
+    const bf16* shared_gate, const float* inject, bf16* y, bf16* hidden4,
+    TokenGraphControlRing* control,
+    const TokenGraphDeviceEpoch* epoch,
+    std::uint32_t top_k = kTokenGraphRouteRanks) {
+    if (top_k == 0u || top_k > kTokenGraphRouteRanks) {
+        throw std::invalid_argument(
+            "token graph fused tail top-k is out of range");
+    }
+    constexpr std::uint32_t work_group = kMergeWorkGroup;
+    const std::size_t groups =
+        (static_cast<std::size_t>(kTokenGraphHiddenElements) +
+         work_group - 1u) /
+        work_group;
+    queue.submit([&](sycl::handler& handler) {
+        sycl::local_accessor<std::uint32_t, 1> status(
+            sycl::range<1>(2), handler);
+        handler.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(groups * work_group),
+                sycl::range<1>(work_group)),
+            [=](sycl::nd_item<1> item) {
+                if (item.get_local_id(0) == 0u) {
+                    status[0] =
+                        epoch != nullptr &&
+                                token_graph_service::device_epoch_valid(epoch)
+                            ? 1u
+                            : 0u;
+                    status[1] = 1u;
+                    if (status[0] != 0u) {
+                        for (std::uint32_t rank = 0u; rank < top_k; ++rank) {
+                            const bool device_resident = selected[rank] >= 0;
+                            const bool host_cold = packet_dev[rank] >= 0;
+                            if (device_resident == host_cold) {
+                                status[1] = 0u;
+                                break;
+                            }
+                        }
+                    }
+                }
+                sycl::group_barrier(
+                    item.get_group(), sycl::memory_scope::work_group);
+                if (status[0] == 0u) return;
+                if (status[1] == 0u) {
+                    if (item.get_group(0) == 0u &&
+                        item.get_local_id(0) == 0u) {
+                        token_graph_service::device_publish_failure(
+                            control,
+                            const_cast<TokenGraphDeviceEpoch*>(epoch),
+                            TokenGraphGateState::PacketShape, 0xE0000000u,
+                            0u);
+                    }
+                    return;
+                }
+                const std::size_t row = item.get_global_id(0);
+                if (row >= kTokenGraphHiddenElements) return;
+
+                const auto* packet_values =
+                    reinterpret_cast<const float*>(
+                        packet_dev + kTokenGraphPacketSlots);
+                float total = 0.0f;
+                for (std::uint32_t rank = 0u; rank < top_k; ++rank) {
+                    const std::int32_t cpu_row = packet_dev[rank];
+                    const float value =
+                        cpu_row >= 0
+                            ? packet_values[
+                                  static_cast<std::size_t>(cpu_row) *
+                                      kTokenGraphHiddenElements +
+                                  row]
+                            : resident_down[
+                                  static_cast<std::size_t>(rank) *
+                                      kTokenGraphHiddenElements +
+                                  row];
+                    total += route_weights[rank] * value;
+                }
+                // Rounding point of submit_gated_ordered_merge.
+                const bf16 merged = bf16(total);
+                // Rounding point of submit_add_shared_expert_to_y.
+                const float gate_value = static_cast<float>(shared_gate[0]);
+                const float gate_act =
+                    1.0f / (1.0f + sycl::native::exp(-gate_value));
+                const bf16 with_shared = bf16(
+                    static_cast<float>(merged) +
+                    gate_act * static_cast<float>(shared_out[row]));
+                y[row] = with_shared;
+                // Rounding point of submit_gated_final_bridge, for each of the
+                // four hidden groups this row contributes to.
+                for (std::uint32_t group = 0u; group < kHiddenGroups;
+                     ++group) {
+                    const std::size_t offset =
+                        static_cast<std::size_t>(group) *
+                            kTokenGraphHiddenElements +
+                        row;
+                    hidden4[offset] = bf16(
+                        static_cast<float>(hidden4[offset]) +
+                        inject[group] * static_cast<float>(with_shared));
+                }
+            });
+    });
+}
+
 }  // namespace token_graph_kernels
 }  // namespace aila

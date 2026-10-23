@@ -778,3 +778,71 @@ largest groups:
 Together those are 672 of the ~750 launches and up to 10 ms, i.e. 49 -> ~39 ms. This is the
 only remaining lever of that size; everything else in the device budget is a small share of
 the 24.5 ms of real work.
+
+## 20. First real launch-count win, and the corrected cost of a launch
+
+### 20.1 Tail fusion (landed, on by default)
+
+`submit_gated_ordered_merge`, `submit_add_shared_expert_to_y` and `submit_gated_final_bridge`
+are three launches per layer, 144 per token. They are all element-wise over the same hidden
+row, and each stage consumes only the value the previous stage produced for that same element,
+so one work-item can carry an element through all three phases with no cross-item dependency
+and therefore no barrier. `submit_gated_fused_tail` does exactly that and reproduces each
+stage's bf16 rounding point explicitly, so it is bit-identical rather than merely close:
+merge rounds to bf16, the shared add rounds again from that value, and the bridge rounds from
+the second value.
+
+Two A/B pairs taken in opposite order, 8 tokens, `route_wait` is the device-side signal:
+
+| pair | tail fused | `route_wait` median | decode p50 |
+|---|---|---:|---:|
+| 1 (fused first) | on / off | 27.09 / 28.06 | 50.31 / 48.47 |
+| 2 (off first) | on / off | 27.19 / 28.04 | 47.50 / 49.87 |
+
+`route_wait` improves by 0.85-0.97 ms in **both** pairs, while decode p50 flips sign between
+them; Direct itself swings 55.9-62.3 ms across those runs, so p50 is dominated by host-side
+noise at this effect size. The fusion is therefore on by default and
+`AILA_Q4E_TG_TAIL_FUSED=0` disables it.
+
+### 20.2 The real cost of a launch is ~9.4 us, not 21 us
+
+96 launches removed bought 0.9 ms, i.e. **9.4 us per launch**. The 21 us figure in 19.1 was
+measured with `ext_oneapi_submit_barrier` marks on a profiling queue, and barriers on a
+profiling queue allocate timestamped L0 events and force a command-list batch boundary, so
+that number is an upper bound that does not describe the production path. Every launch-cost
+projection in 19.4 must be rescaled by 0.45:
+
+| fusion | launches removed | projected saving at 9.4 us |
+|---|---:|---:|
+| tail (done) | 96 | 0.90 ms |
+| HC 3 -> 1 | 192 | 1.80 ms |
+| router 4 -> 1 | 144 | 1.35 ms |
+| packet copy folded into the merge | 48 | 0.45 ms |
+
+### 20.3 `AILA_Q4E_DECODE_FUSED_HC=1` is confirmed worse
+
+Previously dismissed on the group-level attribution; re-tested with the reliable metric, with
+tail fusion on and 8 tokens:
+
+```text
+DECODE_FUSED_HC=0 : route_wait median 27.36   p50 49.01
+DECODE_FUSED_HC=1 : route_wait median 30.05   p50 52.63
+```
+
+So the existing fused norm+down kernel costs more than the 96 launches it saves. It stays off.
+Fusing HC is still worth 1.8 ms in principle, but it needs a different kernel (compute the
+four per-group RMS scales inside the down kernel and apply them to the dot product on the fly,
+so the normalised vector never has to be materialised) rather than the existing variant.
+
+### 20.4 Sub-graphs: promising on paper, and unvalidated here
+
+An external review suggests recording per-layer command sub-graphs so that each layer's ~15
+kernels execute back to back inside one closed L0 command list (claimed ~2.2 us per node) with
+the WDDM submit happening immediately after the doorbell write, cutting host submission from
+40.4 ms to ~2.4 ms and the launch floor to ~2.4 ms per token.
+
+That contradicts what this machine already measured: replaying the same node sequence as one
+352-node command graph gives `route_wait` 96.3-97.1 ms versus 28.0-28.4 ms when submitted
+directly, i.e. roughly 90 us per real kernel of graph-execution overhead, not 2.2 us. Before
+any sub-graph refactor, a one-layer sub-graph must be measured: if per-node graph overhead
+persists, sub-graphs inherit the whole-token graph's problem and the refactor is worthless.

@@ -366,6 +366,21 @@ bool whole_token_node_prof_requested() {
 // handoff, no graph executable. Exists to separate graph-replay cost from the
 // cost of the nodes themselves; measurements showed the two differ by a wide
 // margin, so this is also a candidate production path, not only a probe.
+// Collapses the three element-wise tail kernels (ordered merge, shared-expert
+// add, final bridge) into a single launch. At the measured 21 us launch floor
+// that removes 96 launches per token, about 2 ms.
+bool whole_token_tail_fused_requested() {
+    static const bool requested = [] {
+        const char* raw = std::getenv("AILA_Q4E_TG_TAIL_FUSED");
+        // On by default: bit-exact, and two A/B pairs taken in opposite order
+        // both show route_wait improving by 0.85-0.97 ms (96 launches removed,
+        // i.e. about 9.4 us per launch in the real non-profiling path).
+        if (raw == nullptr || raw[0] == '\0') return true;
+        return raw[0] != '0';
+    }();
+    return requested;
+}
+
 bool whole_token_unrolled_requested() {
     static const bool requested = [] {
         const char* raw = std::getenv("AILA_Q4E_TOKEN_GRAPH_UNROLLED");
@@ -512,20 +527,32 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
         aila::token_graph_service::submit_packet_handoff(
             ctx.queue(), control_ring, packet, epoch, packet_dev,
             static_cast<uint32_t>(top_k), kServiceSpinLimit);
-        aila::token_graph_kernels::submit_gated_ordered_merge(
-            ctx.queue(), resident_down_.data_as<float>(),
-            graph.route_weights.data_as<float>(),
-            graph.selected.data_as<int>(), packet_dev,
-            buf_.y.data_as<bf16>(), control_ring, epoch,
-            static_cast<uint32_t>(top_k));
-        aila::token_graph_kernels::submit_add_shared_expert_to_y(
-            ctx.queue(), buf_.y.data_as<bf16>(),
-            buf_.shared_out_buf.data_as<bf16>(),
-            buf_.shared_gate_buf.data_as<bf16>(), epoch);
-        aila::token_graph_kernels::submit_gated_final_bridge(
-            ctx.queue(), buf_.hidden4.data_as<bf16>(),
-            buf_.y.data_as<bf16>(),
-            buf_.hc_inject_f32.data_as<float>(), epoch);
+        if (whole_token_tail_fused_requested()) {
+            aila::token_graph_kernels::submit_gated_fused_tail(
+                ctx.queue(), resident_down_.data_as<float>(),
+                graph.route_weights.data_as<float>(),
+                graph.selected.data_as<int>(), packet_dev,
+                buf_.shared_out_buf.data_as<bf16>(),
+                buf_.shared_gate_buf.data_as<bf16>(),
+                buf_.hc_inject_f32.data_as<float>(),
+                buf_.y.data_as<bf16>(), buf_.hidden4.data_as<bf16>(),
+                control_ring, epoch, static_cast<uint32_t>(top_k));
+        } else {
+            aila::token_graph_kernels::submit_gated_ordered_merge(
+                ctx.queue(), resident_down_.data_as<float>(),
+                graph.route_weights.data_as<float>(),
+                graph.selected.data_as<int>(), packet_dev,
+                buf_.y.data_as<bf16>(), control_ring, epoch,
+                static_cast<uint32_t>(top_k));
+            aila::token_graph_kernels::submit_add_shared_expert_to_y(
+                ctx.queue(), buf_.y.data_as<bf16>(),
+                buf_.shared_out_buf.data_as<bf16>(),
+                buf_.shared_gate_buf.data_as<bf16>(), epoch);
+            aila::token_graph_kernels::submit_gated_final_bridge(
+                ctx.queue(), buf_.hidden4.data_as<bf16>(),
+                buf_.y.data_as<bf16>(),
+                buf_.hc_inject_f32.data_as<float>(), epoch);
+        }
         if (layer_index + 1 == cfg_.num_hidden_layers) {
             aila::token_graph_service::submit_publish_done(
                 ctx.queue(), control_ring, epoch);
