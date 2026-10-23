@@ -261,6 +261,15 @@ public:
         CheckTrace(); // Check only after drain, preserving any device first cause.
     }
 
+    bool drain_noexcept() noexcept {
+        try {
+            synchronize();
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     size_t current_allocated_bytes() const { return device_budget_.Current(); }
     size_t peak_allocated_bytes() const { return device_budget_.Peak(); }
     size_t current_pinned_host_bytes() const { return host_budget_.Current(); }

@@ -131,7 +131,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             const bf16* b_ptr = linear_all_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_;
 
             static const bool s_gdn_history_fused = aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", false);
-            const bool defer_history = s_gdn_history_fused && allowQ8 && !attention_q8 && !interior &&
+            const bool defer_history =
+                s_gdn_history_fused && allowQ8 && !use_device_conv_head &&
+                !attention_q8 && !interior &&
                 !gpuNf4Q8ReferenceForTest_ && !decodeHcReferenceForTest_ &&
                 ops::supports_default_grouped_linear_delta_fastpath(layer.geom.q_heads, layer.geom.v_heads,
                     layer.geom.head_k_dim, layer.geom.head_v_dim, layer.geom.kernel, layer.geom.conv_rows);
@@ -818,6 +820,123 @@ aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeQsaLayerGraphKey(
     return key;
 }
 
+std::size_t Qwen4ExpBnb4Backend::RecordQsaLayerGraphBody(
+    Context& ctx, Session& session, int layer_index, int layer_ordinal,
+    Tensor& input, Tensor& output, int* control) {
+    if (layer_index < 0 ||
+        layer_index >= static_cast<int>(layers_.size()) ||
+        layers_[layer_index].is_linear ||
+        layer_ordinal < 0 ||
+        layer_ordinal >= kQsaGraphLayerOrdinal + 12) {
+        throw std::invalid_argument(
+            "Qwen4Exp full-attention graph body has invalid layer geometry");
+    }
+    auto& layer = layers_[layer_index];
+    auto& cache = session.layerCaches_[layer_index];
+    const int indexer_out_dim =
+        (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) *
+        cfg_.indexer_head_dim;
+    const int indexer_q_dim =
+        cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+    const int max_blocks =
+        static_cast<int>(cache.indexer_compressed_k.shape(0));
+
+    std::size_t captured_nodes = 0;
+    auto captured_node = [&captured_nodes]() noexcept {
+        ++captured_nodes;
+    };
+    layer.qkv_proj.ForwardDecodeRows(
+        ctx, linear_scratch_, input, buf_.full_qkv, 1);
+    captured_node();
+    ops::bf16_gemv_bf16(
+        ctx, *layer.index_qk_weight, input.data_as<bf16>(),
+        buf_.indexer_qk.data_as<bf16>(), indexer_out_dim,
+        hidden_size_);
+    captured_node();
+
+    bf16* fused_ptr = buf_.full_qkv.data_as<bf16>();
+    Tensor q_gate_view = Tensor::view(
+        ctx, fused_ptr, {1, full_q_proj_dim_});
+    Tensor k_view = Tensor::view(
+        ctx, fused_ptr + full_q_proj_dim_,
+        {1, full_kv_dim_});
+    Tensor v_view = Tensor::view(
+        ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_,
+        {1, full_kv_dim_});
+    Tensor indexer_qk_row = Tensor::view(
+        ctx, buf_.indexer_qk.data_as<bf16>(),
+        {1, indexer_out_dim});
+    Tensor indexer_q_row = Tensor::view(
+        ctx, buf_.indexer_q.data_as<bf16>(),
+        {1, indexer_q_dim});
+
+    ops::decode_prepare_qgkv_packed_partial_graph(
+        ctx, q_gate_view, k_view, v_view, buf_.q, buf_.z,
+        *layer.q_norm_weight, *layer.k_norm_weight,
+        cache.k, cache.v, control,
+        full_q_heads_, full_kv_heads_, full_head_dim_,
+        cfg_.rms_norm_eps, 64, cfg_.rope.rope_theta,
+        cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
+        0, 0, cfg_.rope.mrope_section[0],
+        cfg_.rope.mrope_section[1],
+        cfg_.rope.mrope_section[2], nullptr, nullptr,
+        layer_ordinal);
+    captured_node();
+    ops::qsa_prepare_q_and_cache_k_graph(
+        ctx, indexer_qk_row, *layer.index_q_norm_weight,
+        cache.indexer_k, indexer_q_row,
+        control, cfg_.rope.rope_theta,
+        cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
+        0, 0, cfg_.rope.mrope_section[0],
+        cfg_.rope.mrope_section[1],
+        cfg_.rope.mrope_section[2],
+        layer_ordinal);
+    captured_node();
+    ops::qsa_compress_one_completed_block_graph(
+        ctx, cache.indexer_k, *layer.index_k_norm_weight,
+        cache.indexer_compressed_k, control,
+        cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+        nullptr, nullptr, nullptr, 0, 0,
+        cfg_.rope.mrope_section[0],
+        cfg_.rope.mrope_section[1],
+        cfg_.rope.mrope_section[2],
+        layer_ordinal);
+    captured_node();
+    ops::qsa_compute_block_scores_compressed_graph(
+        ctx, indexer_q_row, cache.indexer_compressed_k,
+        buf_.indexer_block_scores, control,
+        max_blocks, layer_ordinal);
+    captured_node();
+    ops::qsa_select_topk_blocks_graph(
+        ctx, buf_.indexer_block_scores,
+        buf_.indexer_active_blocks, control,
+        kQsaGraphBlockTopK, kQsaGraphCompressRatio, max_blocks,
+        layer_ordinal);
+    captured_node();
+    ops::attention_validate_qsa_active_blocks_graph(
+        ctx, cache.k, cache.v, buf_.indexer_active_blocks,
+        control, full_kv_heads_,
+        layer_ordinal);
+    captured_node();
+    ops::attention_decode_exact_head256_block_native_graph(
+        ctx, buf_.q, cache.k, cache.v, buf_.attn_out,
+        buf_.decode_attn_partials, buf_.indexer_active_blocks,
+        control, full_q_heads_,
+        full_kv_heads_, &buf_.z, layer_ordinal);
+    captured_node();
+    layer.o_proj.ForwardDecodeRows(
+        ctx, linear_scratch_, buf_.attn_out, output, 1);
+    captured_node();
+    return captured_nodes;
+}
+
+std::size_t Qwen4ExpBnb4Backend::RecordSingleFullAttentionLayerGraphBody(
+    Context& ctx, Session& session, int layer, int layer_ordinal,
+    Tensor& input, Tensor& output, int* control) {
+    return RecordQsaLayerGraphBody(
+        ctx, session, layer, layer_ordinal, input, output, control);
+}
+
 bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
     Context& ctx, Session& session, Tensor& input, Tensor& output,
     int start_pos) {
@@ -890,108 +1009,17 @@ bool Qwen4ExpBnb4Backend::ForwardQsaLayerGraph(
                 qsa_layer_graph_.control.size_bytes());
             ctx.synchronize();
 
-            auto& layer = layers_[kQsaGraphLayer];
-            auto& cache = session.layerCaches_[kQsaGraphLayer];
-            const int indexer_out_dim =
-                (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) *
-                cfg_.indexer_head_dim;
-            const int indexer_q_dim =
-                cfg_.indexer_n_heads * cfg_.indexer_head_dim;
-            const int max_blocks =
-                static_cast<int>(cache.indexer_compressed_k.shape(0));
-            const int* control = qsa_layer_graph_.control.data_as<int>();
+            int* control = qsa_layer_graph_.control.data_as<int>();
 
             sycl::ext::oneapi::experimental::command_graph<
                 sycl::ext::oneapi::experimental::graph_state::modifiable>
                 recording(ctx.queue().get_context(), ctx.queue().get_device());
             recording.begin_recording(ctx.queue());
             std::size_t captured_nodes = 0;
-            auto captured_node = [&captured_nodes]() noexcept {
-                ++captured_nodes;
-            };
             try {
-                layer.qkv_proj.ForwardDecodeRows(
-                    ctx, linear_scratch_, input, buf_.full_qkv, 1);
-                captured_node();
-                ops::bf16_gemv_bf16(
-                    ctx, *layer.index_qk_weight, input.data_as<bf16>(),
-                    buf_.indexer_qk.data_as<bf16>(), indexer_out_dim,
-                    hidden_size_);
-                captured_node();
-
-                bf16* fused_ptr = buf_.full_qkv.data_as<bf16>();
-                Tensor q_gate_view = Tensor::view(
-                    ctx, fused_ptr, {1, full_q_proj_dim_});
-                Tensor k_view = Tensor::view(
-                    ctx, fused_ptr + full_q_proj_dim_,
-                    {1, full_kv_dim_});
-                Tensor v_view = Tensor::view(
-                    ctx, fused_ptr + full_q_proj_dim_ + full_kv_dim_,
-                    {1, full_kv_dim_});
-                Tensor indexer_qk_row = Tensor::view(
-                    ctx, buf_.indexer_qk.data_as<bf16>(),
-                    {1, indexer_out_dim});
-                Tensor indexer_q_row = Tensor::view(
-                    ctx, buf_.indexer_q.data_as<bf16>(),
-                    {1, indexer_q_dim});
-
-                ops::decode_prepare_qgkv_packed_partial_graph(
-                    ctx, q_gate_view, k_view, v_view, buf_.q, buf_.z,
-                    *layer.q_norm_weight, *layer.k_norm_weight,
-                    cache.k, cache.v, const_cast<int*>(control),
-                    full_q_heads_, full_kv_heads_, full_head_dim_,
-                    cfg_.rms_norm_eps, 64, cfg_.rope.rope_theta,
-                    cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
-                    0, 0, cfg_.rope.mrope_section[0],
-                    cfg_.rope.mrope_section[1],
-                    cfg_.rope.mrope_section[2], nullptr, nullptr,
-                    kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::qsa_prepare_q_and_cache_k_graph(
-                    ctx, indexer_qk_row, *layer.index_q_norm_weight,
-                    cache.indexer_k, indexer_q_row,
-                    const_cast<int*>(control), cfg_.rope.rope_theta,
-                    cfg_.rope.mrope_interleaved, nullptr, nullptr, nullptr,
-                    0, 0, cfg_.rope.mrope_section[0],
-                    cfg_.rope.mrope_section[1],
-                    cfg_.rope.mrope_section[2],
-                    kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::qsa_compress_one_completed_block_graph(
-                    ctx, cache.indexer_k, *layer.index_k_norm_weight,
-                    cache.indexer_compressed_k, const_cast<int*>(control),
-                    cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
-                    nullptr, nullptr, nullptr, 0, 0,
-                    cfg_.rope.mrope_section[0],
-                    cfg_.rope.mrope_section[1],
-                    cfg_.rope.mrope_section[2],
-                    kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::qsa_compute_block_scores_compressed_graph(
-                    ctx, indexer_q_row, cache.indexer_compressed_k,
-                    buf_.indexer_block_scores, const_cast<int*>(control),
-                    max_blocks, kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::qsa_select_topk_blocks_graph(
-                    ctx, buf_.indexer_block_scores,
-                    buf_.indexer_active_blocks, const_cast<int*>(control),
-                    kQsaGraphBlockTopK, kQsaGraphCompressRatio, max_blocks,
-                    kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::attention_validate_qsa_active_blocks_graph(
-                    ctx, cache.k, cache.v, buf_.indexer_active_blocks,
-                    const_cast<int*>(control), full_kv_heads_,
-                    kQsaGraphLayerOrdinal);
-                captured_node();
-                ops::attention_decode_exact_head256_block_native_graph(
-                    ctx, buf_.q, cache.k, cache.v, buf_.attn_out,
-                    buf_.decode_attn_partials, buf_.indexer_active_blocks,
-                    const_cast<int*>(control), full_q_heads_,
-                    full_kv_heads_, &buf_.z, kQsaGraphLayerOrdinal);
-                captured_node();
-                layer.o_proj.ForwardDecodeRows(
-                    ctx, linear_scratch_, buf_.attn_out, output, 1);
-                captured_node();
+                captured_nodes = RecordSingleFullAttentionLayerGraphBody(
+                    ctx, session, kQsaGraphLayer, kQsaGraphLayerOrdinal,
+                    input, output, control);
                 if (captured_nodes == 0) {
                     throw std::runtime_error(
                         "Qwen4Exp L3 graph capture recorded no nodes");

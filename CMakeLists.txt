@@ -207,6 +207,7 @@ set(LIB_SOURCES
     src/models/Qwen4ExpMtpDraft.cpp
     src/models/Qwen4ExpMtpRuntime.cpp
     src/models/Qwen4ExpPrefill.cpp
+    src/models/Qwen4ExpWholeTokenGraph.cpp
     src/models/Qwen4ExpExpertExecutor.cpp
     src/models/Qwen4ExpExpertReader.cpp
     src/models/Qwen4ExpHostArena.cpp

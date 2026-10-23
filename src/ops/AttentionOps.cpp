@@ -1409,29 +1409,38 @@ void attention_decode_exact_head256_block_native_graph_impl(
         sycl::range<1>(CacheActiveTokens ? tile_t : 1), cgh);
     sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
     sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+    sycl::local_accessor<int, 1> geometry_words(
+        sycl::range<1>(6), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<1>(
             static_cast<size_t>(num_heads) * MaxTiles * tile_wg, tile_wg),
         [=](sycl::nd_item<1> item) {
-          const QsaDecodeGraphGeometry geometry =
-              qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
-          if (!geometry.valid) {
-            return;
+          const int lid = item.get_local_id(0);
+          if (lid == 0) {
+            const QsaDecodeGraphGeometry geometry =
+                qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
+            geometry_words[0] = geometry.visible_len;
+            geometry_words[1] = geometry.compressed_blocks;
+            geometry_words[2] = geometry.selected_blocks;
+            geometry_words[3] = geometry.effective_len;
+            geometry_words[4] = geometry.actual_tiles;
+            geometry_words[5] = geometry.valid ? 1 : 0;
           }
+          item.barrier(sycl::access::fence_space::local_space);
+          if (geometry_words[5] == 0) return;
 
           const int group = item.get_group(0);
           const int head = group / MaxTiles;
           const int tile_idx = group % MaxTiles;
-          if (tile_idx >= geometry.actual_tiles) {
+          if (tile_idx >= geometry_words[4]) {
             return;
           }
 
-          const int lid = item.get_local_id(0);
           const int kv_head = head / heads_per_kv;
           const int tile_start = tile_idx * tile_t;
           const int tile_len =
-              sycl::min(tile_t, geometry.effective_len - tile_start);
+              sycl::min(tile_t, geometry_words[3] - tile_start);
           float *partial =
               partials_ptr +
               (head * partial_tile_capacity + tile_idx) *
@@ -1443,7 +1452,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
           if constexpr (CacheActiveTokens) {
             if (lid < tile_len) {
               cache_tokens[lid] = qsa_decode_active_cache_token(
-                  active_blocks_ptr, geometry.selected_blocks, tile_start + lid);
+                  active_blocks_ptr, geometry_words[2], tile_start + lid);
             }
           }
           item.barrier(sycl::access::fence_space::local_space);
@@ -1456,7 +1465,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
               cache_t = cache_tokens[lid];
             } else {
               cache_t = qsa_decode_active_cache_token(
-                  active_blocks_ptr, geometry.selected_blocks, t);
+                  active_blocks_ptr, geometry_words[2], t);
             }
             using vec8 = sycl::vec<bf16, 8>;
             const bf16 *k_tok =
@@ -1510,7 +1519,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
                 cache_t = cache_tokens[i];
               } else {
                 cache_t = qsa_decode_active_cache_token(
-                    active_blocks_ptr, geometry.selected_blocks, tile_start + i);
+                    active_blocks_ptr, geometry_words[2], tile_start + i);
               }
               acc += logits[i] *
                      static_cast<float>(
@@ -1529,22 +1538,31 @@ void attention_decode_exact_head256_block_native_graph_impl(
     sycl::local_accessor<float, 1> tile_factors(
         sycl::range<1>(MaxTiles), cgh);
     sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+    sycl::local_accessor<int, 1> geometry_words(
+        sycl::range<1>(6), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<1>(
             static_cast<size_t>(num_heads) * merge_wg, merge_wg),
         [=](sycl::nd_item<1> item) {
-          const QsaDecodeGraphGeometry geometry =
-              qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
-          if (!geometry.valid) {
-            return;
-          }
-
-          const int head = item.get_group(0);
           const int lid = item.get_local_id(0);
           if (lid == 0) {
+            const QsaDecodeGraphGeometry geometry =
+                qsa_decode_graph_geometry(control_ptr, MaxTiles, layer);
+            geometry_words[0] = geometry.visible_len;
+            geometry_words[1] = geometry.compressed_blocks;
+            geometry_words[2] = geometry.selected_blocks;
+            geometry_words[3] = geometry.effective_len;
+            geometry_words[4] = geometry.actual_tiles;
+            geometry_words[5] = geometry.valid ? 1 : 0;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+          if (geometry_words[5] == 0) return;
+
+          const int head = item.get_group(0);
+          if (lid == 0) {
             float global_max = -1e30f;
-            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+            for (int tile_idx = 0; tile_idx < geometry_words[4];
                  ++tile_idx) {
               const float *partial =
                   partials_ptr +
@@ -1553,7 +1571,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
               global_max = sycl::fmax(global_max, partial[0]);
             }
             float sum = 0.0f;
-            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+            for (int tile_idx = 0; tile_idx < geometry_words[4];
                  ++tile_idx) {
               const float *partial =
                   partials_ptr +
@@ -1571,7 +1589,7 @@ void attention_decode_exact_head256_block_native_graph_impl(
           const float inv_sum = 1.0f / norm_sum[0];
           for (int d = lid; d < head_dim; d += merge_wg) {
             float acc = 0.0f;
-            for (int tile_idx = 0; tile_idx < geometry.actual_tiles;
+            for (int tile_idx = 0; tile_idx < geometry_words[4];
                  ++tile_idx) {
               const float *partial =
                   partials_ptr +

@@ -966,6 +966,21 @@ Qwen4ExpPleGraphView Qwen4ExpPle::create_graph_view(
     return view;
 }
 
+void Qwen4ExpPle::detach_graph_view(
+    Context& ctx, Qwen4ExpPleState& state) {
+    if (!state.conv_head_dev.valid()) return;
+    int head = 0;
+    ctx.memcpy_d2h(
+        &head, state.conv_head_dev.data(), sizeof(head));
+    if (head < 0 || head >= CONV_STATE_LEN) {
+        throw std::runtime_error(
+            "Qwen4ExpPle: graph conv-head is out of range");
+    }
+    state.conv_head = head;
+    state.conv_head_dev = Tensor{};
+    ++state.graph_view_generation;
+}
+
 void Qwen4ExpPle::consume_graph(Context& ctx, const Qwen4ExpPleGraphView& view) {
     if (!initialized_ || ctx_ != &ctx)
         throw std::invalid_argument("Qwen4ExpPle: consume_graph context mismatch");

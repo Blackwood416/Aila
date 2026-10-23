@@ -211,6 +211,10 @@ public:
         const bf16* hidden_states,
         bf16* out,
         bf16* residual = nullptr);
+    // Only call after the owning graph/queue is drained. Restores the host
+    // conv-head authority and invalidates the fixed graph-only tensor so the
+    // ordinary consume path can run again.
+    void detach_graph_view(Context& ctx, Qwen4ExpPleState& state);
 
     // Queues only fixed one-row kernels. No wait, capacity growth, ticket
     // validation, host-head update or commit occurs here.

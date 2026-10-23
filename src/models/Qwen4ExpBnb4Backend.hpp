@@ -17,6 +17,7 @@
 #include "Qwen4ExpPle.hpp"
 #include "Qwen4ExpTokenGraph.hpp"
 #include "Qwen4ExpTokenGraphRuntime.hpp"
+#include "Qwen4ExpTokenGraphService.hpp"
 #include "Qwen4ExpHotsetPolicy.hpp"
 #include "engine/Types.hpp"
 
@@ -192,6 +193,23 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         Tensor control;
         std::array<int, ops::graph_control::words> control_host{};
         std::size_t node_count = 0;
+    };
+    struct WholeTokenGraphState {
+        using Executable = sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>;
+        std::unique_ptr<Executable> executable;
+        Tensor control;
+        Tensor device_epoch;
+        Tensor packet_dev;
+        Tensor route_ids;
+        Tensor route_weights;
+        Tensor selected;
+        Tensor resident_descriptors;
+        std::array<int, ops::graph_control::words> control_host{};
+        Qwen4ExpPleGraphView ple_view;
+        bool ple_view_valid = false;
+        std::size_t node_count = 0;
+        aila::Qwen4ExpTokenGraphService service;
     };
 
 public:
@@ -547,12 +565,15 @@ private:
         int startPos, int row_offset, bool allowQ8 = false);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
-    void CaptureSnapshot(Context& ctx, Session& session, int nextLength, int tokenCount, bool force = false);
+    void CaptureSnapshot(Context& ctx, Session& session, int nextLength,
+                         int tokenCount, bool force = false,
+                         bool preserve_token_graph = false);
     StateSnapshot& ReserveSnapshot(Session& session, int nextLength);
     void ValidateGdnHeadPath(const Session& session, int count) const;
     bool PleTicketEpochMatches(const Session& session, const PleTicket& ticket) const noexcept;
     static bool GdnDeviceHeadReadable(const Qwen4ExpLayerCache& cache) noexcept;
-    void SynchronizeGdnDeviceHeadsToHost(Context& ctx, Session& session);
+    void SynchronizeGdnDeviceHeadsToHost(
+        Context& ctx, Session& session, bool preserve_token_graph = false);
     void PublishGdnHostHeadsToDevice(Context& ctx, Session& session);
     void PrepareGdnGraphState(Context& ctx, Session& session);
     // Whole-token graph replay must call this after every launch: authority and
@@ -569,8 +590,30 @@ private:
     static bool QsaLayerBlockStateEligible(
         int current_blocks, int target_blocks) noexcept;
     aila::TokenGraphKey MakeQsaLayerGraphKey(const Session& session) const;
+    std::size_t RecordQsaLayerGraphBody(
+        Context& ctx, Session& session, int layer, int layer_ordinal,
+        Tensor& input, Tensor& output, int* control);
+    // Single-layer recording entry for a future whole-token body. The caller
+    // owns capture/replay; this method records nodes only.
+    std::size_t RecordSingleFullAttentionLayerGraphBody(
+        Context& ctx, Session& session, int layer, int layer_ordinal,
+        Tensor& input, Tensor& output, int* control);
     bool ForwardQsaLayerGraph(Context& ctx, Session& session, Tensor& input,
                               Tensor& output, int start_pos);
+    bool WholeTokenGraphEligible(
+        Context& ctx, Session& session, int count,
+        const ForwardOptions& options);
+    static bool WholeTokenGraphEnabled();
+    Tensor& ForwardWholeTokenGraph(
+        Context& ctx, Session& session, const int* tokenIdsDevice,
+        int count, const ForwardOptions& options);
+    std::size_t RecordWholeTokenGraphBody(
+        Context& ctx, Session& session, int* control);
+    bool ServiceWholeTokenGraphReplay(
+        Context& ctx, Session& session, sycl::event& event,
+        uint32_t token_sequence, uint32_t& gate_done_sequence);
+    bool ReleaseWholeTokenGraph(
+        Context* ctx, Session* session, bool idle_confirmed) noexcept;
     // The only path that may destroy the P10 executable. idle_confirmed is
     // true only after the caller has drained the in-order queue.
     bool ReleaseQsaLayerGraph(Context* ctx, bool idle_confirmed) noexcept;
@@ -608,7 +651,9 @@ private:
         const sycl::ext::oneapi::bfloat16* shared_out_base = nullptr,
         const sycl::ext::oneapi::bfloat16* shared_gate_base = nullptr);
     // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
-    void EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count);
+    void EmbedTokens(
+        Context& ctx, const int* tokenIdsDevice, int count,
+        const int* tokenIdsHost = nullptr);
     // bf16 Linear with raw [out, in] weight: native GEMV for one row, oneDNN otherwise.
     void DenseLinear(Context& ctx, Linear& linear, Tensor* raw_weight,
                      Tensor& input, Tensor& output, int count, int out_features, int in_features);
@@ -675,6 +720,7 @@ private:
     // Declared before defaultSession_ so it outlives Session teardown.
     aila::TokenGraphRuntime token_graph_runtime_;
     QsaLayerGraphState qsa_layer_graph_;
+    WholeTokenGraphState whole_token_graph_;
     std::unique_ptr<Session> defaultSession_;
 
     std::vector<Qwen4ExpLayer> layers_;

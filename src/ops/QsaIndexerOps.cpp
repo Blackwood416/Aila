@@ -1362,19 +1362,26 @@ void qsa_compute_block_scores_compressed_graph(
     constexpr float inv_sqrt_d = 0.08838834764831845f;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<int, 1> control_state(
+            sycl::range<1>(2), cgh);
         cgh.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(max_blocks) * kWgSize, kWgSize),
             [=](sycl::nd_item<1> item) {
-                int visible_len = 0;
-                int active_blocks = 0;
-                if (!graph_control_consistent_blocks(
-                        control_ptr, max_blocks, visible_len,
-                        active_blocks, layer))
-                    return;
-                const int b = item.get_group(0);
-                if (b >= active_blocks) return;
-
                 const int lid = item.get_local_id(0);
+                if (lid == 0) {
+                    int visible_len = 0;
+                    int active_blocks = 0;
+                    const bool valid = graph_control_consistent_blocks(
+                        control_ptr, max_blocks, visible_len,
+                        active_blocks, layer);
+                    control_state[0] = valid ? 1 : 0;
+                    control_state[1] = active_blocks;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (control_state[0] == 0) return;
+                const int b = item.get_group(0);
+                if (b >= control_state[1]) return;
+
                 const float kl = static_cast<float>(comp_k_ptr[static_cast<size_t>(b) * kHeadDim + lid]);
                 const float p0 = static_cast<float>(q_ptr[0 * kHeadDim + lid]) * kl;
                 const float p1 = static_cast<float>(q_ptr[1 * kHeadDim + lid]) * kl;

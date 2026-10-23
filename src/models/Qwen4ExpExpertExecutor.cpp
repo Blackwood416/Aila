@@ -414,6 +414,93 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         (void)current; (void)completed;
 #endif
     }
+    void execute_compute(Job& current, Result& completed) {
+        std::array<ops::cpu::CpuExpertTask, ops::cpu::kMaxExpertBatchTasks>
+            original_tasks;
+        if (verify_q8 || verify_a64)
+            std::copy_n(current.tasks.begin(), current.count,
+                        original_tasks.begin());
+        arena.execute([&] {
+            ops::cpu::CpuTilePoolScope poolScope(tilePool.get());
+            if (!current.count) return;
+            if (verify_a64 && !current.resident_prepared)
+                throw std::invalid_argument("CPU A64 verification requires resident Activation64 tasks");
+            if (batched || current.resident_prepared) {
+                if (current.hidden != ops::cpu::kHiddenDim || current.intermediate != ops::cpu::kIntermediateDim)
+                    throw std::invalid_argument("CPU batch requires real Q4E geometry");
+                static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
+                static const bool prepared = aila::env::read_flag("AILA_Q4E_CPU_PREPARED_INPUT", false);
+                static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false);
+                static const bool nf4_q8_block64 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_BLOCK64", false);
+                static const bool nf4_q8_row4 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_ROW4", false);
+                static const bool nf4_scale_shift = aila::env::read_flag("AILA_Q4E_CPU_SCALE_SHIFT", false);
+                static const bool nf4_q8_activation64 = aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", false);
+                if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && verify_q8)
+                    throw std::invalid_argument("Activation64 uses different Q8 arithmetic; H8 bitwise verification is incompatible");
+                if (verify_a64 && (!nf4_q8 || !nf4_q8_activation64))
+                    throw std::invalid_argument("CPU A64 verification requires the NF4Q8 Activation64 primary backend");
+                if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && !activation64_logged) {
+                    AILA_LOG_INFO("[Q4E CpuActivation64Enabled] activation_block=64 merged_integer_halves=1");
+                    activation64_logged = true;
+                }
+                if (current.resident_prepared && nf4_q8 && nf4_scale_shift && !scale_shift_logged) {
+                    AILA_LOG_INFO("[Q4E CpuScaleShiftEnabled] nested_block256=shift8 other_blocks=division");
+                    scale_shift_logged = true;
+                }
+                const auto batch_backend = current.resident_prepared
+                    ? (nf4_q8 ? (nf4_q8_activation64 ? ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2 : nf4_q8_block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2 : nf4_q8_row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2 : ops::cpu::CpuKernelBackend::Nf4Q8Avx2)
+                              : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2)
+                    : (gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
+                                 : ops::cpu::CpuKernelBackend::Avx2);
+                if (current.group_count > 0) {
+                    ops::cpu::cpu_expert_batch_forward_groups(current.groups.data(), current.group_count,
+                        current.group_members.data(), current.tasks.data(), current.count,
+                        current.x, current.tokens, current.h, current.out, nullptr, batch_backend,
+                        diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
+                } else {
+                    ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
+                        batch_backend, diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
+                }
+                if (verify_q8 && current.resident_prepared && nf4_q8) {
+                    ops::cpu::CpuTilePoolScope originalPool(nullptr);
+                    const auto* reference = current.reference_tasks ? current.reference_tasks :
+                        original_tasks.data();
+                    ops::cpu::cpu_expert_batch_forward(reference, current.count,
+                        current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
+                        ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
+                    if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)) ||
+                        std::memcmp(current.out, verify_out.data(), current.count * current.hidden * sizeof(float)))
+                        throw std::runtime_error("CPU Q8 candidate differs bitwise from H8 on actual model activation");
+                    completed.verify_batches = 1;
+                }
+                if (verify_a64) {
+                    ops::cpu::CpuTilePoolScope originalPool(nullptr);
+                    const auto* reference = current.reference_tasks ? current.reference_tasks : original_tasks.data();
+                    ops::cpu::cpu_expert_batch_forward(reference, current.count,
+                        current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
+                        ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2, nullptr, false, false, false, false);
+                    if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)))
+                        throw std::runtime_error("CPU A64 candidate differs bitwise from original A64 BF16 h on actual model activation");
+                    if (std::memcmp(current.out, verify_out.data(), current.count * current.hidden * sizeof(float)))
+                        throw std::runtime_error("CPU A64 candidate differs bitwise from original A64 F32 out on actual model activation");
+                    completed.a64_verify_batches = 1;
+                }
+            } else for (int c = 0; c < current.count; ++c)
+                compute_expert(current.tasks[c].slot, current.x + current.tasks[c].token * current.hidden,
+                    current.h + c * current.intermediate, current.out + c * current.hidden,
+                    current.hidden, current.intermediate);
+        });
+    }
+    void execute_direct(Job current, Result& completed) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (busy || pending)
+                throw std::logic_error("CPU direct execution requires an idle worker");
+        }
+        prepare_mapped_sources(current, completed);
+        prepare_cached_scales(current, completed);
+        execute_compute(current, completed);
+    }
     void run() {
         for (;;) {
             Job current;
@@ -465,78 +552,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                 if (current.transfer_reader != sycl::event{}) current.transfer_reader.wait_and_throw();
                 const auto before = diagnostic ? sample_cpu_process() : CpuProcessSample{};
                 completed.begin_ns = steady_ns();
-                arena.execute([&] {
-                    ops::cpu::CpuTilePoolScope poolScope(tilePool.get());
-                    if (!current.count) return;
-                    if (verify_a64 && !current.resident_prepared)
-                        throw std::invalid_argument("CPU A64 verification requires resident Activation64 tasks");
-                    if (batched || current.resident_prepared) {
-                        if (current.hidden != ops::cpu::kHiddenDim || current.intermediate != ops::cpu::kIntermediateDim)
-                            throw std::invalid_argument("CPU batch requires real Q4E geometry");
-                        static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
-                        static const bool prepared = aila::env::read_flag("AILA_Q4E_CPU_PREPARED_INPUT", false);
-                        static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false);
-                        static const bool nf4_q8_block64 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_BLOCK64", false);
-                        static const bool nf4_q8_row4 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_ROW4", false);
-                        static const bool nf4_scale_shift = aila::env::read_flag("AILA_Q4E_CPU_SCALE_SHIFT", false);
-                        static const bool nf4_q8_activation64 = aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", false);
-                        if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && verify_q8)
-                            throw std::invalid_argument("Activation64 uses different Q8 arithmetic; H8 bitwise verification is incompatible");
-                        if (verify_a64 && (!nf4_q8 || !nf4_q8_activation64))
-                            throw std::invalid_argument("CPU A64 verification requires the NF4Q8 Activation64 primary backend");
-                        if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && !activation64_logged) {
-                            AILA_LOG_INFO("[Q4E CpuActivation64Enabled] activation_block=64 merged_integer_halves=1");
-                            activation64_logged = true;
-                        }
-                        if (current.resident_prepared && nf4_q8 && nf4_scale_shift && !scale_shift_logged) {
-                            AILA_LOG_INFO("[Q4E CpuScaleShiftEnabled] nested_block256=shift8 other_blocks=division");
-                            scale_shift_logged = true;
-                        }
-                        const auto batch_backend = current.resident_prepared
-                            ? (nf4_q8 ? (nf4_q8_activation64 ? ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2 : nf4_q8_block64 ? ops::cpu::CpuKernelBackend::Nf4Q8Block64Avx2 : nf4_q8_row4 ? ops::cpu::CpuKernelBackend::Nf4Q8Row4Avx2 : ops::cpu::CpuKernelBackend::Nf4Q8Avx2)
-                                      : ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2)
-                            : (gpu_order ? (prepared ? ops::cpu::CpuKernelBackend::GpuOrderPreparedAvx2 : ops::cpu::CpuKernelBackend::GpuOrderAvx2)
-                                         : ops::cpu::CpuKernelBackend::Avx2);
-                        if (current.group_count > 0) {
-                            ops::cpu::cpu_expert_batch_forward_groups(current.groups.data(), current.group_count,
-                                current.group_members.data(), current.tasks.data(), current.count,
-                                current.x, current.tokens, current.h, current.out, nullptr, batch_backend,
-                                diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
-                        } else {
-                            ops::cpu::cpu_expert_batch_forward(current.tasks.data(), current.count, current.x, current.tokens, current.h, current.out, nullptr,
-                                batch_backend, diagnostic ? &completed.phases : nullptr, nf4_scale_shift);
-                        }
-                        if (verify_q8 && current.resident_prepared && nf4_q8) {
-                            ops::cpu::CpuTilePoolScope originalPool(nullptr);
-                            const auto* reference = current.reference_tasks ? current.reference_tasks :
-                                original_tasks.data();
-                            ops::cpu::cpu_expert_batch_forward(reference, current.count,
-                                current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
-                                ops::cpu::CpuKernelBackend::Nf4Q8Avx2);
-                            if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)) ||
-                                std::memcmp(current.out, verify_out.data(), current.count * current.hidden * sizeof(float)))
-                                throw std::runtime_error("CPU Q8 candidate differs bitwise from H8 on actual model activation");
-                            completed.verify_batches = 1;
-                        }
-                        if (verify_a64) {
-                            ops::cpu::CpuTilePoolScope originalPool(nullptr);
-                            const auto* reference = current.reference_tasks ? current.reference_tasks : original_tasks.data();
-                            // Original mapped nested scales, division loader,
-                            // original A64 single-row dot and scalar SwiGLU.
-                            ops::cpu::cpu_expert_batch_forward(reference, current.count,
-                                current.x, current.tokens, verify_h.data(), verify_out.data(), nullptr,
-                                ops::cpu::CpuKernelBackend::Nf4Q8Activation64Avx2, nullptr, false, false, false, false);
-                            if (std::memcmp(current.h, verify_h.data(), current.count * current.intermediate * sizeof(bf16)))
-                                throw std::runtime_error("CPU A64 candidate differs bitwise from original A64 BF16 h on actual model activation");
-                            if (std::memcmp(current.out, verify_out.data(), current.count * current.hidden * sizeof(float)))
-                                throw std::runtime_error("CPU A64 candidate differs bitwise from original A64 F32 out on actual model activation");
-                            completed.a64_verify_batches = 1;
-                        }
-                    } else for (int c = 0; c < current.count; ++c)
-                        compute_expert(current.tasks[c].slot, current.x + current.tasks[c].token * current.hidden,
-                            current.h + c * current.intermediate, current.out + c * current.hidden,
-                            current.hidden, current.intermediate);
-                });
+                execute_compute(current, completed);
                 completed.end_ns = steady_ns();
                 if (diagnostic && current.count) {
                     const auto after = sample_cpu_process();
@@ -1012,14 +1028,21 @@ int Qwen4ExpExpertExecutor::RunGraphColdPacket(
         arena_verify_pending_ || cpu_host_result_active_)
         throw std::logic_error("Graph CPU packet requires an idle executor");
 
+    // The packet is uncached host USM. Stage the activation once into the
+    // cacheable pinned input buffer so AVX2 expert work does not stream every
+    // reused activation element through uncached PCIe-side memory.
+    std::memcpy(
+        x_host_, x_host,
+        static_cast<std::size_t>(hidden_size_) * sizeof(bf16));
+
     CpuWorker::Job job;
     job.count = count;
     job.hidden = hidden_size_;
     job.intermediate = intermediate_size_;
     job.tokens = 1;
-    job.x = x_host;
+    job.x = x_host_;
     job.h = scratch_h_;
-    job.out = cpu_out_host_;
+    job.out = packet_rows;
     job.resident_prepared = true;
     std::fill_n(rank_to_row, 16, -1);
     for (int c = 0; c < count; ++c) {
@@ -1031,13 +1054,12 @@ int Qwen4ExpExpertExecutor::RunGraphColdPacket(
         job.tasks[c] = {source, 0};
         rank_to_row[ranks[c]] = c;
     }
-    cpu_worker_->submit(job);
-    (void)cpu_worker_->finish();
-    for (int c = 0; c < count; ++c) {
-        std::memcpy(packet_rows + size_t(c) * hidden_size_,
-                    cpu_out_host_ + size_t(c) * hidden_size_,
-                    size_t(hidden_size_) * sizeof(float));
-    }
+    // This path is already synchronous and owns the service thread. Execute on
+    // the same bounded arena directly instead of waking the worker thread and
+    // immediately blocking on its condition variable for every layer.
+    CpuWorker::Result result;
+    cpu_worker_->execute_direct(job, result);
+    if (result.error) std::rethrow_exception(result.error);
     return count;
 }
 

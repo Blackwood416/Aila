@@ -170,7 +170,8 @@ public:
     bool Launch(std::uint32_t sequence, sycl::event event) noexcept;
 
     // InFlight -> Ready only when sequence matches and gate_valid is true.
-    // A sequence mismatch or rejected gate enters Aborting and returns false.
+    // The event must already be observably complete. A sequence mismatch,
+    // pending event, or rejected gate enters Aborting and returns false.
     bool Complete(std::uint32_t sequence, bool gate_valid) noexcept;
 
     // Enters Aborting without waiting or destroying the event. The caller must
@@ -198,6 +199,9 @@ public:
     // Non-throwing diagnostic query. Query failures are reported as Failed,
     // never as Pending; only an actual in-flight SYCL event can be Pending.
     TokenGraphEventStatus event_status() const noexcept;
+    // Teardown-only drain. Wait failures are ignored, but the event is cleared
+    // only after the runtime can observably prove completion (or no event).
+    bool wait_drained_noexcept() noexcept;
     bool executable_ready() const noexcept { return executableReady_; }
     bool gate_valid() const noexcept { return gateValid_; }
     bool abort_requested() const noexcept { return abortRequested_; }
@@ -222,6 +226,12 @@ static_assert(!std::is_move_constructible<TokenGraphRuntime>::value);
 static_assert(!std::is_move_assignable<TokenGraphRuntime>::value);
 
 inline bool TokenGraphRuntime::BeginCapture(const TokenGraphKey& key) noexcept {
+    if (phase_ == TokenGraphPhase::Aborting && hasInFlightEvent_) {
+        const TokenGraphEventStatus status = event_status();
+        if (status != TokenGraphEventStatus::Done) return false;
+        inFlightEvent_ = sycl::event{};
+        hasInFlightEvent_ = false;
+    }
     if (phase_ != TokenGraphPhase::Empty &&
         phase_ != TokenGraphPhase::Ready &&
         phase_ != TokenGraphPhase::Aborting) {
@@ -288,7 +298,8 @@ inline bool TokenGraphRuntime::Complete(
     std::uint32_t sequence, bool gate_valid) noexcept {
     const std::uint32_t expected = nextSequence_ - 1u;
     if (phase_ != TokenGraphPhase::InFlight || abortRequested_ ||
-        sequence != expected || !gate_valid) {
+        sequence != expected || !gate_valid ||
+        event_status() != TokenGraphEventStatus::Done) {
         EnterAborting();
         return false;
     }
@@ -297,6 +308,19 @@ inline bool TokenGraphRuntime::Complete(
     hasInFlightEvent_ = false;
     lastCompletedSequence_ = sequence;
     gateValid_ = true;
+    return true;
+}
+
+inline bool TokenGraphRuntime::wait_drained_noexcept() noexcept {
+    if (!hasInFlightEvent_) return true;
+    try {
+        inFlightEvent_.wait();
+    } catch (...) {
+    }
+    if (event_status() != TokenGraphEventStatus::Done) return false;
+    inFlightEvent_ = sycl::event{};
+    hasInFlightEvent_ = false;
+    executableReady_ = false;
     return true;
 }
 

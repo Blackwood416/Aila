@@ -244,7 +244,10 @@ Qwen4ExpBnb4Backend::Session::Session(
         AILA_LOG_INFO("[Q4E KV] AILA_KV_QUANT=1 format=%s",
                       int8_kv ? "int8" : "fp8(ignored: Qwen4Exp keeps bf16 KV)");
     }
-    graph_gdn_state_enabled_ = aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false);
+    const bool token_graph_requested =
+        aila::env::read_flag("AILA_Q4E_TOKEN_GRAPH", false);
+    graph_gdn_state_enabled_ = aila::env::read_flag(
+        "AILA_Q4E_GRAPH_GDN_STATE", token_graph_requested);
     if (graph_gdn_state_enabled_) {
         gdn_conv_heads_dev_ = Tensor::allocate(
             ctx, {48, ops::delta_net_conv_head_device_slots},
@@ -294,7 +297,7 @@ Qwen4ExpBnb4Backend::Session::~Session() {
         (void)token_graph_runtime_->RetireSession(this);
     }
     if (context_) {
-        context_->synchronize();
+        (void)context_->drain_noexcept();
     }
 }
 
@@ -331,19 +334,17 @@ void Qwen4ExpBnb4Backend::ValidateGdnHeadPath(
         throw std::invalid_argument(
             "Qwen4Exp graph GDN state has mixed host/device authority");
     }
-    if (aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", false)) {
-        throw std::invalid_argument(
-            "Qwen4Exp graph GDN state is incompatible with "
-            "AILA_Q4E_GDN_HISTORY_FUSED=1");
-    }
 }
 
 void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
-    Context& ctx, Session& session) {
+    Context& ctx, Session& session, bool preserve_token_graph) {
     if (!session.gdn_conv_heads_dev_.valid()) return;
-    (void)AbortTokenGraph();
-    session.InvalidateTokenGraphState();
+    if (!preserve_token_graph) {
+        (void)AbortTokenGraph();
+        session.InvalidateTokenGraphState();
+    }
     sycl::event last_d2h{};
+    bool have_last_d2h = false;
     for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
         if (cache.linear_conv_head_dev == nullptr ||
@@ -354,8 +355,9 @@ void Qwen4ExpBnb4Backend::SynchronizeGdnDeviceHeadsToHost(
             i * ops::delta_net_conv_head_device_slots;
         last_d2h = ctx.memcpy_d2h_async(
             host_row, cache.linear_conv_head_dev, sizeof(int));
+        have_last_d2h = true;
     }
-    if (last_d2h != sycl::event{}) last_d2h.wait_and_throw();
+    if (have_last_d2h) last_d2h.wait_and_throw();
     for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
         auto& cache = session.layerCaches_[i];
         if (cache.linear_conv_head_dev == nullptr ||
@@ -433,7 +435,15 @@ Qwen4ExpBnb4Backend::Qwen4ExpBnb4Backend()
     : sessionOwner_(std::make_shared<SessionOwner>()) {}
 
 Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
-    if (!ReleaseQsaLayerGraph(context_, false)) {
+    (void)token_graph_runtime_.wait_drained_noexcept();
+    const bool idle_confirmed =
+        context_ && context_->drain_noexcept();
+    if (!ReleaseWholeTokenGraph(
+            context_, defaultSession_.get(), idle_confirmed)) {
+        AILA_LOG_ERROR(
+            "[Q4E Graph] whole-token executable drain failed during teardown");
+    }
+    if (!ReleaseQsaLayerGraph(context_, idle_confirmed)) {
         AILA_LOG_ERROR(
             "[Q4E Graph] P10 executable drain failed during backend teardown");
     }
@@ -2237,13 +2247,22 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
     return last;
 }
 
-void Qwen4ExpBnb4Backend::EmbedTokens(Context& ctx, const int* tokenIdsDevice, int count) {
+void Qwen4ExpBnb4Backend::EmbedTokens(
+    Context& ctx, const int* tokenIdsDevice, int count,
+    const int* tokenIdsHost) {
     if (!embed_host_.valid()) {
         ops::embedding_lookup(ctx, *embed_weight_, tokenIdsDevice, count, buf_.x, hidden_size_);
         return;
     }
-    // The blocking readback also drains the previous h2d, so the pinned rows can be reused.
-    ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
+    if (tokenIdsHost) {
+        std::copy_n(tokenIdsHost, count, embed_host_ids_);
+    } else {
+        // The blocking readback also drains the previous h2d, so the pinned
+        // rows can be reused.
+        ctx.memcpy_d2h(
+            embed_host_ids_, tokenIdsDevice,
+            static_cast<size_t>(count) * sizeof(int));
+    }
     const size_t row_bytes = static_cast<size_t>(hidden_size_) * sizeof(bf16);
     const int64_t rows = embed_host_.shape[0];
     for (int t = 0; t < count; ++t) {
@@ -2466,6 +2485,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // synchronously below. Keep its reusable executable alive across ordinary
     // count==1 forwards; every state/layout mutation still aborts it.
     static const bool s_qsa_layer_graph =
+        !WholeTokenGraphEnabled() &&
         aila::env::read_flag("AILA_Q4E_QSA_LAYER_GRAPH", false);
     const bool preserve_l3_graph = s_qsa_layer_graph && count == 1;
     if (!preserve_l3_graph) (void)AbortTokenGraph();
@@ -3845,7 +3865,8 @@ Qwen4ExpBnb4Backend::StateSnapshot& Qwen4ExpBnb4Backend::ReserveSnapshot(Session
 }
 
 void Qwen4ExpBnb4Backend::CaptureSnapshot(
-    Context& ctx, Session& session, int nextLength, int tokenCount, bool force) {
+    Context& ctx, Session& session, int nextLength, int tokenCount,
+    bool force, bool preserve_token_graph) {
     if (session.token_graph_poisoned()) {
         throw std::logic_error(
             "Qwen4Exp cannot checkpoint a poisoned token-graph session");
@@ -3856,10 +3877,12 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
     if (!force && tokenCount <= 1 && nextLength % step != 0) return;
 
     ctx.synchronize();
-    SynchronizeGdnDeviceHeadsToHost(ctx, session);
+    SynchronizeGdnDeviceHeadsToHost(
+        ctx, session, preserve_token_graph);
     auto& snapshot = ReserveSnapshot(session, nextLength);
     try {
         sycl::event last_d2h_event{};
+        bool have_last_d2h_event = false;
         for (size_t i = 0; i < layers_.size(); ++i) {
             if (!layers_[i].is_linear) continue;
             auto& cache = session.layerCaches_[i];
@@ -3867,14 +3890,16 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
                 if (!cache.host_linear_state.empty() && cache.linear_state.valid()) {
                     last_d2h_event = ctx.memcpy_d2h_async(cache.host_linear_state.data(), cache.linear_state.data(),
                                                           cache.host_linear_state.size() * sizeof(float));
+                    have_last_d2h_event = true;
                 }
                 if (!cache.host_linear_conv_state.empty() && cache.linear_conv_state.valid()) {
                     last_d2h_event = ctx.memcpy_d2h_async(cache.host_linear_conv_state.data(), cache.linear_conv_state.data(),
                                                           cache.host_linear_conv_state.size() * sizeof(float));
+                    have_last_d2h_event = true;
                 }
             }
         }
-        if (last_d2h_event != sycl::event{}) {
+        if (have_last_d2h_event) {
             last_d2h_event.wait_and_throw();
         }
         for (size_t i = 0; i < layers_.size(); ++i) {
@@ -4055,11 +4080,26 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
 Tensor& Qwen4ExpBnb4Backend::Forward(
     Context& ctx, Session& session, const int* tokenIdsDevice, int count,
     const ForwardOptions& options) {
+    if (WholeTokenGraphEnabled() &&
+        WholeTokenGraphEligible(ctx, session, count, options)) {
+        return ForwardWholeTokenGraph(
+            ctx, session, tokenIdsDevice, count, options);
+    }
+    if (whole_token_graph_.executable &&
+        !ReleaseWholeTokenGraph(&ctx, &session, false)) {
+        throw std::runtime_error(
+            "Qwen4Exp whole-token graph could not drain before direct path");
+    }
     return ForwardImpl(ctx, session, tokenIdsDevice, count, true, options);
 }
 
 Tensor& Qwen4ExpBnb4Backend::ForwardLegacyLogits(
     Context& ctx, Session& session, const int* tokenIdsDevice, int count) {
+    if (whole_token_graph_.executable &&
+        !ReleaseWholeTokenGraph(&ctx, &session, false)) {
+        throw std::runtime_error(
+            "Qwen4Exp whole-token graph could not drain before legacy path");
+    }
     return ForwardImpl(ctx, session, tokenIdsDevice, count, false, {});
 }
 
@@ -4121,8 +4161,14 @@ bool Qwen4ExpBnb4Backend::PleTicketEpochMatches(
 
 void Qwen4ExpBnb4Backend::ValidateTokenGraphLaunch(Session& session) {
     ValidateSession(session);
-    ValidateGdnHeadPath(session, 1);
-    if (!session.graph_gdn_state_enabled_) return;
+    const auto& key = token_graph_runtime_.key();
+    if (key.body != aila::TokenGraphBody::WholeToken) {
+        ValidateGdnHeadPath(session, 1);
+        if (!session.graph_gdn_state_enabled_) return;
+    } else if (!session.graph_gdn_state_enabled_) {
+        throw std::invalid_argument(
+            "Qwen4Exp whole-token graph requires device GDN state");
+    }
     for (const auto& cache : session.layerCaches_) {
         if (cache.linear_state.valid() && !GdnDeviceHeadReadable(cache)) {
             throw std::invalid_argument(
@@ -4143,12 +4189,7 @@ bool Qwen4ExpBnb4Backend::ReleaseQsaLayerGraph(
         token_graph_runtime_.event_status() ==
             aila::TokenGraphEventStatus::Done;
     if (!safe && ctx) {
-        try {
-            ctx->synchronize();
-            safe = true;
-        } catch (...) {
-            safe = false;
-        }
+        safe = ctx->drain_noexcept();
     }
     if (!safe) return false;
 
@@ -4222,7 +4263,9 @@ aila::TokenGraphKey Qwen4ExpBnb4Backend::MakeTokenGraphKey(
         throw std::logic_error(
             "Qwen4Exp token graph is poisoned; recreate the session");
     }
-    ValidateGdnHeadPath(session, 1);
+    if (body != aila::TokenGraphBody::WholeToken) {
+        ValidateGdnHeadPath(session, 1);
+    }
     if (session.mropePosT_.valid() || session.mropePosH_.valid() ||
         session.mropePosW_.valid() || session.mropePromptLength_ > 0 ||
         session.mropeTextPositionDelta_ != 0) {
