@@ -347,3 +347,55 @@ The handoff document's section 8 items are now known to be worth far less than t
 mechanism: packet-merge fusion removes ~4.8 MB of host traffic and one node per layer
 (~1-2 ms), GDN conv-history fusion removes 36 small kernels per token (~0.2-1 ms), and the
 final mixer is <=0.33%. None of them should be prioritised over the launch-mechanism fix.
+
+## 12. Post-fix bottleneck: host submission vs host service
+
+After 11.4 the token is `max(host submission, host service)` plus ~2 ms, so both terms
+were measured directly. A `submit_ms` probe now brackets `RecordWholeTokenGraphBody`.
+
+```text
+pos  submit_ms  nodes  route_wait  cold    service  replay
+2109  40.394    352    28.293      17.780  46.712   48.573
+2110  40.897    352    28.570      18.460  47.683   49.451
+2111  41.720    352    28.188      19.890  48.864   50.902
+pip50: direct 55.35  unrolled 51.03
+```
+
+`nodes=352` counts logical node groups; the actual `queue.submit` calls are roughly 750-800
+per token (15-17 per layer), so a submission costs ~53 us and the whole pass is ~40 ms.
+
+The service is the limiter and it is fully serial:
+
+```text
+service 46.7 = route_wait 28.2 (device work) + cold 17.8 (CPU experts) + publish 0.16
+```
+
+`spin_iters` (8.7k-13.8k) shows the device is idle during most of `cold`, so the two phases
+do not overlap: the device's post-doorbell work is only the resident plus shared expert
+groups, 5 ms + 2 ms per token. The remaining lever is therefore not node fusion but making
+the device own more of the expert work so that the CPU service hides behind it.
+
+Rejected this round: `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0` together with
+`SYCL_PI_LEVEL_ZERO_BATCH_SIZE=16`, proposed as a way to cut host submission to 15-20 ms.
+It changed nothing (`submit_ms` 38.9-47.5, `replay` 50.6), so the per-submit cost here is
+not immediate-command-list / WDDM submission overhead.
+
+Also noted for later review, from an independent review of the node inventory: the four
+tail kernels (`submit_packet_copy`, `submit_gated_ordered_merge`,
+`submit_add_shared_expert_to_y`, `submit_gated_final_bridge`) are four launches per layer
+and `submit_packet_copy` moves the full 160 KiB row block from uncached host memory every
+layer. Gating the empty rows out of that copy is *not* safe as stated, because
+`submit_gated_ordered_merge` decides membership from `packet_dev[rank] >= 0` and the sentinel
+write is what clears stale rows; any fusion here must rewrite that check together with it.
+
+### 12.1 Determinism status
+
+`AILA_Q4E_HOTSET_INTERVAL=0` removed one source of cross-process drift (Direct's fifth
+token became stable), but a second source remains and affects both arms equally. Both arms
+diverge from themselves at token 5-6 across processes, so cross-process Top-1 comparison
+cannot adjudicate correctness at all. The leading candidate is floating-point reduction
+order in the CPU-served expert path (TBB parallelism). The decision recorded for this
+project is that micro-precision alignment is not a requirement: weights are NF4, and the
+gate that matters is whether the produced text degrades. A same-process frozen-prefix
+comparison, or a text-quality comparison over a longer generation, is therefore the correct
+acceptance test, not per-token id equality.
