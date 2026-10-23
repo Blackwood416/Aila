@@ -224,25 +224,36 @@ does **not** block on the CPU; the CPU's `route_wait` idle really is the device 
 through the 48 doorbells. This removes the doorbell-latency hypothesis entirely and
 confirms the earlier sub-1% verdict on packet-copy fusion.
 
-Comparing the two arms on device work:
+Comparing the two arms:
 
 | Metric | Direct | Graph |
 |---|---:|---:|
 | forward span | 88.05 ms | 112.97 ms (`service_ms`) |
-| GPU idle gaps (`dev_*_ms` sum) | 82.47 ms | n/a |
-| implied device busy | **5.6 ms** | **~85 ms** |
+| barrier-to-barrier device span (`dev_*_ms` sum) | 82.47 ms | ~85 ms (`route_wait`) |
+| exposed CPU cold service | overlapped | 27.5 ms (of which ~17.5 ms is device spin) |
 
-`dev_*_ms` in `Qwen4ExpBnb4Backend.cpp:3508-3514` sums `start[i] - end[i-1]`, i.e. gaps,
-not kernel durations, so Direct's device busy is span minus gaps. Direct's 5.6 ms agrees
-with a first-order bandwidth estimate for this model (48 layers of NF4 expert/shared
-weights, 10 CPU-served experts per layer, 2K context): roughly 4-5 ms.
+**Correction (same day).** An earlier reading of this data concluded that Direct's device
+busy time is only ~5.6 ms and that the graph inflates device work by ~12x. That reading was
+wrong. `dev_marks` are `ext_oneapi_submit_barrier()` events
+(`Qwen4ExpBnb4Backend.cpp:2856-2860`), so `dev_ms[bucket]` is the *span* between two
+consecutive barriers, which already contains any wait for host-side work. It is neither a
+kernel-duration sum nor an idle-gap sum. The corrected reading is that Direct and the graph
+spend essentially the same ~82-85 ms of barrier-to-barrier device time.
 
-Consequence: **the graph's device body is inflated by an order of magnitude** relative to
-Direct doing the same arithmetic. That, not the host bridge, is the dominant remaining
-defect. Identifying which node group is responsible needs per-node device timings inside
-the captured graph, which round 2 must add (the queue supports
-`sycl::property::queue::enable_profiling`; the CLI enables it via
-`AILA_PROFILE_Q4E_COLD_DEVICE`, `src/engine/EngineLoad.cpp:15`).
+What the numbers do support:
+
+- The graph's deficit versus Direct (113.0 vs 88.0 ms) is accounted for by the exposed CPU
+  cold service, not by graph device work.
+- `spin_iters=17527` (~365 per layer) shows the device does block on the CPU packet, so the
+  two sides are not overlapped in practice even though the device has resident/shared expert
+  work scheduled between the doorbell and the packet wait.
+- `cold_ms` itself is dominated by pushing the expert result rows into the uncached host
+  packet ring (10 rows x 2560 floats per layer, ~100 KiB over PCIe), not by TBB arithmetic:
+  `publish_ms` is only 0.175 ms per token because `RunGraphColdPacket` writes the rows inline.
+
+Consequence: the dominant lever is overlapping that host-to-device result traffic with
+device work, and the correct attribution tool is per-node device timing of the graph body
+(see section 10), not the barrier-span buckets.
 
 ## 10. Build environment change (blocking, fixed)
 
