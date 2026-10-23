@@ -1050,3 +1050,50 @@ figure with all of those in place.
 The three-way comparison also settles what the remaining device budget is spent on: at 25.37 ms
 of `route_wait` with ~750 submissions, launch and ordering overhead is no longer the dominant
 term, and kernel work is.
+
+## 25. Corrected decode budget from the observer-free trace
+
+A trace taken with `--max-tokens 1200` makes decode long enough to dominate the hotspot
+report (prefill is unchanged at ~127 s while decode grows to ~58 s), and decode kernels then
+separate cleanly by instance count: 96, 48 or 12 calls per token. Two corrections to earlier
+readings came out of it.
+
+### 25.1 The resident-expert group is not on the critical path
+
+`launch_moe_decode_gate_up_swiglu_grouped` and `launch_moe_decode_down_to_rank_f32` together
+cost about **12.8 ms/token**, which would make them the largest group in the token. They are
+not, because they run between the doorbell and the packet wait, i.e. inside the window where
+the host is computing cold experts, so they never appear in `route_wait`. They are already
+free and must not be optimised for critical-path reasons.
+
+### 25.2 `zeCommandListAppendMemoryCopy` in the decode rows is prefill
+
+The row that looks like 12.65 ms/token of copies is 7330 instances, which is 94 copies times
+the 78 prefill chunks, not 109 per decode token. Prefill remains 97% of the wall time in this
+workload and instance-count division must always be checked against a known multiplicity.
+
+### 25.3 The actual critical path, in observer-free numbers
+
+```text
+HC (norm + down + up)                  ~7.0 ms after the work-group-per-row change
+packed_nf4_gemv_bf16_impl               3.02   (96 calls, 31 us each)
+packed_nf4_gemv_gate_up_swiglu          1.43   (48 calls, 30 us each)
+hc_inject_add_and_grouped_rms_norm      0.96   (48 calls, 20 us each)
+moe_ordered_accumulate_down_rows        0.84
+launch_router_softmax_topk              0.82
+QSA attention_decode_exact_head256      1.9    (12 calls, 154 us each)
+route_wait                              25.4 total
+```
+
+### 25.4 Next target has the same defect the GEMM had
+
+`packed_nf4_gemv_gate_up_swiglu` uses one sub-group per output row and sixteen rows per
+work-group (`rows_per_group = wg_size / sub_group_size`, `num_groups =
+ceil(intermediate_size / 16)`), so the shared expert's `intermediate_size = 640` launches only
+**40 work-groups**. That is the identical defect the hyper-connection down GEMM had, and the
+same remap applies: one work-group per row gives 640 work-groups. At 30 us per call and 48
+calls per token the ceiling on that change is about 0.9 ms.
+
+`packed_nf4_gemv_bf16_impl` already uses one work-group per output row (`grid = out_features x
+wg_size`), so it has no equivalent remap available and its 31 us has to be attacked differently
+or left alone.
