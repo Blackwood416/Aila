@@ -846,3 +846,52 @@ That contradicts what this machine already measured: replaying the same node seq
 directly, i.e. roughly 90 us per real kernel of graph-execution overhead, not 2.2 us. Before
 any sub-graph refactor, a one-layer sub-graph must be measured: if per-node graph overhead
 persists, sub-graphs inherit the whole-token graph's problem and the refactor is worthless.
+
+## 21. Norm reduction change, and the current combined state
+
+### 21.1 Sub-group shuffle reduction in the HC normalisation
+
+`grouped_rms_norm` reduced a 256-entry SLM array with an eight-step tree, paying one full
+work-group barrier per level. It now reduces inside sub-groups with `reduce_over_group`,
+collapses 16 sub-group partials with one barrier, and finishes with a second barrier. The
+summation order changes; the operator does not.
+
+```text
+hc_norm  5.16 -> 4.58 ms per token  (-0.58 ms, 97 calls, 6 us per call)
+```
+
+So the barrier tree did cost something, but a 10240-element normalisation still costs ~38 us
+of kernel time after subtracting the ~9.4 us launch floor, which remains unexplained and is
+now the largest single anomaly in the device budget.
+
+`route_wait` did not move measurably (27.19 -> 27.24 across the before/after runs). At this
+effect size the token-level metric cannot resolve it: direct p50 alone swings between 54.6 and
+62.3 ms across consecutive runs on this machine, and the unrolled p50 swings 47.5-49.2. Any
+future change worth less than ~1 ms needs paired repeat runs, not a single A/B.
+
+### 21.2 Current state, and a correctness note
+
+```text
+route_wait median 27.24   cold median 20.30
+unrolled decode p50 49.24 (47.50-49.24 across recent runs)
+direct   decode p50 54.64 (54.64-62.28 across recent runs)
+```
+
+In the combined run the Direct arm and the unrolled arm produced **all eight** token ids
+identically, including the fifth and sixth positions that had diverged in earlier runs, and
+`gate_fail` was 0 in every run. The fused tail is bit-exact by construction and this is
+consistent with that.
+
+### 21.3 Where the remaining time is
+
+```text
+token ~47.5-49 ms  =  host cold 20.3 (DRAM-bound, irreducible)
+                    + device critical path 27.2 (route_wait)
+                    + ~1-2 ms handoff and mismatch
+```
+
+Everything after the packet is on the critical path. Per section 20.1 the exposed device work
+is HC ~12.6, GDN attention 8.3, router 3.5, QSA 6.8, tail ~2. Launch reduction has been
+exhausted as far as it is cheap (tail done, 0.9 ms; the remaining HC and router fusions are
+worth ~0.9-1.8 ms each at 9.4 us per launch and both need real kernel work, with one failed
+precedent already recorded in 20.3).

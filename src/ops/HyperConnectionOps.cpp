@@ -196,12 +196,34 @@ void grouped_rms_norm(
                 red_slm[lid] = sum_sq;
                 item.barrier(sycl::access::fence_space::local_space);
 
-                for (int stride = wg / 2; stride > 0; stride >>= 1) {
-                    if (lid < stride) {
-                        red_slm[lid] += red_slm[lid + stride];
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
+                // Reduce with sub-group shuffles and two work-group barriers
+                // instead of an eight-step SLM tree. The tree paid one full
+                // work-group barrier per level, which is the remaining
+                // candidate explanation for a 10240-element normalisation
+                // costing tens of microseconds once vectorised loads had been
+                // ruled out. The summation order changes; the operator does
+                // not.
+                auto reduction_sg = item.get_sub_group();
+                constexpr int kSubGroups = wg / 16;
+                const int reduction_sg_id = lid / 16;
+                const int reduction_lane = lid % 16;
+                const float sg_sum = sycl::reduce_over_group(
+                    reduction_sg, red_slm[lid], sycl::plus<>());
+                if (reduction_lane == 0) {
+                    red_slm[reduction_sg_id] = sg_sum;
                 }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (reduction_sg_id == 0) {
+                    const float partial = reduction_lane < kSubGroups
+                                              ? red_slm[reduction_lane]
+                                              : 0.0f;
+                    const float total = sycl::reduce_over_group(
+                        reduction_sg, partial, sycl::plus<>());
+                    if (reduction_lane == 0) {
+                        red_slm[0] = total;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
 
                 float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
 
