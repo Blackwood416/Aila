@@ -531,3 +531,51 @@ participating cores the same 851 MB would take roughly 7-8 ms, which would move
 
 The 12.7% median improvement in 14.1 stands as measured; what changes is that it is not the
 end of the road.
+
+## 16. The host is a 2015 Xeon: 48 GB/s is the memory wall, not a thread-starvation artefact
+
+Section 15 hypothesised that `cold` was thread-starved and that intra-expert parallelism would
+recover a 2x. Both halves of that are wrong, and the code plus the hardware spec settle it.
+
+**Code**: the parallelism is already fine-grained. `cpu_expert_gate_up_swiglu_tbb_avx2`
+(`src/ops/Qwen4ExpCpuExpertOps.cpp:1517`) partitions the 640 intermediate rows in tiles of 16,
+`cpu_expert_down_tbb_avx2` (`:1557`) partitions 2560 output rows in tiles of 32, and
+`cpu_expert_batch_forward` (`:1648`, `:1675`) additionally partitions tasks x tiles. A single
+expert already spreads over dozens of TBB chunks; there is no one-thread-per-expert serialisation
+to remove.
+
+**Hardware**:
+
+```text
+CPU      : Intel Xeon E5-2696 v3 (Haswell-EP), 18 cores / 18 threads @ 2.3 GHz, AVX2 only
+Memory   : 4 x 16 GB Micron DDR4-1866 RDIMM, 4 channels
+Peak     : 1866 MT/s x 4 channels x 8 B = 59.7 GB/s theoretical
+Practical: ~45-52 GB/s sustained for streaming reads
+Measured : 851 MB / 17.8 ms = 47.8 GB/s  -> 80-95% of the sustainable figure
+```
+
+So `cold` is already at the host memory wall. The 47.8 GB/s figure in 13.2 stands, and the
+"floor" wording in 13.3 was only wrong in the sense that it discouraged further work: the
+physically available win is not in making `cold` faster, it is in **not paying it serially**.
+
+Restating the decomposition with the hardware bound in place:
+
+```text
+device work per token          = 28.4 (route_wait) + 6.7 (resident+shared, after doorbell)
+                                 = 35.1 ms
+host cold per token            = 851 MB / 47.8 GB/s = 17.8 ms
+overlap achievable today       = 6.7 ms (only the post-doorbell device work is concurrent)
+exposed cold                   = 11.1 ms
+token                          = 35.1 + 11.1 = 46.2 ms   (measured 49.0-51.0 at p50)
+```
+
+Since `cold` cannot get faster and residency is VRAM-capped, the only remaining way to recover
+the 11.1 ms is to place more device work between the doorbell and the packet wait. Everything
+after the router depends on the cold result, so that work has to come from a restructure:
+giving the device work that is independent of layer L's expert result (for example moving a
+part of the next layer's pre-router chain, or speculating the route so cold results are ready
+before the doorbell). Both are pipeline redesigns, not tuning.
+
+The remaining tuning lever is device compute itself, 35.1 ms, of which attention is ~14 ms
+(12 QSA layers at ~0.6 ms plus 36 GDN layers at ~0.15 ms) and the hidden-state/hyper-connection
+groups another ~9 ms.
