@@ -895,3 +895,65 @@ is HC ~12.6, GDN attention 8.3, router 3.5, QSA 6.8, tail ~2. Launch reduction h
 exhausted as far as it is cheap (tail done, 0.9 ms; the remaining HC and router fusions are
 worth ~0.9-1.8 ms each at 9.4 us per launch and both need real kernel work, with one failed
 precedent already recorded in 20.3).
+
+## 22. Observer effect: the in-code profiler inflates short spans by up to 5x
+
+Every per-stage number in sections 17-21 came from the in-code profiler, which is not a
+neutral observer. This section measures how far off it is, using VTune `xpu-offload` as the
+observer-free reference: it is a pure trace of Level Zero timestamps, so it needs no marks, no
+profiling queue and adds no barriers.
+
+### 22.1 What each observer actually changes
+
+| observer | what it does | changes synchronisation? |
+|---|---|---|
+| `AILA_Q4E_TOKEN_GRAPH_TRACE` | two `steady_clock::now()` per layer plus a final log line | **no** — it is host-side bookkeeping only |
+| `AILA_PROFILE_Q4E_COLD_DEVICE=1` | constructs the queue with `sycl::property::queue::enable_profiling` | yes, indirectly: every command carries a timestamp request |
+| `AILA_Q4E_TOKEN_GRAPH_NODE_PROF=1` | submits one `ext_oneapi_submit_barrier()` after each of 7 groups and 21 sub-stages, 756 per token | **yes, strongly** — each barrier is an explicit L0 barrier node that drains all prior work and carries cache-flush semantics |
+
+The trace flag defaults to false in the code but the benchmark runner sets
+`AILA_Q4E_TOKEN_GRAPH_TRACE=1` (run_ab.ps1:638), so every p50 and every `route_wait` reported
+so far was taken with trace on. That is acceptable: trace changes no synchronisation, and it
+is the only way `route_wait` is emitted at all.
+
+### 22.2 Measured inflation
+
+Same kernels, both methods, same run configuration:
+
+| stage | profiler span | VTune real | inflation |
+|---|---:|---:|---:|
+| `hc_decode_down_inject` | 50 us | **41 us** | 1.2x |
+| `hc_decode_up_mix` | 28 us | **21 us** | 1.3x |
+| HC normalisation (`Global=1024`, 4 work-groups) | 47 us | **9-20 us** | **2.5-5x** |
+| QSA `attention_decode_exact_head256_partial_merge` | 197 us | **154 us** | 1.3x |
+
+The inflation is **not uniform**: the shorter and narrower the kernel, the more the 756 barrier
+nodes and the profiling timestamps dominate it. A barrier node apparently costs on the order of
+10 us of device-visible time on this stack, which is why an empty kernel measured 21 us through
+the marks while the production path only pays ~9.4 us per launch (section 20.2).
+
+Consequences that must be applied to earlier sections:
+
+- The claim in 18.2 and 21.1 that the HC normalisation is "10x too slow for 20 KB" is **wrong**.
+  It really costs 9-20 us, which is unremarkable. There is no anomaly there to fix.
+- HC's real per-call cost is about 41 + 21 + ~15 = **77 us**, so ~7.4 ms per token rather than
+  the 13.27 ms derived from inflated spans.
+- Per-stage spans from the in-code profiler remain usable for **ranking** and for measuring a
+  change made in the same configuration, but must never be quoted as absolute kernel costs, and
+  they bias against short kernels when comparing across stages.
+
+By contrast `route_wait` (27.2 ms) is host-measured around the doorbell protocol and contains
+no marks, so it is a true device-side figure and stays the primary metric.
+
+### 22.3 Method going forward
+
+1. `route_wait` and decode p50 for decisions.
+2. VTune `xpu-offload` (no marks, no profiling queue) for absolute kernel durations.
+3. The in-code profiler only for A/B of a change within the same configuration, and only after
+   checking that the change does not merely move work between marks.
+
+One caveat recorded for the next user of the VTune trace: a 2108-token prompt spends ~127 s in
+prefill and only ~0.1 s in decode, so the aggregated hotspot CSV is prefill-dominated. Decode
+kernels must be isolated either by name (`hc_decode_*`, `attention_decode_*` run only in
+decode) or by work size (`grouped_rms_norm` at `Global=1024` is the four-work-group decode
+shape; the prefill shape is `Global=524288`).
