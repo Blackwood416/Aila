@@ -637,3 +637,59 @@ For anyone resuming this work: the host side is finished. `cold` is at 80-95% of
 DDR4-1866 four-channel memory system, residency is capped by 16 GB of VRAM, host submission is
 40 ms and already fully overlapped, and the command-graph replay penalty is avoided. All
 remaining headroom is in GPU kernel efficiency, starting with QSA.
+
+## 18. Measured device breakdown, and why the target changed
+
+Section 17 assumed QSA was the expensive part and proposed an ESIMD rewrite of its dominant
+stage. Section 18.1 is the measurement that was required first, and it invalidates that
+assumption before any kernel was written.
+
+### 18.1 Breakdown at pos 2109, steady state, ms per token
+
+| bucket | ms | share | notes |
+|---|---:|---:|---|
+| HC (`attn_hc` + `mlp_hc`) | 9.40 | 27% | 96 calls, 0.098 ms each |
+| GDN attention, 36 layers | 8.04 | 23% | 0.223 ms/layer |
+| resident + shared experts | 8.21 | 23% | 0.120 + 0.051 ms/layer |
+| QSA, 12 layers, all stages | 6.70 | 19% | 0.558 ms/layer |
+| router (front + topk + publish + classify) | 3.08 | 9% | 0.064 ms/layer |
+| **device compute total** | **35.4** | | `tail` excluded, it contains the packet wait |
+
+QSA per stage, 12 layers: `qkv_proj` 1.14, `indexer_qk` 0.27, `prepare_qkv` 0.52,
+`prepare_idx_q` 0.21, `compress` 0.24, `blk_scores` 0.48, `select` 0.52, `validate` 0.19,
+`attend` 2.36, `o_proj` 0.77. The sparse attention core is only **2.36 ms/token**, and no
+single QSA stage exceeds 1.2 ms. An ESIMD rewrite of `attend` therefore caps out at about
+2.4 ms, not the 14 ms that was assumed.
+
+### 18.2 Every bucket runs at 20-35 GB/s on a 500 GB/s device
+
+The QSA `attend` stage moves ~4.2 MB of K/V per layer and takes 0.197 ms, i.e. 21 GB/s. The
+resident expert stage moves ~2.4 MB per layer in 0.120 ms, i.e. 20 GB/s. The HC stage is
+0.098 ms for a 2560-wide projection. Every bucket sits at the same low effective bandwidth,
+which is the signature of a **per-launch cost**, not of arithmetic or memory limits: ~750
+`queue.submit` calls over 35.4 ms is 47 us per launch.
+
+### 18.3 The pipeline is balanced, so only kernel count helps both sides
+
+```text
+host submission   40.4 ms/token = 0.83 ms/layer
+device spans      28.0 ms/token = 0.58 ms/layer   (= route_wait)
+```
+
+The two are within 40% of each other. Reducing only the host side cannot help because the
+device spans would not shrink, and reducing only the device side cannot help because the
+submitter is already at 0.83 ms/layer. Any change that removes kernels reduces **both** terms
+at once, which is why the next round should fuse rather than micro-optimise:
+
+- the four tail kernels per layer (`packet_copy`, `gated_ordered_merge`,
+  `add_shared_expert_to_y`, `gated_final_bridge`) are 4 launches each, 192 per token, and one
+  of them moves 160 KiB from uncached host memory every layer;
+- `router_softmax_topk_device` + `submit_input_and_route_publish` +
+  `moe_resident_classify_device` are three single-work-group kernels over the same ten route
+  ids, 96 launches per token;
+- the two HC calls per layer are 96 launches at 0.098 ms each and are the single largest
+  bucket, so any fusion that absorbs them is worth more than the whole QSA rewrite.
+
+ESIMD remains the right tool for a stage once it is shown to be arithmetic- or
+bandwidth-bound in isolation rather than launch-bound; none of the measured stages currently
+is, so writing ESIMD first would have optimised the wrong thing.
