@@ -485,3 +485,49 @@ Direct spans 54.8-73.4 ms (+-15%); the unrolled path spans 49.0-51.0 ms (+-2%). 
 improvement is 1 - 49.5/56.7 = 12.7%, and the worst pairing still clears the 5% gate. The
 stability of the unrolled path is itself a property worth keeping: it comes from having no
 per-layer host submission in the critical path.
+
+## 15. Correction: the floor in 13.3 was over-stated, and the cause is thread starvation
+
+Section 13.3 concluded that cold at 47.8 GB/s was near the memory-system limit and that the
+pipeline therefore sat at a structural floor of 46-50 ms. An independent review of that
+reasoning is correct and the conclusion is withdrawn.
+
+### 15.1 The CPU is idle for the entire device phase
+
+`route_wait` is 28.0-28.8 ms per token during which the host service thread is parked in
+`wait_request`. `cold` is 15.5-22.6 ms per token during which the device has only the
+resident plus shared groups queued, 0.10 + 0.04 = 0.14 ms/layer = 6.7 ms/token, before it
+reaches `submit_packet_wait`. The two phases are strictly serial:
+
+```text
+per layer:  device 0.58 -> doorbell -> device 0.14 -> wait for cold 0.371 -> merge
+exposed cold per layer = 0.371 - 0.140 = 0.231 ms   -> 11.1 ms/token
+service_ms = route_wait 28.4 + cold 17.8 + publish 0.15 = 46.4 (matches measurement)
+```
+
+The achievable value if cold overlapped fully would be `max(device 35.1, cold 17.8) = 35.1`,
+not 46.4.
+
+### 15.2 Why the 47.8 GB/s figure is not a hardware limit
+
+851 MB/token divided by 17.8 ms gives 47.8 GB/s, which *looks* like a platform limit. It is
+not. There are only ~346 cold tasks per token spread over 48 layers, i.e. **about 7 tasks per
+layer**, and the executor parallelises one task per TBB thread. With 7 runnable tasks on an
+18-thread arena, at most 7 cores participate, so the aggregate is 7 x ~6.8 GB/s. The
+bandwidth per participating core is already at a normal single-core streaming rate for
+unpack-bound NF4 work; the shortfall is **parallelism within a layer, not bytes**.
+
+Refilling the arena requires splitting one expert's reduction across several thread tiles
+(row-block partition of `gate_up` and `down`) instead of one thread per expert. At 18
+participating cores the same 851 MB would take roughly 7-8 ms, which would move
+`service_ms` from 46.4 to about 36, and the token from 49 to about 42 (at which point the
+40 ms host submission pass finally becomes the limiter and is worth attacking).
+
+### 15.3 Revised lever order
+
+1. Intra-expert parallelism in the CPU cold path (target `cold` 17.8 -> ~8 ms).
+2. Host submission cost, 40 ms, only after (1) because it is not the limiter today.
+3. Device compute, 28 ms, unchanged and dominated by attention (14 ms of it).
+
+The 12.7% median improvement in 14.1 stands as measured; what changes is that it is not the
+end of the road.
