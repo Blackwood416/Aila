@@ -269,3 +269,81 @@ ninja: error: 'C:/Program Files/LevelZeroSDK/1.28.2/lib/ze_loader.lib' ... missi
 Both cache entries were repointed at `1.33.1` and the tree rebuilt 292/292. Anyone
 reusing this build directory on a machine with a different Level Zero SDK version must
 expect the same failure and repoint those two cache variables.
+
+## 11. Round-1 conclusion: the command graph and the serialised submission were the regression
+
+Two probes built this round resolved the "graph is ~2x slower than Direct" question
+completely, and the answer is neither the doorbell nor the CPU experts.
+
+### 11.1 Per-node device timing (`AILA_Q4E_TOKEN_GRAPH_NODE_PROF`)
+
+A captured command graph yields no per-node events, so the body is executed un-captured on
+the live queue in this mode (`Qwen4ExpWholeTokenGraph.cpp`, `WholeTokenNodeProfiler`). A
+barrier is inserted after the last submission of each of the seven node groups per layer and
+labelled with that group; the interval between two marks is the device span of the group
+between them. Same technique as the Direct path's `dev_*_ms`.
+
+Measured device spans per token (48 layers, pos 2108-2110):
+
+| group | total | per layer |
+|---|---:|---:|
+| attn_hc | 5 ms | 0.10 |
+| attention | 13-14 ms | 0.29 |
+| mlp_hc | 4 ms | 0.08 |
+| route + doorbell publish | 3 ms | 0.06 |
+| resident experts | 5 ms | 0.10 |
+| shared expert | 2 ms | 0.04 |
+| **compute total** | **32-33 ms** | 0.68 |
+
+The `tail` bucket is 107-416 ms because it contains the packet-wait spin, i.e. the handoff,
+not compute. Compute is therefore ~33 ms/token.
+
+### 11.2 The graph executable costs ~66 ms/token on its own
+
+Same body, same nodes, same handoff, two launch mechanisms:
+
+| launch | `route_wait` | `replay_ms` |
+|---|---:|---:|
+| `ext_oneapi_graph` replay | 96.3-97.1 ms | 115-133 ms |
+| direct in-order submission | 28.0-28.4 ms | 103-113 ms |
+
+`route_wait` measures the segment from publishing packet(L) to observing doorbell(L+1), so
+it excludes both `cold` and the spin. It drops by 3.4x when the identical node sequence is
+submitted directly instead of replayed from an executable. With compute at ~33 ms, the
+captured replay pays roughly **66 ms/token of graph-execution overhead** (1.35 ms/layer,
+~190 us/node), which is what made the graph look device-bound.
+
+### 11.3 Serialised submission: the second, independent defect
+
+Un-captured submission initially measured `replay_ms=103-113` while `service_ms` was only
+47 ms, with `spin_iters=272164` on the first token. The submission pass is node-by-node and
+costs the host tens of milliseconds, and `ServiceWholeTokenGraphReplay` was invoked *after*
+it, so the device stalled at layer 0's packet wait for the whole submission. The submission
+and the service are now run concurrently (service on a worker thread started before the body
+is submitted). `event` is consumed only by the service's final wait and the following in-order
+`memcpy_d2h` re-establishes that ordering.
+
+```text
+before (serialised):  replay_ms=102.9-113.0  spin_iters=56581-272164
+after  (concurrent):  replay_ms=48.4-50.3    spin_iters=8725-11132
+```
+
+### 11.4 Result
+
+```text
+AILA_Q4E_TOKEN_GRAPH=1 AILA_Q4E_TOKEN_GRAPH_UNROLLED=1, 4 tokens, pos 2108-2111
+direct p50 = 73.40 ms   unrolled p50 = 49.45 ms   (-32.7%)
+token ids identical in both arms: 16,13,24624,279   gate_fail = 0
+route_wait 27.9-30.2   cold 17.9-34.3   publish ~0.16   service 46.4-48.5
+```
+
+The remaining budget of the unrolled path is balanced: service is 46-48 ms and the host
+submission pass is of the same order, so the two threads are both close to saturated. The
+next levers are therefore submission cost (~0.16 ms/node x 352) and `cold`, not node fusion.
+
+### 11.5 Status of the earlier node-cutting plan
+
+The handoff document's section 8 items are now known to be worth far less than the launch
+mechanism: packet-merge fusion removes ~4.8 MB of host traffic and one node per layer
+(~1-2 ms), GDN conv-history fusion removes 36 small kernels per token (~0.2-1 ms), and the
+final mixer is <=0.33%. None of them should be prioritised over the launch-mechanism fix.
