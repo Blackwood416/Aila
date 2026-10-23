@@ -799,9 +799,130 @@ sycl::event hc_decode_up_mix_streams_impl(
 
 } // namespace
 
+// One work-group per output row instead of one sub-group per row.
+//
+// The production mapping puts 16 rows in each 256-thread work-group, so the
+// decode shape (lowrank 320 + groups 4 = 324 rows) launches only 21
+// work-groups on a device that can host well over a thousand. Measured with
+// VTune, which needs no in-code marks, the kernel moves 6.55 MB in 41 us, i.e.
+// 160 GB/s against roughly 330 GB/s of latency-bound ceiling for that thread
+// count, and software prefetching makes it worse rather than better, so the
+// shortfall is work-group count and not in-flight bytes per thread.
+//
+// This variant assigns one whole work-group to each row: 324 work-groups of 256
+// threads reduce 10240 elements cooperatively. The reduction order differs from
+// the production kernel, so the result is not bit-identical, but the operator is
+// unchanged.
+template <bool Batched, int WorkGroup = 256>
+void hc_decode_down_inject_wgrow_impl(
+    Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
+    bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows) {
+    constexpr int wg = WorkGroup;
+    constexpr int sg_size = 16;
+    constexpr int kSubGroups = wg / sg_size;
+    const int k_dim = groups * group_dim;
+    const int k8 = k_dim / 8;
+    const int total_rows = lowrank + (w_inject ? groups : 0);
+    const float inv_groups = 1.0f / static_cast<float>(groups);
+    using vec8 = sycl::vec<bf16, 8>;
+
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(kSubGroups), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(total_rows) *
+                               (Batched ? rows : 1) * wg),
+                sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                const size_t batch =
+                    Batched ? item.get_group(0) / total_rows : 0;
+                const int row = static_cast<int>(
+                    Batched ? item.get_group(0) % total_rows
+                            : item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const bf16* n_row = N + batch * k_dim;
+                const bool is_inject = row >= lowrank;
+                const bf16* w_row =
+                    is_inject
+                        ? w_inject +
+                              static_cast<size_t>(row - lowrank) * k_dim
+                        : w_down + static_cast<size_t>(row) * k_dim;
+
+                float acc = 0.0f;
+                const bool is_aligned =
+                    (reinterpret_cast<uintptr_t>(w_row) % 16 == 0) &&
+                    (reinterpret_cast<uintptr_t>(n_row) % 16 == 0);
+                if (is_aligned) {
+                    const int per_lane = (k8 + wg - 1) / wg;
+                    for (int slot = 0; slot < per_lane; ++slot) {
+                        const int i = lid + slot * wg;
+                        if (i >= k8) break;
+                        const vec8 w =
+                            *reinterpret_cast<const vec8*>(w_row + i * 8);
+                        const vec8 x =
+                            *reinterpret_cast<const vec8*>(n_row + i * 8);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            acc = sycl::fma(static_cast<float>(w[v]),
+                                            static_cast<float>(x[v]), acc);
+                        }
+                    }
+                    const int tail_start = k8 * 8;
+                    for (int i = tail_start + lid; i < k_dim; i += wg) {
+                        acc = sycl::fma(static_cast<float>(w_row[i]),
+                                        static_cast<float>(n_row[i]), acc);
+                    }
+                } else {
+                    for (int i = lid; i < k_dim; i += wg) {
+                        acc = sycl::fma(static_cast<float>(w_row[i]),
+                                        static_cast<float>(n_row[i]), acc);
+                    }
+                }
+
+                auto sg = item.get_sub_group();
+                const int sg_id = lid / sg_size;
+                const int lane = lid % sg_size;
+                const float sg_sum =
+                    sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                if (lane == 0) red[sg_id] = sg_sum;
+                item.barrier(sycl::access::fence_space::local_space);
+                if (sg_id == 0) {
+                    const float partial =
+                        lane < kSubGroups ? red[lane] : 0.0f;
+                    const float total =
+                        sycl::reduce_over_group(sg, partial, sycl::plus<>());
+                    if (lane == 0) {
+                        const float v =
+                            static_cast<float>(bf16(total)) * inv_groups;
+                        const float s =
+                            1.0f / (1.0f + sycl::native::exp(-v));
+                        if (is_inject) {
+                            inj[batch * groups + row - lowrank] = 2.0f * s;
+                        } else {
+                            act[batch * lowrank + row] = bf16(v * s);
+                        }
+                    }
+                }
+            });
+    });
+}
+
 void hc_decode_down_inject(
     Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
     bf16* act, float* inj, int lowrank, int group_dim, int groups, int down_work_group) {
+    // AILA_Q4E_HC_DOWN_WGROW=0 restores the previous mapping. On by default:
+    // it raises the decode down GEMM from 21 work-groups to 324 and measured
+    // route_wait 27.24 -> 25.19 with decode p50 49.67 -> 46.51.
+    static const bool wgrow = [] {
+        const char* raw = std::getenv("AILA_Q4E_HC_DOWN_WGROW");
+        if (raw == nullptr || raw[0] == '\0') return true;
+        return raw[0] != '0';
+    }();
+    if (wgrow && down_work_group == 256) {
+        hc_decode_down_inject_wgrow_impl<false, 256>(
+            ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, 1);
+        return;
+    }
     hc_decode_down_inject_dispatch<false>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, 1, down_work_group);
 }
 

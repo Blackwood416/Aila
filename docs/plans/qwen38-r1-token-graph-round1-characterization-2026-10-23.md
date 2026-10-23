@@ -957,3 +957,57 @@ prefill and only ~0.1 s in decode, so the aggregated hotspot CSV is prefill-domi
 kernels must be isolated either by name (`hc_decode_*`, `attention_decode_*` run only in
 decode) or by work size (`grouped_rms_norm` at `Global=1024` is the four-work-group decode
 shape; the prefill shape is `Global=524288`).
+
+## 23. Work-group per row: the first kernel change that the observer-free data predicted
+
+### 23.1 The finding
+
+VTune's no-marks trace (section 22) put the decode down GEMM at 41 us for 6.55 MB, i.e.
+160 GB/s. The limit for that kernel is not bandwidth but **work-group count**: the production
+mapping puts sixteen output rows in each 256-thread work-group, and the decode shape has
+`lowrank + groups = 324` rows, so it launches **21 work-groups** on a device that can host well
+over a thousand. In-flight bytes per thread were never the problem, which is exactly why the
+software-pipelined `_pl` variants make it worse at every prefetch depth (4 in section 20, 2 and
+3 re-tested here: `route_wait` 27.2 -> 33.5).
+
+Re-mapping so that one whole work-group owns one output row gives 324 work-groups of 256
+threads, with the row reduction done cooperatively inside the work-group: sub-group
+`reduce_over_group`, one barrier, a second sub-group reduction over the 16 partials. No extra
+launch and no split-K buffer.
+
+### 23.2 Result, two A/B pairs in opposite order
+
+| pair | mapping | `route_wait` | decode p50 | Direct p50 same run |
+|---|---|---:|---:|---:|
+| 1 | sub-group per row | 27.24 | 49.67 | 55.75 |
+| 1 | **work-group per row** | **25.19** | **46.51** | 56.21 |
+| 2 | sub-group per row | 27.26 | 48.57 | 56.53 |
+| 2 | **work-group per row** | **25.43** | **46.51** | 60.63 |
+
+`route_wait` improves 1.81-2.05 ms and p50 2.06-3.16 ms in both orders. The predicted saving
+was 2.0 ms (41 us -> ~20 us on 96 calls), so the measurement matches the mechanism.
+
+The mapping is on by default; `AILA_Q4E_HC_DOWN_WGROW=0` restores the old one. It is not
+bit-identical (the reduction order inside a row changes), which is accepted: weights are NF4
+and the acceptance criterion is text quality, not per-token id equality.
+
+### 23.3 Cumulative state
+
+```text
+unrolled decode p50   46.5 ms  (was 49.5 before the tail fusion and this change)
+route_wait            25.2-25.4 ms  (was 28.0)
+Direct     decode p50 55.7-60.6 ms in the same runs
+```
+
+Against Direct measured in the same process this is now a 17-23% improvement, and against the
+slowest Direct runs observed (73.4 ms) 36%.
+
+### 23.4 What the method change bought
+
+Sections 17-21 spent four attempts on the hyper-connection kernels and got nothing but negative
+results, because the in-code profiler reported the down GEMM at 50 us and the normalisation at
+47 us, which made them look like arithmetic or memory problems. The observer-free trace put the
+same kernels at 41 us and 9-20 us and, more importantly, exposed the work-group count, which
+was visible in the profiler data all along but not interpretable without the true durations.
+The lesson is recorded in 22.3: VTune trace for durations, `route_wait` for decisions, in-code
+marks only for same-configuration A/B.
