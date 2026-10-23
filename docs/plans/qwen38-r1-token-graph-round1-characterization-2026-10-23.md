@@ -455,3 +455,33 @@ Recorded for the next round, in expected-value order:
 3. Reserve headroom is 3584 MB of 15933 MB. Shrinking it would admit a few hundred more
    slots, but 13.1 shows the miss rate is dominated by the per-layer share, so the expected
    gain is small.
+
+## 14. Null results recorded so they are not retried
+
+Three single-variable experiments were run against the unrolled path and left the
+bottleneck untouched. All three are recorded here because each one looks plausible on paper.
+
+| experiment | setting | measured | verdict |
+|---|---|---|---|
+| host packed expert cache | `AILA_Q4E_CPU_PACKED_CACHE_MB=4096` | `cold_ms` 14.9-20.0 vs 16.7-22.6, p50 49.04 | null |
+| runtime hotset adoption | `HOTSET_INTERVAL=1 SWAPS=512 ADOPT_LIMIT=4096 ADOPT_READY=1` | `cold_ms` no trend over 12 tokens, `swap_ms=0.000` | null, cache already fully admitted |
+| L0 command-list batching | `SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0`, `BATCH_SIZE=16` | `submit_ms` 38.9-47.5 vs 40.3-41.7 | null |
+
+The packed-cache result is the informative one: if `cold` were limited by page-fault or
+mmap behaviour, caching 4 GB of packed weights in host memory would have moved it. It did
+not, which supports section 13.2: the cost is the bytes that must be touched, not how they
+are laid out or cached.
+
+### 14.1 Paired results accumulated so far
+
+Nine paired runs of the same process (Direct arm and unrolled arm back to back):
+
+```text
+Direct   p50: 73.40 57.53 56.16 56.73 57.68 55.35 56.06 54.80 55.77
+unrolled p50: 49.45 49.14 49.64 49.48 49.24 51.03 50.62 50.64 49.04
+```
+
+Direct spans 54.8-73.4 ms (+-15%); the unrolled path spans 49.0-51.0 ms (+-2%). Median
+improvement is 1 - 49.5/56.7 = 12.7%, and the worst pairing still clears the 5% gate. The
+stability of the unrolled path is itself a property worth keeping: it comes from having no
+per-layer host submission in the critical path.
