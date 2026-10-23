@@ -399,3 +399,59 @@ project is that micro-precision alignment is not a requirement: weights are NF4,
 gate that matters is whether the produced text degrades. A same-process frozen-prefix
 comparison, or a text-quality comparison over a longer generation, is therefore the correct
 acceptance test, not per-token id equality.
+
+## 13. Residency is exhausted, and cold is at the host memory-bandwidth limit
+
+Section 12 left one lever: give the device more expert work so the 17.8 ms of CPU cold
+service hides behind it. That lever is now closed, with direct evidence.
+
+### 13.1 The adaptive cache cannot grow or swap
+
+```text
+[Q4E Adaptive Residency] profile_total_keys=24576 ranked_keys=2800 admitted_slots=2800
+```
+
+Admission is already at the cap (`AILA_Q4E_MAX_GPU_SLOTS` 2800, Expert Cache 7883 MB of a
+15933 MB card, ~2.8 MB per slot). 48 layers x 512 experts = 24576 keys, so residency averages
+58 experts per layer against a top-10 selection, and decode misses ~346 of 480 selections
+per token (73%).
+
+Enabling the whole runtime-adoption chain (`AILA_Q4E_HOTSET_INTERVAL=1`,
+`AILA_Q4E_HOTSET_SWAPS=512`, `AILA_Q4E_HOTSET_ADOPT_LIMIT=4096`,
+`AILA_Q4E_HOTSET_ADOPT_READY=1`) over 12 tokens produced no trend in `cold_ms`
+(15.5-22.6 ms, no decay) and `route_wait` stayed at 28.0-28.8 ms. The decisive detail is
+`swap_ms=0.000` in the AdaptiveWork line: with the cache already fully admitted, no swap is
+ever executed, so runtime adoption cannot replace the profile's generic ranking with this
+conversation's actual hot set. Residency is effectively static.
+
+### 13.2 cold is bandwidth-bound, not compute-bound
+
+One expert's weights: `gate_up` 2 x 640 x 2560 plus `down` 2560 x 640 = 4.91 M parameters,
+4-bit packed = **2.46 MB**. At 346 cold tasks per token that is **851 MB of host weight
+traffic per token**, and `cold_ms` averages 17.8 ms, i.e. **47.8 GB/s**.
+
+A desktop dual-channel platform sustains roughly 50-70 GB/s, so the CPU expert path is
+already within ~1.3x of the memory system's limit. There is no large factor hiding in CPU
+vectorisation: cutting `cold` materially would require reading fewer bytes, which needs
+residency, which needs VRAM that does not exist on a 16 GB card.
+
+### 13.3 Resulting floor
+
+```text
+token ~= device work 28.2 ms + cold 17.8 ms, with cold's device overlap limited to the
+         7 ms of post-doorbell resident+shared work
+```
+
+Both terms sit near their hardware limits, so the unrolled pipeline is close to its
+structural floor at 46-50 ms/token. Reaching it required removing the two defects in
+section 11; what remains is device kernel efficiency (28 ms) rather than pipeline structure.
+
+Recorded for the next round, in expected-value order:
+
+1. Device compute is 28 ms for ~750 launches, i.e. 37 us per launch against 0.68 ms/layer of
+   actual work. Per-launch fixed cost, not arithmetic, is the term to attack next.
+2. `AILA_Q4E_CPU_PACKED_CACHE_MB` defaults to 0 (host packed expert cache disabled) and was
+   never exercised in these runs; worth one A/B before concluding 13.2 is final.
+3. Reserve headroom is 3584 MB of 15933 MB. Shrinking it would admit a few hundred more
+   slots, but 13.1 shows the miss rate is dominated by the per-layer share, so the expected
+   gain is small.
