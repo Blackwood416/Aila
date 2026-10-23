@@ -579,3 +579,61 @@ before the doorbell). Both are pipeline redesigns, not tuning.
 The remaining tuning lever is device compute itself, 35.1 ms, of which attention is ~14 ms
 (12 QSA layers at ~0.6 ms plus 36 GDN layers at ~0.15 ms) and the hidden-state/hyper-connection
 groups another ~9 ms.
+
+## 17. Next target: the QSA layer body, and why ESIMD is the right tool here
+
+Section 16 closes the host side. The remaining device budget is 35.1 ms/token, of which
+attention is ~14 ms and the QSA layers are the expensive part (~0.62 ms per QSA layer for 12
+layers, versus ~0.15 ms per GDN layer for 36).
+
+### 17.1 The QSA body is two orders of magnitude off roofline
+
+QSA is block-sparse (512-token blocks) with an indexer, `head_dim=256`, `Q=1` decode at
+KV ~= 2052. First-order bounds for one QSA layer with `Hkv=2`:
+
+```text
+K/V traffic = 2052 x 256 x 2 (K,V) x 2 B x Hkv(2) = 4.2 MB
+measured 0.62 ms  ->  ~6.8 GB/s      versus A770 ~500 GB/s
+arithmetic  = 2052 x 256 x Hkv x 2   = 2.1 MMAC  ->  ~6.8 GFLOP/s  versus ~10+ TFLOP/s
+```
+
+Both the bandwidth and the arithmetic occupancy are ~50-70x below what the device can do.
+So this kernel is latency/occupancy bound, not bandwidth bound, and there is real room. This
+is the one place in the current token budget where a large factor is plausible.
+
+### 17.2 The body is a six-stage chain, not one kernel
+
+`RecordSingleFullAttentionLayerGraphBody` (`src/models/Qwen4ExpPrefill.cpp:933`) forwards to
+`RecordQsaLayerGraphBody`, which drives: `qsa_prepare_q_and_cache_k`,
+`qsa_compute_block_scores` (indexer), `qsa_compress_key_blocks`,
+`qsa_select_topk_blocks_graph`, then the sparse attention core. The 0.62 ms is the sum of all
+of them, and the next measurement must split it before any rewrite: rewriting the indexer when
+the sparse core dominates would be wasted effort, and vice versa.
+
+### 17.3 Execution plan, in the order the evidence discipline requires
+
+1. Add sub-stage marks inside `RecordQsaLayerGraphBody` using the existing
+   `whole_token_node_profiler()` mechanism, so the 0.62 ms splits into per-stage device spans.
+   Run one token, read the split. No kernel changes yet.
+2. Write the ESIMD variant **only for the dominant stage**, behind an env flag, keeping the
+   current kernel as the control.
+3. Build the correctness harness before claiming anything: f64 CPU reference for the exact
+   operator, per-stage tolerance, `errors: 0/N`, warmup plus >=20 timed samples, median with
+   p10/p90 over 3 runs.
+4. Then A/B against the current stage on the real token.
+
+Constraints that apply from the A770 kernel skill and must not be violated:
+
+- ESIMD attention work-groups must stay small: `WG=512` has produced TDRs on A770 even for
+  trivial kernels, and non-zero compiler spill with `RPT>4` is a device-lost trigger.
+- `BM=64, BN=32, VLEN=8, WG=512` (~40 KB SLM) is a preserved `UR_RESULT_ERROR_DEVICE_LOST`
+  failure. Do not reintroduce that geometry.
+- Run new ESIMD geometry as isolated one-shot processes one at a time, with the GPU singleton
+  held, and record any hang or device loss as a versioned negative result.
+
+### 17.4 What the host cannot do any more, restated
+
+For anyone resuming this work: the host side is finished. `cold` is at 80-95% of a 59.7 GB/s
+DDR4-1866 four-channel memory system, residency is capped by 16 GB of VRAM, host submission is
+40 ms and already fully overlapped, and the command-graph replay penalty is avoided. All
+remaining headroom is in GPU kernel efficiency, starting with QSA.
