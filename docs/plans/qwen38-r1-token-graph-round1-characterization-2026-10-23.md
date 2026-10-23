@@ -1011,3 +1011,42 @@ same kernels at 41 us and 9-20 us and, more importantly, exposed the work-group 
 was visible in the profiler data all along but not interpretable without the true durations.
 The lesson is recorded in 22.3: VTune trace for durations, `route_wait` for decisions, in-code
 marks only for same-configuration A/B.
+
+## 24. Sub-graph experiment: implemented, measured, rejected
+
+Section 20.4 recorded a proposal to record the token as per-layer command sub-graphs so that
+each layer's nodes execute from one closed command list and each layer's doorbell reaches the
+device at its own submission instead of at a batch boundary. It is now implemented
+(`AILA_Q4E_TG_SUBGRAPHS=1`, 50 graphs: prologue + 48 layers + epilogue, built by
+`RecordWholeTokenGraphPrologue/Layer/Epilogue`) and measured against the two alternatives on
+the same code.
+
+| launch mechanism | `route_wait` median | decode p50 | gate failures |
+|---|---:|---:|---:|
+| one whole-token graph (352 logical nodes) | 93.34 | 116.44 | 0 |
+| **50 per-layer graphs** | 30.00 | 54.61 | 0 |
+| **direct unrolled submission** | **25.37** | **47.08** | 0 |
+
+Sub-graphs are a large improvement over the whole-token graph (93.3 -> 30.0) and still worse
+than submitting the same nodes directly (25.4). The per-node cost of command-graph execution
+scales with graph size:
+
+```text
+whole-token graph : (93.34 - 25.37) / 750 nodes = 90 us per node
+50 per-layer graphs: (30.00 - 25.37) / 750 nodes = 6.1 us per node
+```
+
+So the penalty is not a fixed per-node charge but grows with the size of the dependency graph,
+which is consistent with graph-wide resource barriers or transitive dependency resolution rather
+than with the 2.2 us per-node figure the proposal assumed. Splitting the graph recovers most of
+the loss and none of the benefit, so direct submission remains the architecture and
+`AILA_Q4E_TG_SUBGRAPHS` stays off by default.
+
+Note that the earlier whole-token graph measurement of 96.6 ms `route_wait` in section 11.2 was
+taken before the tail fusion, the work-group-per-row GEMM, the normalisation change and the
+concurrent service thread, so it is not comparable; the 93.34 ms above is the current-code
+figure with all of those in place.
+
+The three-way comparison also settles what the remaining device budget is spent on: at 25.37 ms
+of `route_wait` with ~750 submissions, launch and ordering overhead is no longer the dominant
+term, and kernel work is.

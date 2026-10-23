@@ -198,6 +198,12 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
         using Executable = sycl::ext::oneapi::experimental::command_graph<
             sycl::ext::oneapi::experimental::graph_state::executable>;
         std::unique_ptr<Executable> executable;
+        // Per-layer command graphs for AILA_Q4E_TG_SUBGRAPHS=1: one prologue,
+        // one per layer, one epilogue. Replaying them in sequence submits each
+        // layer's nodes as a single WDDM command list, so that layer's doorbell
+        // reaches the device as soon as that graph is submitted instead of at a
+        // batch boundary.
+        std::vector<std::unique_ptr<Executable>> subgraphs;
         Tensor control;
         Tensor device_epoch;
         Tensor packet_dev;
@@ -609,6 +615,17 @@ private:
         int count, const ForwardOptions& options);
     std::size_t RecordWholeTokenGraphBody(
         Context& ctx, Session& session, int* control);
+    // Sub-graph pieces for AILA_Q4E_TG_SUBGRAPHS=1. They mirror the three
+    // regions of RecordWholeTokenGraphBody (pre-loop, one layer, publish_done)
+    // so each can be recorded into its own command graph. The single-graph path
+    // above is left untouched on purpose while this is an experiment.
+    std::size_t RecordWholeTokenGraphPrologue(
+        Context& ctx, Session& session);
+    std::size_t RecordWholeTokenGraphLayer(
+        Context& ctx, Session& session, int layer_index, int full_ordinal,
+        int* control);
+    std::size_t RecordWholeTokenGraphEpilogue(
+        Context& ctx, Session& session);
     bool ServiceWholeTokenGraphReplay(
         Context& ctx, Session& session, sycl::event& event,
         uint32_t token_sequence, uint32_t& gate_done_sequence);

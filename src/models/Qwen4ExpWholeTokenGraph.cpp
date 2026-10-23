@@ -381,6 +381,16 @@ bool whole_token_tail_fused_requested() {
     return requested;
 }
 
+// Records the token as one command graph per layer instead of one graph for
+// the whole token. Experimental: see section 20.4 of the round-1 document.
+bool whole_token_subgraphs_requested() {
+    static const bool requested = [] {
+        const char* raw = std::getenv("AILA_Q4E_TG_SUBGRAPHS");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    return requested;
+}
+
 bool whole_token_unrolled_requested() {
     static const bool requested = [] {
         const char* raw = std::getenv("AILA_Q4E_TOKEN_GRAPH_UNROLLED");
@@ -560,6 +570,179 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
         }
         whole_token_node_profiler().mark(kNodeTail);
     }
+    return nodes;
+}
+
+std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphPrologue(
+    Context& ctx, Session& session) {
+    auto& graph = whole_token_graph_;
+    if (!graph.service.allocated()) {
+        throw std::runtime_error("whole-token graph service is not allocated");
+    }
+    (void)session;
+    auto* epoch = reinterpret_cast<aila::TokenGraphDeviceEpoch*>(
+        graph.device_epoch.data());
+    std::size_t nodes = 0;
+    aila::token_graph_service::submit_begin_replay(ctx.queue(), epoch);
+    ++nodes;
+    if (whole_token_node_profiler().enabled) {
+        for (int sample = 0; sample < 8; ++sample) {
+            ctx.queue().parallel_for(
+                sycl::range<1>(32),
+                [=](sycl::item<1> item) { (void)item; });
+            whole_token_node_profiler().mark(kNodeEmpty);
+        }
+    }
+    submit_repeat_hidden4(
+        ctx.queue(), buf_.x.data_as<bf16>(),
+        buf_.hidden4.data_as<bf16>());
+    ++nodes;
+    whole_token_node_profiler().mark(kNodeAnchor);
+    return nodes;
+}
+
+std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphEpilogue(
+    Context& ctx, Session& session) {
+    auto& graph = whole_token_graph_;
+    (void)session;
+    auto* control_ring = graph.service.control();
+    auto* epoch = reinterpret_cast<aila::TokenGraphDeviceEpoch*>(
+        graph.device_epoch.data());
+    aila::token_graph_service::submit_publish_done(
+        ctx.queue(), control_ring, epoch);
+    return 1;
+}
+
+std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphLayer(
+    Context& ctx, Session& session, int layer_index, int full_ordinal,
+    int* control) {
+    auto& graph = whole_token_graph_;
+    if (!graph.service.allocated()) {
+        throw std::runtime_error("whole-token graph service is not allocated");
+    }
+    auto* control_ring = graph.service.control();
+    auto* route_ring = graph.service.route();
+    auto* packet = graph.service.packet();
+    auto* epoch = reinterpret_cast<aila::TokenGraphDeviceEpoch*>(
+        graph.device_epoch.data());
+    auto* packet_dev = graph.packet_dev.data_as<int>();
+    const int top_k = cfg_.num_experts_per_tok;
+    const int experts = cfg_.num_experts;
+    const int intermediate = cfg_.moe_intermediate_size;
+    std::size_t nodes = 0;
+    auto node = [&nodes] { ++nodes; };
+
+    auto& layer = layers_[layer_index];
+    if (layer_index == 1) {
+        ple_.consume_graph(ctx, graph.ple_view);
+        node();
+    }
+
+    RunHyperConnection(ctx, layer.attn_hc, 1, true);
+    node();
+    whole_token_node_profiler().mark(kNodeAttnHc);
+    if (layer.is_linear) {
+        RunAttentionLayerTile(
+            ctx, session, layer_index, buf_.x, buf_.y, 1,
+            session.CurrentLength(), nullptr, 0, false);
+        node();
+    } else {
+        nodes += RecordSingleFullAttentionLayerGraphBody(
+            ctx, session, layer_index, full_ordinal, buf_.x,
+            buf_.y, control);
+    }
+    whole_token_node_profiler().mark(kNodeAttention);
+
+    RunHyperConnectionCombined(
+        ctx, layer.mlp_hc, 1, true, buf_.y.data_as<bf16>(),
+        buf_.hc_inject_f32.data_as<float>(), nullptr);
+    node();
+    whole_token_node_profiler().mark(kNodeMlpHc);
+
+    ops::bf16_moe_front_fused(
+        ctx, layer.router_w->data_as<bf16>(),
+        layer.shared_expert_gate_w->data_as<bf16>(),
+        buf_.x.data_as<bf16>(),
+        buf_.router_scores.data_as<bf16>(),
+        buf_.shared_gate_buf.data_as<bf16>(), nullptr, nullptr,
+        hidden_size_, experts);
+    ops::router_softmax_topk_device(
+        ctx, buf_.router_scores.data_as<bf16>(), nullptr,
+        graph.route_ids.data_as<int>(),
+        graph.route_weights.data_as<float>(), 1, experts, top_k,
+        true);
+    aila::token_graph_service::submit_input_and_route_publish(
+        ctx.queue(),
+        reinterpret_cast<const std::uint16_t*>(buf_.x.data_as<bf16>()),
+        control_ring, route_ring, packet, epoch,
+        graph.route_ids.data_as<int>(),
+        graph.route_weights.data_as<float>(),
+        static_cast<uint32_t>(top_k), layer_index == 0);
+    ops::moe_resident_classify_device(
+        ctx, graph.route_ids.data_as<int>(),
+        adaptive_cache_.DeviceSlotTable() + layer_index * experts,
+        graph.selected.data_as<int>(), top_k, experts);
+    node();
+    whole_token_node_profiler().mark(kNodeRoute);
+
+    ops::moe_resident_gate_up(
+        ctx, graph.resident_descriptors.data_as<ops::MoeExpertSlotDev>(),
+        graph.selected.data_as<int>(), buf_.x.data_as<bf16>(),
+        buf_.moe_h.data_as<bf16>(), top_k, hidden_size_,
+        intermediate, true, true);
+    ops::moe_resident_down(
+        ctx, graph.resident_descriptors.data_as<ops::MoeExpertSlotDev>(),
+        graph.selected.data_as<int>(), buf_.moe_h.data_as<bf16>(),
+        resident_down_.data_as<float>(), top_k, hidden_size_,
+        intermediate, true, true);
+    whole_token_node_profiler().mark(kNodeResident);
+
+    if (!Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
+            ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf,
+            cfg_.shared_expert_intermediate_size)) {
+        layer.shared_gate_up_proj.ForwardDecodeRows(
+            ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, 1);
+        ops::moe_silu_gate_up_mul_flat(
+            ctx, buf_.shared_gate_up_buf.data_as<bf16>(),
+            buf_.shared_inter_buf.data_as<bf16>(), 1,
+            cfg_.shared_expert_intermediate_size);
+    }
+    layer.shared_down_proj.ForwardDecodeRows(
+        ctx, linear_scratch_, buf_.shared_inter_buf,
+        buf_.shared_out_buf, 1);
+    node();
+    whole_token_node_profiler().mark(kNodeShared);
+
+    aila::token_graph_service::submit_packet_handoff(
+        ctx.queue(), control_ring, packet, epoch, packet_dev,
+        static_cast<uint32_t>(top_k), kServiceSpinLimit);
+    if (whole_token_tail_fused_requested()) {
+        aila::token_graph_kernels::submit_gated_fused_tail(
+            ctx.queue(), resident_down_.data_as<float>(),
+            graph.route_weights.data_as<float>(),
+            graph.selected.data_as<int>(), packet_dev,
+            buf_.shared_out_buf.data_as<bf16>(),
+            buf_.shared_gate_buf.data_as<bf16>(),
+            buf_.hc_inject_f32.data_as<float>(),
+            buf_.y.data_as<bf16>(), buf_.hidden4.data_as<bf16>(),
+            control_ring, epoch, static_cast<uint32_t>(top_k));
+    } else {
+        aila::token_graph_kernels::submit_gated_ordered_merge(
+            ctx.queue(), resident_down_.data_as<float>(),
+            graph.route_weights.data_as<float>(),
+            graph.selected.data_as<int>(), packet_dev,
+            buf_.y.data_as<bf16>(), control_ring, epoch,
+            static_cast<uint32_t>(top_k));
+        aila::token_graph_kernels::submit_add_shared_expert_to_y(
+            ctx.queue(), buf_.y.data_as<bf16>(),
+            buf_.shared_out_buf.data_as<bf16>(),
+            buf_.shared_gate_buf.data_as<bf16>(), epoch);
+        aila::token_graph_kernels::submit_gated_final_bridge(
+            ctx.queue(), buf_.hidden4.data_as<bf16>(),
+            buf_.y.data_as<bf16>(),
+            buf_.hc_inject_f32.data_as<float>(), epoch);
+    }
+    whole_token_node_profiler().mark(kNodeTail);
     return nodes;
 }
 
@@ -862,6 +1045,43 @@ Tensor& Qwen4ExpBnb4Backend::ForwardWholeTokenGraph(
             (void)ReleaseWholeTokenGraph(&ctx, &session, false);
             throw;
         }
+        if (whole_token_subgraphs_requested()) {
+            // Record the same node sequence as fifty command graphs: prologue,
+            // one per layer, epilogue. The single whole-token graph above is
+            // still built so the existing reuse and phase machinery is
+            // unchanged; only the replay path chooses between them.
+            graph.subgraphs.clear();
+            auto record_piece = [&](auto&& submit) {
+                sycl::ext::oneapi::experimental::command_graph<
+                    sycl::ext::oneapi::experimental::graph_state::modifiable>
+                    rec(ctx.queue().get_context(), ctx.queue().get_device());
+                rec.begin_recording(ctx.queue());
+                submit();
+                rec.end_recording(ctx.queue());
+                graph.subgraphs.push_back(std::make_unique<
+                    WholeTokenGraphState::Executable>(rec.finalize()));
+            };
+            record_piece(
+                [&] { (void)RecordWholeTokenGraphPrologue(ctx, session); });
+            int ordinal = 0;
+            for (int layer_index = 0;
+                 layer_index < cfg_.num_hidden_layers; ++layer_index) {
+                const int layer_ordinal = ordinal;
+                record_piece([&] {
+                    (void)RecordWholeTokenGraphLayer(
+                        ctx, session, layer_index, layer_ordinal,
+                        graph.control.data_as<int>());
+                });
+                if (!layers_[layer_index].is_linear) ++ordinal;
+            }
+            record_piece(
+                [&] { (void)RecordWholeTokenGraphEpilogue(ctx, session); });
+            if (trace) {
+                AILA_LOG_INFO(
+                    "[Q4E TokenGraph] subgraph_ready pos=%d graphs=%zu",
+                    start_pos, graph.subgraphs.size());
+            }
+        }
     } else {
         prepare_ple();
     }
@@ -927,6 +1147,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardWholeTokenGraph(
                     "[Q4E TokenGraph] submit pos=%d nodes=%zu "
                     "submit_ms=%.3f",
                     start_pos, submitted_nodes, submit_ms);
+            }
+        } else if (!graph.subgraphs.empty()) {
+            // One ext_oneapi_graph per layer is one WDDM submission per layer,
+            // so a layer's doorbell reaches the device as soon as that graph is
+            // submitted rather than at a batch boundary. Inside each graph the
+            // layer's nodes run back to back from one closed command list.
+            for (auto& sub : graph.subgraphs) {
+                event = ctx.queue().ext_oneapi_graph(*sub);
             }
         } else {
             event = ctx.queue().ext_oneapi_graph(*graph.executable);
@@ -1074,6 +1302,7 @@ bool Qwen4ExpBnb4Backend::ReleaseWholeTokenGraph(
     if (!safe) return false;
 
     graph.executable.reset();
+    graph.subgraphs.clear();
     graph.node_count = 0;
     if (graph.ple_view_valid && ctx && session) {
         try {
