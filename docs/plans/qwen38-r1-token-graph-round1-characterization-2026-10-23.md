@@ -693,3 +693,88 @@ at once, which is why the next round should fuse rather than micro-optimise:
 ESIMD remains the right tool for a stage once it is shown to be arithmetic- or
 bandwidth-bound in isolation rather than launch-bound; none of the measured stages currently
 is, so writing ESIMD first would have optimised the wrong thing.
+
+## 19. The launch floor is 21 us, and it is 39% of the device time
+
+Sections 17-18 tried to attack individual kernels and every attempt failed. This section
+records why, with the calibration that should have been taken first.
+
+### 19.1 Calibration
+
+Eight empty kernels were submitted back to back, each bracketed by two profiler marks:
+
+```text
+[Q4E NodeProf] ... empty=0.15/7        -> 21 us per empty kernel
+```
+
+So every span in the profiler contains a **21 us launch floor** on top of whatever the kernel
+actually does. That single number reconciles every previous contradiction:
+
+| stage | span | minus 21 us floor | verdict |
+|---|---:|---:|---|
+| `hc_norm` (per call) | 53 us | 32 us | real work, surprisingly slow for 20 KB |
+| `hc_down` | 54 us | 33 us | real work, ~200 GB/s |
+| `hc_up` | 30 us | 9 us | matches the 6.5 MB / 500 GB/s estimate |
+
+Corrected device budget, ms per token:
+
+| bucket | ms |
+|---|---:|
+| HC (`hc_norm` + `hc_down` + `hc_up`) | **13.27** |
+| GDN attention, 36 layers | 8.25 |
+| resident + shared experts | 7.97 |
+| QSA, 12 layers, all stages | 6.78 |
+| router | 3.47 |
+| **total** | **40.25** |
+
+The earlier `attn_hc 4.88 + mlp_hc 4.52` reading was an attribution artefact: with only
+group-level marks the HC call was split across two labels. The sub-stage marks give the true
+13.27 ms, and HC is therefore **33% of the device time**, not 27%.
+
+### 19.2 Launch floor share
+
+```text
+750 launches x 21 us = 15.75 ms  =  39% of the 40.25 ms device budget
+```
+
+Kernel work is the other 24.5 ms. Any change that keeps the kernel count the same can at best
+touch 61% of the device time, and each individual stage is only a few percent of it, which is
+exactly why tuning `grouped_rms_norm`, `hc_decode_down_inject`, its work-group size, its
+prefetch depth and its fused form all moved nothing.
+
+### 19.3 Negative results recorded this round
+
+| attempt | change | result |
+|---|---|---|
+| software-pipelined loads | `AILA_Q4E_HC_DECODE_PL_DEPTH=4` (existing bit-exact `_pl` variants) | worse: `attn_hc` 4.88 -> 7.98, `mlp_hc` 4.52 -> 7.78 |
+| work-group size | `AILA_Q4E_HC_DECODE_DOWN_WG=64` / `=128` | no change (4.86/4.53, 4.83/4.52) |
+| fused norm+down submission | `AILA_Q4E_DECODE_FUSED_HC=1` | worse: 5.72 / 5.72 |
+| vectorised norm loads | vec8 in `grouped_rms_norm` | no change: `hc_norm` 5.23 -> 5.16 |
+| L0 batching | `UR_L0_BATCH_SIZE=16` | submit 40 -> 29 ms but `route_wait` 28 -> 55 ms, p50 77 ms |
+| immediate command lists | `UR_L0_USE_IMMEDIATE_COMMANDLISTS=1` | submit 40 -> 32 ms but `route_wait` -> 123 ms, p50 150 ms |
+
+The last two are important: making host submission cheaper made the token *worse*, which proves
+the device is the limiter and that `route_wait` is real device time rather than a submission
+artefact. The work-group result also has a structural explanation: the down GEMM has 324
+output rows and assigns one subgroup per row, so the total thread count is fixed at ~5184 no
+matter how the subgroups are grouped into work-groups. Raising parallelism there would need a
+split-K reduction, which changes the summation order.
+
+### 19.4 Plan that follows from the calibration
+
+Cut launches, in this order, because each launch removed is worth 21 us and these are the
+largest groups:
+
+1. HC: 3 kernels x 96 calls = **288 launches**. Fusing to one is worth up to 4.0 ms, and it is
+   the biggest single group in the token.
+2. Tail: 4 kernels x 48 = **192 launches**, worth up to 3.0 ms. The existing suggestion to gate
+   the empty rows out of `submit_packet_copy` is unsafe on its own because
+   `submit_gated_ordered_merge` uses the sentinel to clear stale rows, so the membership check
+   must move with the fusion.
+3. Router: `moe_front_fused` + `topk` + `route_publish` + `resident_classify` = **192 launches**,
+   worth up to 3.0 ms, and all four already operate on the same ten route ids in one
+   work-group.
+
+Together those are 672 of the ~750 launches and up to 10 ms, i.e. 49 -> ~39 ms. This is the
+only remaining lever of that size; everything else in the device budget is a small share of
+the 24.5 ms of real work.

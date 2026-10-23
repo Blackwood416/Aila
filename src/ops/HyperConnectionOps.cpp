@@ -165,9 +165,33 @@ void grouped_rms_norm(
                 const size_t w_base = static_cast<size_t>(g) * group_dim;
 
                 float sum_sq = 0.0f;
-                for (int i = lid; i < group_dim; i += wg) {
-                    float v = static_cast<float>(x[stream_base + i]);
-                    sum_sq += v * v;
+                // Only four work-groups exist for the decode shape (one per
+                // group), so this kernel is latency-bound: each thread used to
+                // issue ten dependent scalar bf16 loads with a 512 B stride.
+                // vec8 loads cut that chain to two and move 16 B per access.
+                // group_dim is 2560 and every per-group base offset is a
+                // multiple of 16 B, so the vec8 view is legal. The summation
+                // order inside a thread changes, so this is not bit-identical
+                // to the scalar loop; the operator matches to float rounding.
+                using vec8b = sycl::vec<bf16, 8>;
+                const bool vec_ok = (group_dim % 8) == 0;
+                const int d8 = group_dim / 8;
+                if (vec_ok) {
+                    const vec8b* xv =
+                        reinterpret_cast<const vec8b*>(x + stream_base);
+                    for (int i = lid; i < d8; i += wg) {
+                        const vec8b v = xv[i];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const float f = static_cast<float>(v[j]);
+                            sum_sq += f * f;
+                        }
+                    }
+                } else {
+                    for (int i = lid; i < group_dim; i += wg) {
+                        float v = static_cast<float>(x[stream_base + i]);
+                        sum_sq += v * v;
+                    }
                 }
                 red_slm[lid] = sum_sq;
                 item.barrier(sycl::access::fence_space::local_space);
@@ -181,14 +205,34 @@ void grouped_rms_norm(
 
                 float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
 
-                for (int i = lid; i < group_dim; i += wg) {
-                    float v = static_cast<float>(x[stream_base + i]);
-                    float scale = inv_rms;
-                    if (w) {
-                        float w_val = w[w_base + i];
-                        scale *= (plus_one ? (1.0f + w_val) : w_val);
+                if (vec_ok) {
+                    const vec8b* xv =
+                        reinterpret_cast<const vec8b*>(x + stream_base);
+                    vec8b* ov = reinterpret_cast<vec8b*>(out + stream_base);
+                    for (int i = lid; i < d8; i += wg) {
+                        const vec8b v = xv[i];
+                        vec8b r;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            float scale = inv_rms;
+                            if (w) {
+                                const float w_val = w[w_base + i * 8 + j];
+                                scale *= (plus_one ? (1.0f + w_val) : w_val);
+                            }
+                            r[j] = bf16(static_cast<float>(v[j]) * scale);
+                        }
+                        ov[i] = r;
                     }
-                    out[stream_base + i] = bf16(v * scale);
+                } else {
+                    for (int i = lid; i < group_dim; i += wg) {
+                        float v = static_cast<float>(x[stream_base + i]);
+                        float scale = inv_rms;
+                        if (w) {
+                            float w_val = w[w_base + i];
+                            scale *= (plus_one ? (1.0f + w_val) : w_val);
+                        }
+                        out[stream_base + i] = bf16(v * scale);
+                    }
                 }
             });
     });

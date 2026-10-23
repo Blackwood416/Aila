@@ -33,6 +33,15 @@ enum QsaStage : int {
     kSparseAttend,
     kOProj,
     kQsaStageEnd,
+
+    // Hyper-connection call internals: norm, down GEMM, up GEMM.
+    kHcNorm = kQsaStageEnd,
+    kHcDown,
+    kHcUp,
+    // Calibration: an empty kernel bracketed by two marks, so the profiler can
+    // separate launch cost from kernel cost in every other span.
+    kEmpty,
+    kStageEnd,
 };
 
 // Records a mark for `stage`. No-op unless the profiler is enabled.

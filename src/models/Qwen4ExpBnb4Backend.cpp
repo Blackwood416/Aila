@@ -2,6 +2,8 @@
 #include "../memory/SessionMemory.hpp"
 #include "../ops/QsaIndexerOps.hpp"
 #include "../ops/Qwen4ExpAttentionPair.hpp"
+#include "../ops/HcDecodeVariant.hpp"
+#include "Qwen4ExpTokenGraphStageProf.hpp"
 #include "models/Qwen4ExpHotsetPolicy.hpp"
 #include "models/Qwen4ExpMoeCopyQueue.hpp"
 #include "Qwen4ExpDecodeFusion.hpp"
@@ -2408,6 +2410,8 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
             cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
             count, 4, hidden_size_, true);
     }
+    aila::token_graph_stage_prof::mark(
+        aila::token_graph_stage_prof::kHcNorm);
 
     static const bool s_small_rows_hc = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_HC", false);
     static const int s_hc_down_wg = [] {
@@ -2428,20 +2432,55 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
         return std::nullopt;
     }
     if (count == 1 && s_fused_hc && hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
+        // Optional software-pipelined variant of the same two kernels. The
+        // decode down GEMM exposes only lowrank + groups = 324 independent dot
+        // products, i.e. 21 work-groups, so it is latency-bound on memory-level
+        // parallelism rather than bandwidth-bound: each lane ends up with a
+        // single 16 B load in flight. Raising prefetch_depth multiplies the
+        // in-flight bytes without changing the arithmetic or the reduction
+        // order, so the result is bit-identical to the production kernels.
+        // 0 keeps the production path.
+        static const int s_hc_pl_depth = [] {
+            const int value = aila::env::read_int_raw(
+                "AILA_Q4E_HC_DECODE_PL_DEPTH", 0);
+            return value >= 1 && value <= 4 ? value : 0;
+        }();
+        if (s_hc_pl_depth > 0) {
+            ops::hc_decode_down_inject_pl(
+                ctx, static_cast<const bf16*>(buf_.hc_N.data()),
+                hc.mix_down_w->data_as<bf16>(),
+                with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
+                static_cast<bf16*>(buf_.hc_mix_down.data()),
+                static_cast<float*>(buf_.hc_inject_f32.data()),
+                lowrank, hidden_size_, 4, s_hc_pl_depth, hc_down_wg);
+            ops::hc_decode_up_mix_pl(
+                ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
+                hc.mix_up_w->data_as<bf16>(),
+                static_cast<const bf16*>(buf_.hc_N.data()),
+                static_cast<bf16*>(buf_.x.data()),
+                lowrank, hidden_size_, 4, s_hc_pl_depth);
+            return std::nullopt;
+        }
         ops::hc_decode_down_inject(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
                                    hc.mix_down_w->data_as<bf16>(),
                                    with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
                                    static_cast<bf16*>(buf_.hc_mix_down.data()),
                                    static_cast<float*>(buf_.hc_inject_f32.data()),
                                    lowrank, hidden_size_, 4, hc_down_wg);
+        aila::token_graph_stage_prof::mark(
+            aila::token_graph_stage_prof::kHcDown);
         // The up-mix is the last submission and writes buf_.x (the activation
         // the decode CPU complement copies out); hand its event back so the
         // copy queue can depend on the kernel directly instead of a barrier.
-        return ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
+        auto hc_up_event =
+            ops::hc_decode_up_mix(ctx, static_cast<const bf16*>(buf_.hc_mix_down.data()),
                                      hc.mix_up_w->data_as<bf16>(),
                                      static_cast<const bf16*>(buf_.hc_N.data()),
                                      static_cast<bf16*>(buf_.x.data()),
                                      lowrank, hidden_size_, 4, hc_up_streams);
+        aila::token_graph_stage_prof::mark(
+            aila::token_graph_stage_prof::kHcUp);
+        return hc_up_event;
     }
 
     DenseLinear(ctx, hc.input_mix_weight_down, hc.mix_down_w, buf_.hc_N, buf_.hc_mix_down,

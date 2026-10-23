@@ -270,18 +270,23 @@ enum WholeTokenNodeLabel : int {
     kNodeValidateBlocks,
     kNodeSparseAttend,
     kNodeOProj,
+    kNodeHcNorm,
+    kNodeHcDown,
+    kNodeHcUp,
+    kNodeEmpty,
     kNodeLabelCount,
 };
 
-static_assert(static_cast<int>(aila::token_graph_stage_prof::kQsaStageEnd) ==
+static_assert(static_cast<int>(aila::token_graph_stage_prof::kStageEnd) ==
                   static_cast<int>(kNodeLabelCount),
-              "QSA stage labels drifted from the whole-token profiler labels");
+              "stage labels drifted from the whole-token profiler labels");
 
 constexpr const char* kNodeLabelNames[kNodeLabelCount] = {
     "anchor", "attn_hc", "attention", "mlp_hc",
     "route", "resident", "shared", "tail",
     "qkv_proj", "indexer_qk", "prepare_qkv", "prepare_idx_q", "compress",
-    "blk_scores", "select", "validate", "attend", "o_proj"};
+    "blk_scores", "select", "validate", "attend", "o_proj",
+    "hc_norm", "hc_down", "hc_up", "empty"};
 
 struct WholeTokenNodeProfiler {
     bool enabled = false;
@@ -397,6 +402,18 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
 
     aila::token_graph_service::submit_begin_replay(ctx.queue(), epoch);
     node();
+    // Launch-cost calibration for the profiler: eight empty kernels, each
+    // bracketed by marks, so the average `empty` span is the floor that every
+    // real stage span contains on top of its own execution time. Without this
+    // number a 40 us span cannot be attributed to either launch or work.
+    if (whole_token_node_profiler().enabled) {
+        for (int sample = 0; sample < 8; ++sample) {
+            ctx.queue().parallel_for(
+                sycl::range<1>(32),
+                [=](sycl::item<1> item) { (void)item; });
+            whole_token_node_profiler().mark(kNodeEmpty);
+        }
+    }
     submit_repeat_hidden4(
         ctx.queue(), buf_.x.data_as<bf16>(),
         buf_.hidden4.data_as<bf16>());
