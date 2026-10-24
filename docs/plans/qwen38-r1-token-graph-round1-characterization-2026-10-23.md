@@ -1133,3 +1133,47 @@ observer-free trace, the remaining critical-path budget is roughly:
 | GDN attention (36 layers) | ~1.5 | |
 | router (front + topk + publish + classify) | ~1.5 | topk 0.82 of it |
 | tail (merge/add/bridge fused + packet wait) | ~2 | |
+
+## 27. Two failed hypotheses on the QSA attention core
+
+`attention_decode_exact_head256_partial_merge_impl` takes 154 us per layer (12 layers, so
+~1.85 ms per token) with GlobalWS 52224 = 408 work-groups of 128. Two explanations were tested
+and both are wrong; they are recorded so they are not retried.
+
+### 27.1 Redundant K/V reads across query heads: neutral
+
+The model has 24 query heads over 2 KV heads, so `heads_per_kv = 12` and twelve work-groups read
+the same K/V tile. The group index was head-major (`head * num_tiles + tile`), which puts those
+twelve work-groups `num_tiles = 17` groups apart in dispatch order, so the tile looked like it
+would be evicted between them: 50.4 MB of traffic per layer for 4.2 MB of unique data, and
+154 us for 50.4 MB is 327 GB/s, i.e. exactly the bandwidth ceiling. Reordering the groups to be
+kv-head-major, which places those twelve work-groups adjacently and changes no arithmetic,
+measured **neutral**:
+
+```text
+AILA_Q4E_QSA_KV_GROUPED=0 : route_wait 25.16   decode p50 46.84
+AILA_Q4E_QSA_KV_GROUPED=1 : route_wait 25.14   decode p50 45.49  (Direct also moved 60.1 -> 55.5)
+```
+
+So the repeats were already served by L2 and DRAM traffic is only the 4.2 MB of unique data.
+The flag stays in the tree, off by default.
+
+### 27.2 Missing vectorisation: already there
+
+The bf16 score path already reads K as 32 `vec8` loads per token and accumulates 256 FMAs per
+thread, and the q vector is read from SLM as a broadcast, so the inner loop is not the scalar
+byte-at-a-time form that would explain the time.
+
+### 27.3 What is actually left to rule out
+
+An instruction-count estimate for the kernel lands two orders of magnitude below the measured
+154 us, so the limiter is neither DRAM traffic nor instruction count. The remaining candidates
+are wave quantisation and occupancy (408 work-groups of 128 threads), the serial dependency of
+the 256-FMA accumulator chain per thread, and the per-tile SLM logits/statistics stage. Naming
+one of those needs the full-compute counters (memory throughput, occupancy, EU stall reasons)
+rather than more hypotheses, which is what the collection started at `tmp/vtune-full-decode`
+is for.
+
+Note for whoever repeats the profile: `-knob characterization-mode=full-compute` over a
+600-token decode needs well over half an hour and the report step alone takes many minutes, so
+it has to be run detached rather than inside a single command with a short timeout.

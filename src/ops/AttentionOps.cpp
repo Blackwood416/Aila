@@ -548,6 +548,25 @@ void attention_decode_exact_head256_partial_merge_impl(
   // accessor path for the same cache contents.
   const bool kv_i8_vec = kv_int8_vector_reads();
 
+  // Group dispatch order: the heads_per_kv work-groups that read the same K/V
+  // tile are dispatched adjacently instead of num_tiles apart, so the tile is
+  // served from L2 rather than re-fetched from DRAM once per query head.
+  // 24 query heads over 2 KV heads means each tile was read twelve times:
+  // 50.4 MB of traffic per layer for 4.2 MB of unique data, which at 154 us
+  // per layer is 327 GB/s, i.e. bound by redundant reads, not by arithmetic.
+  // Group dispatch order: the heads_per_kv work-groups that read the same K/V
+  // tile are dispatched adjacently instead of num_tiles apart. Measured
+  // NEUTRAL (route_wait 25.16 -> 25.14), so the twelve redundant reads were
+  // already being served by L2 and the kernel is not bound by DRAM traffic
+  // from the other query heads. Kept behind the flag, off by default.
+  static const bool kv_grouped_order_cached = [] {
+    const char* raw = std::getenv("AILA_Q4E_QSA_KV_GROUPED");
+    if (raw == nullptr || raw[0] == 0) return false;
+    return raw[0] != 0x30;
+  }();
+  // A SYCL kernel cannot capture a static, so hand it a plain local copy.
+  const bool kv_grouped_order = kv_grouped_order_cached;
+
   // Phase 1: compute per-tile exact softmax stats and exp-weighted V partials.
   if constexpr (Dpas) {
     attention_decode_int8_dpas_partials(ctx, q_ptr, static_cast<const int8_t *>(k_ptr),
@@ -563,8 +582,18 @@ void attention_decode_exact_head256_partial_merge_impl(
         sycl::nd_range<1>(num_heads * num_tiles * tile_wg, tile_wg),
         [=](sycl::nd_item<1> item) {
           const int group = item.get_group(0);
-          const int head = group / num_tiles;
-          const int tile_idx = group % num_tiles;
+          int head = 0;
+          int tile_idx = 0;
+          if (kv_grouped_order) {
+            const int per_kv = num_tiles * heads_per_kv;
+            const int kv_group = group / per_kv;
+            const int within = group % per_kv;
+            tile_idx = within / heads_per_kv;
+            head = kv_group * heads_per_kv + (within % heads_per_kv);
+          } else {
+            head = group / num_tiles;
+            tile_idx = group % num_tiles;
+          }
           const int lid = item.get_local_id(0);
           const int kv_head = head / heads_per_kv;
           const int tile_start = tile_idx * tile_t;
