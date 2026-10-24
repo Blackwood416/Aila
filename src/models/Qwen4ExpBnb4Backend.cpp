@@ -3100,6 +3100,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
         const auto t_topk = hsplit_begin();
+        const auto t_route_split = std::chrono::steady_clock::now();
         sycl::event actual_route_event;
         if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512) {
             actual_route_event = ops::router_softmax_topk_resident(
@@ -3114,10 +3115,23 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 resident_epoch ? resident_route_ids_.data_as<int>() : router_host_ids_,
                 resident_epoch ? resident_weights_.data_as<float>() : router_host_weights_,
                 count, cfg_.num_experts, top_k, true);
+            const auto t_after_topk = std::chrono::steady_clock::now();
             if (resident_epoch) {
                 actual_route_event = ops::moe_resident_classify(ctx, resident_route_ids_.data_as<int>(), resident_weights_.data_as<float>(),
                     expert_cache_.resident_layer_table(L), resident_selected_.data_as<int>(), router_host_ids_, router_host_weights_,
                     resident_selected_host_, top_k, cfg_.num_experts);
+                if (L == 0) {
+                    AILA_LOG_INFO(
+                        "[Q4E RouteSplit] count=%d topk_submit_us=%.1f classify_submit_us=%.1f",
+                        count,
+                        std::chrono::duration<double, std::micro>(t_after_topk - t_route_split).count(),
+                        std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t_after_topk).count());
+                }
+            } else if (L == 0) {
+                AILA_LOG_INFO(
+                    "[Q4E RouteSplit] count=%d topk_submit_us=%.1f classify_submit_us=0 (no epoch)",
+                    count,
+                    std::chrono::duration<double, std::micro>(t_after_topk - t_route_split).count());
             }
         }
         hsplit_add(host_topk_submit_ms, t_topk);

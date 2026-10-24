@@ -1962,3 +1962,45 @@ them on the host for the layer's routing must synchronise.
 
 If this holds, prefill is worth far more than everything decode has produced: a 2K-token prefill at
 127 s is 60 ms per token, and 77 s of that is one bracket.
+
+## 46. The prefill bracket measures backpressure, not top-k cost
+
+The bracket from 45 was split into top-k and classify with a one-line probe (first layer only):
+
+```text
+count=2048 : topk_submit_us = 78,143,770   classify skipped (no epoch)
+count=56   : topk_submit_us = 24.7
+count=4    : topk_submit_us = 59.1
+```
+
+The same call costs **tens of microseconds** at 56 or 4 tokens and **78 seconds** at 2048. That cannot be
+the call's own work: it is the host blocking on an in-order queue that is full because the device is
+behind. So `topk_submit_ms` is where backpressure surfaces, not where the time goes.
+
+### 46.1 What it actually says about prefill
+
+If the host blocks there, the device is the limiter, and the per-layer device time is
+
+```text
+78.1 s / 48 layers = 1.63 s per layer for 2048 tokens
+                  = 0.79 ms per token per layer
+x 48 layers       = 38 ms per token, i.e. ~62 ms/token of device work in a 127 s prefill
+```
+
+So prefill is **device-bound at about 62 ms per token** against decode's 46 ms per token for a single
+token. A 2K-token prefill of a 512-expert top-10 MoE should be far cheaper per token than that, because
+its GEMMs are batched, so the gap is in prefill's own kernel efficiency, not in the handoff machinery.
+
+That reverses the priority: prefill is 97% of every benchmark run's wall time and runs at ~62 ms/token
+of device work, while decode's remaining levers are worth at most ~3 ms. Prefill is the prize.
+
+### 46.2 First three things to measure there
+
+1. Per-layer device time in prefill from an observer-free trace (VTune `xpu-offload` on a short chunk),
+   to see whether the 1.63 s per layer is expert GEMMs, QSA attention, or staging.
+2. The 42 GB of host-to-device staging per run: 42.6 GB for 2048 tokens x 48 layers implies expert
+   weights are being copied repeatedly rather than kept resident; quantify the copy time against
+   `h2d_mb` and the fill/bank timers already present.
+3. Whether the 512-expert top-10 routing at 2048 tokens is being evaluated as one batched grouped GEMM
+   or as per-token work: 2048 x 10 expert tasks per layer is exactly the shape a grouped GEMM should
+   absorb in a few hundred microseconds, not 1.6 s.
