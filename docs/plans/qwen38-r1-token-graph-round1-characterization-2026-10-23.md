@@ -3394,3 +3394,53 @@ After this, the pass is 22.1 s at 7878 tokens. The earlier attribution put copie
 with the direct path that should now be ~5.2 s of `queue.memcpy` from large pages, and it is still serial
 with compute on the main queue. Hiding it remains the next item, but the gap to 400 is now only 1.12x, so
 even a partial overlap reaches the target.
+
+## 75. The direct-arena stage still blocks the host 4.7 s, and the memcpy may be synchronous
+
+Re-running the section 70 instrumentation on the new default (direct arena) at 7878 tokens:
+
+```text
+prefill                       22,063 ms   357.1 tok/s
+sum gemm_host                 3,155 ms    (unchanged)
+sum stage_host                4,717 ms    (was 7,127 ms before the direct-arena switch)
+per chunk 4717 / 1210       = 3.9 ms
+```
+
+So the switch removed 2.4 s of host time, and then stopped. What remains is 3.9 ms per chunk in a code
+path that no longer performs a host memcpy: the `direct_arena` branch only issues `count` (16)
+`q.memcpy(...)` calls and stores the last event.
+
+```text
+3.9 ms / 16 calls = 0.25 ms per call, and 2.4 MB / 0.25 ms = 9.6 GB/s
+```
+
+That is exactly the transfer time of a 2.4 MB copy at the measured arena bandwidth, which means
+**`sycl::queue::memcpy` from a non-USM large-page pointer blocks the calling thread for the duration of
+the transfer** rather than merely enqueueing it. The section 74 probe could not tell the difference
+because it queued 109 copies and waited once at the end: the 32.5 ms it measured is the same whether the
+calls block one by one or are all async.
+
+### 75.1 What this means for the remaining 1.12x
+
+The 4.7 s is not going away by choosing a different pointer or flag; the host has to stop being the party
+that waits. Two options, both narrow:
+
+1. **Move `stage_chunk` off the submitting thread.** The fill for chunk N+1 already happens after chunk
+   N's GEMMs are submitted (`Qwen4ExpBnb4Backend.cpp:2014-2030`), so if that call ran on a worker and the
+   main thread continued to the next `RunGroupedExperts`, the 4.7 s would overlap the device work instead
+   of adding to it. The join point is already well defined: `batch.ready_event`.
+2. **Confirm and exploit the async path.** If the blocking is a property of `queue::memcpy` on a foreign
+   pointer, the alternative is to register the arena as proper USM host memory once at load (so the
+   pointer becomes legal) and then the same calls are genuinely asynchronous.
+
+The probe change that settles option 2 is small: print the enqueue-loop time separately from the final
+wait. If enqueue time is ~0 and only the wait is long, the copies are async and the blocking is elsewhere;
+if enqueue time equals the total, the calls block and option 1 is the way.
+
+### 75.2 Goal state
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens        (4952 -> 299.3, 2026 -> 173.2)
+gap           1.12x
+```
