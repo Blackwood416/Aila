@@ -70,6 +70,13 @@ struct MoeExpertXmxScratch {
     // banks, a1 and a2 hold fp16 (same 2 bytes/elem) and c1 is forced to f32
     // (f16 x f16 -> f32 on both GEMMs).  Latched per scratch like c1_f32.
     bool w_f16 = false;
+    // Set at scratch_create from AILA_Q4E_PREFILL_EXPERT_XMX_W_KN: the weight
+    // banks hold [K][N] with N contiguous instead of the packed [N][K] order with
+    // K contiguous.  oneDNN's canonical matmul B operand is N contiguous, so the
+    // default forces a strided view ({b,h,2I} with K stride 1) that the systolic
+    // path cannot use natively.  The dequant pays for the transpose with eight
+    // scattered stores per work-item, so this is a measurement, not a default.
+    bool w_kn = false;
 
     // Internal: geometry + primitive cache owner.  Do not copy this struct and
     // do not restore it by hand; only scratch_create/scratch_destroy manage it.

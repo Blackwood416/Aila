@@ -2668,3 +2668,41 @@ measured: throughput(n) = 1000 n / (6844 + 2.47 n)   373 tok/s at 32K, 388 at 64
 So the asymptote clears 400 but no realistic prompt reaches 400 measured yet. The two remaining levers
 are the weight layout above (marginal 2.47 -> ~2.0 ms would put 400 within reach at 16K tokens) and the
 6.8 s fixed cost.
+
+## 60. The weight-layout change is measured and neutral: oneDNN absorbs the strided view
+
+Section 59 proposed transposing the dequantized expert weights from the packed `[N][K]` order (K
+contiguous) to a canonical `[K][N]` order (N contiguous), on the theory that the strided descriptor
+`{b, h, two_i}` with strides `{two_i*h, 1, h}` was starving the systolic path. Implemented behind
+`AILA_Q4E_PREFILL_EXPERT_XMX_W_KN`: `submit_dequant` writes the eight decoded values of each work-item
+`n_dim` apart so the bank holds `[K][N]`, and the two weight descriptors switch to
+`{K*N, N, 1}` / `{K*N, N, 1}`.
+
+Measurement at 7878 tokens with the shipped preset (gate on, XMX active):
+
+```text
+W_KN=0   26,352.3 ms   3.35 ms/token   298.9 tok/s
+W_KN=1   26,411.4 ms   3.35 ms/token   298.3 tok/s
+```
+
+**Neutral.** oneDNN evidently reorders the strided operand internally, so the descriptor shape costs
+nothing at these sizes and the transpose only adds the scattered stores. The flag stays default-off and
+the code stays, because it rules out the whole layout family: the expert GEMM's 1.4 TFLOPS (~7% of peak)
+is **not** a weight-layout problem.
+
+### 60.1 What the numbers now rule out, and what is left
+
+| hypothesis for the 2.47 ms/token marginal | verdict |
+|---|---|
+| staging / host-to-device copies | out - 1.85 GB and 285 ms fill for a whole pass |
+| CPU expert serving | out - `experts_host_ms` 315 ms |
+| attention | out - per-token cost is flat in prompt length |
+| weight descriptor layout | out - this section, neutral |
+| small M starving the systolic units | partly - fixed by the row gate (section 58) |
+| VRAM traffic of the dequant round trip | small - 48 layers x ~5 GB x 2 at ~500 GB/s is ~1 s of 26 |
+| **512 tiny GEMMs per layer (M~154 per expert)** | **still open and now the leading candidate** |
+
+The leading candidate follows from the shape: with 10 experts per token and 512 experts per layer, a
+7878-token chunk routes about 154 rows to each expert, so each layer is 512 separate
+M=154 / K=2560 / N=1280 matmuls. That is where the ~7% of peak would come from, and fixing it means one
+genuinely grouped GEMM over all experts of a layer rather than a loop of per-expert matmuls.

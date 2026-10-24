@@ -90,6 +90,7 @@ sycl::event submit_dequant(Context& ctx, const MoeExpertXmxScratch& s,
     const size_t per_expert = gu_words + dn_words;
     const size_t block_size = size_t(blocksize);
     const int experts = chunk.num_experts;
+    const bool w_kn = s.w_kn;
     const bool have_ready = ready != nullptr && *ready != sycl::event{};
     const sycl::event ready_event = have_ready ? *ready : sycl::event{};
     return ctx.queue().submit([&](sycl::handler& cgh) {
@@ -120,7 +121,21 @@ sycl::event submit_dequant(Context& ctx, const MoeExpertXmxScratch& s,
             }
             w_t* out = gate_up ? wgu + size_t(expert) * gu_elems
                                : wdn + size_t(expert) * dn_elems;
-            *reinterpret_cast<sycl::vec<w_t, 8>*>(out + word * 8) = decoded;
+            if (w_kn) {
+                // [K][N] store with N contiguous: the eight decoded values are
+                // consecutive in k, so they land n_dim apart in memory.  The
+                // default writes the packed [N][K] order, which oneDNN can only
+                // consume through a strided descriptor.
+                const int n_dim = gate_up ? 2 * intermediate : hidden;
+                const int k8_per_row = gate_up ? (hidden / 8) : (intermediate / 8);
+                const int n = static_cast<int>(word / size_t(k8_per_row));
+                const int k8 = static_cast<int>(word - size_t(n) * size_t(k8_per_row));
+                w_t* base = out + size_t(k8) * 8 * size_t(n_dim) + size_t(n);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) base[size_t(j) * size_t(n_dim)] = decoded[j];
+            } else {
+                *reinterpret_cast<sycl::vec<w_t, 8>*>(out + word * 8) = decoded;
+            }
         });
     });
 }
@@ -298,12 +313,20 @@ XmxPrim& ensure_xmx_prim(Context& ctx, MoeExpertXmxScratch& s, int num_experts, 
     // The A/W element type is bf16 by default and fp16 under W_F16 (c1 is f32
     // then), so both matmuls are f16 x f16 -> f32 in that mode.
     const dt elem_dt = w_f16 ? dt::f16 : dt::bf16;
+    // AILA_Q4E_PREFILL_EXPERT_XMX_W_KN selects a canonical N-contiguous B
+    // operand (strides {K*N, N, 1}) to match the transposed store in
+    // submit_dequant.  Read once: the scratch latches the same flag at creation
+    // and a scratch is created once per model load.
+    static const bool s_w_kn =
+        aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_KN", 0) != 0;
     prim.s1 = dnnl::memory::desc({b, m, h}, elem_dt, {m * h, h, 1});
-    prim.w1 = dnnl::memory::desc({b, h, two_i}, elem_dt, {two_i * h, 1, h});
+    prim.w1 = s_w_kn ? dnnl::memory::desc({b, h, two_i}, elem_dt, {h * two_i, two_i, 1})
+                     : dnnl::memory::desc({b, h, two_i}, elem_dt, {two_i * h, 1, h});
     prim.d1 = dnnl::memory::desc({b, m, two_i}, c1_f32 ? dt::f32 : dt::bf16,
                                  {m * two_i, two_i, 1});
     prim.s2 = dnnl::memory::desc({b, m, i}, elem_dt, {m * i, i, 1});
-    prim.w2 = dnnl::memory::desc({b, i, h}, elem_dt, {h * i, 1, i});
+    prim.w2 = s_w_kn ? dnnl::memory::desc({b, i, h}, elem_dt, {i * h, h, 1})
+                     : dnnl::memory::desc({b, i, h}, elem_dt, {h * i, 1, i});
     prim.d2 = dnnl::memory::desc({b, m, h}, dt::f32, {m * h, h, 1});
     prim.mm1 = dnnl::matmul(dnnl::matmul::primitive_desc(ctx.engine(), prim.s1, prim.w1, prim.d1));
     prim.mm2 = dnnl::matmul(dnnl::matmul::primitive_desc(ctx.engine(), prim.s2, prim.w2, prim.d2));
@@ -417,6 +440,7 @@ bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s, int max
     s.max_chunk_rows = rows;
     s.c1_f32 = c1_f32;
     s.w_f16 = w_f16;
+    s.w_kn = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_KN", 0) != 0;
     s.hidden = hidden;
     s.intermediate = intermediate;
     return true;
