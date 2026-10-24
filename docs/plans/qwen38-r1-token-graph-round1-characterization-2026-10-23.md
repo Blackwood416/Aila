@@ -3561,3 +3561,43 @@ best measured 357.1 tok/s at 7878 tokens, 299.3 at 4952, 173.2 at 2026
 gap           1.12x
 start of goal 150.3 tok/s at 2026 tokens
 ```
+
+## 79. Growing the expert cache does not reduce prefill staging
+
+The 42.6 GB of staging exists because prefill routes to nearly every expert, so the last untried zero-code
+idea was to enlarge the expert cache by shrinking the VRAM reserve:
+
+```text
+AILA_Q4E_VRAM_RESERVE_MB=2048   22,076.7 ms   356.8 tok/s   expert cache 9117 MB
+AILA_Q4E_VRAM_RESERVE_MB=1024   21,936.7 ms   359.1 tok/s   expert cache 10141 MB
+shipped (3584)                  22,059.1 ms   357.1 tok/s   expert cache 8605 MB
+```
+
+An 18% larger cache buys 0.6%, inside run-to-run variation, and it costs 2.5 GB of safety headroom on a
+16 GB card. That is the confirmation that prefill staging volume is **saturated by routing, not by
+capacity**: a 2048-token-plus chunk selects nearly all 512 experts in every layer, so residency cannot
+avoid the transfer. Not adopted.
+
+### 79.1 The optimisation space for this goal, closed
+
+```text
+shipped result  357.1 tok/s at 7878 tokens (299.3 at 4952, 173.2 at 2026)
+start           150.3 tok/s at 2026 tokens
+```
+
+Everything measured, with the five that paid:
+
+| change | effect |
+|---|---|
+| `PREFILL_CHUNK` 512 -> 8192 | +11..25% depending on prompt length |
+| XMX/DPAS gated on rows >= 4096 | 151 -> 171 tok/s at 2K, 238 -> 299 at 8K |
+| `QSA_QUERY_TILE` 64 (pinned by a 4 MB budget) -> 1024 | +3.9% |
+| `GDN_CHUNK_MODE` 0 -> 1 | +2.6% |
+| `direct_arena` argument actually passed to prefill staging | +10.8% |
+
+And the ones that did not: weight layout, `MIN_M`, `LARGE_PAGE_PIPELINE`, `GDN_HISTORY_FUSED`,
+`LAYER_MAJOR`, `RESIDENT_PREFILL`, `FUSED_PREFILL`, `XMX_ROWS` 2048/8192, `STAGING_SLOTS` 32/64,
+`PREFILL_STAGING_BANKS` 3/4, a merged 16-copy chunk, and `VRAM_RESERVE_MB` 2048/1024.
+
+One item remains unimplemented - moving the staging enqueue off the submitting thread - and it is the only
+place the last 1.12x can come from.
