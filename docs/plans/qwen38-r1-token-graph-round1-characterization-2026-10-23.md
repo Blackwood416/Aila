@@ -2449,3 +2449,66 @@ The QSA prefill kernel really does give each query token its own work-group
 (`AttentionOps.cpp:5743`, `row = group / num_groups`), which is a genuine inefficiency and worth fixing
 for long prompts, but at the current numbers it is **not** where the 400 tok/s target is lost. Fixing it
 would help at 8K-32K contexts, not at 2K.
+
+## 56. First prefill wins: +72% marginal throughput from two defaults
+
+Both changes were found by sweeping one variable at a time on the scoreboard, and both are now defaults
+for the `qwen38-a770` preset rather than flags a user has to know about.
+
+### 56.1 The XMX prefill expert path is a net loss
+
+```text
+2026 tokens, AILA_Q4E_PREFILL_EXPERT_XMX=1 (old default)   13,412.6 ms   6.62 ms/token   151 tok/s
+2026 tokens, AILA_Q4E_PREFILL_EXPERT_XMX=0                 11,826.8 ms   5.84 ms/token   171 tok/s
+```
+
+The source comment already recorded that this path won 2.1x **in its kernel alone with no end-to-end
+change**; on prefill it is simply slower. `src/models/Qwen4ExpBnb4Backend.cpp` now defaults it off, with
+the measurement recorded in the comment and the flag still available.
+
+### 56.2 Expert weight reuse scales with the chunk size, and the preset pinned the worst value
+
+`[Q4E PrefillExpertXmx] max_chunk_rows=4096` and a sweep of `AILA_Q4E_PREFILL_EXPERT_XMX_ROWS` shows the
+mechanism directly:
+
+```text
+rows = 256    25,453.5 ms   12.56 ms/token    79.6 tok/s
+rows = 4096   13,412.6 ms    6.62 ms/token   151.1 tok/s
+```
+
+Halving the row batch doubles the time, so each expert's weights are being read per row-batch and the
+cost falls as the batch grows. The same holds for the chunk size, because a prompt longer than one chunk
+repeats the whole expert set per chunk:
+
+```text
+2995 tokens, PREFILL_CHUNK=2048   19,247.6 ms   6.43 ms/token   155.6 tok/s
+2995 tokens, PREFILL_CHUNK=4096   15,389.7 ms   5.14 ms/token   194.6 tok/s
+```
+
+`src/utils/Qwen38A770Preset.hpp` set `AILA_Q35_PREFILL_CHUNK` to **512**, the worst of those, so it is
+now 4096 with the numbers recorded beside it.
+
+### 56.3 The default path after both changes
+
+Measured on `tools/prefill-bench.ps1` with no chunk override, i.e. the shipped preset:
+
+| prompt | before | after |
+|---|---:|---:|
+| 1019 | 98.6 tok/s | **117.6** |
+| 2026 | 150.3 tok/s | **171.1** |
+| 2995 | 137.0 tok/s | **194.7** |
+
+```text
+marginal 3.40 ms/token -> 294 tok/s     fixed per run 5,200 ms
+```
+
+So the marginal per-token cost went from 5.86 to 3.40 ms (**+72%**) and the distance to the 400 tok/s goal
+is now **1.36x** rather than 2.34x. Throughput also still rises with prompt length (117.6 at 1K, 194.7 at
+3K), because the 5.2 s fixed cost amortises.
+
+### 56.4 Next
+
+The same reuse argument implies an even larger chunk helps longer prompts, so the next sweep is
+`PREFILL_CHUNK` 4096 against 8192 at a 6K prompt, checking VRAM headroom since activation buffers scale
+with the chunk. After that the remaining 1.36x has to come from the expert kernel itself, since the
+weight-reuse structure is now doing what it can.

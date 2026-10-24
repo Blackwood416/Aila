@@ -1386,8 +1386,15 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             // contract; two XMX variants differ 0.0099; fp16 storage tightened
             // the kernel 2.1x with no e2e change). AILA_Q4E_PREFILL_EXPERT_XMX=0
             // returns to the ALU path.
+            //
+            // Round 2: measured on tools/prefill-bench.ps1 at 2026 tokens, the XMX
+            // path is a net loss - 6.62 ms/token with it on against 5.84 ms/token
+            // with AILA_Q4E_PREFILL_EXPERT_XMX=0 (151 -> 171 tok/s, -12%). The
+            // kernel was already known to win 2.1x in isolation with no end-to-end
+            // change; on prefill the ALU path is simply faster, so the default is
+            // now off and the flag remains for anyone who wants the XMX path back.
             static const bool s_prefill_expert_xmx =
-                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", true);
+                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", false);
             const size_t bases_bytes = size_t(17) * sizeof(int);
             const size_t rows_bytes = size_t(cap) * cfg_.num_experts_per_tok * sizeof(int);
             const size_t ranks_off = bases_bytes + rows_bytes;

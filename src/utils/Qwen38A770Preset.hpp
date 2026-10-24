@@ -16,7 +16,12 @@ inline void ApplyQwen38A770Preset() {
         {"AILA_Q4E_PHASE_SCRATCH", "1"},
         {"AILA_Q4E_HOT_RAM_MB", "32768"},
         {"AILA_Q4E_EXPERT_READER", "readfile"},
-        {"AILA_Q35_PREFILL_CHUNK", "512"},
+        // Round 2: 512 forces a 3K-token prompt through six chunks, and expert
+    // staging plus the expert weight reads are paid again per chunk. Measured on
+    // tools/prefill-bench.ps1 at 2995 tokens: chunk 512 -> 137 tok/s,
+    // chunk 2048 -> 156 tok/s, chunk 4096 -> 195 tok/s, because a single chunk
+    // lets each expert's weights be read once for all of its routed token rows.
+    {"AILA_Q35_PREFILL_CHUNK", "4096"},
         {"AILA_Q4E_INLINE_CHECKPOINT", "1"},
         {"AILA_Q4E_STATIC_PINNING", "0"},
         {"AILA_Q4E_GROUPED_XMX_MIN_ROWS", "0"},
