@@ -2608,3 +2608,63 @@ marginal is 2.47 ms. Two levers, both now precisely sized:
    repack) would remove that per-tile work. It is the remaining big item and it is a data-layout change,
    not an algorithm change.
 2. **The 6.8 s fixed cost**, which is what holds measured throughput well under the asymptote.
+
+## 59. The remaining marginal cost is a weight-layout problem, exactly as the user suggested
+
+User's direction: the weights are sharded, so transpose them to the systolic (VNNI-style) layout at load
+time; cost unknown, benefit probably large, work substantial. The source confirms the defect and pins
+the location.
+
+### 59.1 The weight operand is strided by construction
+
+`src/ops/MoeExpertXmx.cpp:76-79` says it outright:
+
+```cpp
+// NF4 -> bf16/fp16 dequant of a whole chunk: 1 work-item = 1 uint32 (8 codes)
+// plus a vec8 store, wgu written [B][2I][H] and wdn [B][H][I] in the packed
+// [N][K] linear order (no transpose; the GEMM takes the strided view).
+```
+
+and the matmuls take exactly that strided view (`MoeExpertXmx.cpp:301-307`):
+
+```cpp
+prim.s1 = dnnl::memory::desc({b, m, h},      elem_dt, {m * h, h, 1});
+prim.w1 = dnnl::memory::desc({b, h, two_i},  elem_dt, {two_i * h, 1, h});   // <-- K contiguous, N stride H
+prim.w2 = dnnl::memory::desc({b, i, h},      elem_dt, {h * i, 1, i});       // <-- same shape of problem
+```
+
+oneDNN's canonical `K x N` operand for a matmul is N-contiguous (`{K*N, N, 1}`); this is the opposite,
+K-contiguous with N strided. That is why the systolic path currently lands around 1.4 TFLOPS (7% of
+peak) even with a large M: the kernel cannot use the native DPAS layout.
+
+### 59.2 Two ways to fix it, in increasing order of work
+
+1. **Transpose inside `submit_dequant`.** Change the write mapping from `n*K + k` to `k*N + n` and the
+   descriptors to `{... , N, 1}`. One side of the copy becomes strided instead of the other, so this may
+   only break even - worth measuring first because it is a small change.
+2. **Transpose the packed NF4 layout once at load.** Store the nibbles as `[K/8][N]` so that a dequant
+   work-item reads its 8 codes contiguously *and* writes them contiguously into `[K][N]`. This removes the
+   strided side completely and is the version that should scale, at the cost of a one-time transform and
+   a matching change in every reader of the packed layout. This is the user's proposal.
+
+The measurement that decides between them: time `submit_dequant` against the two matmuls per chunk. If
+dequant is a small share (rough arithmetic says one chunk of experts is a few GB of bf16 writes, so tens
+of ms against a layer's ~548 ms), then option 1's cost is irrelevant and option 2's only advantage is the
+GEMM descriptor, which option 1 already delivers.
+
+### 59.3 Where the goal stands after this round
+
+| prompt | start of round | now |
+|---|---:|---:|
+| 2026 | 150.3 tok/s | **171.0** |
+| 2995 | 137.0 tok/s | **250.3** |
+| 7878 | - | **299.5** |
+
+```text
+marginal 2.47 ms/token -> 405 tok/s asymptote     fixed per run 6,844 ms
+measured: throughput(n) = 1000 n / (6844 + 2.47 n)   373 tok/s at 32K, 388 at 64K
+```
+
+So the asymptote clears 400 but no realistic prompt reaches 400 measured yet. The two remaining levers
+are the weight layout above (marginal 2.47 -> ~2.0 ms would put 400 within reach at 16K tokens) and the
+6.8 s fixed cost.
