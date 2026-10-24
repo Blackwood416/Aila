@@ -2051,3 +2051,47 @@ copy - it is the host orchestrating those transfers and the per-phase bookkeepin
 
 Both are measurable with counters already printed (`h2d_mb`, `fill_ms`, `bank_wait_ms`, `staged`) plus
 one new counter: copy calls per phase.
+
+## 48. First prefill knob test: wrong knob, and where the right one is
+
+The staging pipeline logs `[Q4E PrefillStage] banks=2 lookahead=1 slots_per_bank=16`, i.e. sixteen
+experts per bank, copied and then computed with one bank of lookahead. Sixteen experts is about 39 MB
+per transfer round, which fits the 574 us average copy and the 2.7 GB/s effective bandwidth.
+
+`AILA_Q4E_LAYER_STAGE_CHUNK_SLOTS` looked like the lever, so 16 versus 64 was measured, one run each:
+
+```text
+slots=16 : GenerateMessages 134.5 s   submitted 128.6 s   h2d 42.22 GB   fill 2.33 s
+slots=64 : GenerateMessages 133.8 s   submitted 128.0 s   h2d 41.59 GB   fill 2.30 s
+```
+
+No effect, and the reason is visible in the log: `slots_per_bank` reads 16 in **both** runs, so that
+variable is not what the staging loop uses. The real chain is
+
+```cpp
+Qwen4ExpBnb4Backend.cpp:1954  const int staging_banks      = adaptive_cache_.StagingBanks();
+Qwen4ExpBnb4Backend.cpp:1956  const int slots_per_chunk    = adaptive_cache_.StagingSlotsPerBuffer();
+Qwen4ExpExpertCache.cpp:2613  const size_t staging_capacity = staging_buffer_bytes_ / slot_bytes_;
+Qwen4ExpExpertCache.cpp:760   prefetch_staging_slots_      = 16;
+```
+
+so the bank size comes from `staging_buffer_bytes_` (or from `prefetch_staging_slots_`, default 16),
+not from the chunk-slot knob. The candidate environment variables to sweep next are
+`AILA_Q4E_STAGING_SLOTS` (raw, default 16) and `AILA_Q4E_LAYER_MAJOR_STAGING_SLOTS`, and the
+verification is simply that `[Q4E PrefillStage] slots_per_bank=` changes in the log.
+
+This is recorded because it cost a run to discover: for the next person, **confirm the logged parameter
+moved before believing a knob test**.
+
+### 48.1 Where prefill work stands
+
+```text
+prefill wall             ~127 s for 2108 tokens (60 ms/token)
+GPU busy                 31.7 s (25%)
+of which memory copies   19.0 s (60%), 42.6 GB at 2.7 GB/s
+staging granularity      16 experts per bank, ~39 MB per transfer round
+```
+
+The two levers remain: move less (42.6 GB is ten times the model) and move it better (larger, fewer
+copies). The knob sweep above is the cheapest way to test the second, provided the logged
+`slots_per_bank` is checked each time.
