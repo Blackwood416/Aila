@@ -1443,3 +1443,50 @@ line-utilisation win is real but the reduction chain costs more than it saves.
    is not on the critical path, and that has to be explained rather than averaged away.
 4. VTune `xpu-offload` only when the shape of the cost is unknown (as in section 22), never as a
    per-iteration tool.
+
+## 34. First structural rewrite attempt of the attention core: wrong and slower
+
+The full GQA-fused kernel was written in the shape of `tmp/XeStrata`'s `qsa_decode_attn.cpp`: one
+work-group per (KV head, tile) computing all twelve query heads that share it, sub-groups owning
+cells with each lane holding `head_dim/32` contiguous dimensions, the `reduce12` butterfly, and a
+value phase where thread `t` owns dimension `t` for every head.
+
+Probe result, against the 216.9 us baseline:
+
+```text
+AILA_Q4E_QSA_GQA_CHUNK=0 : 217.9 us   PROBE_OK
+AILA_Q4E_QSA_GQA_CHUNK=1 : 292.6 us   PROBE_FAILED (output is all zeros)
+```
+
+So the first attempt is both incorrect and 34% slower. It was reverted; the probe stays, because it
+is what turned a 46 ms token into a two-second verdict and caught the all-zero output immediately.
+
+Two things are already clear from the numbers.
+
+### 34.1 Why it cannot be faster yet: 34 work-groups
+
+The partials layout fixes the tile at 128 cells, so a one-work-group-per-(KV head, tile) kernel
+launches only `2 x 17 = 34` work-groups of 256 threads. That is the starvation case the review
+warned about, and it is almost certainly why the rewrite is slower even before the correctness bug.
+The reference implementation avoids it by using `CHUNK = 64` and 33 chunks, giving 66 work-groups;
+its tile count is its own, whereas here 128 is fixed by the merge kernel.
+
+The lever that keeps the layout: split the heads across work-groups. `HEADS_PER_WG = 6` gives
+`2 x 17 x 2 = 68` work-groups and still reads K/V twice instead of twelve times; `HEADS_PER_WG = 4`
+gives 102 work-groups at three reads. That is the knob the next attempt should sweep, with the probe
+as the instrument.
+
+### 34.2 Correctness to fix first
+
+The all-zero output means the value accumulators or the probability weights came out zero. The
+places to check, in order: whether `sp` is written for every head by the even-lane rule (heads 12-15
+are skipped by the `hd_lane < heads_per_kv` guard and must be zero in `pp`), whether `srow` masks
+compressed every cell, and whether the `(head * max_tiles + tile) * stride` slot agrees with the
+merge kernel's expectation, which is the bug the first revision actually had (it wrote
+`tile * stride + head * max_tiles * stride`).
+
+### 34.3 Method note
+
+The probe's sanity check (output not all zeros) is what made this attempt cheap to judge. Every
+future kernel experiment should keep that check, because a fast-but-wrong kernel would otherwise look
+like a win in the model the moment the gate happens not to trip.
