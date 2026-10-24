@@ -2555,3 +2555,56 @@ Next measurements, in order: read the ALU expert kernel's work-group geometry an
 same way the hyper-connection GEMM was diagnosed (a tiny work-group count on a huge GPU was the defect
 there), then compare its achieved FLOP/s against the 6.5% figure to decide whether the problem is
 occupancy or instruction mix.
+
+## 58. The systolic path wins once M is large, and a row gate takes both sides
+
+Section 56.1 turned XMX off after measuring it at chunk 2048. That conclusion does not survive the 8192
+chunk: the systolic units need a large M, which the larger chunk supplies.
+
+```text
+M=2026   XMX 13,396 ms vs ALU 11,838 ms    XMX loses 13%
+M=2995   XMX 15,641 ms vs ALU 15,412 ms    XMX loses  1%
+M=4952   XMX 19,971 ms vs ALU 22,483 ms    XMX wins  13%
+M=7878   XMX 26,159 ms vs ALU 33,042 ms    XMX wins  26%
+```
+
+So both paths are right, for different M. `RunGroupedExperts` now gates the XMX consumer on the row
+count (`AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS`, default 4096, the measured crossover) and the XMX path
+is enabled again by default. Measured on the shipped preset with no overrides:
+
+| prompt | tok/s | path |
+|---|---:|---|
+| 2026 | **171.0** | ALU |
+| 4952 | **250.3** | XMX |
+| 7878 | **299.5** | XMX |
+
+```text
+marginal 2.47 ms/token -> 405 tok/s asymptote     fixed per run 6,844 ms
+```
+
+Progress against the goal: **150 tok/s at 2K and 137 at 3K when this round started, now 171 and 250, with
+299.5 at 8K.**
+
+### 58.1 A trap worth recording
+
+`AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` looks like the obvious gate and is not: it is a padded-band
+parameter. Setting it to 4096 forced every band to pad that far and measured 39,636 ms at M=7878 against
+26,159 ms - worse than either path alone. The real gate had to be a row-count condition at the call site.
+Reading the surrounding comment before reusing a knob saved nothing here; measuring did.
+
+### 58.2 What is left for 400 tok/s measured, not asymptotic
+
+```text
+throughput(n) = 1000 n / (6844 + 2.47 n)
+at 32K tokens -> 373 tok/s    at 64K -> 388 tok/s    asymptote 405
+```
+
+So the asymptote clears 400 but no realistic prompt reaches it while the fixed cost is 6.8 s and the
+marginal is 2.47 ms. Two levers, both now precisely sized:
+
+1. **The marginal 2.47 ms/token.** Per token the expert path is 4.7 GFLOP, so 2.47 ms is 1.9 TFLOPS,
+   about 9.5% of peak. This is exactly the user's suggestion: the weights are stored NF4-packed and are
+   unpacked into the DPAS layout per tile, so a load-time transform into the systolic layout (a VNNI-style
+   repack) would remove that per-tile work. It is the remaining big item and it is a data-layout change,
+   not an algorithm change.
+2. **The 6.8 s fixed cost**, which is what holds measured throughput well under the asymptote.

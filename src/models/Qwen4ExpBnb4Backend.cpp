@@ -1387,14 +1387,18 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             // the kernel 2.1x with no e2e change). AILA_Q4E_PREFILL_EXPERT_XMX=0
             // returns to the ALU path.
             //
-            // Round 2: measured on tools/prefill-bench.ps1 at 2026 tokens, the XMX
-            // path is a net loss - 6.62 ms/token with it on against 5.84 ms/token
-            // with AILA_Q4E_PREFILL_EXPERT_XMX=0 (151 -> 171 tok/s, -12%). The
-            // kernel was already known to win 2.1x in isolation with no end-to-end
-            // change; on prefill the ALU path is simply faster, so the default is
-            // now off and the flag remains for anyone who wants the XMX path back.
+            // Round 2 measurements on tools/prefill-bench.ps1, all at the shipped
+            // 8192 chunk, show the choice depends entirely on the row count M:
+            //   M=2026  XMX 13,396 ms vs ALU 11,838 ms   XMX loses 13%
+            //   M=2995  XMX 15,641 ms vs ALU 15,412 ms   XMX loses  1%
+            //   M=4952  XMX 19,971 ms vs ALU 22,483 ms   XMX wins  13%
+            //   M=7878  XMX 26,159 ms vs ALU 33,042 ms   XMX wins  26%
+            // A small M starves the systolic units, which is why an earlier
+            // chunk-2048 measurement concluded this path was a net loss. With the
+            // 8192 chunk the large-M case is common, so the path is enabled and
+            // MIN_M (below) keeps small chunks on the ALU kernels.
             static const bool s_prefill_expert_xmx =
-                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", false);
+                aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_XMX", true);
             const size_t bases_bytes = size_t(17) * sizeof(int);
             const size_t rows_bytes = size_t(cap) * cfg_.num_experts_per_tok * sizeof(int);
             const size_t ranks_off = bases_bytes + rows_bytes;
@@ -2013,7 +2017,18 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     float* down_dev = down_acc_base ? down_acc_base : buf_.moe_down_acc.data_as<float>();
     // R1 expert-XMX consumer. Only the plain prefill call shape is replaced;
     // every other (test/alternate-base) call stays on the ALU path verbatim.
-    if (prefill_expert_xmx_ &&
+    //
+    // Row-count gate: the systolic units only pay once M is large. Measured on
+    // tools/prefill-bench.ps1 at the shipped 8192 chunk, XMX against ALU is
+    //   M=2026 13,396 vs 11,838 ms (loses 13%)   M=2995 15,641 vs 15,412 (loses 1%)
+    //   M=4952 19,971 vs 22,483 ms (wins 13%)    M=7878 26,159 vs 33,042 (wins 26%)
+    // so the crossover is between 2995 and 4952 and 4096 is the gate. Note that
+    // AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M is NOT this knob - it is a padded-band
+    // parameter, and raising it to 4096 forced every band to pad that far and
+    // measured 39,636 ms at M=7878 against 26,159 ms.
+    static const int s_prefill_xmx_gate_rows =
+        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS", 4096));
+    if (prefill_expert_xmx_ && count >= s_prefill_xmx_gate_rows &&
         use_counts == nullptr && x_base == nullptr && moe_h_base == nullptr &&
         down_acc_base == nullptr && route_base == 0 && token_base == 0) {
         return RunGroupedExpertsXmx(ctx, layer, count, firstUnique, numUnique, actStart, ready);
