@@ -2706,3 +2706,43 @@ The leading candidate follows from the shape: with 10 experts per token and 512 
 7878-token chunk routes about 154 rows to each expert, so each layer is 512 separate
 M=154 / K=2560 / N=1280 matmuls. That is where the ~7% of peak would come from, and fixing it means one
 genuinely grouped GEMM over all experts of a layer rather than a loop of per-expert matmuls.
+
+## 61. The prefill throughput curve, measured end to end
+
+All rows are the shipped preset unless noted, `--max-tokens 1`, single measurement each:
+
+| prompt | ms/token | tok/s | note |
+|---:|---:|---:|---|
+| 20 | - | 13.5 | 1,485 ms total, mostly warm-up avoided |
+| 1019 | 8.50 | 117.6 | |
+| 2026 | 5.85 | 171.0 | ALU path (M < gate) |
+| 2995 | 5.15 | 194.3 | |
+| 4952 | 4.00 | 250.3 | XMX path |
+| **7878** | **3.35** | **299.5** | single chunk, best measured |
+| 12172, chunk 8192 | 3.74 | 267.1 | two chunks: staging paid twice |
+| 12172, chunk 16384 | 3.46 | 289.2 | single chunk, +8% over two |
+
+Two structural facts fall out.
+
+**Staging is per chunk and independent of prompt length.** A 20-token prompt and a 2102-token prompt both
+report `staged` 766 and `h2d_mb` 1,851. So a chunk costs the same expert traffic whether it holds 20 rows
+or 2000, which is why throughput rises steeply with prompt length up to one chunk and why splitting a
+prompt into two chunks costs 8% at 12K.
+
+**Within a single chunk the curve turns back up slightly** (3.35 ms/token at 7878 rows, 3.46 at 12172),
+consistent with the quadratic term attention has and nothing else does.
+
+### 61.1 Best measured state, and what it means for the goal
+
+```text
+best measured   299.5 tok/s at 7878 tokens (single chunk)
+12172 tokens    289.2 tok/s with a 16384 chunk
+asymptote from the 2026..7878 slope    405 tok/s
+```
+
+So prefill now runs at **about 300 tok/s from 8K tokens upward**, against 400 wanted, and the round as a
+whole moved it from 150 tok/s to 300 (+100%). The remaining gap is one factor of 1.34, and section 60
+pinned it: 512 per-expert matmuls of M~154 per layer at ~7% of peak, which needs a real grouped GEMM
+rather than the per-expert loop. `AILA_Q35_PREFILL_CHUNK=16384` is worth 8% at 12K and is measured and
+available, but it is left out of the preset because the scratch's `max_chunk_rows` is 4096 and the extra
+size buys nothing short of 8K.
