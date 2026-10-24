@@ -3177,3 +3177,58 @@ which is exactly the goal.
 
 None of that is reachable by configuration: section 69 already established the flag space is exhausted,
 and this is a change to how staged weights are addressed.
+
+## 71. The 7.1 s narrows to one 2.4 MB host memcpy per expert inside slot acquisition
+
+The section 70 timing said `stage_host` is ~6 ms per chunk. Each chunk calls `GetStagingSlotDev` once per
+expert for 16 experts, so
+
+```text
+6 ms / 16 experts            = 375 us per expert
+2.4 MB / 375 us              = 6.4 GB/s  -> this host's DDR4 streaming rate
+```
+
+**One 2.4 MB host memcpy per expert**, which matches `load_expert_to_staging`'s copy branch exactly:
+
+```cpp
+if (resident_data_) {
+    const int host_slot = resident_host_slots_.at(expert_flat_index(layer, expert_id));
+    size_t begin = 0, end = 0;
+    part_range(slot_bytes_, part, nparts, begin, end);
+    std::memcpy(staging_slot + begin, resident_slot_bases_[host_slot] + begin, end - begin);
+    return;
+}
+```
+
+So the expert is already resident in a **large-page** host arena (`Qwen4ExpExpertCache.cpp:3592`,
+`ctx_->alloc_large_host` -> `VirtualAlloc(MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES)`, i.e. physically
+locked and DMA-capable), and the engine copies it into the 16-slot `pinned_staging_ptr_` before the device
+copies it again into VRAM.
+
+### 71.1 Why this is worth 7 s and why it was not changed in this round
+
+Deleting the hop means handing `resident_slot_bases_[host_slot]` straight to
+`copy_q_->memcpy(slot_dev_base_[slot], ...)`. The blocker is that a `VirtualAlloc(MEM_LARGE_PAGES)` pointer
+is not a SYCL USM pointer: `queue::memcpy` requires runtime-allocated USM, and passing a foreign pointer is
+undefined behaviour - the backend may DMA it correctly (it is locked, and large pages are contiguous) or
+throw, and there is no way to know without running it.
+
+The safe shape is a small guarded experiment: an env flag that, when `resident_data_` covers the whole
+slot, passes the arena pointer directly, wrapped in `try/catch` with a fallback to the existing memcpy on
+any `sycl::exception`, and a one-shot log saying which path ran. That is a contained change but it touches
+the weight-staging hot path of both prefill and decode, so it needs a full correctness pass (greedy output
+plus the attention/MoE kernel tests), which is more than this round's remaining budget allowed.
+
+### 71.2 Goal state
+
+```text
+target        400 tok/s
+best measured 322.9 tok/s at 7878 tokens
+gap           1.24x
+identified    7.1 s of redundant host memcpy (42.6 GB moved twice) + 6.4 s of device copies
+              that cannot overlap while the host is blocked in that memcpy
+```
+
+The arithmetic that makes this the decisive item: removing the 7.1 s unblocks the host, which lets the
+6.4 s of device copies hide behind compute, which takes the pass from 24.4 s to the measured device-only
+~19 s, i.e. **405 tok/s**.
