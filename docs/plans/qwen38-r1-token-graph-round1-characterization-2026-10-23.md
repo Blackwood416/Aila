@@ -1596,3 +1596,29 @@ about 1.3 ms of the token's submission budget, and it is consistent with the ope
    pass and the partial merge, or folding the operator into a larger submission. That is worth about
    0.65 ms per token for the fusion alone, and it also re-prioritises the whole critical path: on this
    stack, submission count per token is a first-class cost, not an implementation detail.
+
+## 37. Collapsing the attention operator to one submission costs more than it saves
+
+Section 36 showed the operator's per-call cost is dominated by its two submissions. The obvious move
+is one submission, so a single-kernel form was written: one work-group per query head walking the
+cache in 128-cell tiles with an online softmax, no partials buffer and no merge kernel.
+
+Probe, 2052 cells:
+
+```text
+two-pass (2 submissions, 408 work-groups) : 180.2 us   PROBE_OK
+online    (1 submission,  24 work-groups) : 1072.9 us  PROBE_OK
+```
+
+Correct, and **six times slower**. The saving of one 53 us submission is swamped by the loss of
+parallelism: the two-pass form gets `num_heads x num_tiles = 408` work-groups, the online form gets
+one per head, i.e. 24, and each of those then walks seventeen tiles serially with two work-group
+barriers and two whole-group reductions per tile.
+
+That is a hard constraint on this operator: it needs on the order of four hundred work-groups, so
+submission count cannot be reduced by reducing parallelism. The two-pass shape is the right one, and
+its second submission can only be removed by a mechanism that keeps the tile parallelism - a
+grid-wide dependency, which SYCL does not expose portably here.
+
+Consequence for the round: the remaining submission savings have to come from elsewhere in the
+layer, where the kernels are small and their work does not need hundreds of work-groups.
