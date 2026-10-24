@@ -22,6 +22,7 @@ bool g_kv_quant_override = false;
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,12 +129,54 @@ int main(int argc, char **argv) {
     const double best = samples.front();
     const double worst = samples.back();
 
+    // Same batch on a queue WITHOUT enable_profiling, timed with the host clock.
+    // The event-timed figure above includes whatever the profiling queue adds to
+    // each submission, and the production pipeline does not enable profiling, so
+    // this is the number that describes the token.
+    double wall_us = -1.0;
+    {
+        Context plain(nullptr, /*profiling=*/false);
+        auto q2 = Tensor::allocate(plain, {1, kHeads * kHeadDim},
+                                   dnnl::memory::data_type::bf16);
+        auto k2 = Tensor::allocate(plain, {kKvHeads, kCells, kHeadDim},
+                                   dnnl::memory::data_type::bf16);
+        auto v2 = Tensor::allocate(plain, {kKvHeads, kCells, kHeadDim},
+                                   dnnl::memory::data_type::bf16);
+        auto o2 = Tensor::allocate(plain, {1, kHeads * kHeadDim},
+                                   dnnl::memory::data_type::bf16);
+        auto p2 = Tensor::allocate(plain, {kHeads, kTiles, kStride},
+                                   dnnl::memory::data_type::f32);
+        plain.memcpy_h2d(q2.data(), host_q.data(), host_q.size() * sizeof(bf16));
+        plain.memcpy_h2d(k2.data(), host_kv.data(), host_kv.size() * sizeof(bf16));
+        plain.memcpy_h2d(v2.data(), host_kv.data(), host_kv.size() * sizeof(bf16));
+        plain.synchronize();
+        auto call = [&] {
+            ops::attention_decode_exact_head256_partial_merge(
+                plain, q2, k2, v2, o2, p2, kHeads, kKvHeads, 0, 0, kCells);
+        };
+        for (int i = 0; i < 5; ++i) call();
+        plain.synchronize();
+        std::vector<double> walls;
+        for (int i = 0; i < kSamples; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int b = 0; b < kBatch; ++b) call();
+            plain.synchronize();
+            const auto t1 = std::chrono::steady_clock::now();
+            walls.push_back(
+                std::chrono::duration<double, std::micro>(t1 - t0).count() /
+                kBatch);
+        }
+        std::sort(walls.begin(), walls.end());
+        wall_us = walls[walls.size() / 2];
+    }
+
     // Reference point: 12 QSA layers per token, so this operator's contribution
     // to a token is twelve times the figure below.
     std::printf("cells=%d heads=%d kv_heads=%d head_dim=%d tiles=%d\n", kCells,
                 kHeads, kKvHeads, kHeadDim, kTiles);
     std::printf("qsa_decode_attention_us: median=%.1f  best=%.1f  worst=%.1f\n",
                 median, best, worst);
+    std::printf("qsa_decode_wall_no_profiling_us: %.1f\n", wall_us);
     std::printf("per_token_12_layers_ms: %.2f\n", median * 12.0 / 1000.0);
 
     // Sanity: the output must not be all zeros, otherwise the probe may have

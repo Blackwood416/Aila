@@ -1553,3 +1553,46 @@ The 143 us per call has to be attributed before anything else. The candidates, i
 
 Until that is answered, per-tile kernel optimisation has a ceiling of about 40 us per call and should
 stay parked.
+
+## 36. The attention operator is charged two host submissions per call
+
+### 36.1 The fixed cost is not the profiling queue
+
+Running the same batch on a queue without `enable_profiling`, timed with the host clock:
+
+| cells | event-timed (profiling) | wall clock (no profiling) |
+|---:|---:|---:|
+| 256 | 143.6 us | 149.5 us |
+| 2052 | 180.2 us | 186.5 us |
+
+A 6 us difference, so the profiling queue is not responsible and the ~143 us per call is real on the
+queue the production pipeline uses.
+
+### 36.2 What it is
+
+The operator submits exactly two kernels: the per-tile score/softmax/V pass and the partial merge.
+Their device work at 256 cells cannot be 143 us: phase 1 is 48 work-groups of 128 threads, phase 2 is
+`num_heads x merge_wg = 24 x 128` threads looping twice. And the earlier measurement of this stack put
+host submission at **53 us per `queue.submit`** (750 submissions per token = 40.4 ms, section 12).
+
+```text
+2 submissions x ~53 us = ~106 us
+plus a few us of device work per tile (2.4 us/tile measured)
+~= the 143 us constant
+```
+
+So the attention operator costs what it costs because it is **two host submissions**, not because of
+its arithmetic or its memory traffic. Across the twelve QSA layers that is 24 submissions per token,
+about 1.3 ms of the token's submission budget, and it is consistent with the operator measuring
+~2.2 ms/token in the model while its per-tile work is only 0.5 ms.
+
+### 36.3 Consequences
+
+1. Every kernel-internal optimisation attempted in sections 28-34 was aimed at the 41 us per-tile
+   part, i.e. at ~20% of the operator and ~0.5 ms of a 46 ms token. That is why all four were neutral
+   and why the probe has to be read as "143 us of submission + 41 us of work".
+2. The GQA restructure cannot pay for itself on its own: it only shrinks the 41 us.
+3. The lever that follows is **fewer submissions on the attention path**, i.e. fusing the per-tile
+   pass and the partial merge, or folding the operator into a larger submission. That is worth about
+   0.65 ms per token for the fusion alone, and it also re-prioritises the whole critical path: on this
+   stack, submission count per token is a first-class cost, not an implementation detail.
