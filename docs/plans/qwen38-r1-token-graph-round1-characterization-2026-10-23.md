@@ -1177,3 +1177,38 @@ is for.
 Note for whoever repeats the profile: `-knob characterization-mode=full-compute` over a
 600-token decode needs well over half an hour and the report step alone takes many minutes, so
 it has to be run detached rather than inside a single command with a short timeout.
+
+## 28. Why the reorder was neutral, and what the traffic actually is
+
+Section 27 concluded that the twelve redundant K/V reads were "already absorbed by L2" and left
+the limiter unnamed. Working the numbers properly gives the mechanism, and it explains the
+neutral result exactly.
+
+Per QSA layer at 2052 tokens, `head_dim` 256, `num_heads` 24, `num_kv_heads` 2:
+
+```text
+unique K + V            = 2052 x 256 x 2 B x 2 kv_heads x 2 (K,V) = 4.2 MB
+K reads by query heads  = 24 heads x 2052 x 512 B                  = 25.2 MB
+V reads by query heads  = 24 heads x 2052 x 512 B                  = 25.2 MB
+total L2/DRAM traffic   ~= 100 MB per layer
+100 MB / 154 us = 650 GB/s
+```
+
+Two things follow. First, a 4.2 MB working set fits inside the 16 MB L2, so the twelve repeats
+are L2 hits and DRAM sees only the 4.2 MB. That is why reordering the work-groups so the twelve
+heads run adjacent changed nothing: it improves *where* the repeats are served from, while the
+**volume** of L2 traffic stays at 100 MB. Second, 650 GB/s is the right order for DG2 L2
+throughput, so the kernel is bound by L2 bandwidth on redundant traffic, not by DRAM, not by
+instruction count and not by the FMA chain.
+
+### 28.1 The consequence for the rewrite
+
+The only fix that scales is to stop reading the same K/V row once per query head: one
+work-group should read a K/V tile once and produce scores for all `heads_per_kv = 12` heads that
+share it. That divides the traffic by twelve, i.e. 100 MB -> 8.4 MB per layer.
+
+The naive form of that change (one work-group per (kv_head, tile), one thread per token, twelve
+accumulators per thread) collapses the grid to `2 x 17 = 34` work-groups, which starves a
+512-core device. It has to be combined with splitting the token dimension, e.g. 32 tokens per
+work-group, giving `2 x 17 x 4 = 136` work-groups of 128 threads, and with twelve independent
+accumulators per thread so the dependency chain does not become 3072 FMAs long.
