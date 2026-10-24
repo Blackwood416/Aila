@@ -21,7 +21,10 @@ inline void ApplyQwen38A770Preset() {
     // tools/prefill-bench.ps1 at 2995 tokens: chunk 512 -> 137 tok/s,
     // chunk 2048 -> 156 tok/s, chunk 4096 -> 195 tok/s, because a single chunk
     // lets each expert's weights be read once for all of its routed token rows.
-    {"AILA_Q35_PREFILL_CHUNK", "4096"},
+    // At 7878 tokens the same effect continues: chunk 4096 -> 214 tok/s,
+    // chunk 8192 -> 239 tok/s, and short prompts (2026, 2995) measure the same
+    // 171 / 194 tok/s at 8192 as at 4096 because they already fit one chunk.
+    {"AILA_Q35_PREFILL_CHUNK", "8192"},
         {"AILA_Q4E_INLINE_CHECKPOINT", "1"},
         {"AILA_Q4E_STATIC_PINNING", "0"},
         {"AILA_Q4E_GROUPED_XMX_MIN_ROWS", "0"},

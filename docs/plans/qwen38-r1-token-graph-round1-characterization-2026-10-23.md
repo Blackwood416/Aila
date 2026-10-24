@@ -2512,3 +2512,46 @@ The same reuse argument implies an even larger chunk helps longer prompts, so th
 `PREFILL_CHUNK` 4096 against 8192 at a 6K prompt, checking VRAM headroom since activation buffers scale
 with the chunk. After that the remaining 1.36x has to come from the expert kernel itself, since the
 weight-reuse structure is now doing what it can.
+
+## 57. Chunk 8192 as the shipped default, and what the asymptote says
+
+The chunk sweep continues to pay at longer prompts, so the preset now ships 8192:
+
+```text
+7878 tokens, PREFILL_CHUNK=4096   36,786.7 ms   4.67 ms/token   214.2 tok/s
+7878 tokens, PREFILL_CHUNK=8192   32,992.7 ms   4.19 ms/token   238.8 tok/s
+2026 tokens, PREFILL_CHUNK=8192   11,862.3 ms   5.86 ms/token   170.8 tok/s
+2995 tokens, PREFILL_CHUNK=8192   15,412.3 ms   5.15 ms/token   194.3 tok/s
+```
+
+Short prompts are unchanged at 8192 because they already fitted in one chunk, so the larger default is
+free where it does not help and worth 11% where it does. Verified on the shipped preset with no
+overrides:
+
+```text
+2026 tokens   11,837.6 ms   5.84 ms/token   171.1 tok/s
+7878 tokens   33,042.2 ms   4.19 ms/token   238.4 tok/s
+```
+
+### 57.1 The goal needs the asymptote, not the fixed cost
+
+```text
+marginal (7878 vs 2026)  = (33042.2 - 11837.6) / (7878 - 2026) = 3.62 ms/token
+asymptotic throughput    = 1 / 3.62 ms = 276 tok/s
+```
+
+Throughput rises with prompt length only because the fixed ~5.2 s amortises; the ceiling set by the
+marginal cost is **276 tok/s**, so no prompt length reaches 400. The target therefore has to come out of
+the per-token term: 3.62 -> 2.50 ms, a factor of 1.45.
+
+### 57.2 Where that factor has to come from
+
+Per token the expert path evaluates 10 experts in each of 48 layers, i.e. 480 x 4.91 M MAC = 2.36 G MAC
+= 4.7 GFLOP. At 3.62 ms that is **1.3 TFLOPS, about 6.5% of this GPU's ~20 TFLOPS bf16 peak**. The reuse
+structure is now doing what it can with the chunk size, so what is left is the efficiency of the expert
+kernel itself under the ALU (non-XMX) path that section 56.1 made the default.
+
+Next measurements, in order: read the ALU expert kernel's work-group geometry and effective bandwidth the
+same way the hyper-connection GEMM was diagnosed (a tiny work-group count on a huge GPU was the defect
+there), then compare its achieved FLOP/s against the 6.5% figure to decide whether the problem is
+occupancy or instruction mix.
