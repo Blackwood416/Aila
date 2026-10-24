@@ -2893,3 +2893,72 @@ Getting this took a prefill-only `xpu-offload` run (about 4 minutes of collectio
 workarounds: the report must be run against a **copy** of the result directory because finalising again on
 the original reports `Cannot re-finalize a read-only result`, and re-running on the original then fails
 with `Insufficient permissions` on `sqlite-db`. Copy the result dir and report from the copy.
+
+## 65. The copies have their own queue already; what serialises them is where the wait sits
+
+Section 64 put 7.2 s (28%) of prefill device time on `zeCommandListAppendMemoryCopy`. Two follow-up
+findings change what the fix is.
+
+### 65.1 A second queue already exists and does overlap
+
+`Qwen4ExpExpertCache.cpp:769-782` creates `copy_q_` unconditionally - a second in-order queue on the same
+device with `sycl::ext::intel::property::queue::immediate_command_list()`. So expert staging does **not**
+share the main queue.
+
+And the probe now proves the premise: `AilaH2DBandwidthProbe` gained an overlap test that runs a busy
+integer kernel on the main queue while the same expert-sized copy volume runs on a second queue.
+
+```text
+kernel 155.8 ms, copies 37.8 ms, sum 193.6 ms, concurrent 154.9 ms -> OVERLAPS
+```
+
+The copies are fully hidden (154.9 ms against a 155.8 ms kernel). So the hardware and driver will
+overlap a copy stream with compute on this machine.
+
+### 65.2 Yet prefill shows wall == sum of device parts, so the wait placement serialises it
+
+```text
+measured wall at 7878 tokens      26.3 s
+sum of device kernel times        25.8 s   (copies 6.4 + 0.8, GDN 5.24, QSA 3.81, experts 3.18, rest)
+```
+
+Overlapping 6.4 s of copies would put the wall near 19.4 s; it is not, so the copies are not covered. The
+mechanism is visible in the staging path: the copy is issued and then waited on before anything else is
+in flight, e.g. `Qwen4ExpExpertCache.cpp:3237-3238`
+
+```cpp
+if (copy_q_) { ... copy_q_->memcpy(slot_dev_base_[slot], staging, slot_bytes_); ... }
+...
+if (copy_q_) { copy_q_->wait_and_throw(); }
+```
+
+and the pinned path at `:3114-3115` waits per copy outright
+(`copy_q_->memcpy(...).wait_and_throw()`). The two weight banks and the `half_fence_` / `half_done[]` /
+`dma_done_event` barriers show the pipelined design was intended (`:2679`, `:2726`, `:2735`), but on the
+measured prefill path the wait lands immediately after the copy, so the host blocks while nothing else is
+queued on the main queue to overlap with.
+
+### 65.3 The concrete change, and why it was not attempted in this round
+
+The fix is to stage band (or layer) N+1's experts before waiting on N's, and to make the consumer depend
+on the copy event rather than the host waiting for it - i.e. use the machinery that already exists
+(`dma_done_event`) to place a single `depends_on` before the band's first matmul instead of
+`copy_q_->wait_and_throw()` on the host.
+
+That is a correctness-sensitive reordering inside the cache's fill pipeline: a slot must never be consumed
+before its copy lands, slots are recycled by LRU, and there is a `consumer_fence` per slot that must
+participate. Getting it wrong silently produces garbage logits, so it needs more care than the remaining
+budget of this round allowed, and the probe above already establishes that the payoff is real
+(6.4 s of 26.3 s, which is the whole 1.34x to 400 tok/s).
+
+### 65.4 State of the goal
+
+```text
+best measured        299.5 tok/s at 7878 tokens (single prefill chunk)
+target               400 tok/s
+remaining lever      6.4 s of staging copies that a second queue can hide (proved by probe)
+```
+
+**Not achieved.** The round added: a prefill-only attribution, the withdrawal of the expert-GEMM theory,
+proof that second-queue copy/compute overlap works on this platform, and the exact anchor
+(`Qwen4ExpExpertCache.cpp:3114`, `:3237`) where the wait has to move.

@@ -103,6 +103,55 @@ int main(int argc, char** argv) {
                         static_cast<double>(total_mb), ms,
                         static_cast<double>(total_bytes) / (ms * 1e6));
         }
+
+        // Does a second queue actually overlap with compute on this driver? The
+        // engine runs everything on one in-order queue, so a copy and a kernel can
+        // never overlap there. This block measures the premise for fixing that: a
+        // busy integer kernel on the main queue against the same 42.6 GB of
+        // expert-sized copies on a second queue.
+        {
+            const size_t spin_iters = 40000000;  // tuned below by measurement
+            auto burn = [&](sycl::queue& q) {
+                int* out = static_cast<int*>(ctx.alloc_device(sizeof(int)));
+                const sycl::event ev = q.submit([&](sycl::handler& h) {
+                    int* o = out;
+                    h.single_task([=]() {
+                        int acc = 0;
+                        for (size_t i = 0; i < spin_iters; ++i) acc += static_cast<int>(i & 0x3ff);
+                        o[0] = acc;
+                    });
+                });
+                return std::make_pair(ev, out);
+            };
+
+            sycl::queue copy_q(ctx.queue().get_device(),
+                               sycl::property_list{sycl::property::queue::in_order()});
+
+            // Sequential: kernel, then the copies, all on the main queue.
+            auto seq_burn = burn(ctx.queue());
+            const auto t0 = Clock::now();
+            seq_burn.first.wait();
+            const double kernel_ms = ms_since(t0);
+            const auto t1 = Clock::now();
+            for (size_t i = 0; i < chunks; ++i) ctx.memcpy_h2d(dev, host, chunk_bytes);
+            ctx.synchronize();
+            const double seq_copy_ms = ms_since(t1);
+
+            // Concurrent: kernel on the main queue, copies on the second queue.
+            const auto t2 = Clock::now();
+            auto con_burn = burn(ctx.queue());
+            for (size_t i = 0; i < chunks; ++i) copy_q.memcpy(dev, host, chunk_bytes).wait();
+            copy_q.wait();
+            con_burn.first.wait();
+            const double con_ms = ms_since(t2);
+
+            std::printf("overlap test: kernel %.1f ms, copies %.1f ms, sum %.1f ms, "
+                        "concurrent %.1f ms -> %s\n",
+                        kernel_ms, seq_copy_ms, kernel_ms + seq_copy_ms, con_ms,
+                        (con_ms < 0.85 * (kernel_ms + seq_copy_ms)) ? "OVERLAPS" : "SERIALISED");
+            ctx.free_device(seq_burn.second);
+            ctx.free_device(con_burn.second);
+        }
         std::printf("PROBE_OK\n");
         return 0;
     } catch (const std::exception& e) {
