@@ -1347,3 +1347,44 @@ For anyone continuing: the ordered experiment list is now
 
 Both need the same measurement discipline used here: `route_wait` as the decision metric, VTune
 `xpu-offload` for kernel durations, and no in-code marks while deciding.
+
+## 32. Fourth neutral result, and what four of them together mean
+
+The V loop was unrolled four cells at a time, with all four V loads issued before any FMA, which
+turns a 128-deep chain of dependent loads into a four-deep pipeline. The cells are still folded in
+ascending order, so the sums are those of the plain loop.
+
+```text
+V unroll x4 : route_wait 25.20   decode p50 46.32   gate_fail 0
+previous    : route_wait 25.14   decode p50 46.4-46.8
+```
+
+Neutral. That is now **four** independent changes to the QSA attention core that `route_wait` cannot
+see:
+
+| change | expected on phase 1 | measured route_wait |
+|---|---|---|
+| work-group reorder for GQA locality (28.1) | none on volume | 25.14 vs 25.16 |
+| token->row map hoisted to SLM (30.1) | index chain removal | 25.32 vs 25.14 |
+| coalesced score phase (31) | up to 2.6x on line traffic | 25.22 vs 25.14 |
+| V loop 4-cell unroll (here) | up to 4x on load MLP | 25.20 vs 25.14 |
+
+Four independent attempts, one of which should have moved a 1.86 ms item by a millisecond, all land
+within 0.2 ms. The conclusion has to be that **the premise is wrong, not the optimisations**: at this
+configuration the QSA attention core is not on the `route_wait` critical path in the way section 29
+assumed. The 155 us per layer was measured on a decode trace taken with `--max-tokens 1200`, where the
+context grows well past 2052 and the tile count with it, so that figure describes a different
+`effective_len` than the 8-token benchmark at pos 2108.
+
+### 32.1 The next step is to re-establish the premise
+
+Before any further work on this kernel:
+
+1. Measure the attention kernel's own duration **at pos 2108** with the observer-free method
+   (VTune `xpu-offload`, isolating rows by name), not on a long-generation trace.
+2. Re-derive which items actually make up the 25.4 ms `route_wait` by putting a *mark-free* duration
+   next to each of them, since the in-code profiler is not usable for absolute numbers (section 22).
+
+Without that, more kernel work on this operator is unguided. The one thing that can be stated with
+confidence is the cost of a mistake here: five changes, five neutral results, and the only real wins
+this round came from where the observer-free data pointed first (tail fusion, work-group-per-row).

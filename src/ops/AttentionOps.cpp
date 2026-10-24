@@ -780,21 +780,41 @@ void attention_decode_exact_head256_partial_merge_impl(
           } else {
             for (int d = lid; d < head_dim; d += tile_wg) {
               float acc = 0.0f;
-              for (int i = 0; i < tile_len; ++i) {
+              // Four cells per step with all four V loads issued before any FMA.
+              // The plain loop is 128 iterations of two dependent loads, i.e. a
+              // 128-deep latency chain per thread with almost no memory level
+              // parallelism, which is what three failed attempts to optimise the
+              // score phase (28.1, 30.1, 31) point at as the real cost here. The
+              // cells are still folded in ascending order, so the sums are those
+              // of the plain loop.
+              auto row_of = [&](int i) {
                 const int t = tile_start + i;
-                int cache_t = 0;
                 if (active_blocks != nullptr && num_active_blocks > 0) {
-                  if (t < num_active_blocks * 4) {
-                    cache_t = active_blocks[t / 4] * 4 + (t % 4);
-                  } else {
-                    cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
-                  }
-                } else if (active_indices) {
-                  cache_t = active_indices[t];
-                } else {
-                  cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+                  return (t < num_active_blocks * 4)
+                             ? (active_blocks[t / 4] * 4 + (t % 4))
+                             : active_blocks[num_active_blocks +
+                                            (t - num_active_blocks * 4)];
                 }
-                acc += logits[i] * v_acc.load(kv_head, cache_t, d);
+                if (active_indices) return active_indices[t];
+                return ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+              };
+              int i = 0;
+              for (; i + 4 <= tile_len; i += 4) {
+                const float v0 =
+                    static_cast<float>(v_acc.load(kv_head, row_of(i), d));
+                const float v1 =
+                    static_cast<float>(v_acc.load(kv_head, row_of(i + 1), d));
+                const float v2 =
+                    static_cast<float>(v_acc.load(kv_head, row_of(i + 2), d));
+                const float v3 =
+                    static_cast<float>(v_acc.load(kv_head, row_of(i + 3), d));
+                acc += logits[i] * v0;
+                acc += logits[i + 1] * v1;
+                acc += logits[i + 2] * v2;
+                acc += logits[i + 3] * v3;
+              }
+              for (; i < tile_len; ++i) {
+                acc += logits[i] * v_acc.load(kv_head, row_of(i), d);
               }
               partial[kDecodeExact256PartialAccOffset + d] = acc;
             }
