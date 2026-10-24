@@ -2295,3 +2295,56 @@ per token grows with position, `tile_max_blocks = (tile_start_pos + tile_count) 
 score and selection work is O(tokens x blocks)) and the expert GEMM path (whose row count per expert
 grows with tokens). One measurement separates them: run 1024- and 1536-token prompts and check whether
 the growth tracks tokens x blocks (attention) or tokens x experts (MoE).
+
+## 53. Prefill is at 150 tok/s, not 16: the runner was the wrong instrument
+
+Sections 47-52 measured prefill through the decode A/B runner, whose `GenerateMessages` wall time and
+whose `AdaptiveWork` counters do not describe prefill. Two direct CLI runs expose the difference:
+
+| run | staged experts | `h2d_mb` | `misses` | `experts_host_ms` |
+|---|---:|---:|---:|---:|
+| A/B runner, 2108 tokens | 17,548 | 42,578 | 869,431 | 7,265 |
+| plain CLI, 2102 tokens | **766** | **1,851** | **766** | **315** |
+
+The runner moves 23x more expert data and reports a different counting convention for misses, and its
+wall time also carries one-time costs (the CLI's `GenerateMessages` was 32.2 s inside a 212.6 s process,
+so 180 s of that run was model load). Everything the earlier sections said about "prefill takes 127 s,
+16 tok/s" is therefore **withdrawn**.
+
+### 53.1 A dedicated prefill scoreboard
+
+`tools/prefill-bench.ps1` drives `Aila.exe` directly, parses `[GenerateMessages] Full prefill: N tokens`
+and the generation wall time, and reports tok/s plus a linear fit for the marginal per-token cost.
+
+```text
+ 1019 tokens   10,338.7 ms   10.15 ms/token    98.6 tok/s
+ 2026 tokens   13,475.8 ms    6.65 ms/token   150.3 tok/s
+ 3033 tokens   22,146.5 ms    7.30 ms/token   137.0 tok/s
+
+marginal 5.86 ms/token -> 171 tok/s   fixed per run 4,364 ms
+```
+
+So prefill today is **150 tok/s at 2K tokens and 171 tok/s marginal**, and the 400 tok/s goal needs a
+**2.34x** improvement in the marginal per-token cost (5.86 -> 2.50 ms), plus attention to the 4.4 s fixed
+cost if short prompts matter.
+
+### 53.2 Where the marginal cost sits
+
+Two facts from the CLI run with `AILA_Q4E_WORK_SUMMARY=1`:
+
+- `h2d_mb` is only 1,851 MB and `fill_ms` 285 ms, so **staging is not the marginal cost** - it is a
+  per-chunk fixed cost, and with `PREFILL_CHUNK=2048` a 2K prompt pays it once.
+- The per-stage sums are `full_host_ms` 26,198, `linear_host_ms` 7,460, `experts_host_ms` 315. Those sum
+  above the 16,953 ms run, so they are per-layer accumulations rather than wall time and must only be
+  used as ratios: **QSA (full attention) is ~76% of prefill compute, GDN ~22%, expert CPU serving ~1%**.
+
+At 5.86 ms/token marginal and 76% in QSA over 12 QSA layers, one token costs ~375 us per QSA layer. The
+arithmetic for that layer is ~50 MFLOP, which at this GPU's ~20 TFLOPS is 2.5 us. So **the prefill QSA
+path runs at well under 1% of peak** and is the single place where the 2.34x has to come from.
+
+### 53.3 Next step
+
+Build the prefill equivalent of the decode attention micro-probe (`AilaQsaAttentionProbe` already exists
+for decode at 2052 cells) so the QSA prefill kernel can be timed in seconds in isolation, then find out
+why it is two orders of magnitude off peak: most likely a per-token or per-block host loop around
+`attention_prefill_qsa_batched`, or a work-group geometry with far too few groups for a 2048-token chunk.
