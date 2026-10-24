@@ -2095,3 +2095,57 @@ staging granularity      16 experts per bank, ~39 MB per transfer round
 The two levers remain: move less (42.6 GB is ten times the model) and move it better (larger, fewer
 copies). The knob sweep above is the cheapest way to test the second, provided the logged
 `slots_per_bank` is checked each time.
+
+## 49. Prefill has a hard ~133 s floor that staging granularity does not move
+
+Two more zero-code knobs were swept, one variable each, same 2108-token prompt:
+
+| config | prefill wall | `h2d_mb` | `fill_ms` | `bank_wait_ms` |
+|---|---:|---:|---:|---:|
+| baseline (`CHUNK_SLOTS=16`) | 134.5 s | 42.22 GB | 2.33 s | - |
+| `CHUNK_SLOTS=64` | 133.8 s | 41.59 GB | 2.30 s | - |
+| `FILL_PARTS=1` | 132.96 s | 41.42 GB | 2.26 s | 1.86 s |
+| `FILL_PARTS=2` | 133.2 s | 42.17 GB | 2.30 s | 1.91 s |
+
+Nothing moves it. The earlier `FILL_PARTS` default of 8 splits each expert fill into eight parts, and
+collapsing that to one part changes neither the transfer volume nor the wall time, so the 19 s of copy
+time is **not** granularity overhead. Read together with section 48, this rules out the whole
+"make the copies bigger" family of fixes.
+
+### 49.1 The arithmetic does not close, and that is the finding
+
+```text
+prefill wall                                 127 s
+GPU busy from an observer-free trace        31.7 s   (25%)
+  of which copies                            19.0 s
+host stage timers (full 26.2 + linear 11.6 + experts 7.3)  45 s
+topk bracket blocking (backpressure)         78 s
+```
+
+The 78 s of blocking cannot be the device, because the device is only busy a quarter of the time. So
+the blocking is the host waiting on **queue drain points** while the device itself sits idle waiting for
+the host to append more work. In other words prefill is a **per-layer host/device ping-pong**:
+
+```text
+per layer = 0.66 s of device work + ~1.0 s of host work, serialised  ->  1.63 s x 48 = 78 s per chunk
+```
+
+`full_host_ms` localises the host half: 26.2 s over 12 QSA layers is **1.07 ms per token per QSA layer**
+against 0.157 ms for a GDN layer, so QSA's stage costs 6.8x a GDN stage and contributes 26 s of the
+host side on its own.
+
+### 49.2 Therefore the next prefill target is the QSA stage's host cost, not the staging
+
+Three things to measure next, in this order:
+
+1. Break `stage_ms[kStageFullAttn]` down inside a QSA layer of the prefill path: how much is submission,
+   how much is an explicit drain/sync, how much is real host compute (RoPE, packing, block selection).
+2. Count the drain points per layer. If each QSA layer forces a `synchronize` for routing or for the
+   indexer's block selection, that is the ping-pong and it should be pipelined away exactly as the
+   decode path's doorbell was.
+3. Compare the prefill attention work against the reference implementations already on disk
+   (`tmp/Strata/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp` and
+   `tmp/XeStrata/src/kernels/xe/qsa_prompt_attn.cpp`, whose DPAS form Strata records as 2-3x slower than
+   the chunk form for decode but was written for the prompt case), to see whether Aila's
+   `attention_prefill_cached_impl` is in the right family at all. Its measured 27.5 ms per instance for
+   2048 tokens is only 1 s of device time in total, so this is a lower priority than the host half.
