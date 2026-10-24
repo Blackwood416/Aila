@@ -3486,3 +3486,34 @@ target        400 tok/s
 best measured 357.1 tok/s at 7878 tokens (299.3 at 4952, 173.2 at 2026)
 gap           1.12x, all of it in the staging enqueue + wait on the submitting thread
 ```
+
+## 77. Merging a chunk's 16 arena copies into one is neutral-to-worse; reverted
+
+Section 76 identified ~111 us of enqueue cost per `sycl::queue::memcpy` on the arena, so 16 calls per
+chunk pay ~1.8 ms of host time for 39 MB. The arena places a chunk's slots contiguously
+(`bases[first+i] = chunk + i*slot_bytes`) and the staging bank is contiguous, so a guard was added to the
+`direct_arena` branch: if the sources are consecutive, issue **one** copy of `count * slot_bytes` instead
+of `count` copies.
+
+```text
+one merged copy per chunk   22,402.6 ms   2.84 ms/token   351.7 tok/s
+16 separate copies          22,059.1 ms   2.79 ms/token   357.1 tok/s
+```
+
+Neutral to slightly worse, so the change was reverted with `git checkout` and the tree is back to the
+measured-best state. Two readings are consistent with the result: either the routing order rarely makes a
+chunk's 16 sources consecutive (the guard then never fires), or one 39 MB copy does not save the enqueue
+overhead that 16 smaller ones cost. Distinguishing them would need a counter on which branch fires, which
+is not worth another round given the size of the possible gain.
+
+### 77.1 Goal state after this attempt
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens   (gap 1.12x)
+reverted      the merged-copy experiment; worktree clean at the best known commit
+```
+
+The staging enqueue cost on the submitting thread is now the only identified item, and both cheap
+approaches to it (bigger banks in section 76, one big copy here) have been measured and do not pay. What
+remains is the worker-thread change, which is a concurrency edit to the weight hot path shared with decode.
