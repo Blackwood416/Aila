@@ -2962,3 +2962,38 @@ remaining lever      6.4 s of staging copies that a second queue can hide (prove
 **Not achieved.** The round added: a prefill-only attribution, the withdrawal of the expert-GEMM theory,
 proof that second-queue copy/compute overlap works on this platform, and the exact anchor
 (`Qwen4ExpExpertCache.cpp:3114`, `:3237`) where the wait has to move.
+
+## 66. Both staging-pipeline flags are neutral; the wait is not the one they control
+
+Two zero-code candidates were tested against the shipped preset at 7878 tokens:
+
+```text
+AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M=0    26,204.3 ms   300.6 tok/s   (vs 26,365.3 / 298.8 at 256)
+AILA_Q4E_LARGE_PAGE_PIPELINE=1         26,312.3 ms   299.4 tok/s   (vs 26,233.4 / 300.3 at 0)
+```
+
+Both are inside noise. The `MIN_M` result was already covered in section 63.1; the pipeline flag matters
+because it looked like exactly the fix section 65.3 described - it sets
+`resident_staging_pipeline_enabled_` (`Qwen4ExpExpertCache.cpp:657`) which skips the host wait on
+`last_dma_event_` at `:2390`. It does nothing because that wait is already gated behind
+`!host_pool_enabled_`, and the host pool is enabled in this configuration, so the prefill path never
+issued that wait in the first place.
+
+That narrows section 65.3 further: the blocking wait that serialises the copies is **not**
+`last_dma_event_` and not the pipelined-staging flag. It has to be located by timing the staging call
+versus the band's first matmul inside a single layer, not inferred from the flags that exist.
+
+### 66.1 Where the goal stands
+
+```text
+target              400 tok/s
+best measured       300.3 tok/s at 7878 tokens (three runs: 298.8 / 299.4 / 300.3)
+                    ~171 tok/s at 2K tokens, ~289 at 12K, asymptote ~405
+remaining work      6.4 s of staging copies that a second queue demonstrably can hide
+                    (probe: 154.9 ms concurrent against 193.6 ms serial), but the
+                    specific host-side wait that prevents it is still unidentified
+```
+
+Two rounds of flag-level attempts at that 6.4 s have both come back neutral, so the next attempt should
+not be another flag: it should be `platform_events`-style tracing of one layer, or a targeted patch that
+wraps the staging call and the first matmul of a band in a timestamp pair and prints them.
