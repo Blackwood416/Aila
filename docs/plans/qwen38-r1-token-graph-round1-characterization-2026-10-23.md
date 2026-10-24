@@ -2149,3 +2149,75 @@ Three things to measure next, in this order:
    the chunk form for decode but was written for the prompt case), to see whether Aila's
    `attention_prefill_cached_impl` is in the right family at all. Its measured 27.5 ms per instance for
    2048 tokens is only 1 s of device time in total, so this is a lower priority than the host half.
+
+## 50. Prefill goal: 400 tok/s, and the measured ceiling that governs it
+
+Target set by the user: **prefill at 400 tok/s**. Baseline today is 2048 tokens in ~127 s, i.e.
+**16 tok/s**, so the target is a 24x improvement that requires 5.1 s for a 2K-token pass.
+
+### 50.1 The volume is inherent
+
+512 experts per layer x 48 layers x 2.46 MB = 60 GB of expert weights. At 2048 tokens with top-10, the
+union of routes per layer is essentially all 512 experts, so a full pass reads the whole 60 GB from
+host memory (observed staging volume 42.6 GB, the remainder being VRAM-resident). That volume cannot be
+argued away: it needs either 60 GB of VRAM, which a 16 GB card does not have, or a transfer.
+
+### 50.2 A new probe gives the copy model
+
+`tests/ops/H2DBandwidthProbe.cpp` (target `AilaH2DBandwidthProbe`) copies pinned host memory to device
+memory and reports bandwidth per chunk size. On this machine (A770 on a Haswell-EP PCIe 3.0 platform):
+
+| chunk | bandwidth | per copy |
+|---|---:|---:|
+| 150 KB | 1.97 GB/s | 78 us |
+| 300 KB | 3.27 GB/s | 92 us |
+| 600 KB | 4.95 GB/s | 121 us |
+| 1200 KB | 6.61 GB/s | 181 us |
+| 2400 KB | 7.05 GB/s | 341 us |
+| 9600 KB | 8.99 GB/s | 1068 us |
+| single 512 MB | 9.91 GB/s | - |
+
+Fitting those points gives the model this round should be planned against:
+
+```text
+t(copy) = 62 us + bytes / 9.54 GB/s
+```
+
+Two negative results pin the model down further. Rotating the destination across a 1 GB region, as the
+real expert pool does, changes nothing (7.01 vs 7.01 GB/s at 2400 KB, 8.97 vs 9.00 at 9600 KB), so
+destination page or TLB behaviour is not the issue. And neither `AILA_Q4E_FILL_PARTS` (1, 2, 16) nor
+`AILA_Q4E_FILL_THREADS` (16) changes the prefill wall time at all (132.96 / 133.2 / 133.4 s), so the
+fill plumbing is not what makes staging slow.
+
+### 50.3 Where that leaves the target
+
+The staging path moves 42.6 GB and an observer-free trace shows it costs 19.0 s, i.e. **2.2 GB/s**,
+while the same copy size at full pipeline gives 7.05 GB/s. So the copies are being issued into an
+in-order queue interleaved with kernels and therefore never pipeline.
+
+```text
+staging at the probe's rate          42.6 GB / 7.05 GB/s  = 6.0 s   -> 341 tok/s
+staging with large runs              42.6 GB / 9.54 GB/s  = 4.5 s   -> 455 tok/s
+non-copy device work today                                 12.7 s
+host stage wall today (46.6 s) plus blocking               the rest of the 127 s
+```
+
+So **400 tok/s is reachable only if all three hold at once**: copies run at the pipelined rate with
+large runs, the non-copy device work stays under ~4.5 s, and copy and compute overlap completely. Today
+none of the three is true, and the largest unexplained block is the host/device ping-pong described in
+section 49.
+
+### 50.4 Ranked plan toward the target
+
+1. **Make copies pipeline.** 19 s -> ~5 s. They currently interleave with compute in one in-order queue.
+   Either batch them into large runs per layer or put them on their own queue so the copy engine and
+   the compute queue overlap.
+2. **Break the host/device ping-pong.** 46.6 s of host stage wall time plus roughly 49 s of submission
+   blocking sits inside a 127 s pass whose device work is only 31.7 s. This is the largest single block
+   of time in prefill and it is not compute.
+3. **Shrink the 12.7 s of non-copy device work.** gemm_kernel 6.77 s, submit_dequant 1.85 s, GDN 1.42 s,
+   QSA 0.99 s. Batched prefill GEMMs should be a fraction of that.
+
+Milestones to report against: 16 tok/s now, ~65 tok/s once the device is the only limiter, ~110 tok/s
+once copies pipeline at todays rate, ~200 tok/s once copies use large runs, 400 tok/s when compute is
+hidden as well.
