@@ -3444,3 +3444,45 @@ target        400 tok/s
 best measured 357.1 tok/s at 7878 tokens        (4952 -> 299.3, 2026 -> 173.2)
 gap           1.12x
 ```
+
+## 76. The arena copies are asynchronous; the cost is enqueue, and more staging slots make it worse
+
+Section 75 could not tell whether `sycl::queue::memcpy` from a large-page pointer blocks. The probe now
+prints enqueue time separately from wait time:
+
+```text
+large-page via queue.memcpy: 109 chunks of 2400 KB in 32.3 ms -> 8.30 GB/s
+                             (enqueue alone 12.1 ms, wait 20.2 ms) -> ASYNC
+```
+
+So the calls are **asynchronous** - they do not block for the transfer - but each enqueue costs
+**12.1 ms / 109 = 111 us**, against the ~5 us a trivial kernel submission costs. That is 20x the enqueue
+cost of ordinary work, and in the engine 16 such calls per chunk give ~1.8 ms of the measured 3.9 ms
+per-chunk `stage_host`.
+
+The obvious follow-up - fewer, larger staging chunks - was measured and is wrong:
+
+```text
+AILA_Q4E_STAGING_SLOTS=32   22,649.8 ms   347.8 tok/s
+AILA_Q4E_STAGING_SLOTS=64   27,105.9 ms   290.6 tok/s
+baseline (16)               22,059.1 ms   357.1 tok/s
+```
+
+Larger banks are strictly worse, so 16 slots per bank is already tuned and the per-chunk enqueue cost
+cannot be amortised by making chunks bigger.
+
+### 76.1 Consequence
+
+The remaining 4.7 s is 1.8 ms/chunk of enqueue cost (111 us x 16) plus waiting, and it sits on the
+submitting thread. The only way left to recover it is to stop paying it there - a worker thread - because
+neither the pointer type, the chunk size, nor any exposed flag changes it. That is a concurrency change in
+the weight hot path shared by prefill and decode, and it is the single remaining item between 357.1 and
+400 tok/s.
+
+### 76.2 Goal state
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens (299.3 at 4952, 173.2 at 2026)
+gap           1.12x, all of it in the staging enqueue + wait on the submitting thread
+```

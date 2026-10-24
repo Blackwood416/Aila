@@ -122,11 +122,15 @@ int main(int argc, char** argv) {
                     sycl::event last{};
                     for (size_t i = 0; i < large_chunks; ++i)
                         last = q.memcpy(dev, large2, chunk_bytes);
+                    const double enqueue_ms = ms_since(t1);
                     last.wait_and_throw();
                     const double ms2 = ms_since(t1);
-                    std::printf("large-page via queue.memcpy: %zu chunks of %zu KB in %.1f ms -> %.2f GB/s\n",
+                    std::printf("large-page via queue.memcpy: %zu chunks of %zu KB in %.1f ms -> %.2f GB/s "
+                                "(enqueue alone %.1f ms, wait %.1f ms) -> %s\n",
                                 large_chunks, chunk_kb, ms2,
-                                static_cast<double>(large_chunks) * static_cast<double>(chunk_bytes) / (ms2 * 1e6));
+                                static_cast<double>(large_chunks) * static_cast<double>(chunk_bytes) / (ms2 * 1e6),
+                                enqueue_ms, ms2 - enqueue_ms,
+                                (enqueue_ms > 0.7 * ms2) ? "BLOCKING" : "ASYNC");
                     ctx.free_host(large2);
                 }
             }
