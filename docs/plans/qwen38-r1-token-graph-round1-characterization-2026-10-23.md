@@ -2285,6 +2285,13 @@ already 2048 under either setting, so only the negligible 56- and 4-token remain
 
 ### 52.1 What this means for the 400 tok/s goal
 
-The staging volume at 2048 tokens is inherent - one chunk routes to ~72% of all (layer, expert) pairs,
-geometry PREFILL_CHUNK = 512 gives 2048 -> 1```
-... (truncated)
+The staging volume at 2048 tokens is inherent - one chunk routes to about 72% of all (layer, expert)
+pairs, so 42.6 GB must cross the link once per pass - and the copy probe says the best achievable rate
+for that volume is 42.6 GB / 9.54 GB/s = 4.5 s. So staging alone does not explain a 127 s pass.
+
+The 5x per-token growth inside one chunk does. Whatever grows faster than linearly there is now the
+target, and the two candidates worth separating are the block-sparse attention path (whose block count
+per token grows with position, `tile_max_blocks = (tile_start_pos + tile_count) / compress_ratio`, so
+score and selection work is O(tokens x blocks)) and the expert GEMM path (whose row count per expert
+grows with tokens). One measurement separates them: run 1024- and 1536-token prompts and check whether
+the growth tracks tokens x blocks (attention) or tokens x experts (MoE).
