@@ -2997,3 +2997,51 @@ remaining work      6.4 s of staging copies that a second queue demonstrably can
 Two rounds of flag-level attempts at that 6.4 s have both come back neutral, so the next attempt should
 not be another flag: it should be `platform_events`-style tracing of one layer, or a targeted patch that
 wraps the staging call and the first matmul of a band in a timestamp pair and prints them.
+
+## 67. The QSA prefill tile was pinned at 64 and the curve peaks near 1024
+
+The tile was not a tunable in the preset: `qsa_query_tile_` came from
+`clamp(logits_budget / row_bytes, 16, 64)` with a 4 MB budget, which at every realistic `max_seq`
+evaluates to the 64 upper bound. Each tile costs three launches (block scores, top-k, sparse attention),
+so a 64-row tile makes **123 launches per QSA layer**, which is exactly the 1,476 instances seen in the
+section 64 trace.
+
+Sweep at 7878 tokens:
+
+| `AILA_QSA_QUERY_TILE` | wall | ms/token | tok/s |
+|---:|---:|---:|---:|
+| 64 (the pinned value) | 26,233 ms | 3.33 | 300.3 |
+| 128 | 25,733 ms | 3.27 | 306.1 |
+| 256 | 25,397 ms | 3.22 | 310.2 |
+| 512 | 25,172 ms | 3.20 | 313.0 |
+| **1024** | **25,128 ms** | **3.19** | **313.5** |
+| 4096 | 25,533 ms | 3.24 | 308.5 |
+
+The curve peaks near 1024 and turns over by 4096. The default is now budget-driven with the ceiling
+raised: `AILA_QSA_LOGITS_BUDGET_BYTES` is 16 MB and the clamp is `[16, 1024]`, so
+`qsa_tile_block_scores` stays bounded at 16 MB for any `max_seq` while the tile lands at 1024 at the
+sequences this engine is used with. Verified on the shipped path with no overrides:
+
+```text
+2026 tokens   11,795.6 ms   5.82 ms/token   171.8 tok/s   (was 171.0, no regression)
+7878 tokens   25,272.3 ms   3.21 ms/token   311.7 tok/s   (was 299.5-300.3, +3.9%)
+```
+
+Two more zero-code candidates were measured and are neutral, so they are recorded rather than pursued:
+
+```text
+AILA_Q4E_GDN_HISTORY_FUSED=1   25,213.4 ms   312.5 tok/s   (vs 313.1 off)
+AILA_Q4E_LARGE_PAGE_PIPELINE=1 26,312.3 ms   299.4 tok/s   (section 66; gated behind !host_pool_enabled_)
+```
+
+### 67.1 Goal state
+
+```text
+target        400 tok/s
+best measured 311.7 tok/s at 7878 tokens, 171.8 at 2026
+remaining     1.28x
+```
+
+The unattended 6.4 s of staging copies (section 65) is still the largest single identified item, and the
+GDN prefill kernel at 5.24 s (section 64) is next. Both are larger than anything left on the QSA side now
+that its launch count is cut by 16x.

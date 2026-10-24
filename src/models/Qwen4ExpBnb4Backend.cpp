@@ -1273,11 +1273,24 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.indexer_active_tokens = Tensor::allocate(ctx, {std::max(max_seq_len_, cfg_.indexer_budget + cfg_.indexer_compress_ratio)}, dnnl::memory::data_type::s32);
     const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / (cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4);
     buf_.indexer_active_blocks = Tensor::allocate(ctx, {block_topk + 4}, dnnl::memory::data_type::s32);
-    static const int s_qsa_logits_budget = aila::env::read_int("AILA_QSA_LOGITS_BUDGET_BYTES", 4 * 1024 * 1024);
+    // Round 3 measurements on tools/prefill-bench.ps1 at 7878 tokens show the tile size is
+    // worth real time because each tile is three kernel launches (block scores, top-k, sparse
+    // attention) and a 64-row tile makes 123 launches per QSA layer:
+    //   tile 64 (old default)  26,233 ms  300.3 tok/s
+    //   tile 128               25,733 ms  306.1 tok/s
+    //   tile 256               25,397 ms  310.2 tok/s
+    //   tile 512               25,172 ms  313.0 tok/s
+    //   tile 1024             25,128 ms  313.5 tok/s
+    //   tile 4096              25,533 ms  308.5 tok/s
+    // so the curve peaks near 1024. The buffer is bounded by a byte budget rather than a fixed
+    // tile count, which keeps qsa_tile_block_scores at 16 MB whatever max_seq is; at max_seq 16384
+    // that yields 1024 rows and at max_seq 4096 it yields 4096 rows, clamped to 1024.
+    static const int s_qsa_logits_budget =
+        aila::env::read_int("AILA_QSA_LOGITS_BUDGET_BYTES", 16 * 1024 * 1024);
     const size_t row_bytes = static_cast<size_t>(max_complete_blocks) * sizeof(float);
     int default_tile = 64;
     if (row_bytes > 0) {
-        default_tile = std::clamp(static_cast<int>(s_qsa_logits_budget / row_bytes), 16, 64);
+        default_tile = std::clamp(static_cast<int>(s_qsa_logits_budget / row_bytes), 16, 1024);
     }
     qsa_query_tile_ = aila::env::read_int("AILA_QSA_QUERY_TILE", default_tile);
     buf_.qsa_tile_block_scores = Tensor::allocate(ctx, {qsa_query_tile_, max_complete_blocks}, dnnl::memory::data_type::f32);
