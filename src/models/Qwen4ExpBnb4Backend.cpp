@@ -591,7 +591,14 @@ bool Qwen4ExpBnb4Backend::load(
         throw std::invalid_argument("AILA_Q4E_PREFILL_ATTN_TILE must be 0, 128, 256 or 512");
     grouped_xmx_supported_ = ctx.queue().get_device().get_info<sycl::info::device::name>().find("Arc(TM) A770") != std::string::npos;
     expert_histogram_enabled_ = aila::env::read_flag("AILA_Q4E_EXPERT_HISTOGRAM", false);
-    gdn_chunk_mode_ = std::clamp(aila::env::read_int("AILA_Q4E_GDN_CHUNK_MODE", 0), 0, 2);
+    // Round 3 measurements on tools/prefill-bench.ps1 at 7878 tokens:
+    //   mode 0 (recurrence)          25,272 ms  311.7 tok/s   <- old default
+    //   mode 1 (FP32 chunk control)  24,645 ms  319.7 tok/s
+    //   mode 2 (BF16 XMX products)   24,798 ms  317.7 tok/s
+    // The chunked path replaces the 5.24 s `run_linear_delta_prefill_gpu_batched` recurrence that
+    // the section 64 trace showed dominating GDN. Mode 1 is the fastest and is the default now;
+    // the flag still selects 0 or 2.
+    gdn_chunk_mode_ = std::clamp(aila::env::read_int("AILA_Q4E_GDN_CHUNK_MODE", 1), 0, 2);
     spec_ = spec;
     cfg_ = spec.qwen4exp_text;
     hidden_size_ = cfg_.hidden_size;

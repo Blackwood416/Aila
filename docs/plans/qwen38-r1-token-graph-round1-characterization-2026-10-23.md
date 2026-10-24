@@ -3045,3 +3045,45 @@ remaining     1.28x
 The unattended 6.4 s of staging copies (section 65) is still the largest single identified item, and the
 GDN prefill kernel at 5.24 s (section 64) is next. Both are larger than anything left on the QSA side now
 that its launch count is cut by 16x.
+
+## 68. GDN prefill was running the recurrence fallback; the chunked path is faster
+
+Section 64's trace showed `run_linear_delta_prefill_gpu_batched_impl` at 5.24 s over 108 instances - 20%
+of prefill and the second largest item. The call site explains why it is the one running: `gdn_chunk_mode_`
+defaults to **0**, and only modes above 0 take `try_linear_delta_prefill_chunked`, so the engine has been
+using the plain recurrence on every prefill.
+
+```text
+mode 0 (recurrence)          25,272 ms  311.7 tok/s   <- old default
+mode 1 (FP32 chunk control)  24,645 ms  319.7 tok/s
+mode 2 (BF16 XMX products)   24,798 ms  317.7 tok/s
+```
+
+Mode 1 is now the default (`Qwen4ExpBnb4Backend.cpp:594`, flag still selects 0 or 2). Note the gain is
+2.6% rather than the ~13% the 5.24 s share suggested, so the chunked path still spends most of that time
+in its own kernels; a remaining GDN lever would have to be inside it.
+
+### 68.1 Shipped state after this round
+
+All defaults, no overrides, `tools/prefill-bench.ps1` shapes:
+
+| prompt | tok/s | previous round |
+|---:|---:|---:|
+| 2026 | **175.6** | 171.8 |
+| 4952 | **267.3** | 250.3 |
+| 7878 | **322.9** | 311.7 |
+
+```text
+target 400 tok/s; best measured 322.9; gap 1.24x
+```
+
+Cumulative through this goal: **150 tok/s (2K) and 137 (3K) at the start, now 175.6 and 322.9.**
+
+### 68.2 What is left, in measured order
+
+1. **6.4 s of expert staging copies** (section 64/65). A second queue demonstrably hides them
+   (probe: 154.9 ms concurrent against 193.6 ms serial) but two rounds of flag attempts found no switch
+   that changes it, so the next attempt has to be a code change in the staging pipeline.
+2. **GDN inside the chunked path** - now ~4.6 s of the run remains in GDN-family kernels.
+3. **QSA** - down from 3.81 s to roughly 1 s after the tile change.
+4. **Experts** - 3.18 s, unchanged and low priority.
