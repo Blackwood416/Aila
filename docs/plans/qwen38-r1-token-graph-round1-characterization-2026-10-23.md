@@ -2004,3 +2004,50 @@ of device work, while decode's remaining levers are worth at most ~3 ms. Prefill
 3. Whether the 512-expert top-10 routing at 2048 tokens is being evaluated as one batched grouped GEMM
    or as per-token work: 2048 x 10 expert tasks per layer is exactly the shape a grouped GEMM should
    absorb in a few hundred microseconds, not 1.6 s.
+
+## 47. Prefill device-time profile: 60% is memory copies and the GPU is only 25% busy
+
+Taking the prefill-dominated observer-free trace already on disk (`tmp/vtune-xpu-1`, a run with two
+generated tokens, so ~97% of its wall time is prefill) and summing by kernel:
+
+| kernel | device time | share |
+|---|---:|---:|
+| `zeCommandListAppendMemoryCopy` | 15.62 s | 49% |
+| another memory-copy row | 0.83 s | 3% |
+| `gemm_kernel` (two shapes) | 6.77 s | 21% |
+| `submit_dequant` | 1.85 s | 6% |
+| `run_linear_delta_prefill_gpu_batched_impl` (GDN) | 1.42 s | 4% |
+| `attention_prefill_cached_impl` (QSA) | 0.99 s | 3% |
+| `packed_nf4_gemm_bf16_joint_matrix_wide` | 0.83 s | 3% |
+| **total kernel time** | **31.7 s** | |
+
+Against a prefill wall time of ~127 s that is **25% GPU utilisation**, and **memory copies alone are
+60% of the device time**.
+
+### 47.1 What the numbers say
+
+```text
+42.6 GB of host-to-device staging per prefill run
+19.0 s of copy time  ->  2.7 GB/s effective
+4242 MB of static model weights  ->  42.6 GB is about ten times the model
+```
+
+So prefill stages the model roughly ten times over a three-chunk run (2048, 56 and 4 tokens). Even a
+generous PCIe 4.0 link would move 42.6 GB in about 2 s, so the copies are running at roughly a seventh
+of the link's capability, which is the signature of many small scattered transfers rather than a few
+large ones: the trace shows 27213 copy instances averaging 574 us each.
+
+And because the GPU is only a quarter busy, the remaining ~95 s of prefill is *not* compute and *not*
+copy - it is the host orchestrating those transfers and the per-phase bookkeeping around them.
+
+### 47.2 Therefore the first two prefill levers, in order
+
+1. **Move less.** 42.6 GB is ten times the model; expert staging should be able to reuse what is
+   already resident between chunks and within a chunk's layers. This is the largest single number in
+   the whole prefill picture.
+2. **Move it better.** 2.7 GB/s for 574 us average copies means the transfers are fragmented; batching
+   them into fewer, larger copies should approach the link's bandwidth, which alone would cut the 15.6 s
+   to a few seconds.
+
+Both are measurable with counters already printed (`h2d_mb`, `fill_ms`, `bank_wait_ms`, `staged`) plus
+one new counter: copy calls per phase.
