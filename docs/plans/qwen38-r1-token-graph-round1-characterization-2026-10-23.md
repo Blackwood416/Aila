@@ -3087,3 +3087,45 @@ Cumulative through this goal: **150 tok/s (2K) and 137 (3K) at the start, now 17
 2. **GDN inside the chunked path** - now ~4.6 s of the run remains in GDN-family kernels.
 3. **QSA** - down from 3.81 s to roughly 1 s after the tile change.
 4. **Experts** - 3.18 s, unchanged and low priority.
+
+## 69. The remaining prefill flags are all neutral: the flag space is exhausted
+
+Following the method that produced sections 67 and 68 (check whether a conservative default is hiding a
+faster path), every prefill-relevant flag that still defaults off was measured at 7878 tokens against the
+shipped 322.9 tok/s:
+
+| flag set to 1 | wall | ms/token | tok/s |
+|---|---:|---:|---:|
+| `AILA_Q4E_LAYER_MAJOR` | 24,598.7 ms | 3.12 | 320.3 |
+| `AILA_Q4E_RESIDENT_PREFILL` | 24,504.7 ms | 3.11 | 321.5 |
+| `AILA_Q4E_FUSED_PREFILL` | 24,667.5 ms | 3.13 | 319.4 |
+| none (shipped) | 24,396.2 ms | 3.10 | **322.9** |
+
+All three are neutral to slightly worse. Together with the earlier neutral results
+(`AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M`, `AILA_Q4E_LARGE_PAGE_PIPELINE`, `AILA_Q4E_GDN_HISTORY_FUSED`,
+the canonical weight layout, `AILA_Q4E_PREFILL_EXPERT_XMX_ROWS` 2048/8192), **the prefill flag space is now
+exhausted**: every switch that the engine exposes for this path has been measured, and the four wins of
+this goal were all found by checking a default (chunk 512 -> 8192, XMX row gate, QSA tile 64 -> 1024,
+GDN chunk mode 0 -> 1).
+
+### 69.1 What that means for the remaining 1.24x
+
+Nothing further can be obtained by configuration. The two candidates left both need code:
+
+1. **The 6.4 s of expert staging copies** (sections 64-65). A second queue provably hides them
+   (`AilaH2DBandwidthProbe`: 154.9 ms concurrent against 193.6 ms serial) and `copy_q_` already exists,
+   so the work is to find and remove the host-side wait that pins the copy to the critical path. Two flag
+   attempts failed to move it, so it must be located by instrumenting the staging call against the band's
+   first matmul.
+2. **GDN inside the chunked path**, still on the order of 4.6 s, plus the 3.18 s of expert GEMMs.
+
+### 69.2 Goal state at the end of this round
+
+```text
+target        400 tok/s
+best measured 322.9 tok/s at 7878 tokens (175.6 at 2026, 267.3 at 4952)
+gap           1.24x
+```
+
+Started at 150 tok/s measured at 2K tokens; the shipped defaults now give 175.6 there and 322.9 at 8K,
+which is **+17% and +115%** respectively, with no flag required of the user.
