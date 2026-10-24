@@ -1743,3 +1743,46 @@ The right procedure is therefore:
 This also argues for one small instrumentation addition before the next group: log the **actual**
 submission count per token next to `submit_ms`, since the node counter reports logical groups (352)
 rather than submissions (~654) and a count is immune to timing noise.
+
+## 41. Correcting the submission-time statistics, and what they now validate
+
+Section 40 concluded that a 2.5 ms submission saving sits inside the noise of `submit_ms`. That
+conclusion was reached from polluted numbers: the pattern `submit_ms=([0-9.]+)` also matches
+`topk_submit_ms=` and `shared_submit_ms=` inside the `[Q4E AdaptiveWork]` lines, which carry values
+like 76558 and 1.375. Half the samples in every run were those fields.
+
+Parsing only the real line, `] submit pos=<n> nodes=<n> submit_ms=<v>`, gives eight decode samples per
+run and a much tighter statistic:
+
+| run | configuration | min | median |
+|---|---|---:|---:|
+| `tail-rev0` | tail fusion **off** | 39.85 | 41.71 |
+| `tail-rev1` | tail fusion **on** | 37.80 | 38.51 |
+| `rfx0` | router fusion **off** | 36.06 | 38.56 |
+| `rfx1` | router fusion **on** | 37.03 | 37.99 |
+
+### 41.1 The tail fusion's host saving is confirmed
+
+41.71 -> 38.51 ms is **3.2 ms** of submission time removed by fusing three element-wise tail kernels
+into one. Until now that fusion was justified only by a 0.9 ms `route_wait` improvement, measured on
+the device side, where removing host submissions should not even show up. The host-side figure is the
+one that matches the mechanism: 96 submissions at ~35 us each.
+
+So `submit_ms` can resolve a group of ~96 submissions at about 3 ms, i.e. the instrument is good to
+roughly 1 ms when parsed correctly. That sets the target: land at least ~50 submissions' worth of
+fusion per measurement, which the roadmap items satisfy individually except the QSA pairs.
+
+### 41.2 The router fusion does not deliver
+
+38.56 -> 37.99 ms median, and its minimum got *worse* (36.06 -> 37.03). The mechanism is real - reading
+`launch_router_softmax_topk` confirms one submission on the 512-expert path - so the plausible
+explanation is that the fused kernel costs more than the submission it removes: it writes three extra
+arrays that the split form did not, and one of them (`host_selected`) duplicates `resident_selected`.
+
+It stays off, and the next attempt should pass `nullptr`-safe distinct targets or drop the redundant
+writes rather than simply renaming the pointers.
+
+### 41.3 Method note for every future measurement
+
+Parse `] submit pos=` only. Use the median over the run's decode tokens. A change worth less than
+about 1 ms of host submission is not worth measuring this way; group such changes.
