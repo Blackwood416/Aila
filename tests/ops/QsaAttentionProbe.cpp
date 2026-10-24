@@ -23,6 +23,7 @@ bool g_kv_quant_override = false;
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -41,14 +42,23 @@ void expect(bool condition, const char *what) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    // Cells can be overridden so the operator's scaling can be measured without
+    // rebuilding: linear in cells means throughput-bound (fewer reads would
+    // help), flat means the per-work-group serial work dominates (more
+    // work-groups would help).
+    int cells_arg = 2052;
+    if (argc > 1) {
+        cells_arg = std::atoi(argv[1]);
+        if (cells_arg < 256) cells_arg = 256;
+    }
     constexpr int kHeads = 24;
     constexpr int kKvHeads = 2;
     constexpr int kHeadDim = 256;
-    constexpr int kCells = 2052;
+    const int kCells = cells_arg;
     constexpr int kTile = 128;
     constexpr int kStride = 272;
-    constexpr int kTiles = (kCells + kTile - 1) / kTile;
+    const int kTiles = (kCells + kTile - 1) / kTile;
 
     Context ctx(nullptr, /*profiling=*/true);
     auto q = Tensor::allocate(ctx, {1, kHeads * kHeadDim},
@@ -91,18 +101,26 @@ int main() {
     ctx.synchronize();
 
     constexpr int kSamples = 30;
+    // Batch the timed calls between one pair of barriers. A single call between
+    // its own barrier pair measures ~180 us regardless of how many cells it
+    // touches, which is the profiling-queue barrier and wait cost, not the
+    // kernel: at 256 cells the operator still reported 180 us against 217 us at
+    // 2052. Amortising over kBatch calls removes that constant.
+    constexpr int kBatch = 10;
     std::vector<double> samples;
     samples.reserve(kSamples);
     for (int i = 0; i < kSamples; ++i) {
         auto begin = ctx.queue().ext_oneapi_submit_barrier();
-        run_once();
+        for (int b = 0; b < kBatch; ++b) {
+            run_once();
+        }
         auto end = ctx.queue().ext_oneapi_submit_barrier();
         end.wait_and_throw();
         const auto t0 =
             begin.get_profiling_info<sycl::info::event_profiling::command_end>();
         const auto t1 =
             end.get_profiling_info<sycl::info::event_profiling::command_end>();
-        samples.push_back(static_cast<double>(t1 - t0) * 1e-3);  // ns -> us
+        samples.push_back(static_cast<double>(t1 - t0) * 1e-3 / kBatch);
     }
 
     std::sort(samples.begin(), samples.end());

@@ -1490,3 +1490,66 @@ merge kernel's expectation, which is the bug the first revision actually had (it
 The probe's sanity check (output not all zeros) is what made this attempt cheap to judge. Every
 future kernel experiment should keep that check, because a fast-but-wrong kernel would otherwise look
 like a win in the model the moment the gate happens not to trip.
+
+## 35. The attention operator is dominated by a per-call fixed cost, not by its tile work
+
+The probe was extended to sweep the cell count, which is the measurement that should have been taken
+before any kernel work on this operator.
+
+### 35.1 Scaling sweep
+
+Single call between its own barrier pair, 30 samples, median:
+
+| cells | tiles | us |
+|---:|---:|---:|
+| 256 | 2 | 180.1 |
+| 512 | 4 | 182.7 |
+| 1024 | 8 | 189.6 |
+| 2052 | 17 | 217.5 |
+| 3072 | 24 | 282.3 |
+
+At 2 tiles, with almost no work at all, the operator still costs 180 us. So essentially the whole
+216 us at the production shape is a **fixed per-call cost**, and the part that scales with the tile
+count is small: about `(282.3 - 187.0) / (24 - 6) = 2.4 us per tile`, i.e. roughly 41 us of the
+216 us at 17 tiles.
+
+### 35.2 Measurement correction
+
+Batching ten calls between one barrier pair and dividing by ten replaces the per-measurement cost
+with the per-call cost:
+
+```text
+batch=1  : 217.5 us at 2052 cells, 180.1 us at 256 cells
+batch=10 : 180.4 us at 2052 cells, 143.6 us at 256 cells
+```
+
+So ~37 us of the single-call figure is the profiling-queue barrier pair and its wait, and the
+remaining **~143 us is charged per call** and does not depend on the context length, the tile count
+or the number of heads.
+
+### 35.3 What this explains, and what it invalidates
+
+It explains the four neutral model results in sections 28-32. Those changes all addressed the
+per-tile work, which is 41 us of a 217 us operator, i.e. 0.5 ms of a 46 ms token, and that is below
+the resolution of a single A/B in the model. The premise behind them - "the attention core is 1.85 ms
+of the critical path because it is 155 us per layer" - was wrong for the operating point, and the
+probe backed it up only because the probe itself was dominated by the same kind of constant.
+
+It also invalidates the first GQA rewrite (section 34) as a way to win: making K/V reads twelve times
+cheaper can at best attack the 41 us, not the 143 us.
+
+### 35.4 The next measurement, before any more kernel work
+
+The 143 us per call has to be attributed before anything else. The candidates, in order:
+
+1. **the operator's own host side**, since two submissions of that size cannot cost 143 us of device
+   time (a launch measures 9.4 us, section 20.2), and a host-side query such as
+   `kv_int8_dpas_enabled(ctx.queue().get_device())` is the only thing besides the submissions in the
+   dispatch path;
+2. **the profiling queue itself**, if `enable_profiling` makes each submission materially slower on
+   this driver - which can be checked by running the same batch on a non-profiling queue and timing
+   wall clock instead of events;
+3. the device drain of the batch tail.
+
+Until that is answered, per-tile kernel optimisation has a ceiling of about 40 us per call and should
+stay parked.
