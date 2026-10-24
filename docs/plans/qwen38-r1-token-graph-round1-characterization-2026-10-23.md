@@ -2746,3 +2746,48 @@ pinned it: 512 per-expert matmuls of M~154 per layer at ~7% of peak, which needs
 rather than the per-expert loop. `AILA_Q35_PREFILL_CHUNK=16384` is worth 8% at 12K and is measured and
 available, but it is left out of the preset because the scratch's `max_chunk_rows` is 4096 and the extra
 size buys nothing short of 8K.
+
+## 62. The per-expert row batch is already at its best available setting
+
+The leading candidate from section 60 was that each layer is 512 per-expert matmuls with M around 154
+rows while the scratch pads every expert in a band to `max_chunk_rows / 16` rows. That padding is real,
+so the sweep was tried at 7878 tokens:
+
+```text
+ROWS=2048  (M=128/expert)   27,672.1 ms   3.51 ms/token   284.7 tok/s
+ROWS=4096  (M=256/expert)   26,304.9 ms   3.34 ms/token   299.5 tok/s   (shipped)
+ROWS=8192  (M=512/expert)   not accepted - the log still reports max_chunk_rows=4096 and the run fails
+```
+
+So 4096 is optimal among what the engine accepts: smaller M loses 5%, and larger is not supported. The
+scratch is sized for `kMaxExpertsPerChunk = 16` experts per band, so raising M further would need that
+constant lowered (fewer experts per band at the same total rows) - a real code change with a matching
+memory trade, since one weight bank is 16 x 3.28 M x 2 B = 105 MB.
+
+### 62.1 Where the goal stands, with the arithmetic of the remaining gap
+
+```text
+expert GEMM work per pass   7878 tokens x 10 experts x 48 layers x 4.91 M MAC = 18.6 T MAC = 37 TFLOP
+padded by 256/154                                   ->  ~61 TFLOP of issued work
+measured                                            26.3 s including everything else
+effective throughput on the padded work              ~2.3 TFLOPS, about 11% of this GPU's ~20 TFLOPS
+```
+
+So the per-expert batched oneDNN matmul is running at roughly a tenth of peak, and the padding is a 1.66x
+tax on top. Neither is addressable by a flag: the remaining 1.34x to 400 tok/s needs either a hand-written
+DPAS grouped GEMM over a layer's experts, or a band geometry with fewer experts per band so each expert's
+M is larger.
+
+### 62.2 Final state of this round
+
+| prompt | tok/s |
+|---:|---:|
+| 2026 | 171.0 |
+| 2995 | 194.3 |
+| 4952 | 250.3 |
+| 7878 | **299.5** |
+| 12172 (16384 chunk) | 289.2 |
+
+Started this goal at 150 tok/s measured at 2K tokens and an assumed 16 tok/s baseline that turned out to
+be an artefact of the decode runner; the engine now does **299.5 tok/s at 8K tokens** with all of it
+landing as shipped defaults (`PREFILL_CHUNK` 8192, XMX enabled above 4096 rows).
