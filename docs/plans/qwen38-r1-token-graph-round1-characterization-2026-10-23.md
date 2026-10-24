@@ -1310,3 +1310,40 @@ documentation records it as **2-3x slower** than the chunk kernel for decode (13
 per 32-query batch at 2051 cells) because the SLM packing and four to five barriers per chunk
 outweigh DPAS on gathered K/V rows. So extending Aila's `joint_matrix` path from `head_dim` 128
 to 256 is the wrong direction for decode, however attractive XMX looks on paper.
+
+## 31. Third neutral result: the score phase is not where phase 1 spends its time
+
+Section 30 identified 25% cache-line utilisation from the 512 B lane stride as the mechanism behind
+the attention core's 155 us. The score phase was rewritten to remove it: one sub-group per cell with
+the head dimension split across its lanes, so each sub-group reads one contiguous 512 B row (eight
+full cache lines) instead of sixteen separate lines. Verified to build and pass the gate, measured:
+
+```text
+coalesced score phase : route_wait 25.22   decode p50 47.28   gate_fail 0
+previous              : route_wait 25.14   decode p50 46.4-46.8
+```
+
+Neutral again. That is the third explanation for this kernel that measurement has rejected (K/V
+reorder 28.1, index-chain hoisting 30.1, coalesced K reads here), and together they say something
+specific: **phase 1 is dominated by the V stage, not the score stage.** The score stage costs 32
+`vec8` loads and 256 FMAs per thread, while the V stage runs `tile_len = 128` sequential iterations
+per thread with two dependent loads each, so it is a much deeper dependency chain with poor memory
+level parallelism. The change was reverted rather than kept: it was neutral, and it simplified away
+the int8 `kv_i8_vec` fast path.
+
+### 31.1 What the evidence now points at
+
+The V loop is the target, and the reference implementation in `tmp/XeStrata` already shows the fix:
+unroll four cells and issue all four `V` loads before folding them into the accumulators, which
+turns a 128-deep chain of dependent loads into a pipeline four deep. Their V loop also has each
+thread own one dimension for **all twelve heads**, which additionally removes the twelve-fold GQA
+re-read.
+
+For anyone continuing: the ordered experiment list is now
+
+1. four-cell unroll of the existing V loop (small, contained, keeps the current grid);
+2. then the full `CHUNK`/`reduce12` port from `tmp/XeStrata/src/kernels/xe/qsa_decode_attn.cpp`
+   if (1) shows the V stage really is the bulk.
+
+Both need the same measurement discipline used here: `route_wait` as the decision metric, VTune
+`xpu-offload` for kernel durations, and no in-code marks while deciding.
