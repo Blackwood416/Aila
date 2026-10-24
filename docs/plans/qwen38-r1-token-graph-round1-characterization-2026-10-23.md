@@ -2255,3 +2255,36 @@ host stage wall time, and ~127 s of wall clock in which device busy is well unde
 
 This is recorded as a correction rather than an edit so the reasoning trail stays honest: the copy model
 in section 50.2 is solid (it comes from a standalone probe), while the phase attribution was not.
+
+## 52. Prefill scaling: per-token cost grows 5x from 772 to 2048 tokens inside a single chunk
+
+Direct CLI runs on the same model, one prompt each, `--max-tokens 1`:
+
+| prompt | wall | ms/token | chunking |
+|---|---:|---:|---|
+| 772 tokens | 13.65 s | **17.7** | `PREFILL_CHUNK=512` -> 512 + 256 |
+| 772 tokens | 9.75 s | **12.6** | `PREFILL_CHUNK=2048` -> single chunk |
+| 2108 tokens | 133.0 s | **63.5** | 2048 + 56 + 4 |
+
+Two facts follow.
+
+**First, the discovered knob works, and it is a real win.** `AILA_Q35_PREFILL_CHUNK` is set by the
+`qwen38-a770` preset to 512, and raising it to 2048 makes a 772-token prefill **29% faster**
+(13.65 -> 9.75 s, i.e. 17.7 -> 12.6 ms/token), verified from the `[PerformancePreset] ... source=environment`
+line so the override was actually in force. The mechanism is that expert staging is a **per-chunk fixed
+cost**: one 512-token chunk already routes to nearly every expert, so two chunks stage the expert set
+twice.
+
+**Second, and more important, the cost is superlinear in tokens within one chunk.** Comparing the two
+single-chunk cases: 772 tokens cost 12.6 ms/token while 2048 tokens cost 63.5 ms/token. That is 5x the
+per-token cost for 2.65x the tokens, so the dominant term grows faster than linearly in sequence length.
+
+That also explains why raising the chunk did nothing for the 2108-token prompt (133.0 s against a 133.8 s
+baseline, with `staged` 17,664 vs 17,548 and `h2d_mb` 42.7 vs 42.2 GB unchanged): its first chunk was
+already 2048 under either setting, so only the negligible 56- and 4-token remainders changed.
+
+### 52.1 What this means for the 400 tok/s goal
+
+The staging volume at 2048 tokens is inherent - one chunk routes to ~72% of all (layer, expert) pairs,
+geometry PREFILL_CHUNK = 512 gives 2048 -> 1```
+... (truncated)
