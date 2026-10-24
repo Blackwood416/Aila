@@ -1212,3 +1212,43 @@ accumulators per thread) collapses the grid to `2 x 17 = 34` work-groups, which 
 512-core device. It has to be combined with splitting the token dimension, e.g. 32 tokens per
 work-group, giving `2 x 17 x 4 = 136` work-groups of 128 threads, and with twelve independent
 accumulators per thread so the dependency chain does not become 3072 FMAs long.
+
+## 29. The attention core split, measured
+
+The observer-free decode trace separates the QSA attention path into three rows by grid size, which
+finally splits it into phases:
+
+| kernel | GlobalWS | work-groups | calls/token | per call | ms/token |
+|---|---:|---:|---:|---:|---:|
+| phase 1 (scores + V partials) | 52224 | 408 | 8.9 | **155 us** | **1.38** |
+| phase 2 (partial merge) | 3072 | 24 | 11.7 | 26 us | 0.30 |
+
+Phase 1 is 85% of it. Its traffic, with `num_heads` 24 over `num_kv_heads` 2:
+
+```text
+K read once per query head : 24 x 2052 x 512 B = 25.2 MB
+V read once per query head : 24 x 2052 x 512 B = 25.2 MB
+total                      : 50.4 MB in 155 us = 322 GB/s
+unique K + V               :  4.2 MB
+```
+
+Both phases read the whole tile once per query head, so the twelve-fold redundancy is confirmed on
+both K and V. Phase 2 also re-reads the per-tile partials: `24 heads x 17 tiles x 272 floats x 4 B
+= 444 KB` in 26 us, which is only 26 GB/s and is itself mostly launch cost at 24 work-groups.
+
+### 29.1 The decisive next experiment
+
+Whether phase 1 is volume-bound or chain-bound can be settled cheaply: make each work-group serve
+**two** query heads that share a KV head (read the K row once, keep two accumulators), which halves
+K traffic and halves the grid. If phase 1 drops roughly in proportion the kernel is volume-bound
+and the full staging rewrite is worth it. If it does not move, the kernel is bound by the
+256-FMA dependency chain per thread and the parallelisation has to change instead.
+
+### 29.2 What the eventual fix has to look like
+
+Cutting the K/V volume by 12x requires one work-group to read a tile once and serve every query
+head that shares it. The naive form collapses the grid to `2 kv_heads x 17 tiles = 34`
+work-groups, which starves a 512-core device, so it has to be combined with a token split and with
+per-head accumulators held in lanes rather than in one thread. That is a flash-attention-shaped
+kernel, and it is the reason the cheap two-head probe comes first: it decides whether the rewrite
+is justified before it is written.
