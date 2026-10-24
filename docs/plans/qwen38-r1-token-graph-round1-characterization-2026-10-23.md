@@ -1786,3 +1786,35 @@ writes rather than simply renaming the pointers.
 
 Parse `] submit pos=` only. Use the median over the run's decode tokens. A change worth less than
 about 1 ms of host submission is not worth measuring this way; group such changes.
+
+## 42. Per-submission cost is not uniform: 33 us for a large kernel, 12 us for a tiny one
+
+Putting the two measured fusions side by side recalibrates the roadmap.
+
+| fusion | submissions removed | measured host saving | per submission |
+|---|---:|---:|---:|
+| tail (3 kernels -> 1, 256-work-group grid) | 96 | 3.2 ms | **33 us** |
+| router (classify folded into top-k, 1 work-group) | 48 | 0.57 ms | **12 us** |
+
+So "53 us per submission" was an average over the whole token, and it is not what a given removal is
+worth: a submission costs roughly with the size of its descriptor and grid, and a single-work-group
+kernel submits at about a third of the rate of a 256-work-group one.
+
+### 42.1 Consequences for the roadmap in section 38
+
+- Layer-body rank 2 (drop `submit_packet_copy`, a 128-work-group copy of the packet rows) is the
+  remaining large-descriptor item, so its 48 removals should be worth ~1.5 ms rather than 2.5 ms.
+- Layer-body rank 3 (fuse top-k + publish + classify) merges one tiny and two small kernels, so 96
+  removals are probably worth ~1.2-1.5 ms, not 5.1 ms.
+- The QSA pairs (12 removals of single-work-group kernels each) are worth ~0.15 ms apiece, i.e. below
+  the instrument. They should be batched with something else or left alone.
+
+Revised expectation for the whole roadmap: roughly **3-4 ms**, not 12 ms. That is still the largest
+remaining item on the critical path, but it will take the whole group to measure.
+
+### 42.2 What would change the picture
+
+If submission cost tracks descriptor size, then the lever is not only *fewer* submissions but
+*cheaper* ones: fewer kernel arguments, no unnecessary USM pointers, and smaller grids. That is worth
+measuring directly with a micro-probe that submits N trivial kernels with 2 arguments versus 2
+hundreds, because a factor of two there would apply to all ~650 submissions in the token.
