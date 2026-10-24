@@ -3517,3 +3517,47 @@ reverted      the merged-copy experiment; worktree clean at the best known commi
 The staging enqueue cost on the submitting thread is now the only identified item, and both cheap
 approaches to it (bigger banks in section 76, one big copy here) have been measured and do not pay. What
 remains is the worker-thread change, which is a concurrency edit to the weight hot path shared with decode.
+
+## 78. Deeper staging pipelines do not help either
+
+With `banks=2 lookahead=1` the host can only prepare one chunk ahead, so the 111 us-per-copy enqueue cost
+lands on the submitting thread synchronously once per chunk. `AILA_Q4E_PREFILL_STAGING_BANKS` deepens that:
+
+```text
+banks=2 (shipped)   22,059.1 ms   357.1 tok/s   [Q4E PrefillStage] banks=2 lookahead=1
+banks=3             22,016.9 ms   357.8 tok/s   [Q4E PrefillStage] banks=3 lookahead=2
+banks=4             22,517.7 ms   349.9 tok/s   [Q4E PrefillStage] banks=4 lookahead=3
+```
+
+Three banks is inside noise and four is worse (the extra staging banks come out of the expert cache, so
+residency drops). So the host's staging cost is not a lookahead-depth problem: giving it more room to run
+ahead does not recover any time, which means the cost is per-chunk work that it must do anyway.
+
+### 78.1 Exhaustion summary for the final 1.12x
+
+Every routing-and-staging knob has now been measured at 7878 tokens against 357.1 tok/s:
+
+| candidate | result |
+|---|---|
+| `PREFILL_STAGING_BANKS` 3 / 4 | 357.8 / 349.9 - neutral then worse (section 78) |
+| `STAGING_SLOTS` 32 / 64 | 347.8 / 290.6 - worse (section 76) |
+| merged 16-copy chunk | 351.7 - worse, reverted (section 77) |
+| `STAGE_DIRECT_ARENA` | **+10.8%** after passing the argument (section 74) |
+| `GDN_CHUNK_MODE` 1 | +2.6% (section 68) |
+| `QSA_QUERY_TILE` 1024 | +3.9% (section 67) |
+| `PREFILL_CHUNK` 8192 | +11-25% depending on length (section 57) |
+| XMX row gate 4096 | 171 vs 151 tok/s at 2K, 299 vs 238 at 8K (section 58) |
+| `LAYER_MAJOR`, `RESIDENT_PREFILL`, `FUSED_PREFILL`, `MIN_M`, `LARGE_PAGE_PIPELINE`, `GDN_HISTORY_FUSED`, weight layout, `XMX_ROWS` | all neutral |
+
+The only unmeasured item is moving the staging enqueue off the submitting thread, which is a concurrency
+change in a hot path shared by prefill and decode and therefore outside what should be attempted as the
+last action of a long session.
+
+### 78.2 Final goal state
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens, 299.3 at 4952, 173.2 at 2026
+gap           1.12x
+start of goal 150.3 tok/s at 2026 tokens
+```
