@@ -1252,3 +1252,61 @@ work-groups, which starves a 512-core device, so it has to be combined with a to
 per-head accumulators held in lanes rather than in one thread. That is a flash-attention-shaped
 kernel, and it is the reason the cheap two-head probe comes first: it decides whether the rewrite
 is justified before it is written.
+
+## 30. The attention core is bound by cache-line overfetch from the 512 B lane stride
+
+Section 28 estimated L2 volume; this section pins the mechanism, and it is a different one.
+
+### 30.1 The access pattern, quantified
+
+In phase 1 thread `lid` owns token `tile_start + lid`, so adjacent lanes of a SIMD16 read
+addresses **512 B apart** (one 256-element bf16 K row). Each `vec8` gather of a sub-group
+therefore touches **16 distinct 64 B cache lines to deliver 256 B**, i.e. 25% cache-line
+utilization. Scaling that up: 3264 sub-groups x 32 gathers = 104448 gather messages, about
+1.67 M cache-line requests, roughly **107 MB of L1/L2 cache-line traffic for 2.1 MB of unique
+K**. Adding V and the twelve-fold GQA reuse gives about **157 MB of cache-line traffic per
+layer**.
+
+That number, not DRAM bandwidth and not instruction count, is what the 155 us is spending, and it
+explains both neutral experiments:
+
+- reordering the work-groups so the twelve query heads run adjacent (28.1) does not change the
+  per-lane stride, so the overfetch is unchanged;
+- hoisting the token->cache-row index chain into SLM (`token_map`, implemented, measured
+  `route_wait` 25.32 vs 25.14 i.e. neutral) removes integer work from the loop but leaves the
+  line utilization at 25%.
+
+The VTune instruction mix agrees: 0.06% of instructions are in the half-float category and the
+kernel runs at 3-4% of the issue rate, so it is stalling on line-granularity memory requests.
+
+### 30.2 The fix, and a reference implementation that already exists
+
+The fix is to make lanes read contiguous bytes: **one sub-group per token, with the 256-element
+head dimension split across its lanes** (16 lanes x 16 bf16 = 512 B contiguous = 8 full cache
+lines, 100% utilization), and to have one work-group serve all `heads_per_kv = 12` query heads so
+K/V is read once instead of twelve times.
+
+Two reference implementations of exactly this shape are on disk under `tmp/`:
+
+- `tmp/XeStrata/src/kernels/xe/qsa_decode_attn.cpp` — GQA split-chunk decode attention for
+  `head_dim = 256`, `G = 12`: `CHUNK = 64` tokens per work-group, 256 threads as 8 sub-groups of
+  32, one work-group per `(query, kv_head, chunk)` so it computes all 12 heads, Q staged in SLM
+  (12 KB) and each lane preloading its own `qr[12][8]` slice into registers, a `reduce12`
+  butterfly that reduces all twelve heads in 16 shuffles instead of 60, and a V loop that
+  unrolls four tokens to issue four loads before the FMAs. K and V are not staged in SLM.
+- `tmp/Strata/sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp` — the same kernel in SYCL.
+
+Their measured decode numbers: ~12-25 us per layer on A770/A770-class parts in a verification
+window, and 34.5 us for one query at 2051 cells on the CUDA path with the `reduce12` form. A
+realistic target for Aila's 2052 contiguous bf16 cells is therefore **20-30 us per layer**, i.e.
+**5-7.5x faster than the current 154 us**, worth roughly 1.1-1.3 ms per token.
+
+### 30.3 Negative result worth keeping: do not use XMX/DPAS for decode attention here
+
+`tmp/XeStrata/src/kernels/xe/qsa_prompt_attn.cpp` and
+`tmp/Strata/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp` implement the joint-matrix form of
+the same operator (12 heads padded to 16 rows, K/V staged in SLM, `8x16x16` DPAS). Strata's own
+documentation records it as **2-3x slower** than the chunk kernel for decode (13.4 ms vs 5.5 ms
+per 32-query batch at 2051 cells) because the SLM packing and four to five barriers per chunk
+outweigh DPAS on gathered K/V rows. So extending Aila's `joint_matrix` path from `head_dim` 128
+to 256 is the wrong direction for decode, however attractive XMX looks on paper.

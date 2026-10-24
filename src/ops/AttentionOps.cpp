@@ -577,6 +577,13 @@ void attention_decode_exact_head256_partial_merge_impl(
     sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
     sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
     sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+    // Token -> cache-row map for this tile, computed once instead of rebuilt
+    // inline on every inner-loop iteration. The VTune instruction mix puts 54%
+    // of this kernel's 32.5 M instructions per call in "Int32 & SP Float", 20%
+    // in "Other" and 15% in "Control Flow", with only 0.06% in the half-float
+    // category: at 6.1 T SIMD-instruction/s that is ~5 us of issue against a
+    // measured 155 us, so the kernel stalls on the dependent index chain.
+    sycl::local_accessor<int, 1> token_map(sycl::range<1>(tile_t), cgh);
 
     cgh.parallel_for(
         sycl::nd_range<1>(num_heads * num_tiles * tile_wg, tile_wg),
@@ -608,11 +615,8 @@ void attention_decode_exact_head256_partial_merge_impl(
           for (int d = lid; d < head_dim; d += tile_wg) {
             q_cache[d] = static_cast<float>(q_ptr[head * head_dim + d]);
           }
-          item.barrier(sycl::access::fence_space::local_space);
-
-          float score = -1e30f;
-          if (lid < tile_len) {
-            const int t = tile_start + lid;
+          for (int i = lid; i < tile_len; i += tile_wg) {
+            const int t = tile_start + i;
             int cache_t = 0;
             if (active_blocks != nullptr && num_active_blocks > 0) {
               if (t < num_active_blocks * 4) {
@@ -625,6 +629,14 @@ void attention_decode_exact_head256_partial_merge_impl(
             } else {
               cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
             }
+            token_map[i] = cache_t;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score = -1e30f;
+          if (lid < tile_len) {
+            const int t = tile_start + lid;
+            const int cache_t = token_map[lid];
             score = 0.0f;
             if constexpr (!Quantized) {
               using vec8 = sycl::vec<bf16, 8>;
