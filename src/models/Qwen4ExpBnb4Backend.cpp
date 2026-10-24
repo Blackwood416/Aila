@@ -2009,13 +2009,34 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
             adaptive_prefill_slots_[prefill_unique_[s+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
         staged_window[c%aila::AdaptiveCacheConfig::kMaxStagingBanks]=batch;
     };
+    // Round 3 instrumentation (AILA_Q4E_PREFILL_EXPERT_TIMING=1): the expert phase is already
+    // pipelined - it stages `lookahead` chunks ahead and hands each chunk's ready_event to
+    // RunGroupedExperts as a dependency instead of waiting on the host - so the open question is
+    // whether the host still blocks inside the staging call itself. These timers print the host wall
+    // time of stage_chunk against RunGroupedExperts per chunk, which separates "the host is blocking"
+    // from "the device is genuinely serialised by dependencies".
+    static const bool s_prefill_expert_timing =
+        aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_TIMING", false);
     for (int c=0;c<lookahead&&c<num_chunks;++c) stage_chunk(c);
     for (int c=0;c<num_chunks;++c) {
         const auto& batch=staged_window[c%aila::AdaptiveCacheConfig::kMaxStagingBanks];
+        const auto t_gemm0 = std::chrono::steady_clock::now();
         last=RunGroupedExperts(ctx,layer,count,chunk_begin(c),chunk_count(c),act_start,tile_start,min_rows,batch.ready_event);
+        const double gemm_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_gemm0).count();
         adaptive_cache_.RecordStagingConsumer(batch.ping_pong_index,last);
         const int next_chunk=c+lookahead;
-        if (next_chunk<num_chunks) stage_chunk(next_chunk);
+        double stage_ms = 0.0;
+        if (next_chunk<num_chunks) {
+            const auto t_stage0 = std::chrono::steady_clock::now();
+            stage_chunk(next_chunk);
+            stage_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_stage0).count();
+        }
+        if (s_prefill_expert_timing) {
+            AILA_LOG_INFO("[Q4E PrefillExpertTiming] layer=%d chunk=%d/%d gemm_host_ms=%.3f stage_host_ms=%.3f",
+                          layer, c + 1, num_chunks, gemm_ms, stage_ms);
+        }
     }
     if (act_start!=count*top_k) throw std::logic_error("Incomplete Qwen4Exp prefill routing map");
     ctx.queue().memcpy(batch_weights_dev_,router_host_weights_,size_t(count)*top_k*sizeof(float));

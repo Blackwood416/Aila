@@ -3129,3 +3129,51 @@ gap           1.24x
 
 Started at 150 tok/s measured at 2K tokens; the shipped defaults now give 175.6 there and 322.9 at 8K,
 which is **+17% and +115%** respectively, with no flag required of the user.
+
+## 70. The host blocks 10.4 s of prefill, 7.1 s of it inside the staging call
+
+`AILA_Q4E_PREFILL_EXPERT_TIMING=1` (added this round, default off) times the two halves of the prefill
+expert driver: the `stage_chunk` call and the `RunGroupedExperts` call, per chunk, on the host clock. At
+7878 tokens there are 1,249 chunks and:
+
+```text
+sum gemm_host  = 3,268.5 ms      (host inside RunGroupedExperts)
+sum stage_host = 7,127.2 ms      (host inside stage_chunk)
+```
+
+Representative lines from layer 0 (`gemm_host_ms=... stage_host_ms=...`):
+
+```text
+chunk 1/11   gemm 37.830  stage 8.737
+chunk 2/11   gemm  5.010  stage 5.965
+chunk 3/11   gemm 72.305  stage 5.953
+chunk 5/11   gemm  2.353  stage 6.000
+chunk 7/11   gemm  2.531  stage 6.191
+```
+
+### 70.1 What the numbers mean
+
+Per chunk `stage_host` is remarkably stable at ~6 ms. A chunk stages 16 experts, so it moves
+16 x 2.4 MB = 39 MB, and **39 MB / 6 ms = 6.5 GB/s**, which is this host's DDR4 streaming rate - the
+staging call is a host-side memory copy (`load_expert_to_staging`, mmap'd weights into the pinned staging
+buffer), and it blocks the host while it runs. That is a *second* movement of the same 42.6 GB, on top of
+the 6.4 s of device-side `zeCommandListAppendMemoryCopy` that the trace showed.
+
+The `gemm_host` column is bimodal: 72 ms and 37 ms early in a layer, then 2.4-5 ms for the rest. Small
+values are just submission; the large ones are the host waiting for a copy, which is the fast chunk
+waiting on its dependency.
+
+So of a 24.4 s prefill, **about 10.4 s has the host blocked**, and 7.1 s of that is one host memcpy of the
+expert weights. Because the host is blocked it cannot keep the main queue fed, which is why the device-side
+copies (6.4 s, hideable by the second queue as the probe showed) still stack up instead of hiding.
+
+### 70.2 The fix this points at, and why it is not a flag
+
+The 42.6 GB is being moved twice: `mmap -> pinned staging` on the host, then `pinned -> VRAM` by the
+device. Removing the host hop - either by DMA-ing straight from the mapped weight pages, or by having the
+kernel read host memory directly - would delete the 7.1 s and, more importantly, stop the host blocking so
+the device copies can overlap compute. Going from 24.4 s to the device-only ~19 s would be 405 tok/s,
+which is exactly the goal.
+
+None of that is reachable by configuration: section 69 already established the flag space is exhausted,
+and this is a change to how staged weights are addressed.
