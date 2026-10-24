@@ -1622,3 +1622,49 @@ grid-wide dependency, which SYCL does not expose portably here.
 
 Consequence for the round: the remaining submission savings have to come from elsewhere in the
 layer, where the kernels are small and their work does not need hundreds of work-groups.
+
+## 38. Submission-reduction roadmap, from two independent scans
+
+With the economics confirmed (`submit_ms` 35.4-38.6 ms for ~654 submissions, so 48-54 us each), two
+scans enumerated every submission in a layer and every submission in the QSA body and ranked the
+fusions. Together they identify about **12 ms of a 46 ms token**, all of it host submission time
+rather than device work.
+
+### 38.1 Whole-token layer body (48 layers per token)
+
+| rank | fusion | saved / token | @ 53 us | barrier |
+|---|---|---:|---:|---|
+| 1 | fold `moe_resident_classify_device` into `submit_input_and_route_publish` | 48 | 2.5 ms | none (the publish already has a group barrier) |
+| 2 | drop `submit_packet_copy` and read the host packet's rows directly in the fused tail | 48 | 2.5 ms | none (`submit_packet_wait` already validated the shape) |
+| 3 | fuse `router_softmax_topk_device` + publish + classify into one kernel | 96 | 5.1 ms | one SLM barrier |
+| 4 | fold `submit_begin_replay` into the layer-0 publish | 1 | 0.05 ms | none |
+
+Rank 3 subsumes rank 1, so the realistic set is 3 + 2 + 4 = 145 submissions = **7.7 ms**.
+
+Rejected by the scan for good reasons: fusing the router front GEMV with the top-k selection (the
+front is a multi-work-group GEMV and the selection needs one work-group), fusing the 1-work-group
+packet wait with the 256-work-group tail, fusing the resident/shared expert GEMVs with each other,
+and folding `submit_publish_done` into the tail on the last layer.
+
+### 38.2 QSA layer body (12 layers per token)
+
+| rank | fusion | saved / token | @ 53 us |
+|---|---|---:|---:|
+| 1 | `qsa_prepare_q_and_cache_k_graph` (4 WG) + `qsa_compress_one_completed_block_graph` (1 WG) | 12 | 0.64 ms |
+| 2 | `qsa_select_topk_blocks_graph` (1 WG) + `attention_validate_qsa_active_blocks_graph` | 12 | 0.64 ms |
+| 3 | `decode_prepare_qgkv_packed_partial_graph` + the two above | 12-24 | 0.64-1.27 ms |
+| 4 | fold the compress into the `b == current_blocks` work-group of the block-score kernel | 12 | 0.64 ms |
+
+### 38.3 What this says about the shape of the remaining work
+
+The scans agree with the measurement: the win is now entirely in **collapsing small submissions**,
+not in making any kernel faster. The three biggest items are all sub-millisecond kernels whose only
+real cost is that they are separate submissions, and two of them need no barrier at all.
+
+Order to execute, by value over risk: 38.1 rank 3 (5.1 ms), 38.1 rank 2 (2.5 ms), 38.2 rank 1 and 2
+(0.64 ms each). Doing all four is ~9 ms, i.e. 46.4 ms -> ~37.5 ms, a further 19%.
+
+One caution recorded from section 37: none of these may reduce a large kernel's work-group count.
+The attention operator needed 408 work-groups and collapsing it to 24 made it six times slower, and
+the same trap applies to the router front GEMV and the resident expert GEMVs, which the scan
+explicitly rejected.
