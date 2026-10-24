@@ -3280,3 +3280,58 @@ best measured 322.9 tok/s at 7878 tokens   (gap 1.24x)
 remaining     the 7.1 s main-thread stall in staging, now quantified, with the naive
               fix excluded by measurement and the threaded fix specified
 ```
+
+## 73. Corrected staging attribution, and the direct-arena switch is neutral here
+
+Section 71 inferred the host memcpy lived in `GetStagingSlotDev`. That is **wrong**: it is a pure accessor
+(`Qwen4ExpAdaptiveCache.cpp:356`, `make_slot(GetStagingSlotDevicePtr(...), ...)`, no copy). The staging is
+`Qwen4ExpAdaptiveCache::StageColdExpertsAsync` (`:622`), called from `stage_chunk` at
+`Qwen4ExpBnb4Backend.cpp:2005`, and it has **three** branches (`:647-690`):
+
+```cpp
+if (parallel_host_copy && count > 1 && copy_executor) {      // executor threads, 16 slots per call
+    for (...) copy_executor->CopyColdStagingHostSlots(...);
+} else if (!direct_arena) {
+    for (i) std::memcpy(staging_host_[pp] + i*slot_bytes, sources[i], slot_bytes);
+}
+if (direct_arena) {                                          // DMA straight from the arena
+    // "The large-page arena is a host USM source that the copy engine can read directly
+    //  (9.05-9.23 GB/s measured)"
+    for (i) last = q.memcpy(staging_dev_[pp] + i*slot_bytes, sources[i], slot_bytes, ...);
+}
+```
+
+The `direct_arena` path is exactly the fix this round intended to write, and it already exists behind
+`AILA_Q4E_STAGE_DIRECT_ARENA` (`Qwen4ExpBnb4Backend.cpp:2615`, default **false**). Measured at 7878
+tokens:
+
+```text
+AILA_Q4E_STAGE_DIRECT_ARENA=1   24,311.0 ms   3.09 ms/token   324.1 tok/s
+shipped default                 24,396.2 ms   3.10 ms/token   322.9 tok/s
+```
+
+Neutral (+0.4%), so in this prefill configuration the flag does not change the branch that is actually
+taken - `:1716` gates the direct path behind `cold_split_num_ > 0 && direct_arena_stage_`, and prefill
+does not satisfy it.
+
+Also relevant: section 72's probe measured a **large-page source at 4.16 GB/s** through
+`ctx.memcpy_h2d`, while the engine's comment records **9.05-9.23 GB/s** for the same memory through
+`q.memcpy`. Both can be true if the two entry points take different runtime paths, and the difference
+matters: the engine's own figure says a direct-arena stage is faster than the pinned buffer, which
+contradicts the probe-based conclusion in 72.1. That conflict is unresolved and is the first thing to
+settle before any further staging work.
+
+### 73.1 Where this leaves the goal
+
+```text
+target        400 tok/s
+best measured 324.1 tok/s at 7878 tokens
+gap           1.23x
+```
+
+Four separate measurements now converge on the same conclusion: the prefill time is dominated by moving
+42.6 GB of expert weights, and every mechanism the engine offers for that (chunk size, XMX row gate, QSA
+tile, GDN chunk mode, direct arena, staging pipeline, parallel host copy) has been swept with only the
+first four paying. The remaining 1.23x needs either the direct-arena path to be reachable from prefill
+(the `cold_split_num_` gate at `:1716`), or the executor-parallel host copy to be enabled for this
+configuration (`parallel_host_copy` at `:647`).
