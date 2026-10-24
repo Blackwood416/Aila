@@ -1907,3 +1907,58 @@ So the honest position is that decode has no single remaining lever above ~3 ms,
 a direction call rather than more of the same. Prefill is a candidate of a different order: it takes
 ~127 s for 2108 tokens (60 ms/token) and stages ~42 GB host-to-device per run, so it dominates every
 benchmark run's wall time and none of the decode work above touches it.
+
+## 45. Prefill: 60% of it sits inside one 21-line bracket around the router submission
+
+Decode has no lever above ~3 ms left (44), so the same `[Q4E AdaptiveWork]` counters were read for the
+prefill chunk, where `count=2048`:
+
+| field | value |
+|---|---:|
+| `submitted_ms` | 127,731 ms |
+| **`topk_submit_ms`** | **77,356 ms** |
+| `full_host_ms` | 26,240 ms |
+| `linear_host_ms` | 11,608 ms |
+| `experts_host_ms` | 7,265 ms |
+| `router_wait_ms` | 3,417 ms |
+| `h2d_mb` | 42,578 MB |
+
+`GenerateMessages` for the whole run is 133.8 s, so prefill dominates everything this project measures,
+and **60% of it is one timer**.
+
+### 45.1 The bracket really is just the submission
+
+`host_topk_submit_ms` is accumulated at `Qwen4ExpBnb4Backend.cpp:3123` from `t_topk`, taken at
+`:3102`. Between them are only the two submit calls:
+
+```cpp
+if (resident_epoch && s_router_resident_fused && cfg_.num_experts == 512)
+    actual_route_event = ops::router_softmax_topk_resident(...);
+else {
+    actual_route_event = ops::router_softmax_topk_device(..., count, cfg_.num_experts, top_k, true);
+    if (resident_epoch)
+        actual_route_event = ops::moe_resident_classify(..., router_host_ids_,
+                                                        router_host_weights_,
+                                                        resident_selected_host_, ...);
+}
+```
+
+There is no wait, no memcpy and no synchronise in that range. Both calls end up in
+`launch_router_softmax_topk`, which for `num_experts == 512` submits one kernel and returns its event.
+So 77.4 s over 48 layers, i.e. **1.61 s per layer**, cannot be the enqueue itself - a bare submission
+measures ~5 us (43). Something inside the callee blocks, and the most likely candidate is the
+host-side route arrays: `router_host_ids_`, `router_host_weights_` and `resident_selected_host_` are
+host allocations that an epoch-free call has the device write into, and any code path that then reads
+them on the host for the layer's routing must synchronise.
+
+### 45.2 The three measurements to take next
+
+1. Split the bracket: time `router_softmax_topk_*` and `moe_resident_classify` separately, and count
+   how many layers take the `resident_epoch` branch.
+2. Instrument inside the callee for any `queue().wait()`, `memcpy_d2h` or `synchronize` per call.
+3. If a D2H is the cause, ask why prefill needs the routes on the host at all: prefill routes 2048
+   tokens per layer and the host only needs them to drive the CPU expert path, so the transfer could
+   be narrowed, deferred, or made asynchronous with the device work that follows it.
+
+If this holds, prefill is worth far more than everything decode has produced: a 2K-token prefill at
+127 s is 60 ms per token, and 77 s of that is one bracket.
