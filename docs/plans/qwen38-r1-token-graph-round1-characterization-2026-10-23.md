@@ -2348,3 +2348,54 @@ Build the prefill equivalent of the decode attention micro-probe (`AilaQsaAttent
 for decode at 2052 cells) so the QSA prefill kernel can be timed in seconds in isolation, then find out
 why it is two orders of magnitude off peak: most likely a per-token or per-block host loop around
 `attention_prefill_qsa_batched`, or a work-group geometry with far too few groups for a 2048-token chunk.
+
+## 54. The prefill QSA attention kernel gives every query token its own work-group
+
+`attention_prefill_qsa_batched_impl` (`src/ops/AttentionOps.cpp:5684`) is dispatched as
+
+```cpp
+const int num_groups = num_heads / 4;                       // 6
+cgh.parallel_for(sycl::nd_range<1>(count * num_groups * wg_size, wg_size), ...);
+const int group  = item.get_group(0);
+const int row    = group / num_groups;                      // one query token per work-group
+const int g_idx  = group % num_groups;
+const int h0     = g_idx * 4;
+```
+
+So a work-group owns **one query row and four heads**, which is 12,288 work-groups for a 2048-token
+chunk. Parallelism is fine; the problem is reuse. Every one of the 2048 query work-groups streams the
+whole K/V for the layer, so the layer's 2.1 MB of K/V is requested 2048 times.
+
+### 54.1 The arithmetic says this is where the 2.34x lives
+
+```text
+K/V traffic per pass   2048 tokens x 2.1 MB x 12 QSA layers      = 51.6 GB
+measured QSA time      ~76% of 5.86 ms/token x 3033 tokens       = 13.5 s   -> 3.8 GB/s
+attention FLOPs        24 heads x 2052 cells x 256 dims x 2 x 2 x 2048 x 12 = 1.24 TFLOP
+                      1.24 TFLOP / 13.5 s = 92 GFLOP/s           = 0.5% of this GPU's ~20 TFLOPS
+```
+
+A layer's K/V is 2.1 MB and the L2 is 16 MB, so this traffic should be served from cache; at 3.8 GB/s
+effective it clearly is not. The kernel is therefore both recomputing and re-fetching, and the wasted
+factor is the query-token count.
+
+### 54.2 The fix is the reference implementations already on disk
+
+The shape that avoids this is a flash-style prefill kernel: stage a **query tile** and a **K/V tile** in
+SLM once and let every query row in the tile reuse them, so K/V is fetched once per tile rather than once
+per token. That is exactly what the reference kernels the user pointed at do:
+
+- `tmp/XeStrata/src/kernels/xe/qsa_prompt_attn.cpp` (prompt-case chunk kernel),
+- `tmp/Strata/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp` (the DPAS variant).
+
+Note the recorded negative from the decode side: the XMX/DPAS form was 2-3x *slower* than the chunk form
+for decode (`Strata/docs/INTEL.md:364,581,629`). That negative is about decode; for prefill the winning
+property to borrow is the tile reuse, not the DPAS.
+
+### 54.3 Concrete next step
+
+Rewrite `attention_prefill_qsa_batched_impl`'s inner kernel to tile queries (e.g. 32 or 64 rows per
+work-group) and stage K/V tiles in SLM, keeping the existing signature and the block-sparse index
+arguments so the caller does not change, and gate it behind an env flag with the current kernel as the
+A/B control. Expected effect: K/V traffic drops by the query-tile factor, which is where the 51.6 GB and
+the 0.5%-of-peak utilisation both come from.
