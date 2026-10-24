@@ -704,6 +704,19 @@ target_include_directories(AilaQsaAttentionProbe PRIVATE
 )
 target_link_libraries(AilaQsaAttentionProbe PRIVATE
     DNNL::dnnl simdjson AilaSyclOptions)
+add_executable(AilaKernelSubmitProbe
+    tests/ops/KernelSubmitProbe.cpp
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp
+    src/profile/Profiling.cpp)
+target_compile_definitions(AilaKernelSubmitProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaKernelSubmitProbe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaKernelSubmitProbe PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
 add_executable(AilaConvOpsKernelTests
     tests/ops/ConvOpsKernelTests.cpp
     src/core/ExecutionTrace.cpp

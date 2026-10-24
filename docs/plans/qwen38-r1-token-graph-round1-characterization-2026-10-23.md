@@ -1818,3 +1818,48 @@ If submission cost tracks descriptor size, then the lever is not only *fewer* su
 *cheaper* ones: fewer kernel arguments, no unnecessary USM pointers, and smaller grids. That is worth
 measuring directly with a micro-probe that submits N trivial kernels with 2 arguments versus 2
 hundreds, because a factor of two there would apply to all ~650 submissions in the token.
+
+## 43. A bare submission costs about 5 us, so the model's 53 us is not submission cost
+
+A second micro-probe (`AilaKernelSubmitProbe`) enqueues hundreds of trivial kernels back to back and
+times only the enqueue loop, then drains. Results, 300 iterations, steady state:
+
+| shape | submit us/kernel | drain us/kernel |
+|---|---:|---:|
+| args=2, grid 1x32 | (JIT, ignore) | 0.56 |
+| args=2, grid 256x256 | 4.94 | 0.32 |
+| args=200, grid 1x32 | 4.71 | 0.30 |
+| args=200, grid 256x256 | 4.42 | 0.36 |
+| 1 `local_accessor`, grid 256 | 6.36 | 0.38 |
+| 4 `local_accessor`, grid 256 | 6.64 | 0.40 |
+
+Two things follow.
+
+**Argument count and grid size do not matter.** 2 arguments versus 200, and 32 threads versus 65536,
+both land at 4.4-4.9 us. Dynamic shared-memory accessors add about 1.5-2 us, but one versus four makes
+no difference, so it is a fixed per-kernel cost for having any at all, not per accessor.
+
+**So a bare submission is ~5 us, ten times less than the 53 us average this document has been quoting.**
+That average was computed as `submit_ms / submissions` in the model, and the model's submit loop is not
+a bare enqueue loop: the same thread also runs the ops functions' host code, and, more importantly, the
+queue applies backpressure once the device is the slower side. With ~650 submissions across a 38 ms
+pass while the device needs ~25-40 ms of work, the host cannot run ahead, so `submit_ms` measures
+device-paced submission, not the host cost of submitting.
+
+### 43.1 What this means for the two measured fusions
+
+The tail fusion removed 96 submissions and 3.2 ms of `submit_ms` - 33 us each; the router fusion
+removed 48 and 0.57 ms - 12 us each. Those numbers are now best read as **device-side per-kernel gaps**
+in a device-paced pipeline, not as host submission cost. That is consistent with the tail kernels
+having 256-work-group grids and the classifier being a single work-group: a larger dispatch costs more
+gap. It also means the earlier attribution "the attention operator's 143 us fixed cost is two
+submissions" (section 36) is wrong, since two submissions are ~10 us; that 133 us is device-side or
+host-side work still to be attributed.
+
+### 43.2 Revised lever
+
+Since a submission is cheap on its own, the reason fewer kernels help is the *gap between kernels on
+the device*, which grows with the size of the dispatch. The remaining roadmap items are therefore
+worth roughly what they measured (tail 3.2 ms, router 0.6 ms) and no more, and the biggest single
+lever this probe points at is not submission count but **whatever makes a dispatch gap 33 us instead
+of 0.3 us** - which the trivial-kernel drain figures say is not intrinsic to submission.
