@@ -1863,3 +1863,47 @@ the device*, which grows with the size of the dispatch. The remaining roadmap it
 worth roughly what they measured (tail 3.2 ms, router 0.6 ms) and no more, and the biggest single
 lever this probe points at is not submission count but **whatever makes a dispatch gap 33 us instead
 of 0.3 us** - which the trivial-kernel drain figures say is not intrinsic to submission.
+
+## 44. What the fusion savings actually were, and the consequence
+
+Section 43 corrected the submission cost to ~5 us. Taking that one step further changes what the two
+measured fusions mean.
+
+The tail fusion removed 96 submissions, 3.2 ms of `submit_ms` (33 us each). Those three kernels were
+not empty: they merged the cold rows into the routed output, added the shared expert and updated the
+residual, and the fused form additionally stops writing and re-reading the intermediate row. A
+single-work-group classifier folded into top-k removed 48 submissions for 0.57 ms (12 us each), and
+that kernel really was almost empty.
+
+So the saving tracks **the work the removed kernel was doing**, not the submission. Two submissions
+cost ~10 us; the tail kernels cost ~33 us each because they move real data. Since `submit_ms` is
+device-paced (43), the fusion savings were device-time savings all along.
+
+### 44.1 Consequence: the pipeline is device-work-limited, not launch-limited
+
+```text
+650 submissions x ~5 us of true submission cost = ~3.2 ms of a 46.3 ms token (7%)
+route_wait 25.1 + cold 18-23 = 44-48 ms, which is the token
+```
+
+The 21 us "launch floor" quoted in section 19.1 was a profiler artefact (the marks themselves), and
+the 53 us "per submission" was device time divided by submission count. Neither describes launching.
+
+That does not invalidate the wins already banked - they were real work reductions - but it does mean
+the local roadmap is finished: the remaining fusions would shave small kernels' real work, worth
+0.5-1 ms each at best, and the QSA pairs are worth ~0.15 ms.
+
+### 44.2 What is left, stated plainly
+
+- `cold` is at 80-95% of this host's memory wall and cannot be reduced without reducing the bytes,
+  which needs VRAM that does not exist on a 16 GB card.
+- `route_wait` is 25 ms of device work whose per-stage attribution is only known to within the
+  profiler's 1.2-5x inflation, and its largest identified components (hyper-connections ~7 ms, GDN
+  attention ~8 ms, attention core ~2 ms, resident+shared ~8 ms overlapped) are each small.
+- Overlap is blocked structurally: the cold computation needs the routed ids, which the doorbell
+  publishes, and the device has only ~7 ms of independent work to hide 18-23 ms behind.
+
+So the honest position is that decode has no single remaining lever above ~3 ms, and the next step is
+a direction call rather than more of the same. Prefill is a candidate of a different order: it takes
+~127 s for 2108 tokens (60 ms/token) and stages ~42 GB host-to-device per run, so it dominates every
+benchmark run's wall time and none of the decode work above touches it.
