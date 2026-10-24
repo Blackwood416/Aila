@@ -2849,3 +2849,47 @@ A GEMM that costs the same at M=160 and M=256 is not compute-bound on its padded
 padding tax assumed in section 62.1 does not exist in practice. Together with the corrected timers, that
 means **section 62's "effective 2.3 TFLOPS on padded work" figure is not a measurement of anything** and
 the remaining 1.34x to 400 tok/s has to be located by profiling first.
+
+## 64. First trustworthy prefill attribution: copies 28%, GDN 20%, QSA 15%, experts 12%
+
+A prefill-only observer-free trace (`vtune -collect xpu-offload`, 7878-token prompt, one generated token,
+max-seq 12288) gives 25.8 s of device time across 770 rows, matching the 26.3 s wall clock:
+
+| kernel | device time | share | instances |
+|---|---:|---:|---:|
+| `zeCommandListAppendMemoryCopy` | 6.40 s | 25% | 19,585 |
+| `run_linear_delta_prefill_gpu_batched_impl` (GDN) | 5.24 s | 20% | 108 |
+| `attention_prefill_qsa_batched_impl` (QSA) | 3.81 s | 15% | 1,476 |
+| `packed_nf4_gemm_bf16_joint_matrix_wide` (experts) | 3.18 s | 12% | 97 |
+| `zeCommandListAppendMemoryCopy` (second row) | 0.78 s | 3% | 3,820 |
+| `gemm_kernel` rows (six shapes) | ~1.0 s | 4% | 400 |
+| `moe_ordered_accumulate_down_rows` | 0.13 s | 0.5% | 48 |
+
+### 64.1 This reverses the plan of sections 59-62
+
+The expert GEMM is **3.2 s of 25.8 s (12%)**, not the 16 s that section 62 assumed. A grouped GEMM over
+the experts would therefore have been a large investment aimed at an eighth of the time, and its expected
+payoff was overestimated by roughly 5x.
+
+The largest single item is **memory copies at 7.2 s (28%)**, and the instance count explains why: 19,585
+copies at 0.33 ms each. With 32 expert bands per layer over 48 layers, the per-band plan upload
+(`bases`, `tokens`, `ranks`, `slots` - four `memcpy` calls per band at
+`Qwen4ExpBnb4Backend.cpp:2250-2256`) alone accounts for ~6,100 of those, and the rest is expert staging.
+Each of those copies is a 0.33 ms latency-dominated operation on a queue that is already busy.
+
+Ranked targets after this measurement:
+
+1. **Copies, 7.2 s.** Stop uploading plan arrays per band. The plan for a whole layer is a few tens of KB
+   and can be written once per layer, or built on the device by the gather kernel from a per-band base
+   table that is uploaded once per chunk.
+2. **GDN, 5.24 s over 36 layers** - three calls per layer at 48.5 ms each.
+3. **QSA, 3.81 s** - 1,476 calls, i.e. ~123 per QSA layer, so roughly 64 rows per call: these are the
+   per-token work-group tiles from section 54, and the count matches 7878/64.
+4. **Experts, 3.18 s** - the grouped GEMM idea, now correctly sized at 12% and therefore low priority.
+
+### 64.2 Method note
+
+Getting this took a prefill-only `xpu-offload` run (about 4 minutes of collection plus the report) and two
+workarounds: the report must be run against a **copy** of the result directory because finalising again on
+the original reports `Cannot re-finalize a read-only result`, and re-running on the original then fails
+with `Insufficient permissions` on `sqlite-db`. Copy the result dir and report from the copy.
