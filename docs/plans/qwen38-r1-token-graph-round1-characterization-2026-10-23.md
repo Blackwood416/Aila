@@ -1704,3 +1704,42 @@ deleted. Two things to check when it is picked up again:
 
 Default path after this round, single run: `submit_ms 37.9`, `route_wait 25.47`, p50 46.16,
 Direct 55.21, `gate_fail 0`.
+
+## 40. The router fusion is mechanically correct but sits inside the measurement noise
+
+Section 39's crash is fixed by writing the three host-side route arrays into the graph's own tensors
+(`route_ids`, `route_weights`, `selected`) instead of the Direct path's buffers, which are sized for a
+different call shape. Verified by reading `launch_router_softmax_topk`: on the 512-expert path it
+issues exactly **one** submission, so the fused caller really does replace two submissions with one.
+
+Single A/B, one run per arm:
+
+```text
+AILA_Q4E_TG_ROUTE_FUSED=0 : submit_ms 38.6   route_wait 25.36   p50 47.15   gate_fail 0
+AILA_Q4E_TG_ROUTE_FUSED=1 : submit_ms 38.0   route_wait 25.81   p50 49.83   gate_fail 0
+```
+
+No crash, gate clean, and `submit_ms` moved by only 0.6 ms where the mechanism predicts 2.5 ms.
+
+### 40.1 Why the measurement cannot decide
+
+`submit_ms` reads 35.4, 37.9, 38.4 and 38.6 ms across the last four runs of the same configuration, so
+its scatter is about 1.6 ms - a 2.5 ms single-item saving is inside it. And `route_wait` is the wrong
+instrument for this change by construction: removing a host submission cannot reduce device work
+between two doorbells, so its 25.36 -> 25.81 movement is noise as well.
+
+The flag therefore stays **off** and the code stays behind it.
+
+### 40.2 How to measure the remaining roadmap
+
+The four layer-body fusions in 38.1 total about 7.7 ms of submission time, and the QSA pairs another
+1.3 ms. No single one of them is measurable in one run, but together they are five times the noise.
+The right procedure is therefore:
+
+1. land the group (or at least three of them) behind their flags,
+2. measure default-vs-off in one A/B, which now has ~9 ms of signal,
+3. keep the group on or off as a whole, and only then bisect if the aggregate is disappointing.
+
+This also argues for one small instrumentation addition before the next group: log the **actual**
+submission count per token next to `submit_ms`, since the node counter reports logical groups (352)
+rather than submissions (~654) and a count is immune to timing noise.

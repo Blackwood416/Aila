@@ -376,11 +376,14 @@ bool whole_token_node_prof_requested() {
 // measured ~53 us per submit.
 bool whole_token_route_fused_requested() {
     static const bool requested = [] {
-        // Off by default: dropping router_softmax_topk_resident into this path
-        // crashes with 0xC0000409 on the second token (fail-fast, likely a
-        // buffer overrun in the host-side route arrays it writes). The code is
-        // kept behind the flag so the next round can debug it, but the default
-        // path must not use it.
+        // Off by default. The mechanism is verified by reading the code -
+        // launch_router_softmax_topk<true> submits one kernel where this path
+        // used to submit two - and wiring the graph tensors in place of the
+        // Direct path's host arrays removed the 0xC0000409 crash. But a single
+        // A/B cannot resolve it: submit_ms is 35.4-38.6 ms across recent runs,
+        // so a 2.5 ms saving is inside its noise, and route_wait (device side)
+        // should not move at all because this only removes a host submission.
+        // Land several roadmap fusions and measure the aggregate instead.
         const char* raw = std::getenv("AILA_Q4E_TG_ROUTE_FUSED");
         return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
     }();
@@ -508,9 +511,16 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
                 graph.route_ids.data_as<int>(),
                 graph.route_weights.data_as<float>(),
                 adaptive_cache_.DeviceSlotTable() + layer_index * experts,
-                graph.selected.data_as<int>(), router_host_ids_,
-                router_host_weights_, resident_selected_host_, experts,
-                top_k, true);
+                // The three host-side route arrays are the graph's own tensors:
+                // router_softmax_topk_resident writes host_ids/weights/selected
+                // unconditionally, and the Direct path's buffers are sized for a
+                // different call shape (cap * top_k), which crashed this path
+                // with 0xC0000409. Writing the same values into the tensors this
+                // path already owns is idempotent.
+                graph.selected.data_as<int>(),
+                graph.route_ids.data_as<int>(),
+                graph.route_weights.data_as<float>(),
+                graph.selected.data_as<int>(), experts, top_k, true);
         } else {
             ops::router_softmax_topk_device(
                 ctx, buf_.router_scores.data_as<bf16>(), nullptr,
