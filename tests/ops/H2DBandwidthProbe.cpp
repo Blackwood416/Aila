@@ -89,6 +89,31 @@ int main(int argc, char** argv) {
             ctx.free_device(dev_pool);
         }
 
+        // The engine keeps resident experts in a VirtualAlloc(MEM_LARGE_PAGES) arena and then
+        // copies each expert into a pinned staging buffer before DMA-ing it, which costs 7.1 s per
+        // prefill pass. The question that decides whether that hop can be deleted: will
+        // queue::memcpy accept a large-page pointer (not a SYCL USM allocation) as the source, and
+        // if it does, does it DMA at link speed or bounce through a runtime copy?
+        try {
+            void* large = ctx.alloc_large_host(256ULL * 1024ULL * 1024ULL);
+            if (large && dev) {
+                std::memset(large, 0xa5, 256ULL * 1024ULL * 1024ULL);
+                const size_t large_chunks = (256ULL * 1024ULL * 1024ULL) / chunk_bytes;
+                ctx.memcpy_h2d(dev, large, chunk_bytes);
+                ctx.synchronize();
+                const auto t0 = Clock::now();
+                for (size_t i = 0; i < large_chunks; ++i) ctx.memcpy_h2d(dev, large, chunk_bytes);
+                ctx.synchronize();
+                const double ms = ms_since(t0);
+                std::printf("large-page source: %zu chunks of %zu KB in %.1f ms -> %.2f GB/s\n",
+                            large_chunks, chunk_kb, ms,
+                            static_cast<double>(large_chunks) * static_cast<double>(chunk_bytes) / (ms * 1e6));
+                ctx.free_host(large);
+            }
+        } catch (const std::exception& e) {
+            std::printf("large-page source: REJECTED by the runtime (%s)\n", e.what());
+        }
+
         void* host_big = ctx.alloc_host(total_bytes);
         void* dev_big = ctx.alloc_device(total_bytes);
         if (host_big && dev_big) {

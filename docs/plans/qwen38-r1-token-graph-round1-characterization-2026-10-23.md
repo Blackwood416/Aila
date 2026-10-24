@@ -3232,3 +3232,51 @@ identified    7.1 s of redundant host memcpy (42.6 GB moved twice) + 6.4 s of de
 The arithmetic that makes this the decisive item: removing the 7.1 s unblocks the host, which lets the
 6.4 s of device copies hide behind compute, which takes the pass from 24.4 s to the measured device-only
 ~19 s, i.e. **405 tok/s**.
+
+## 72. DMA-ing straight from the large-page arena works but is 1.7x slower, which kills the naive fix
+
+Section 71 proposed deleting the host hop by handing the large-page resident arena straight to
+`copy_q_->memcpy`. `AilaH2DBandwidthProbe` now answers whether that is viable, using
+`ctx.alloc_large_host(256 MB)` (the same `VirtualAlloc(MEM_LARGE_PAGES)` arena the resident pool uses) as
+the copy source:
+
+```text
+pinned USM host source   7.15 GB/s   (2400 KB chunks)
+large-page source        4.16 GB/s   (2400 KB chunks, no exception thrown)
+```
+
+So the runtime **accepts** the foreign pointer - it does not throw - but it runs 1.7x slower, which means
+it bounce-copies internally instead of DMA-ing the locked pages. The trade is therefore not free:
+
+```text
+today       7.1 s host memcpy (blocking)  +  6.4 s device copies at 7.15 GB/s
+direct      0 s host                      + 10.2 s device copies at 4.16 GB/s
+```
+
+Direct staging only wins if the device copies overlap compute completely, which would give
+`max(19 s compute, 10.2 s copies) = 19 s -> 405 tok/s`; if they do not overlap it gives 29 s, which is
+worse than today's 24.4 s. That is too risky to land blind, and the probe result is exactly the kind of
+negative that should stop a change before it is written.
+
+### 72.1 The better-shaped fix, now that the numbers are in hand
+
+Keep the pinned staging buffer (it is the only way to get 7.15 GB/s into VRAM) and instead **move the
+host memcpy off the submitting thread**: have a worker fill the staging slots for chunk N+1 while the
+main thread submits chunk N's GEMMs, which is what the existing `lookahead`/`ExpertFillPool` structure is
+for. The 7.1 s does not need to disappear, it needs to stop blocking the submit path, because the probe
+already proved that once the host is not blocked the 6.4 s of device copies hide completely behind compute
+(`154.9 ms concurrent against 193.6 ms serial`).
+
+Concretely: the per-expert `std::memcpy` in `load_expert_to_staging`'s resident branch is synchronous on
+whatever thread calls `GetStagingSlotDev`; issuing those copies through `fill_pool_` (8 threads by default)
+and joining at the point where `batch.ready_event` is consumed would leave the timing exactly as measured
+but remove the main-thread stall.
+
+### 72.2 Goal state
+
+```text
+target        400 tok/s
+best measured 322.9 tok/s at 7878 tokens   (gap 1.24x)
+remaining     the 7.1 s main-thread stall in staging, now quantified, with the naive
+              fix excluded by measurement and the threaded fix specified
+```
