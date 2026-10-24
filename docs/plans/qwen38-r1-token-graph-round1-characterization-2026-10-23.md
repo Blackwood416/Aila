@@ -1668,3 +1668,39 @@ One caution recorded from section 37: none of these may reduce a large kernel's 
 The attention operator needed 408 work-groups and collapsing it to 24 made it six times slower, and
 the same trap applies to the router front GEMV and the resident expert GEMVs, which the scan
 explicitly rejected.
+
+## 39. First roadmap item attempted: the existing fused router crashes in this path
+
+Section 38.1 rank 1 asked to fold `moe_resident_classify_device` into the router, and there is
+already a kernel that does it: `launch_router_softmax_topk<true>`, exposed as
+`ops::router_softmax_topk_resident`, which performs the resident slot classification inside the top-k
+kernel and writes `resident_selected`, `host_ids`, `host_weights` and `host_selected`. Wiring it into
+`RecordWholeTokenGraphBody` in place of `router_softmax_topk_device` + `moe_resident_classify_device`
+would remove one submission per layer, 48 per token, about 2.5 ms.
+
+Measured, one run per arm:
+
+```text
+AILA_Q4E_TG_ROUTE_FUSED=0 : submit_ms 38.4   route_wait 25.37   p50 46.25   gate_fail 0
+AILA_Q4E_TG_ROUTE_FUSED=1 : graph arm exited -1073740791 (0xC0000409) on the second token
+```
+
+A fail-fast, which on this platform usually means a buffer overrun caught by the CRT. The log shows
+the first token generated correctly and the crash on the next one, so the fused kernel's first
+invocation is fine and something it leaves behind - most likely one of the three host-side route
+arrays it writes (`router_host_ids_`, `router_host_weights_`, `resident_selected_host_`) - does not
+match what this path allocated.
+
+The flag therefore defaults to **off** and the code is kept behind it for debugging rather than
+deleted. Two things to check when it is picked up again:
+
+1. `router_host_ids_` is allocated as `cap * top_k` ints where `cap` belongs to the Direct path's
+   prompt capacity; the token-graph path should not be writing through a pointer sized for a
+   different call shape.
+2. `launch_router_softmax_topk<true>` writes `host_ids[k]`, `host_weights[k]` and `host_selected[k]`
+   unconditionally; the token-graph path only needs `route_ids`, `route_weights` and `selected`, so
+   the simplest safe wiring is to pass the graph tensors for all three and leave the Direct-path host
+   arrays out of it entirely.
+
+Default path after this round, single run: `submit_ms 37.9`, `route_wait 25.47`, p50 46.16,
+Direct 55.21, `gate_fail 0`.

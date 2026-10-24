@@ -369,6 +369,24 @@ bool whole_token_node_prof_requested() {
 // Collapses the three element-wise tail kernels (ordered merge, shared-expert
 // add, final bridge) into a single launch. At the measured 21 us launch floor
 // that removes 96 launches per token, about 2 ms.
+// AILA_Q4E_TG_ROUTE_FUSED=0 restores the split router. The fused form uses
+// launch_router_softmax_topk<true>, which performs the resident slot
+// classification inside the top-k kernel, so the separate classify submission
+// disappears: one submission saved per layer, 48 per token, about 2.5 ms at the
+// measured ~53 us per submit.
+bool whole_token_route_fused_requested() {
+    static const bool requested = [] {
+        // Off by default: dropping router_softmax_topk_resident into this path
+        // crashes with 0xC0000409 on the second token (fail-fast, likely a
+        // buffer overrun in the host-side route arrays it writes). The code is
+        // kept behind the flag so the next round can debug it, but the default
+        // path must not use it.
+        const char* raw = std::getenv("AILA_Q4E_TG_ROUTE_FUSED");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    return requested;
+}
+
 bool whole_token_tail_fused_requested() {
     static const bool requested = [] {
         const char* raw = std::getenv("AILA_Q4E_TG_TAIL_FUSED");
@@ -484,11 +502,22 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
             buf_.router_scores.data_as<bf16>(),
             buf_.shared_gate_buf.data_as<bf16>(), nullptr, nullptr,
             hidden_size_, experts);
-        ops::router_softmax_topk_device(
-            ctx, buf_.router_scores.data_as<bf16>(), nullptr,
-            graph.route_ids.data_as<int>(),
-            graph.route_weights.data_as<float>(), 1, experts, top_k,
-            true);
+        if (whole_token_route_fused_requested()) {
+            ops::router_softmax_topk_resident(
+                ctx, buf_.router_scores.data_as<bf16>(), nullptr,
+                graph.route_ids.data_as<int>(),
+                graph.route_weights.data_as<float>(),
+                adaptive_cache_.DeviceSlotTable() + layer_index * experts,
+                graph.selected.data_as<int>(), router_host_ids_,
+                router_host_weights_, resident_selected_host_, experts,
+                top_k, true);
+        } else {
+            ops::router_softmax_topk_device(
+                ctx, buf_.router_scores.data_as<bf16>(), nullptr,
+                graph.route_ids.data_as<int>(),
+                graph.route_weights.data_as<float>(), 1, experts, top_k,
+                true);
+        }
         aila::token_graph_service::submit_input_and_route_publish(
             ctx.queue(),
             reinterpret_cast<const std::uint16_t*>(
@@ -497,10 +526,12 @@ std::size_t Qwen4ExpBnb4Backend::RecordWholeTokenGraphBody(
             graph.route_ids.data_as<int>(),
             graph.route_weights.data_as<float>(),
             static_cast<uint32_t>(top_k), layer_index == 0);
-        ops::moe_resident_classify_device(
-            ctx, graph.route_ids.data_as<int>(),
-            adaptive_cache_.DeviceSlotTable() + layer_index * experts,
-            graph.selected.data_as<int>(), top_k, experts);
+        if (!whole_token_route_fused_requested()) {
+            ops::moe_resident_classify_device(
+                ctx, graph.route_ids.data_as<int>(),
+                adaptive_cache_.DeviceSlotTable() + layer_index * experts,
+                graph.selected.data_as<int>(), top_k, experts);
+        }
         node();
         whole_token_node_profiler().mark(kNodeRoute);
 
