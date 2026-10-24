@@ -1388,3 +1388,58 @@ Before any further work on this kernel:
 Without that, more kernel work on this operator is unguided. The one thing that can be stated with
 confidence is the cost of a mistake here: five changes, five neutral results, and the only real wins
 this round came from where the observer-free data pointed first (tail fusion, work-group-per-row).
+
+## 33. Micro kernel probes, and the end of the attention-core detour
+
+Full-workload VTune runs were taking over half an hour per iteration and the in-code profiler
+inflates short spans by 2.5-5x (section 22), which left no usable instrument for kernel work. The
+answer is a **micro probe**, and it changes the working method.
+
+### 33.1 The probe
+
+`tests/ops/QsaAttentionProbe.cpp` (target `AilaQsaAttentionProbe`) times one operator in isolation at
+the production shape: 24 query heads, 2 KV heads, `head_dim` 256, 2052 cells, `tile_t` 128, so 17
+tiles. It builds its own `Context` with a profiling queue, allocates the tensors, warms up five
+iterations off the clock (the pipeline under study has no persistent cache, so every run is a warm
+run), then reports the median and the best of 30 event-timed samples. It takes seconds.
+
+Baseline:
+
+```text
+cells=2052 heads=24 kv_heads=2 head_dim=256 tiles=17
+qsa_decode_attention_us: median=216.1  best=192.2  worst=221.0
+per_token_12_layers_ms: 2.59
+```
+
+That also corrects section 29's 155 us figure: that was phase 1 only, measured on a
+long-generation trace where the context had grown well past 2052. At the benchmark's own context the
+whole operator, both phases, is 216 us, i.e. **2.6 ms of a 46 ms token**, about 10% of `route_wait`.
+
+### 33.2 The probe reproduces the model's verdict in seconds
+
+The coalesced score phase from section 31 was re-applied and measured both ways:
+
+| variant | probe median | model `route_wait` |
+|---|---:|---:|
+| baseline (one thread per cell) | 216.1-217.7 us | 25.14 |
+| coalesced score (sub-group per cell) | **231.7 us** | 25.22 |
+
+It is **6.5% slower** in isolation, and neutral in the model. So the four neutral model results were
+not a measurement failure: the change genuinely does not help, and the probe says so in seconds
+instead of through a 46 ms token containing twenty other stages. That is the instrument this work
+needed from the start.
+
+Why coalescing loses: it replaces 128 independent per-thread dot products with 128 sequential
+sub-group scores, so the work within a work-group becomes a serial loop of 128 reductions. The
+line-utilisation win is real but the reduction chain costs more than it saves.
+
+### 33.3 Method that replaces the previous rounds
+
+1. **Single A/B in the model.** The pipeline warms up and keeps no persistent cache, so every run is
+   a warm run; a real gain shows in one run and p50 over many runs only hides that behind host noise.
+2. **Micro probe first for kernel changes.** Seconds per iteration, isolated from the other twenty
+   stages of the token.
+3. If a change wins in the probe but not in the model, the cost has moved elsewhere or the operator
+   is not on the critical path, and that has to be explained rather than averaged away.
+4. VTune `xpu-offload` only when the shape of the cost is unknown (as in section 22), never as a
+   per-iteration tool.

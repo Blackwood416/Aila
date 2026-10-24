@@ -691,6 +691,19 @@ target_link_libraries(AilaBnb4BitLinearKernelTests PRIVATE
     DNNL::dnnl simdjson AilaSyclOptions)
 add_test(NAME AilaBnb4BitLinearKernelTests COMMAND AilaBnb4BitLinearKernelTests)
 
+add_executable(AilaQsaAttentionProbe
+    tests/ops/QsaAttentionProbe.cpp
+    src/profile/Profiling.cpp
+    src/core/ExecutionTrace.cpp
+    src/memory/LargePages.cpp)
+target_compile_definitions(AilaQsaAttentionProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(AilaQsaAttentionProbe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+)
+target_link_libraries(AilaQsaAttentionProbe PRIVATE
+    DNNL::dnnl simdjson AilaSyclOptions)
 add_executable(AilaConvOpsKernelTests
     tests/ops/ConvOpsKernelTests.cpp
     src/core/ExecutionTrace.cpp
