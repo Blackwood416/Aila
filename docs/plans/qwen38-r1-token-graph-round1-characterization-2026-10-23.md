@@ -2791,3 +2791,61 @@ M is larger.
 Started this goal at 150 tok/s measured at 2K tokens and an assumed 16 tok/s baseline that turned out to
 be an artefact of the decode runner; the engine now does **299.5 tok/s at 8K tokens** with all of it
 landing as shipped defaults (`PREFILL_CHUNK` 8192, XMX enabled above 4096 rows).
+
+## 63. Correction: several `AdaptiveWork` timers exceed the run's wall clock and must not be used
+
+Two runs prove the point:
+
+```text
+20-token prompt:    wall 1,485 ms      submitted_ms = 117,140
+2102-token prompt:  wall 11,848 ms     full_host_ms = 26,198
+```
+
+No field of a single run can exceed that run's wall time, so `submitted_ms` and the `*_host_ms` stage
+accumulators are **not** elapsed milliseconds - they are almost certainly per-layer accumulations taken
+from GPU timestamps that overlap, or a different unit. Everything in sections 53-55 that reasoned from
+"26 s of full-attention host time" or "QSA is 76% of prefill compute" is **withdrawn**; section 55 had
+already withdrawn the attention conclusion for an independent reason, and this is the mechanism.
+
+Fields that are self-consistent and therefore usable:
+
+```text
+h2d_mb     1,851.4   identical for a 20-token and a 2102-token prompt
+staged     766       identical, same two runs
+fill_ms    286.1     and 1.84 GB / 0.286 s = 6.4 GB/s matches the standalone copy probe
+bank_wait_ms, hits, misses - consistent with the above
+```
+
+Note in particular that `fill_ms` is a real millisecond figure and equals the probe's rate for the same
+volume, which is why the staging conclusions (per-chunk fixed, ~6.4 GB/s) survive while the stage-share
+conclusions do not.
+
+### 63.1 Consequence: prefill has no trustworthy attribution yet
+
+The only reliable decompositions in hand are:
+
+```text
+7878 tokens, XMX on    26,304.9 ms   299.5 tok/s
+7878 tokens, XMX off   33,042.2 ms   238.4 tok/s   -> the XMX expert path is worth >= 6.7 s here
+2026 tokens, ALU       11,848 ms     and a 20-token prompt costs 1,485 ms total
+staging: 42.6 GB in the decode runner, 1.85 GB in the clean path, at ~6.4 GB/s
+```
+
+So the expert path is at least 6.7 s of a 26.3 s pass at 8K, and the other ~19 s is unattributed: GDN
+attention (36 layers), QSA (12 layers), the dense linears, the hyper-connections and the per-band kernel
+chain all sit in that gap with no measurement separating them.
+
+**The next step therefore has to be instrumentation, not a kernel rewrite.** A grouped GEMM would be a
+large investment aimed at a term whose size has not been measured, and the padding-tax hypothesis that
+motivated it was measured this round and is essentially neutral:
+
+```text
+MIN_M=0    (rows_per_band = ceil16(max_rows), ~160)   26,204.3 ms   300.6 tok/s
+MIN_M=160                                             26,298.0 ms   299.6 tok/s
+MIN_M=256  (shipped)                                  26,365.3 ms   298.8 tok/s
+```
+
+A GEMM that costs the same at M=160 and M=256 is not compute-bound on its padded rows, so the 1.66x
+padding tax assumed in section 62.1 does not exist in practice. Together with the corrected timers, that
+means **section 62's "effective 2.3 TFLOPS on padded work" figure is not a measurement of anything** and
+the remaining 1.34x to 400 tok/s has to be located by profiling first.
