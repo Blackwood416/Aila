@@ -3335,3 +3335,62 @@ tile, GDN chunk mode, direct arena, staging pipeline, parallel host copy) has be
 first four paying. The remaining 1.23x needs either the direct-arena path to be reachable from prefill
 (the `cold_split_num_` gate at `:1716`), or the executor-parallel host copy to be enabled for this
 configuration (`parallel_host_copy` at `:647`).
+
+## 74. The prefill path never passed the direct-arena flag: 322.9 -> 357.1 tok/s
+
+Two facts combined into this round's win.
+
+**The probe conflict is resolved, and the engine's own figure was right.** Same large-page source, two
+entry points:
+
+```text
+large-page via Context::memcpy_h2d   4.14 GB/s
+large-page via sycl::queue::memcpy   8.24 GB/s   <- matches the engine comment's 9.05-9.23
+pinned USM staging buffer            7.08 GB/s
+```
+
+So DMA-ing straight from the arena is not only viable, it is **faster than staging through the pinned
+buffer**. Section 72's conclusion ("direct staging is 1.7x slower") was an artefact of measuring the wrong
+entry point and is withdrawn.
+
+**The flag was never reaching the call.** `StageColdExpertsAsync` has a trailing `direct_arena` parameter
+that defaults to `false` (`Qwen4ExpAdaptiveCache.hpp:317`), and the prefill call site simply omitted it:
+
+```cpp
+auto batch=adaptive_cache_.StageColdExpertsAsync(host_arena_,*copy_q_,layer,
+    prefill_unique_.data()+s,n,ping_pong_index_,&expert_executor_);        // 8 args, default false
+```
+
+That is why section 73 measured `AILA_Q4E_STAGE_DIRECT_ARENA` as neutral. Passing `direct_arena_stage_`
+as the eighth argument and defaulting the flag on gives:
+
+```text
+direct_arena=1   21,959.0 ms   2.79 ms/token   358.8 tok/s
+direct_arena=0   24,320.7 ms   3.09 ms/token   323.9 tok/s      (+10.8%)
+```
+
+The mechanism is exactly section 71's prediction: the 7.1 s host memcpy disappears, and the device copy
+runs faster from the arena than it did from staging.
+
+### 74.1 Shipped state
+
+| prompt | tok/s | previous round |
+|---:|---:|---:|
+| 2026 | 173.2 | 175.6 |
+| 4952 | **299.3** | 267.3 |
+| 7878 | **357.1** | 322.9 |
+
+```text
+target 400 tok/s; best measured 357.1; gap 1.12x
+```
+
+The 2K case is a touch slower (173.2 against 175.6) because the direct path has a fixed cost per chunk that
+short prompts amortise less; it is inside run-to-run variation and the goal's numbers are at 8K, so the
+flag is left unconditional rather than gated on row count.
+
+### 74.2 What is left
+
+After this, the pass is 22.1 s at 7878 tokens. The earlier attribution put copies at ~6.4 s of device time;
+with the direct path that should now be ~5.2 s of `queue.memcpy` from large pages, and it is still serial
+with compute on the main queue. Hiding it remains the next item, but the gap to 400 is now only 1.12x, so
+even a partial overlap reaches the target.

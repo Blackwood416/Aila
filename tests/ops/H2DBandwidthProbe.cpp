@@ -109,6 +109,26 @@ int main(int argc, char** argv) {
                             large_chunks, chunk_kb, ms,
                             static_cast<double>(large_chunks) * static_cast<double>(chunk_bytes) / (ms * 1e6));
                 ctx.free_host(large);
+                // Same source, but through sycl::queue::memcpy - the entry point the engine's
+                // direct_arena staging uses (Qwen4ExpAdaptiveCache.cpp:677 records 9.05-9.23 GB/s
+                // for it) - rather than Context::memcpy_h2d, which measured far lower above.
+                void* large2 = ctx.alloc_large_host(256ULL * 1024ULL * 1024ULL);
+                if (large2) {
+                    std::memset(large2, 0x5a, 256ULL * 1024ULL * 1024ULL);
+                    sycl::queue& q = ctx.queue();
+                    q.memcpy(dev, large2, chunk_bytes);
+                    q.wait_and_throw();
+                    const auto t1 = Clock::now();
+                    sycl::event last{};
+                    for (size_t i = 0; i < large_chunks; ++i)
+                        last = q.memcpy(dev, large2, chunk_bytes);
+                    last.wait_and_throw();
+                    const double ms2 = ms_since(t1);
+                    std::printf("large-page via queue.memcpy: %zu chunks of %zu KB in %.1f ms -> %.2f GB/s\n",
+                                large_chunks, chunk_kb, ms2,
+                                static_cast<double>(large_chunks) * static_cast<double>(chunk_bytes) / (ms2 * 1e6));
+                    ctx.free_host(large2);
+                }
             }
         } catch (const std::exception& e) {
             std::printf("large-page source: REJECTED by the runtime (%s)\n", e.what());

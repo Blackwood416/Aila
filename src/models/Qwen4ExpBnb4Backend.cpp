@@ -2003,7 +2003,7 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     auto stage_chunk=[&](int c){
         const int s=chunk_begin(c),n=chunk_count(c);
         auto batch=adaptive_cache_.StageColdExpertsAsync(host_arena_,*copy_q_,layer,
-            prefill_unique_.data()+s,n,ping_pong_index_,&expert_executor_);
+            prefill_unique_.data()+s,n,ping_pong_index_,&expert_executor_, direct_arena_stage_);
         ping_pong_index_=(ping_pong_index_+1)%staging_banks;
         for (int j=0;j<n;++j)
             adaptive_prefill_slots_[prefill_unique_[s+j]]=adaptive_cache_.GetStagingSlotDev(batch.ping_pong_index,j,&metadata);
@@ -2613,7 +2613,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const int s_cold_split_num =
         std::clamp(aila::env::read_int_raw("AILA_Q4E_COLD_SPLIT_NUM", 0), 0, 256);
     static const bool s_direct_arena_stage =
-        aila::env::read_flag("AILA_Q4E_STAGE_DIRECT_ARENA", false);
+        aila::env::read_flag("AILA_Q4E_STAGE_DIRECT_ARENA", true);
     // The split is a token-level share, not a per-layer floor. Reset it once
     // per forward; prefill and multi-row verify never consume it.
     cold_split_credit_ = 0;
