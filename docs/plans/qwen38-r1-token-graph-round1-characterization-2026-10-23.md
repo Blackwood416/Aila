@@ -2221,3 +2221,37 @@ section 49.
 Milestones to report against: 16 tok/s now, ~65 tok/s once the device is the only limiter, ~110 tok/s
 once copies pipeline at todays rate, ~200 tok/s once copies use large runs, 400 tok/s when compute is
 hidden as well.
+
+## 51. Correction: the trace used in sections 47, 50 mixes prefill with decode
+
+The counts in `tmp/vtune-xpu-1-hotspots.csv` separate the phases cleanly once they are read as instance
+counts rather than durations:
+
+```text
+gemm_kernel                 n = 3619   }  three kernels tracking 1:1, about 3620 calls
+gemm_kernel                 n = 3622   }  3620 / 3 per decode token ~ 1200 decode tokens
+submit_dequant              n = 3620   }
+attention_prefill_cached    n = 36     }  12 QSA layers x 3 prefill chunks
+run_linear_delta_prefill    n = 252    }  36 GDN layers x 7
+attention_prefill_qsa_batched n = 12   }  12 QSA layers x 1
+```
+
+So that trace contains ~1200 decode tokens as well as prefill, and the "31.7 s of device time" splits
+into prefill and decode parts that the aggregate cannot separate. Nothing above about the copy model is
+affected, because the copy rows are staging (`n = 27213`, tracking the 17548 expert stagings) and the
+copy probe is independent; but three specific claims in sections 47 and 50 are withdrawn:
+
+- "prefill's non-copy device work is 12.7 s" - unknown, that figure includes decode GEMMs.
+- "QSA prefill is 0.99 s" - `attention_prefill_cached_impl` at n = 36 is 0.99 s but it is the non-QSA
+  fallback; the batched QSA path measures 0.08 s total.
+- "the GPU is 25% busy during prefill" - the ratio is against the whole run, not prefill alone.
+
+### 51.1 The measurement that must come next
+
+A **prefill-only** trace: the same collection with generation limited to one token, so every instance
+count is a multiple of the three prefill chunks and the per-kernel durations are prefill durations.
+Until that exists, prefill's cost structure is known only as: 42.6 GB of staging at 2.2 GB/s, ~46.6 s of
+host stage wall time, and ~127 s of wall clock in which device busy is well under half.
+
+This is recorded as a correction rather than an edit so the reasoning trail stays honest: the copy model
+in section 50.2 is solid (it comes from a standalone probe), while the phase attribution was not.
