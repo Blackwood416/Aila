@@ -2399,3 +2399,53 @@ work-group) and stage K/V tiles in SLM, keeping the existing signature and the b
 arguments so the caller does not change, and gate it behind an env flag with the current kernel as the
 A/B control. Expected effect: K/V traffic drops by the query-tile factor, which is where the 51.6 GB and
 the 0.5%-of-peak utilisation both come from.
+
+## 55. Correction: the marginal prefill cost is per-token MoE weight traffic, not attention
+
+Section 54 blamed the QSA attention kernel using a 76% share. That share came from the per-layer stage
+sums, which section 53.2 already flagged as unreliable because they sum above the run's wall time. The
+scoreboard's own scaling contradicts the conclusion:
+
+| prompt | ms/token |
+|---:|---:|
+| 1019 | 10.15 |
+| 2026 | **6.65** |
+| 3033 | **7.30** |
+
+A cost that dominated and grew with the key count, as dense attention does, would make the per-token
+figure rise steeply with prompt length. Instead it is flat (2026 -> 3033 is +50% tokens for +10%
+ms/token, and 1019 is only worse because the 4.4 s fixed cost is spread over fewer tokens). So attention
+is **not** the marginal term, and rewriting its kernel would not move the scoreboard.
+
+### 55.1 What the marginal term actually is
+
+Marginal 5.86 ms/token, independent of prompt length, with only ~1% of it on the CPU expert path
+(`experts_host_ms` 315 ms) and ~285 ms of staging for a whole pass. That leaves the GPU expert path:
+each token selects 10 experts in each of 48 layers, so it touches
+
+```text
+10 x 48 = 480 (layer, expert) pairs x 2.46 MB = 1.18 GB of expert weights per token
+1.18 GB / 5.86 ms = 202 GB/s   (~40% of an A770's ~500 GB/s)
+```
+
+So prefill is **weight-bandwidth-bound on the expert set**, running at 202 GB/s of effective throughput.
+That is the number the 2.34x has to move, and the way to move it is reuse: if each expert's weights are
+read once and applied to all of the token rows routed to it, the per-token traffic falls by the average
+rows-per-expert factor (about 60 for a 3033-token chunk against 512 experts per layer) rather than being
+paid per token.
+
+### 55.2 The question to answer before writing any kernel
+
+Whether the prefill expert kernel is already expert-major or row-major. The preset enables
+`[Q4E PrefillExpertXmx] enabled=1 max_chunk_rows=4096 channels=2560/640`, which suggests a batched path
+exists, so the first measurement is not "write a grouped GEMM" but "count how many times each expert's
+weights are read per chunk". A cheap proxy: compare `h2d_mb` and the expert kernel's instance count
+against the chunk's (layer, expert) set. If the kernel is already read-once, the 202 GB/s is a real
+bandwidth ceiling and the lever becomes occupancy/access pattern instead.
+
+### 55.3 Correction to the attention claim
+
+The QSA prefill kernel really does give each query token its own work-group
+(`AttentionOps.cpp:5743`, `row = group / num_groups`), which is a genuine inefficiency and worth fixing
+for long prompts, but at the current numbers it is **not** where the 400 tok/s target is lost. Fixing it
+would help at 8K-32K contexts, not at 2K.
