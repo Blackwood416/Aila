@@ -3812,3 +3812,214 @@ remaining     Argon Rank 1 (GDN launch restructure, 90% confidence, -2.2..-2.9 s
 Both are kernel/driver-level projects rather than configuration: Rank 1 restructures
 `try_linear_delta_prefill_chunked` into a batched solve plus a persistent scan, and Rank 2 needs the L0
 driver extension plumbed in at arena creation.
+
+## 84. Round 4: GDN launch fusion lands (-1.06 s); the scoreboard was measuring a truncated 4K window; arena import and layer prefetch are negative
+
+Round 3 closed with three "high-confidence" options from Argon (batched GDN solve, Level Zero arena
+import, pre-router prefetch). This round measured every one of them. Only the GDN restructure paid, and
+the pay came with a correction to the measurement instrument itself.
+
+```text
+                             tokens   wall ms   ms/token   tok/s     round 3
+tools/prefill-bench.ps1       2007    11,304      5.632     177.5     173.2
+                              4895    15,545      3.176     314.9     299.3  (4,952)
+                              7764    20,842      2.684     372.5     357.1  (7,878)
+
+linear fit over the three: marginal 1.66 ms/token (604 tok/s) + 7,980 ms fixed per run
+```
+
+Need 19.41 s at 7764 tokens for 400 tok/s, so **1.40 s left**; round 3 needed 2.37 s. The marginal slope
+already beats the 2.50 ms/token that 400 tok/s implies, and what remains is the 7.98 s of per-run /
+per-layer fixed cost (48 layers x ~166 ms of row-independent work). That is a different shape from the
+one round 3 was attacking and it reframes the remaining work.
+
+### 84.1 The scoreboard could not measure the number it was reporting
+
+`tools/prefill-bench.ps1` hardcoded `--max-seq 4096`. The CLI does not truncate an oversized prompt, it
+refuses it:
+
+```text
+[GenerateMessages] Prompt exceeds context window (prompt=7764 max_seq=4096)
+```
+
+so the documented `-Tokens 7878` run parsed nothing and printed "could not parse a measurement". The round
+3 numbers must have come from the direct invocation in section 4.4 of the handoff, which uses
+`--max-seq 12288`. max-seq is now a script parameter defaulting to 12288, and it is part of the
+measurement identity because it sizes the KV cache and therefore the admitted resident expert pool. With
+it fixed the script reproduces round 3 exactly (2007 tokens / 172.5 tok/s against the documented 173.2).
+
+### 84.2 The preset was overriding the GDN mode default (the handoff's cheapest TODO)
+
+`src/utils/Qwen38A770Preset.hpp` wrote `AILA_Q4E_GDN_CHUNK_MODE=0`, and a preset value beats the
+`read_int(..., 1)` default, so round 3's faster chunk-controlled path never shipped. Fixed to `1`.
+Paired measurement of mode 0 against mode 1 in this session: 21,960 ms -> 21,760 ms, i.e. **-0.20 s**,
+which is smaller than round 3's -2.6% but the same sign.
+
+### 84.3 GDN chunked scan: one kernel per head instead of 2 launches per chunk (-1.06 s)
+
+`solve_chunk` and `product_f32` are now `ops::chunk_scan` in `src/ops/GdnChunkOps.cpp`: one work-group
+per value head walks every T-token chunk in order, so the head's recurrent state column stays with the
+thread that owns it and the launch pair disappears. The arithmetic per chunk is exactly the concatenation
+of the two old kernels in the same reduction order.
+
+Paired A/B on the scoreboard at 7764 tokens, two runs per arm, back to back (the only reliable form on this
+machine):
+
+```text
+launched scan  21,939.5 / 21,834.9 ms   353.9 / 355.6 tok/s
+fused scan     20,821.9 / 20,831.8 ms   372.9 / 372.7 tok/s
+```
+
+`AilaGdnChunkTests --bench` isolates the op at v_heads=48 (wall / device span, median of 20):
+
+```text
+             count=30    count=256   count=2048
+mode 0       0.762 ms     4.959 ms    38.04 ms     recurrence path (the mode-0 preset)
+mode 1       0.528 ms     2.614 ms    18.84 ms     fused scan
+mode 2       0.703 ms     3.966 ms    30.54 ms     XMX product, still launched
+```
+
+The observer-free trace agrees: `solve_chunk` 3.079 s (17,820 calls at 0.173 ms) + `product_f32` 0.741 s
+became `chunk_scan` 2.389 s across 108 calls. Two rounds of tuning were needed to get there and both are
+worth recording:
+
+- **q/k must live in SLM.** The first version re-read them from `prepared`. Every consumer is either
+  coalesced or a sub-group broadcast, so the reads look free, but the S0 projection is 8,192 SLM/global
+  reads per thread per chunk and the kernel measured **0.36 ms per chunk against 0.30 ms for the two old
+  launches** - i.e. slower than what it replaced. Staging q/k in SLM (26 KB total with the causal matrix
+  and the triangular factor) fixed it.
+- **The state column loads need 8 in flight.** One strided element per j meant 128 serialised L2 round
+  trips. Blocking the j loop by 8 (and the state update by 4) took count=2048 from 22.1 ms to 18.8 ms.
+  The trace still reports a 4,992-byte private spill; dropping `bse[]` in favour of `prefix[t]*qs[t]`
+  shrank it but did not eliminate it, and the remaining gap to the instruction-issue bound is ~10x, so
+  there is more here than has been found.
+
+`AilaGdnChunkTests --scan-parity` (new) pins the fused path against the launched one over 2 geometries x 11
+lengths including every tail case: `state_nrmse ~1.2e-7`, `out_nrmse <= 2.8e-5`, conv history unchanged.
+It is **not** bit-identical - icx contracts a different subset of the inner products into FMAs inside the
+fused loop body - and the tolerance is documented in the test so a future reader does not chase it. The
+CPU-reference canaries are unchanged (`state_nrmse 8e-7`, `output_nrmse 5e-5`).
+
+### 84.4 Merging adjacent arena slots into one copy (+0.19 s, and it explains the "36.7k small copies")
+
+Section 83.1 concluded that ~36,700 of the 37,465 copies were small and could not find them. They are not
+small, and they are not from the ALU path: VTune's `Transfer Size` column says the copy stream moves
+**62,197,882,427 bytes H2D**, i.e. 62.2 GB, which at the 8.57 GB/s the same trace implies is exactly the
+6.48 s it reports. Every one of the 24,576 (layer, expert) pairs in the model is staged at 7764 tokens,
+because coupon-collector says all 512 experts of every layer get at least one token. The `h2d_mb=1,851 /
+staged=766` counters in section 83.1 are the *warm-up and decode slices*, not the prefill slice; the
+prefill slice's own line reads `staged=21,776 h2d_mb=52,632`. New opt-in line
+`[Q4E StageShape] pos=.. staged=.. copies=.. experts_per_copy=..` prints it per forward.
+
+That also means round 3's "the copy cost is dominated by many small transfers, not by streaming expert
+weights" was wrong in the same direction as the two conclusions section 83 already retracted: the copy
+cost **is** streaming expert weights, at 2.5 MB per expert.
+
+What was worth fixing is that the destination bank is contiguous while the source is not.
+`Qwen4ExpAdaptiveCache::StageColdExpertsAsync` now coalesces runs of adjacent arena slots into one
+`queue::memcpy`:
+
+```text
+staged=19,213  copies=3,489  experts_per_copy=5.42  ->  ~13.5 MB per transfer
+```
+
+which is the size class where this platform's DMA stops losing efficiency (probe: 2.4 MB chunks
+8.69 GB/s, 64 MB 9.76 GB/s), and which cuts the host enqueue count per staging chunk from 16 to ~2.
+Scoreboard: 372.8 -> 372.9 at default settings, but with `AILA_Q4E_STAGING_SLOTS=64` (fewer batch
+boundaries, so longer runs) 376.3. The slots=64 config was **not** adopted: +0.9% is at the edge of what
+this machine's drift can resolve and it doubles the staging footprint.
+
+### 84.5 Level Zero arena import: mechanism works, engine crashes - parked
+
+Round 3 section 9-C verified that `zexDriverImportExternalPointer` drops copy enqueue from 23.7 us to
+4.0 us per 2.4 MB transfer. This round plumbed it in: `src/memory/L0HostImport.{hpp,cpp}` resolves
+`zeDriverGet` / `zeDriverGetExtensionFunctionAddress` / `zexDriverImportExternalPointer` at run time
+through the loader (no link dependency, so every probe target keeps building),
+`Context::alloc_large_host` imports each range, `free_host` releases it, and
+`AILA_Q4E_L0_IMPORT_HOST` gates it. The probe section was extended to check something the old one never
+did - that the bytes survive the import and reach device code:
+
+```text
+AilaH2DBandwidthProbe.exe 16 2400 24576
+imported arena: 24576 MB requested, 10147 slots of 2536000 bytes
+zexDriverImportExternalPointer: OK (0x0)
+imported arena round trip: 261 sampled slots x 2536000 bytes, mismatches=0
+imported arena device read: bad=0 (want 0)
+```
+
+24 GiB imported, data correct, kernel reads correct, enqueue 5.0 -> 3.7 us (the "before" arm now measures
+an already-imported pointer, so the A/B in the probe is no longer meaningful - the 6x in section 9-C is the
+number to trust). But the **engine dies with 0xC0000409 right after `[Q4E PrefillStage]`**, i.e. on the
+first staged chunk, and reproducibly so. The probe cannot reproduce it at any import size, so the trigger is
+something about the engine's interleaving, and it is not worth chasing for a ~0.5 s enqueue saving. The
+flag defaults to **off**; the plumbing stays because it is tested and correct at probe scale.
+
+### 84.6 Pre-router prefetch of the cold set: implemented, adopted, and 7.6 s slower - reverted
+
+Argon Rank 3, built the narrow way. The cold set of a layer is route-independent (`GetSlot(layer, e) < 0`),
+so it can be streamed into the staging banks while the attention window runs - the only long window in
+which the copy queue is otherwise idle. The implementation staged the whole cold set into the bank ring
+before `RunAttentionWindow`, wrote slot descriptors per expert at prefetch time, and had
+`RunAdaptivePrefill` gate each consumer chunk on the prefetch chunk holding its last expert (copy-queue
+order makes a later chunk's event cover the earlier ones), so adoption did not depend on the routed set
+matching the prefetched list. That last property was needed: 454 experts per layer are cold but only ~400
+are routed at 7764 tokens.
+
+It adopted correctly (`staged=21,776`, i.e. the pump did not run a second time) and measured
+**28,293 ms / 274.4 tok/s against 20,822 / 372.9**, with `bank_wait_ms=1,214` of new host stall. Every
+variation of the surrounding config was worse. Its sibling `AILA_Q4E_LAYER_STAGE=1`, which stages the
+whole layer through a host bounce and then host-waits for the epoch before any expert kernel is submitted,
+measured 281.0 tok/s in this same session. So the conclusion to carry forward is that **the expert phase is
+DMA-bound already** - prefetching does not create overlap, it only moves the same bytes earlier and pays a
+deeper ring plus a coarser gating granularity for it. The code is reverted; `kMaxStagingBanks` is back to 4 and
+`AILA_Q4E_PREFILL_STAGING_BANKS` above 2 measured 307-318 tok/s.
+
+### 84.7 Where the remaining 1.40 s has to come from
+
+The linear fit says the wall is `7,980 ms + 1.66 ms/token`, so at 7764 tokens the target needs the fixed
+term at 6.52 s. The fixed term is 48 layers x ~166 ms of row-independent work, and the observer-free
+attribution on the current build is:
+
+```text
+ 7.37 s  40,966  zeCommandListAppendMemoryCopy   62 GB at 8.57 GB/s
+ 4.15 s   7,278  onednn gemm_kernel              expert XMX batched matmul
+ 3.27 s     389  packed_nf4_gemm_bf16_joint_matrix_wide   dense NF4 projections
+ 2.79 s  14,959  everything else, ~0.19 ms each
+ 2.78 s     108  attention_prefill_qsa_batched_impl       12 QSA layers
+ 2.39 s     108  chunk_scan                      fused GDN, was 3.82 s
+ 1.36 s   2,945  submit_dequant                  NF4 -> BF16 for the expert matmul
+ 0.16 s     432  moe_ordered_accumulate_down_rows
+ 0.13 s     108  prepare_inputs
+---------------
+24.45 s device against 20.84 s wall, so 3.6 s of DMA is still exposed
+```
+
+Two levers remain and both are now clearly bounded:
+
+1. **The expert phase is DMA-bound at ~7 s** and cannot be overlapped further from inside `prefill` (84.6).
+   The only lossless reduction left is DMA throughput above 8.57 GB/s, which needs the arena to hold a
+   layer's cold experts contiguously so one transfer is ~1 GB rather than 13 MB - a load-time layout change
+   that the adaptive swap machinery also has to maintain.
+2. **The row-independent per-layer work is ~166 ms and is the whole fixed cost.** `attention_prefill_qsa`
+   (232 ms per QSA layer) and the dense NF4 projections (68 ms per layer) are the two largest pieces, and
+   neither has been profiled for itself in this round.
+
+Rejected again this round, with measurements: `AILA_Q4E_STAGING_SLOTS` 32 (+0.2 s) and 64 (+0.19 s, not
+adopted), `AILA_Q4E_PREFILL_STAGING_BANKS` 3/4 (307-318 tok/s), `AILA_Q4E_LAYER_STAGE=1` (281 tok/s),
+`AILA_Q4E_L0_IMPORT_HOST=1` (crash).
+
+### 84.8 State
+
+```text
+target        400 tok/s   (19.41 s at 7764 tokens)
+best measured 372.5 tok/s (20,842 ms)
+round 3       357.1 tok/s (22,059 ms)
+gap           1.40 s, all of it inside the 7.98 s row-independent fixed cost
+committed     GDN fused chunk scan; adjacent-slot copy coalescing; preset GDN mode
+parked        L0 arena import (needs the engine crash explained first)
+dead          pre-router expert prefetch; deeper staging banks; AILA_Q4E_LAYER_STAGE
+```
+
+Tests: `AilaGdnChunkTests` (17 CPU canaries plus 22 scan-parity cells), `AilaQwen4ExpToleranceTests`,
+`AilaQwen4ExpAdaptiveCacheTests`, `AilaQwen4ExpArenaVerifyTests`, `AilaQwen4ExpHostArenaTests`,
+`AilaQwen4ExpDmaTimingTests` - all green (`ctest -L qwen4_exp`, 172 s).
