@@ -3662,6 +3662,24 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                                  static_cast<double>(b.count) * 1e-3
                            : 0.0;
         };
+        // Staging DMA shape for this forward. `copies` is the number of H2D calls
+        // the direct-arena path actually issued after collapsing runs of adjacent
+        // arena slots, so staged/copies is the average experts per transfer.
+        if (aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_TIMING", false)) {
+            const uint64_t staged_now = a.cold_experts_staged - adaptive_stats0.cold_experts_staged;
+            const uint64_t copies_now = a.staging_copies_merged - adaptive_stats0.staging_copies_merged;
+            AILA_LOG_INFO("[Q4E StageShape] pos=%d count=%d staged=%llu copies=%llu "
+                          "experts_per_copy=%.2f mb=%.1f banks=%d slots=%d",
+                          start_pos, count, (unsigned long long)staged_now,
+                          (unsigned long long)copies_now,
+                          copies_now ? static_cast<double>(staged_now) /
+                                           static_cast<double>(copies_now)
+                                     : 0.0,
+                          (a.cold_bytes_transferred - adaptive_stats0.cold_bytes_transferred) /
+                              1048576.0,
+                          adaptive_cache_.StagingBanks(),
+                          adaptive_cache_.StagingSlotsPerBuffer());
+        }
         // The HC submit/gap block leads the message: the line is truncated at
         // ~1025 chars, and hc_submit_down/up n/min/max must survive the cut.
         AILA_LOG_INFO("[Q4E AdaptiveWork] pos=%d count=%d ple_reused=%d "

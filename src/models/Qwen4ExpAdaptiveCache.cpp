@@ -675,18 +675,35 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         // read directly (9.05-9.23 GB/s measured). Keep the same in-order
         // staging bank and prior-consumer dependency, but do not perform the
         // 5.45 GB/s coordinator memcpy that made the cap=4 split negative.
+        //
+        // Consecutive cold experts in id order are usually consecutive arena
+        // slots (the arena is laid out layer-major/expert-major and only the
+        // GPU-resident experts leave gaps), so a run of them is one contiguous
+        // source range and one contiguous destination range. Collapsing those
+        // runs into a single memcpy lifts each transfer from one 2.5 MB slot to
+        // ~20 MB, which is where this platform's DMA stops losing efficiency
+        // (probe: 2.4 MB chunks 8.69 GB/s, 64 MB 9.76 GB/s) and cuts the host
+        // enqueue count per chunk from 16 to ~2.
         sycl::event last{};
-        for (int i=0;i<count;++i) {
-            if (i==0 && staging_read_[pp]) {
-                last=q.memcpy(staging_dev_[pp]+size_t(i)*geom_.slot_bytes,
-                               sources[i],geom_.slot_bytes,
-                               std::vector<sycl::event>{staging_reader_[pp]});
+        int merged_copies = 0;
+        for (int i = 0; i < count;) {
+            int run = 1;
+            while (i + run < count &&
+                   sources[i + run] == sources[i] + size_t(run) * geom_.slot_bytes)
+                ++run;
+            const size_t run_bytes = size_t(run) * geom_.slot_bytes;
+            if (i == 0 && staging_read_[pp]) {
+                last = q.memcpy(staging_dev_[pp], sources[0], run_bytes,
+                                std::vector<sycl::event>{staging_reader_[pp]});
             } else {
-                last=q.memcpy(staging_dev_[pp]+size_t(i)*geom_.slot_bytes,
-                              sources[i],geom_.slot_bytes);
+                last = q.memcpy(staging_dev_[pp] + size_t(i) * geom_.slot_bytes,
+                               sources[i], run_bytes);
             }
+            ++merged_copies;
+            i += run;
         }
-        batch.ready_event=last;
+        stats_.staging_copies_merged += static_cast<uint64_t>(merged_copies);
+        batch.ready_event = last;
     } else {
         batch.ready_event=q.submit([&](sycl::handler& cgh) {
             if (staging_read_[pp]) cgh.depends_on(staging_reader_[pp]);

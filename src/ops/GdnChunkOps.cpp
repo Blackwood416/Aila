@@ -221,7 +221,11 @@ void chunk_scan(Context& ctx, const float* p, float* state, float* raw,
                         mat[(T+v)*T+t]=kt[t*D+v]*ratio;
                     }
                     item.barrier(sycl::access::fence_space::local_space);
-                    float ks[T]={},qs[T]={},d[T]={},bse[T]={};
+                    // ks and qs are the only private arrays that must survive the
+                    // whole S0 projection; bse was a third (16 more live registers)
+                    // and measured as a 4,992-byte private spill per thread, which
+                    // is why the base term is recomputed from prefix/qs instead.
+                    float ks[T]={},qs[T]={},d[T]={};
                     // The S0 projections touch one strided element of the state
                     // column per j, so a naive j loop serialises on 128 separate
                     // L2 round trips. Eight independent loads are issued per block
@@ -245,14 +249,13 @@ void chunk_scan(Context& ctx, const float* p, float* state, float* raw,
                         float dv=beta[t]*(val-prefix[t]*ks[t]);
                         for(int j=0;j<t;++j) dv-=l[t*T+j]*d[j];
                         d[t]=dv;
-                        bse[t]=prefix[t]*qs[t];
                     }
                     #pragma unroll
                     for(int m=0;m<T;++m) {
                         float sum=0.f;
                         #pragma unroll
                         for(int t=0;t<T;++t) sum+=mat[m*T+t]*d[t];
-                        if(m<n) raw[(size_t(start+m)*heads+h)*D+v]=sum+bse[m];
+                        if(m<n) raw[(size_t(start+m)*heads+h)*D+v]=sum+prefix[m]*qs[m];
                     }
                     // The state update is a strided read-modify-write; four rows
                     // in flight hide the round trip the same way.

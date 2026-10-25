@@ -88,6 +88,10 @@ struct AdaptiveCacheStats {
     uint64_t cold_bytes_transferred = 0;
     uint64_t swap_bytes_transferred = 0;
     uint64_t cold_experts_staged = 0;
+    // Expert slots per H2D issued by the direct-arena staging path. Runs of
+    // adjacent arena slots collapse into one memcpy, so this stays far below
+    // cold_experts_staged when the layer's cold set is mostly contiguous.
+    uint64_t staging_copies_merged = 0;
     uint64_t swaps_executed = 0;
     // Host intervals only; fill and bank waits may overlap GPU computation.
     uint64_t staging_fill_ns = 0;
@@ -345,8 +349,8 @@ private:
 
     // Staging banks [0..staging_banks-1]; 2 banks reproduce the historical
     // ping-pong A/B layout verbatim.
-    uint8_t* staging_dev_[AdaptiveCacheConfig::kMaxStagingBanks] = {nullptr, nullptr, nullptr, nullptr};
-    uint8_t* staging_host_[AdaptiveCacheConfig::kMaxStagingBanks] = {nullptr, nullptr, nullptr, nullptr};
+    uint8_t* staging_dev_[AdaptiveCacheConfig::kMaxStagingBanks] = {};
+    uint8_t* staging_host_[AdaptiveCacheConfig::kMaxStagingBanks] = {};
     std::array<std::array<int, AdaptiveCacheConfig::kMaxStagingSlots>,
         AdaptiveCacheConfig::kMaxStagingBanks> staging_experts_{};
     sycl::event staging_copy_[AdaptiveCacheConfig::kMaxStagingBanks]{};
