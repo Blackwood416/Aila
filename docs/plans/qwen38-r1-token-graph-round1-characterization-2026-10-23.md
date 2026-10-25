@@ -3745,3 +3745,70 @@ rest            ~8 s    (31%)   spread over ~600 rows
 
 Every one of these has now been attacked and measured: copies (sections 71-81), experts (58, 62, 64),
 GDN (68, this section), QSA (67), and the remainder is small-kernel spread that no single change moves.
+
+## 83. Argon's direction call, and a correction to the copy picture
+
+### 83.1 The copy picture in the current build is not 42.6 GB of expert weights
+
+The 42.6 GB figure came from the decode A/B runner and older configurations. On the shipped build at 7878
+tokens the counters say:
+
+```text
+h2d_mb = 1,851 MB     staged = 766 experts     -> 2.42 MB per staged expert
+hits = 194            misses = 766             fill_ms = 284     bank_wait_ms = 0.3
+```
+
+So only **766 experts (1.85 GB)** are staged, while the trace shows **37,465 memory copies**. That means
+roughly **36,700 of those copies are small**, and at the measured 0.17 ms average they account for most of
+the 6.48 s copy time. The copy cost is therefore dominated by *many small transfers*, not by streaming
+expert weights - which is a different problem from the one sections 71-81 were attacking.
+
+Candidate sources were tested and excluded this round:
+
+```text
+AILA_Q4E_DIRECT_PREFILL_IO=0   22,763.3 ms   346.1 tok/s   (worse than the 357.1 default)
+AILA_Q4E_PREFILL_XMX=0         27,070.7 ms   291.0 tok/s   (much worse; the joint-matrix path is right)
+```
+
+The remaining candidate in the source is the ALU per-segment map upload at
+`Qwen4ExpBnb4Backend.cpp:2142-2146` (three or four `queue().memcpy` per activation segment), which the
+XMX path should not be taking at this row count - so identifying the actual 36.7k copies needs a counter at
+each copy site rather than more flag tests.
+
+### 83.2 Argon's verdict
+
+Asked whether 400 tok/s is reachable on this hardware, Argon's answer was **yes, ceiling ~430-460 tok/s**,
+and it reframed the budget: device work is 25.4 s but wall is 22.06 s, so 3.34 s of DMA already overlaps
+compute and **3.91 s of DMA/host stall is exposed**; only **2.37 s** has to be recovered.
+
+Its ranked options:
+
+| rank | change | expected saving | confidence |
+|---|---|---|---|
+| 1 | batch GDN `solve_chunk` across all 493 chunks (36 launches instead of 17.8k) and fuse the inter-chunk state scan into one persistent kernel per layer | -2.2 to -2.9 s | 90% |
+| 2 | import the large-page arena into Level Zero once via `zexDriverImportExternalPointer` so the driver stops doing per-call host-pointer registration | -1.8 to -2.8 s | 85% |
+| 3 | pre-router speculative cold-expert prefetch while attention/GDN runs | -1.5 to -2.4 s | 75% |
+| 4 | cache-aware tail routing (approximate) | -0.9 to -1.4 s | 65% |
+
+It explicitly rejected two ideas as dead ends: reducing the 42.6 GB losslessly (coupon-collector says
+>95% of experts get at least one token), and multi-pass or layer-sorted scheduling (at chunk 8192 every
+layer is already visited exactly once, so re-segmenting is mathematically identical with more overhead).
+
+Its Rank 1 mechanism is worth recording because it explains the 35k launches: intra-chunk triangular
+inversion in the WY form has **no cross-chunk dependency**, so all 493 chunks per layer can be solved in a
+single launch of `nd_range{H, 493}`, leaving only the inter-chunk scan sequential, and that scan can be one
+persistent kernel per head with the recurrent state resident in registers or SLM instead of being read and
+written to VRAM 493 times per layer.
+
+### 83.3 State
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens (gap 1.12x, need -2.37 s)
+remaining     Argon Rank 1 (GDN launch restructure, 90% confidence, -2.2..-2.9 s)
+              or Rank 2 (arena import, 85%, -1.8..-2.8 s), either of which closes the gap alone
+```
+
+Both are kernel/driver-level projects rather than configuration: Rank 1 restructures
+`try_linear_delta_prefill_chunked` into a batched solve plus a persistent scan, and Rank 2 needs the L0
+driver extension plumbed in at arena creation.
