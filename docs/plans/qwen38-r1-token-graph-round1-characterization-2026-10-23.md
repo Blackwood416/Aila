@@ -3638,3 +3638,47 @@ So the honest statement is: the remaining 1.12x is a contained but real concurre
 mutex (or per-bank ownership), make the enqueue asynchronous, then validate with the greedy-output check
 plus the MoE and attention kernel tests - and it is not a change to land blind at the end of a long
 session.
+
+## 81. Asynchronous staging is neutral too, which closes the last hypothesis
+
+The final untried idea from section 80.1 was implemented: `AILA_Q4E_PREFILL_ASYNC_STAGE` runs
+`stage_chunk(c+lookahead)` on a `std::async` worker while the main thread submits chunk c's GEMMs, with a
+mutex serialising every `adaptive_cache_` access (the staging call and `RecordStagingConsumer`) so the
+shared cache object is never touched concurrently, and a join at the top of each iteration before the
+staged batch is consumed.
+
+```text
+async staging   22,112.8 ms   2.81 ms/token   356.3 tok/s
+sync staging    22,169.3 ms   2.81 ms/token   355.4 tok/s     (baseline 357.1)
+```
+
+Neutral. That is the decisive result for this line of work: the ~3.9 ms per chunk inside `stage_chunk` is
+**not** enqueue overhead that can be moved to another thread. It is work that has to happen and that is
+gated by the staging bank's previous consumer, so moving it off the submitting thread changes nothing -
+the main thread still has to wait for it before the next chunk's GEMMs can depend on the result.
+
+The change was reverted (`git checkout`) rather than left behind a default-off flag: it added a mutex and a
+join to the weight hot path shared with decode for zero measured benefit, and this project's convention is
+not to carry neutral complexity in that path.
+
+### 81.1 Every hypothesis for the last 1.12x is now measured and closed
+
+| hypothesis | verdict |
+|---|---|
+| staging granularity (slots, banks, merged copies) | neutral or worse (sections 76-78) |
+| direct-arena DMA | **+10.8%** - adopted (section 74) |
+| enqueue cost moved to a worker thread | neutral (this section) |
+| expert cache capacity (VRAM reserve) | +0.6%, not worth the headroom (section 79) |
+| GDN, QSA tile, chunk size, XMX gate | **adopted** (sections 57-68) |
+| weight layout, MIN_M, pipeline flags, LAYER_MAJOR, FUSED/RESIDENT_PREFILL, W_F16, XMX_ROWS | neutral |
+
+```text
+target        400 tok/s
+best measured 357.1 tok/s at 7878 tokens (299.3 at 4952, 173.2 at 2026)
+gap           1.12x
+```
+
+The remaining 1.12x is not reachable by moving work between threads or by any configuration this engine
+exposes. It requires making the staged work itself cheaper, i.e. reducing the 42.6 GB that prefill must
+move - which the routing saturates (section 79) - or a materially faster transfer path than the 8.3 GB/s
+the arena achieves today.
