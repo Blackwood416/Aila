@@ -6417,6 +6417,57 @@ sycl::event moe_ordered_accumulate_down_rows(
         throw std::invalid_argument("CPU result packet requires one token and at most 16 ranks");
     }
     if (tokens <= 0 || out_features <= 0) return {};
+    if (cpu_result_packet == nullptr && (out_features % 4 == 0)) {
+        const size_t vecs_per_row = static_cast<size_t>(out_features) / 4;
+        constexpr size_t wg_col = 64;
+        const size_t padded_cols = ((vecs_per_row + wg_col - 1) / wg_col) * wg_col;
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (dep_event && *dep_event != sycl::event{}) {
+                cgh.depends_on(*dep_event);
+            }
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(tokens), padded_cols),
+                                  sycl::range<2>(1, wg_col)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int token = static_cast<int>(item.get_global_id(0));
+                    const size_t c4 = item.get_global_id(1);
+                    if (c4 >= vecs_per_row) return;
+                    const size_t row0 = c4 * 4;
+                    const size_t token_base = static_cast<size_t>(token) * top_k;
+                    sycl::vec<float, 4> total_val(0.0f);
+                    for (int k = 0; k < top_k; ++k) {
+                        const float w_exp = weights[token_base + k];
+                        const sycl::vec<float, 4> v =
+                            *reinterpret_cast<const sycl::vec<float, 4>*>(
+                                down_acc + (token_base + k) * static_cast<size_t>(out_features) + row0);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            total_val[j] += w_exp * v[j];
+                        }
+                    }
+                    const size_t y_off = static_cast<size_t>(token) * static_cast<size_t>(out_features) + row0;
+                    sycl::vec<bf16, 4> out4;
+                    if (shared_out && shared_gate) {
+                        const float gate = static_cast<float>(shared_gate[token]);
+                        const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                        const sycl::vec<bf16, 4> sh4 =
+                            *reinterpret_cast<const sycl::vec<bf16, 4>*>(shared_out + y_off);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const bf16 routed = bf16(total_val[j]);
+                            out4[j] = bf16(static_cast<float>(routed) +
+                                           gate_act * static_cast<float>(sh4[j]));
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            out4[j] = bf16(total_val[j]);
+                        }
+                    }
+                    *reinterpret_cast<sycl::vec<bf16, 4>*>(y + y_off) = out4;
+                });
+        });
+    }
     constexpr size_t wg_size = 256;
     const size_t total_elements = static_cast<size_t>(tokens) * out_features;
     const size_t num_wgs = (total_elements + wg_size - 1) / wg_size;
