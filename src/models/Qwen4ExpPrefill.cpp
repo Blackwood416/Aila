@@ -479,9 +479,13 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, buf_.qsa_tile_valid_counts.data_as<int>(),
                             {tile_count, 2});
 
-                        ops::qsa_compute_block_scores_compressed_batched(
-                            ctx, q_tile, cache.indexer_compressed_k, buf_.qsa_tile_block_scores,
-                            tile_count, tile_max_blocks, compress_ratio, tile_start_pos);
+                        static const bool s_skip_dense_scores =
+                            aila::env::read_flag("AILA_QSA_SKIP_DENSE_SCORES", true);
+                        if (!s_skip_dense_scores || tile_max_blocks > block_topk) {
+                            ops::qsa_compute_block_scores_compressed_batched(
+                                ctx, q_tile, cache.indexer_compressed_k, buf_.qsa_tile_block_scores,
+                                tile_count, tile_max_blocks, compress_ratio, tile_start_pos);
+                        }
 
                         ops::qsa_select_topk_blocks_batched(
                             ctx, buf_.qsa_tile_block_scores, buf_.qsa_tile_active_blocks,

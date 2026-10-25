@@ -2471,6 +2471,79 @@ void qsa_compute_block_scores_compressed_batched(
     constexpr int kNumHeads = 4;
     constexpr float inv_sqrt_d = 0.08838834764831845f;
 
+    static const bool s_fast_scores = aila::env::read_flag("AILA_QSA_FAST_BLOCK_SCORES", true);
+    if (s_fast_scores) {
+        // 8 blocks per 128-thread work-group (8 sub-groups of 16 lanes):
+        // Q[4, 128] is staged into SLM once per 8 blocks (8x fewer Q global loads),
+        // compressed_k is loaded via vec<bf16, 8>, and each sub-group reduces its block
+        // via pure register shuffles (zero work-group reduction barriers).
+        constexpr int kBlocksPerWg = 8;
+        const int block_tiles = (max_complete_blocks + kBlocksPerWg - 1) / kBlocksPerWg;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> q_slm(sycl::range<1>(kNumHeads * kHeadDim), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<1>(static_cast<size_t>(query_count) * block_tiles * kWgSize, kWgSize),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    auto sg = item.get_sub_group();
+                    const int group = item.get_group(0);
+                    const int query = group / block_tiles;
+                    const int b_tile = group % block_tiles;
+                    const int lid = item.get_local_id(0);
+                    const int sg_id = lid >> 4;
+                    const int lane = lid & 15;
+                    const int b = b_tile * kBlocksPerWg + sg_id;
+
+                    const int pos = start_pos + query;
+                    const int visible_len = pos + 1;
+                    const int num_complete_blocks = visible_len / compress_ratio;
+                    const size_t q_base = static_cast<size_t>(query) * (kNumHeads * kHeadDim);
+
+                    #pragma unroll
+                    for (int h = 0; h < kNumHeads; ++h) {
+                        q_slm[h * kHeadDim + lid] = static_cast<float>(q_ptr[q_base + h * kHeadDim + lid]);
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    if (b >= max_complete_blocks) return;
+                    if (b >= num_complete_blocks) {
+                        if (lane == 0) {
+                            scores_ptr[static_cast<size_t>(query) * max_complete_blocks + b] = -1e30f;
+                        }
+                        return;
+                    }
+
+                    const int d_base = lane * 8;
+                    const auto kv8 = *reinterpret_cast<const sycl::vec<bf16, 8>*>(
+                        comp_k_ptr + static_cast<size_t>(b) * kHeadDim + d_base);
+                    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+                    #pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        const float kl = static_cast<float>(kv8[u]);
+                        const int d = d_base + u;
+                        p0 += q_slm[0 * kHeadDim + d] * kl;
+                        p1 += q_slm[1 * kHeadDim + d] * kl;
+                        p2 += q_slm[2 * kHeadDim + d] * kl;
+                        p3 += q_slm[3 * kHeadDim + d] * kl;
+                    }
+
+                    const float dot0 = sycl::reduce_over_group(sg, p0, sycl::plus<float>());
+                    const float dot1 = sycl::reduce_over_group(sg, p1, sycl::plus<float>());
+                    const float dot2 = sycl::reduce_over_group(sg, p2, sycl::plus<float>());
+                    const float dot3 = sycl::reduce_over_group(sg, p3, sycl::plus<float>());
+
+                    if (lane == 0) {
+                        const float r0 = sycl::fmax(0.0f, dot0);
+                        const float r1 = sycl::fmax(0.0f, dot1);
+                        const float r2 = sycl::fmax(0.0f, dot2);
+                        const float r3 = sycl::fmax(0.0f, dot3);
+                        scores_ptr[static_cast<size_t>(query) * max_complete_blocks + b] =
+                            (r0 + r1 + r2 + r3) * inv_sqrt_d;
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(query_count) * max_complete_blocks * kWgSize, kWgSize),

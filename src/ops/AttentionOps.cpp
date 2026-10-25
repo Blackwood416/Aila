@@ -5728,10 +5728,214 @@ void attention_prefill_qsa_batched_impl(
   constexpr int wg_size = 64;
   const size_t active_blocks_stride = static_cast<size_t>(block_topk + 4);
 
-  const int heads_per_wg_cfg = read_env_int_local("AILA_QSA_HEADS_PER_WG", 2);
+  const int heads_per_wg_cfg = aila::env::read_int_raw("AILA_QSA_HEADS_PER_WG", 25);
   const int s_heads_per_wg_env = (heads_per_wg_cfg <= 0)
-      ? ((count >= 16 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) ? 4 : 2)
+      ? ((count >= 16 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) ? 25 : 2)
       : heads_per_wg_cfg;
+
+  if (s_heads_per_wg_env == 25 && (compress_ratio == 4) &&
+      (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) {
+    // Mode 25: 4 Q heads per WG, Q in registers (zero Q SLM reads), vec4 bf16 KV loads,
+    // and 4-token block-batched SLM reduction (0.25 barriers/token vs 4-8 barriers/token).
+    // Measured on AilaQsaAttentionProbe --prefill (1024-row sparse tile): 15.10 ms vs 33.70 ms (2.23x).
+    const int num_groups = num_heads / 4;
+    ctx.queue().submit([&](sycl::handler& cgh) {
+      sycl::local_accessor<float, 1> dot_slm(sycl::range<1>(2 * 4 * 4 * 4), cgh);
+      cgh.parallel_for(
+          sycl::nd_range<1>(static_cast<size_t>(count) * num_groups * wg_size, wg_size),
+          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+            auto sg = item.get_sub_group();
+            const int group = item.get_group(0);
+            const int row = group / num_groups;
+            const int g_idx = group % num_groups;
+            const int lid = item.get_local_id(0);
+            const int sg_id = lid >> 4;
+            const int lane = lid & 15;
+            const int h0 = g_idx * 4;
+            const int kv_head = h0 / heads_per_kv;
+
+            int num_active_blocks = 0, tail_len = 0, tail_start = 0;
+            bool is_sparse = false;
+            if (valid_counts_ptr != nullptr) {
+              num_active_blocks = valid_counts_ptr[row * 2 + 0];
+              tail_len = valid_counts_ptr[row * 2 + 1];
+              is_sparse = (num_active_blocks >= block_topk);
+              tail_start = (start_pos + row + 1) - tail_len;
+            } else {
+              const int visible_len = start_pos + row + 1;
+              const int num_complete_blocks = visible_len / 4;
+              is_sparse = (num_complete_blocks > block_topk);
+              num_active_blocks = is_sparse ? block_topk : num_complete_blocks;
+              tail_start = num_complete_blocks * 4;
+              tail_len = std::max(0, visible_len - tail_start);
+            }
+
+            const int d_base = lid * 4;
+            float q_r[4][4];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const size_t q_off = (static_cast<size_t>(row) * num_heads + (h0 + k)) * head_dim + d_base;
+              const auto qv4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(q_ptr + q_off);
+              q_r[k][0] = static_cast<float>(qv4[0]);
+              q_r[k][1] = static_cast<float>(qv4[1]);
+              q_r[k][2] = static_cast<float>(qv4[2]);
+              q_r[k][3] = static_cast<float>(qv4[3]);
+            }
+
+            const int* my_blocks = active_blocks_ptr + static_cast<size_t>(row) * active_blocks_stride;
+            const size_t kv_offset = (static_cast<size_t>(kv_head) * max_seq_len) * head_dim;
+            float running_max[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+            float running_sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float acc0[4] = {}, acc1[4] = {}, acc2[4] = {}, acc3[4] = {};
+            int parity = 0;
+
+            for (int b = 0; b < num_active_blocks; ++b) {
+              const int blk = is_sparse ? my_blocks[b] : b;
+              const int base_t = blk * 4;
+              const int base_slm = parity * 64;
+              #pragma unroll
+              for (int c = 0; c < 4; ++c) {
+                const int cache_t = base_t + c;
+                const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim + d_base;
+                float k0, k1, k2, k3;
+                if constexpr (Fmt == kKvFmtInt8) {
+                  const float ks = k_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                  k0 = static_cast<float>(k8_ptr[tok_offset + 0]) * ks;
+                  k1 = static_cast<float>(k8_ptr[tok_offset + 1]) * ks;
+                  k2 = static_cast<float>(k8_ptr[tok_offset + 2]) * ks;
+                  k3 = static_cast<float>(k8_ptr[tok_offset + 3]) * ks;
+                } else {
+                  const auto kv4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(k_ptr + tok_offset);
+                  k0 = static_cast<float>(kv4[0]);
+                  k1 = static_cast<float>(kv4[1]);
+                  k2 = static_cast<float>(kv4[2]);
+                  k3 = static_cast<float>(kv4[3]);
+                }
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                  const float ldot = q_r[k][0] * k0 + q_r[k][1] * k1 + q_r[k][2] * k2 + q_r[k][3] * k3;
+                  const float sg_sum = sycl::reduce_over_group(sg, ldot, sycl::plus<float>());
+                  if (lane == 0) dot_slm[base_slm + (c * 4 + k) * 4 + sg_id] = sg_sum;
+                }
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+
+              #pragma unroll
+              for (int c = 0; c < 4; ++c) {
+                const int cache_t = base_t + c;
+                const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim + d_base;
+                float v0, v1, v2, v3;
+                if constexpr (Fmt == kKvFmtInt8) {
+                  const float vs = v_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                  v0 = static_cast<float>(v8_ptr[tok_offset + 0]) * vs;
+                  v1 = static_cast<float>(v8_ptr[tok_offset + 1]) * vs;
+                  v2 = static_cast<float>(v8_ptr[tok_offset + 2]) * vs;
+                  v3 = static_cast<float>(v8_ptr[tok_offset + 3]) * vs;
+                } else {
+                  const auto vv4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(v_ptr + tok_offset);
+                  v0 = static_cast<float>(vv4[0]);
+                  v1 = static_cast<float>(vv4[1]);
+                  v2 = static_cast<float>(vv4[2]);
+                  v3 = static_cast<float>(vv4[3]);
+                }
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                  const int idx = base_slm + (c * 4 + k) * 4;
+                  const float dot = dot_slm[idx + 0] + dot_slm[idx + 1] + dot_slm[idx + 2] + dot_slm[idx + 3];
+                  const float score = dot * scale;
+                  const float new_max = sycl::fmax(running_max[k], score);
+                  const float rescale = (running_max[k] <= -1e20f) ? 0.0f : sycl::native::exp(running_max[k] - new_max);
+                  const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+                  running_sum[k] = running_sum[k] * rescale + exp_score;
+                  running_max[k] = new_max;
+                  acc0[k] = acc0[k] * rescale + exp_score * v0;
+                  acc1[k] = acc1[k] * rescale + exp_score * v1;
+                  acc2[k] = acc2[k] * rescale + exp_score * v2;
+                  acc3[k] = acc3[k] * rescale + exp_score * v3;
+                }
+              }
+              parity ^= 1;
+            }
+
+            for (int t = 0; t < tail_len; ++t) {
+              const int cache_t = tail_start + t;
+              const size_t tok_offset = kv_offset + static_cast<size_t>(cache_t) * head_dim + d_base;
+              float k0, k1, k2, k3;
+              if constexpr (Fmt == kKvFmtInt8) {
+                const float ks = k_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                k0 = static_cast<float>(k8_ptr[tok_offset + 0]) * ks;
+                k1 = static_cast<float>(k8_ptr[tok_offset + 1]) * ks;
+                k2 = static_cast<float>(k8_ptr[tok_offset + 2]) * ks;
+                k3 = static_cast<float>(k8_ptr[tok_offset + 3]) * ks;
+              } else {
+                const auto kv4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(k_ptr + tok_offset);
+                k0 = static_cast<float>(kv4[0]);
+                k1 = static_cast<float>(kv4[1]);
+                k2 = static_cast<float>(kv4[2]);
+                k3 = static_cast<float>(kv4[3]);
+              }
+              const int base_slm = parity * 64;
+              #pragma unroll
+              for (int k = 0; k < 4; ++k) {
+                const float ldot = q_r[k][0] * k0 + q_r[k][1] * k1 + q_r[k][2] * k2 + q_r[k][3] * k3;
+                const float sg_sum = sycl::reduce_over_group(sg, ldot, sycl::plus<float>());
+                if (lane == 0) dot_slm[base_slm + k * 4 + sg_id] = sg_sum;
+              }
+              item.barrier(sycl::access::fence_space::local_space);
+              float v0, v1, v2, v3;
+              if constexpr (Fmt == kKvFmtInt8) {
+                const float vs = v_scale_ptr[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                v0 = static_cast<float>(v8_ptr[tok_offset + 0]) * vs;
+                v1 = static_cast<float>(v8_ptr[tok_offset + 1]) * vs;
+                v2 = static_cast<float>(v8_ptr[tok_offset + 2]) * vs;
+                v3 = static_cast<float>(v8_ptr[tok_offset + 3]) * vs;
+              } else {
+                const auto vv4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(v_ptr + tok_offset);
+                v0 = static_cast<float>(vv4[0]);
+                v1 = static_cast<float>(vv4[1]);
+                v2 = static_cast<float>(vv4[2]);
+                v3 = static_cast<float>(vv4[3]);
+              }
+              #pragma unroll
+              for (int k = 0; k < 4; ++k) {
+                const int idx = base_slm + k * 4;
+                const float dot = dot_slm[idx + 0] + dot_slm[idx + 1] + dot_slm[idx + 2] + dot_slm[idx + 3];
+                const float score = dot * scale;
+                const float new_max = sycl::fmax(running_max[k], score);
+                const float rescale = (running_max[k] <= -1e20f) ? 0.0f : sycl::native::exp(running_max[k] - new_max);
+                const float exp_score = sycl::native::exp(sycl::fmax(-88.0f, score - new_max));
+                running_sum[k] = running_sum[k] * rescale + exp_score;
+                running_max[k] = new_max;
+                acc0[k] = acc0[k] * rescale + exp_score * v0;
+                acc1[k] = acc1[k] * rescale + exp_score * v1;
+                acc2[k] = acc2[k] * rescale + exp_score * v2;
+                acc3[k] = acc3[k] * rescale + exp_score * v3;
+              }
+              parity ^= 1;
+            }
+
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              const float inv_sum = (running_sum[k] > 0.0f) ? (1.0f / running_sum[k]) : 0.0f;
+              float o0 = static_cast<float>(bf16(acc0[k] * inv_sum));
+              float o1 = static_cast<float>(bf16(acc1[k] * inv_sum));
+              float o2 = static_cast<float>(bf16(acc2[k] * inv_sum));
+              float o3 = static_cast<float>(bf16(acc3[k] * inv_sum));
+              const size_t out_off = (static_cast<size_t>(row) * num_heads + (h0 + k)) * head_dim + d_base;
+              if (gate_ptr != nullptr) {
+                const auto g4 = *reinterpret_cast<const sycl::vec<bf16, 4>*>(gate_ptr + out_off);
+                o0 = static_cast<float>(bf16(o0 * (1.0f / (1.0f + sycl::native::exp(-static_cast<float>(g4[0]))))));
+                o1 = static_cast<float>(bf16(o1 * (1.0f / (1.0f + sycl::native::exp(-static_cast<float>(g4[1]))))));
+                o2 = static_cast<float>(bf16(o2 * (1.0f / (1.0f + sycl::native::exp(-static_cast<float>(g4[2]))))));
+                o3 = static_cast<float>(bf16(o3 * (1.0f / (1.0f + sycl::native::exp(-static_cast<float>(g4[3]))))));
+              }
+              sycl::vec<bf16, 4> out4{bf16(o0), bf16(o1), bf16(o2), bf16(o3)};
+              *reinterpret_cast<sycl::vec<bf16, 4>*>(o_ptr + out_off) = out4;
+            }
+          });
+    });
+    return;
+  }
 
   if (s_heads_per_wg_env == 4 && (num_heads % 4 == 0) && (heads_per_kv % 4 == 0)) {
     // Phase P2 (R4b): Multi-Q-head parallelism (4 Q heads sharing 1 KV head per workgroup)

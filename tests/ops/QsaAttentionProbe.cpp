@@ -41,9 +41,114 @@ void expect(bool condition, const char *what) {
     }
 }
 
+int run_prefill_probe() {
+    constexpr int kCount = 1024;
+    constexpr int kStartPos = 4096;
+    constexpr int kMaxSeq = 8192;
+    constexpr int kHeads = 24;
+    constexpr int kKvHeads = 2;
+    constexpr int kHeadDim = 256;
+    constexpr int kBlockTopK = 512;
+    constexpr int kRatio = 4;
+    constexpr int kStride = kBlockTopK + 4;
+
+    Context ctx(nullptr, /*profiling=*/false);
+    auto q = Tensor::allocate(ctx, {kCount, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+    auto gate = Tensor::allocate(ctx, {kCount, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+    auto k = Tensor::allocate(ctx, {kKvHeads, kMaxSeq, kHeadDim}, dnnl::memory::data_type::bf16);
+    auto v = Tensor::allocate(ctx, {kKvHeads, kMaxSeq, kHeadDim}, dnnl::memory::data_type::bf16);
+    auto active_blocks = Tensor::allocate(ctx, {kCount, kStride}, dnnl::memory::data_type::s32);
+    auto valid_counts = Tensor::allocate(ctx, {kCount, 2}, dnnl::memory::data_type::s32);
+    auto out = Tensor::allocate(ctx, {kCount, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+
+    std::vector<bf16> h_q(size_t(kCount) * kHeads * kHeadDim);
+    std::vector<bf16> h_gate(size_t(kCount) * kHeads * kHeadDim);
+    std::vector<bf16> h_kv(size_t(kKvHeads) * kMaxSeq * kHeadDim);
+    std::vector<int> h_blocks(size_t(kCount) * kStride, 0);
+    std::vector<int> h_counts(size_t(kCount) * 2, 0);
+
+    for (size_t i = 0; i < h_q.size(); ++i) {
+        h_q[i] = bf16(0.01f * float((i * 37) % 61) - 0.3f);
+        h_gate[i] = bf16(0.02f * float((i * 19) % 43) - 0.4f);
+    }
+    for (size_t i = 0; i < h_kv.size(); ++i) {
+        h_kv[i] = bf16(0.01f * float((i * 53) % 67) - 0.33f);
+    }
+    for (int r = 0; r < kCount; ++r) {
+        const int pos = kStartPos + r;
+        const int num_blocks = (pos + 1) / kRatio;
+        const int tail = (pos + 1) - num_blocks * kRatio;
+        h_counts[r * 2 + 0] = kBlockTopK;
+        h_counts[r * 2 + 1] = tail;
+        for (int b = 0; b < kBlockTopK; ++b) {
+            h_blocks[size_t(r) * kStride + b] = (b * 2) % num_blocks;
+        }
+    }
+    ctx.memcpy_h2d(q.data(), h_q.data(), h_q.size() * sizeof(bf16));
+    ctx.memcpy_h2d(gate.data(), h_gate.data(), h_gate.size() * sizeof(bf16));
+    ctx.memcpy_h2d(k.data(), h_kv.data(), h_kv.size() * sizeof(bf16));
+    ctx.memcpy_h2d(v.data(), h_kv.data(), h_kv.size() * sizeof(bf16));
+    ctx.memcpy_h2d(active_blocks.data(), h_blocks.data(), h_blocks.size() * sizeof(int));
+    ctx.memcpy_h2d(valid_counts.data(), h_counts.data(), h_counts.size() * sizeof(int));
+    ctx.synchronize();
+
+    std::vector<bf16> ref_out(h_q.size());
+    auto run_mode = [&](const char* mode_val) {
+#ifdef _WIN32
+        _putenv_s("AILA_QSA_HEADS_PER_WG", mode_val);
+#else
+        setenv("AILA_QSA_HEADS_PER_WG", mode_val, 1);
+#endif
+        auto call = [&] {
+            ops::attention_prefill_qsa_batched(
+                ctx, q, k, v, active_blocks, out, kCount, kStartPos,
+                kHeads, kKvHeads, kHeadDim, kBlockTopK, kRatio,
+                &gate, &valid_counts, nullptr, nullptr);
+        };
+        for (int w = 0; w < 2; ++w) call();
+        ctx.synchronize();
+        std::vector<double> ms;
+        for (int s = 0; s < 7; ++s) {
+            const auto t0 = std::chrono::steady_clock::now();
+            call();
+            ctx.synchronize();
+            ms.push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
+        }
+        std::sort(ms.begin(), ms.end());
+        return ms[ms.size() / 2];
+    };
+
+    const double ms2 = run_mode("2");
+    ctx.memcpy_d2h(ref_out.data(), out.data(), ref_out.size() * sizeof(bf16));
+
+    for (const char* m : {"25"}) {
+        const double t_ms = run_mode(m);
+        std::vector<bf16> cand_out(h_q.size());
+        ctx.memcpy_d2h(cand_out.data(), out.data(), cand_out.size() * sizeof(bf16));
+        double max_abs = 0.0, sq_err = 0.0, sq_ref = 0.0;
+        for (size_t i = 0; i < ref_out.size(); ++i) {
+            const double r = double(float(ref_out[i]));
+            const double c = double(float(cand_out[i]));
+            const double d = std::abs(r - c);
+            if (d > max_abs) max_abs = d;
+            sq_err += d * d;
+            sq_ref += r * r;
+        }
+        const double nrmse = std::sqrt(sq_err / std::max(sq_ref, 1e-30));
+        std::printf("[QSA Prefill 1024-tile] mode=%s median=%.2fms (84x=%.2fs) vs mode2=%.2fms (84x=%.2fs) speedup=%.2fx nrmse=%.2e max_abs=%.4f\n",
+                    m, t_ms, t_ms * 84.0 / 1000.0, ms2, ms2 * 84.0 / 1000.0, ms2 / t_ms, nrmse, max_abs);
+        expect(nrmse < 1e-4 && max_abs <= 0.02, "QSA prefill mode parity within bf16 ulp");
+    }
+    return g_failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--prefill") == 0) {
+        return run_prefill_probe();
+    }
     // Cells can be overridden so the operator's scaling can be measured without
     // rebuilding: linear in cells means throughput-bound (fewer reads would
     // help), flat means the per-work-group serial work dominates (more
