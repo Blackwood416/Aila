@@ -3821,15 +3821,15 @@ the pay came with a correction to the measurement instrument itself.
 
 ```text
                              tokens   wall ms   ms/token   tok/s     round 3
-tools/prefill-bench.ps1       2007    11,304      5.632     177.5     173.2
-                              4895    15,545      3.176     314.9     299.3  (4,952)
-                              7764    20,842      2.684     372.5     357.1  (7,878)
+tools/prefill-bench.ps1       2007    11,217      5.588     178.9     173.2
+                              4895    15,318      3.129     319.6     299.3  (4,952)
+                              7764    20,467      2.636     379.3     357.1  (7,878)
 
-linear fit over the three: marginal 1.66 ms/token (604 tok/s) + 7,980 ms fixed per run
+linear fit over the three: marginal 1.61 ms/token (622 tok/s) + 7,993 ms fixed per run
 ```
 
-Need 19.41 s at 7764 tokens for 400 tok/s, so **1.40 s left**; round 3 needed 2.37 s. The marginal slope
-already beats the 2.50 ms/token that 400 tok/s implies, and what remains is the 7.98 s of per-run /
+Need 19.41 s at 7764 tokens for 400 tok/s, so **1.06 s left**; round 3 needed 2.37 s. The marginal slope
+already beats the 2.50 ms/token that 400 tok/s implies, and what remains is the ~8.0 s of per-run /
 per-layer fixed cost (48 layers x ~166 ms of row-independent work). That is a different shape from the
 one round 3 was attacking and it reframes the remaining work.
 
@@ -3974,7 +3974,26 @@ DMA-bound already** - prefetching does not create overlap, it only moves the sam
 deeper ring plus a coarser gating granularity for it. The code is reverted; `kMaxStagingBanks` is back to 4 and
 `AILA_Q4E_PREFILL_STAGING_BANKS` above 2 measured 307-318 tok/s.
 
-### 84.7 Where the remaining 1.40 s has to come from
+### 84.7 The expert-XMX padded band is a oneDNN tiling knob, not a padding knob (-0.63 s)
+
+`AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` is documented as the minimum padded band height, and round 2/3 only
+tested it at 4096 (39,636 ms, catastrophic) - the useful range was never swept. At the shipped 8192 chunk,
+one run per point, bracketed by the old 256 default (20,734 / 20,975 ms):
+
+```text
+128 -> 20,586 ms      160 -> 20,496 ms      192 -> 20,221 ms      208 -> 20,680 ms      224 -> 20,839 ms
+```
+
+and at 4895 tokens, 192 -> 15,113 ms against 15,592 / 15,646 for 256. 192 is the value, in the preset and
+in the code default.
+
+The result is worth recording because it does not fit the variable's own explanation. If the GEMM were
+weight-bandwidth bound, padded rows would be nearly free and a taller band would only cost; if it were
+purely padded-FLOP bound, 128 or 160 would win. 192 pads *more* rows than 160 and wins anyway, which makes
+this the oneDNN batched-GEMM M-tile preference, not a padding-volume effect. That also means the knob is
+machine- and kernel-version-specific in a way most of the others are not.
+
+### 84.8 Where the remaining 1.06 s has to come from
 
 The linear fit says the wall is `7,980 ms + 1.66 ms/token`, so at 7764 tokens the target needs the fixed
 term at 6.52 s. The fixed term is 48 layers x ~166 ms of row-independent work, and the observer-free
@@ -4008,14 +4027,15 @@ Rejected again this round, with measurements: `AILA_Q4E_STAGING_SLOTS` 32 (+0.2 
 adopted), `AILA_Q4E_PREFILL_STAGING_BANKS` 3/4 (307-318 tok/s), `AILA_Q4E_LAYER_STAGE=1` (281 tok/s),
 `AILA_Q4E_L0_IMPORT_HOST=1` (crash).
 
-### 84.8 State
+### 84.9 State
 
 ```text
 target        400 tok/s   (19.41 s at 7764 tokens)
-best measured 372.5 tok/s (20,842 ms)
+best measured 379.3 tok/s (20,467 ms; 383.5 on the best single run)
 round 3       357.1 tok/s (22,059 ms)
-gap           1.40 s, all of it inside the 7.98 s row-independent fixed cost
-committed     GDN fused chunk scan; adjacent-slot copy coalescing; preset GDN mode
+gap           1.06 s, all of it inside the ~8.0 s row-independent fixed cost
+committed     GDN fused chunk scan (-1.06 s), adjacent-slot copy coalescing,
+              preset GDN mode (-0.20 s), expert-XMX band 192 (-0.63 s)
 parked        L0 arena import (needs the engine crash explained first)
 dead          pre-router expert prefetch; deeper staging banks; AILA_Q4E_LAYER_STAGE
 ```

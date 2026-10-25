@@ -2204,9 +2204,12 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
         std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 4096));
     // Optional minimum pad band: (16,96)-shaped batched GEMMs are less
     // efficient per weight byte than the probe's larger-M chunks, and padded A
-    // rows are nearly free while the GEMM is weight-bandwidth bound.
+    // rows are nearly free while the GEMM is weight-bandwidth bound. The band is
+    // also the oneDNN batched-GEMM M, so its value selects the tiling: round 4
+    // measured 192 (20,221 ms at 7764 tokens) over 160 (20,496), 128 (20,586) and
+    // the old 256 (20,734 / 20,975), even though 192 pads more rows than 160.
     static const int min_band_env =
-        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 256));
+        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 192));
     const int min_band = min_band_env > 0 ? ((min_band_env + 15) & ~15) : 0;
     const int max_band_rows = xmx_scratch_.max_chunk_rows;
 

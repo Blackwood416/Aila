@@ -28,6 +28,14 @@ inline void ApplyQwen38A770Preset() {
         {"AILA_Q4E_INLINE_CHECKPOINT", "1"},
         {"AILA_Q4E_STATIC_PINNING", "0"},
         {"AILA_Q4E_GROUPED_XMX_MIN_ROWS", "0"},
+        // Expert-XMX padded band height. Round 4 sweep at the shipped 8192 chunk,
+        // one run per point, bracketed by the 256 default (20,734 / 20,975 ms):
+        //   128 -> 20,586 ms   160 -> 20,496 ms   192 -> 20,221 ms
+        // and at 4895 tokens 192 -> 15,113 ms against 15,592 / 15,646 for 256.
+        // The optimum is not a padding-volume effect: 192 pads *more* rows than
+        // 160 does, so this is the oneDNN batched-GEMM tiling preferring a 192-row
+        // M, not less padded work.
+        {"AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", "192"},
         // Round 3 A/B on tools/prefill-bench.ps1 at 7764 tokens: mode 0 (the old
         // preset value) 311.7 tok/s, mode 1 (FP32 chunk control) 319.7, mode 2
         // 317.7. The preset used to write 0 here, which silently overrode the
