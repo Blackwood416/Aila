@@ -714,9 +714,10 @@ target_include_directories(AilaH2DBandwidthProbe PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
+    ${AILA_LEVEL_ZERO_INCLUDE_DIR}
 )
 target_link_libraries(AilaH2DBandwidthProbe PRIVATE
-    DNNL::dnnl simdjson AilaSyclOptions)
+    DNNL::dnnl simdjson AilaSyclOptions ${AILA_LEVEL_ZERO_LOADER_LIBRARY})
 add_executable(AilaKernelSubmitProbe
     tests/ops/KernelSubmitProbe.cpp
     src/core/ExecutionTrace.cpp

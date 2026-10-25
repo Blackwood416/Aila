@@ -14,6 +14,8 @@
 #include <chrono>
 #include <vector>
 
+#include <level_zero/ze_api.h>
+
 #include "src/core/Context.hpp"
 
 using Clock = std::chrono::steady_clock;
@@ -136,6 +138,69 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::printf("large-page source: REJECTED by the runtime (%s)\n", e.what());
+        }
+
+        // Argon's rank-2 claim: a VirtualAlloc(MEM_LARGE_PAGES) pointer is locked by the OS but unknown to
+        // Level Zero, so every queue::memcpy makes NEO do per-call host-pointer registration, which is why
+        // the enqueue costs ~111 us. Importing the arena once should make those calls cheap. This tests the
+        // premise only - nothing here changes the engine.
+        {
+            void* arena = ctx.alloc_large_host(256ULL * 1024ULL * 1024ULL);
+            void* dev2 = ctx.alloc_device(chunk_bytes);
+            if (arena && dev2) {
+                std::memset(arena, 0x11, 256ULL * 1024ULL * 1024ULL);
+                const size_t n = (256ULL * 1024ULL * 1024ULL) / chunk_bytes;
+                sycl::queue& q = ctx.queue();
+
+                auto time_copies = [&](const char* tag) {
+                    q.memcpy(dev2, arena, chunk_bytes);
+                    q.wait_and_throw();
+                    const auto t0 = Clock::now();
+                    sycl::event last{};
+                    for (size_t i = 0; i < n; ++i) last = q.memcpy(dev2, arena, chunk_bytes);
+                    const double enq = ms_since(t0);
+                    last.wait_and_throw();
+                    const double tot = ms_since(t0);
+                    std::printf("%s: %zu copies, enqueue %.1f ms (%.1f us/copy), total %.1f ms\n",
+                                tag, n, enq, enq * 1000.0 / static_cast<double>(n), tot);
+                };
+
+                time_copies("arena, before import");
+
+                // Import through the Level Zero driver extension, if the driver offers it.
+                bool imported = false;
+                try {
+                    auto ze_context = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+                    ze_driver_handle_t driver = nullptr;
+                    uint32_t driver_count = 0;
+                    if (zeDriverGet(&driver_count, nullptr) == ZE_RESULT_SUCCESS && driver_count > 0) {
+                        std::vector<ze_driver_handle_t> drivers(driver_count);
+                        zeDriverGet(&driver_count, drivers.data());
+                        driver = drivers[0];
+                    }
+                    using import_fn = ze_result_t (*)(ze_driver_handle_t, void*, size_t);
+                    void* raw = nullptr;
+                    auto fn = (driver && zeDriverGetExtensionFunctionAddress(
+                                   driver, "zexDriverImportExternalPointer", &raw) == ZE_RESULT_SUCCESS)
+                        ? reinterpret_cast<import_fn>(raw)
+                        : nullptr;
+                    if (fn != nullptr) {
+                        const ze_result_t r = fn(driver, arena, 256ULL * 1024ULL * 1024ULL);
+                        imported = (r == ZE_RESULT_SUCCESS);
+                        std::printf("zexDriverImportExternalPointer: %s (0x%x)\n",
+                                    imported ? "OK" : "failed", static_cast<unsigned>(r));
+                    } else {
+                        std::printf("zexDriverImportExternalPointer: extension not available\n");
+                    }
+                    (void)ze_context;
+                } catch (const std::exception& e) {
+                    std::printf("zexDriverImportExternalPointer: threw (%s)\n", e.what());
+                }
+
+                time_copies(imported ? "arena, after import" : "arena, import unavailable");
+                ctx.free_device(dev2);
+                ctx.free_host(arena);
+            }
         }
 
         void* host_big = ctx.alloc_host(total_bytes);
