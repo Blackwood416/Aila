@@ -1263,9 +1263,216 @@ int run_real_v1_v2_bitwise_test() {
     return failed != 0 ? 1 : 0;
 }
 
+int bench_q4e_prefill_shapes() {
+    Context ctx;
+    constexpr int Block = 64;
+    std::vector<float> qmap(16);
+    for (int i = 0; i < 16; ++i) qmap[size_t(i)] = (float(i) - 7.5f) * 0.125f;
+    Tensor qmap_dev = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::f32);
+    ctx.memcpy_h2d(qmap_dev.data(), qmap.data(), 16 * sizeof(float));
+
+    struct Shape { const char* tag; int M, N, K, count_in_pass; };
+    const Shape shapes[] = {
+        {"o_proj_6144", 7760, 2560, 6144, 48},
+        {"shared_down_640", 7760, 2560, 640, 48},
+        {"ple_val_2560", 7760, 2560, 2560, 1},
+    };
+
+    double sum_jm32 = 0.0, sum_jm64 = 0.0, sum_onednn_ab = 0.0, sum_onednn_ba = 0.0;
+    for (const auto& s : shapes) {
+        const size_t packed_bytes = size_t(s.N) * s.K / 2;
+        const size_t blocks = size_t(s.N) * (s.K / Block);
+        Tensor packed_dev = Tensor::allocate(ctx, {int64_t(packed_bytes)}, dnnl::memory::data_type::u8);
+        Tensor absmax_dev = Tensor::allocate(ctx, {int64_t(blocks)}, dnnl::memory::data_type::f32);
+        Tensor input_dev = Tensor::allocate(ctx, {s.M, s.K}, dnnl::memory::data_type::bf16);
+        Tensor output_dev = Tensor::allocate(ctx, {s.M, s.N}, dnnl::memory::data_type::bf16);
+        Tensor weight_bf16 = Tensor::allocate(ctx, {s.K, s.N}, dnnl::memory::data_type::bf16);
+        ctx.queue().memset(packed_dev.data(), 0x53, packed_bytes);
+        ctx.queue().fill(absmax_dev.data_as<float>(), 0.125f, blocks);
+        ctx.queue().fill(input_dev.data_as<bf16>(), bf16(0.0625f), size_t(s.M) * s.K);
+        ctx.synchronize();
+
+        const auto* packed_ptr = packed_dev.data_as<uint8_t>();
+        const auto* qmap_ptr = qmap_dev.data_as<float>();
+        const auto* absmax_ptr = absmax_dev.data_as<float>();
+        const auto* input_ptr = input_dev.data_as<bf16>();
+        auto* output_ptr = output_dev.data_as<bf16>();
+        auto* w_ptr = weight_bf16.data_as<bf16>();
+
+        auto time_fn = [&](auto&& fn) {
+            for (int w = 0; w < 2; ++w) fn();
+            ctx.synchronize();
+            std::vector<double> ms;
+            for (int i = 0; i < 7; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                fn();
+                ctx.synchronize();
+                ms.push_back(std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count());
+            }
+            std::sort(ms.begin(), ms.end());
+            return ms[ms.size() / 2];
+        };
+
+        const double t_jm32 = time_fn([&] {
+            packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 32, 8, 8, 16, 8>(
+                ctx, packed_ptr, qmap_ptr, absmax_ptr, input_ptr, output_ptr, s.M, s.N, s.K, Block);
+        });
+        const double t_jm64 = time_fn([&] {
+            packed_nf4_gemm_bf16_joint_matrix_wide<64, 64, 64, 8, 8, 16, 8>(
+                ctx, packed_ptr, qmap_ptr, absmax_ptr, input_ptr, output_ptr, s.M, s.N, s.K, Block);
+        });
+
+        // oneDNN ab (current dequantize_weight transpose + ab matmul)
+        auto src_md = dnnl::memory::desc({s.M, s.K}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::ab);
+        auto w_ab_md = dnnl::memory::desc({s.K, s.N}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::ab);
+        auto dst_md = dnnl::memory::desc({s.M, s.N}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::ab);
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        auto pd_ab = dnnl::matmul::primitive_desc(ctx.engine(), src_md, w_ab_md, dst_md, attr);
+        auto prim_ab = dnnl::matmul(pd_ab);
+        auto src_mem = dnnl::sycl_interop::make_memory(src_md, ctx.engine(), dnnl::sycl_interop::memory_kind::usm, input_dev.data());
+        auto w_ab_mem = dnnl::sycl_interop::make_memory(w_ab_md, ctx.engine(), dnnl::sycl_interop::memory_kind::usm, weight_bf16.data());
+        auto dst_mem = dnnl::sycl_interop::make_memory(dst_md, ctx.engine(), dnnl::sycl_interop::memory_kind::usm, output_dev.data());
+        std::unordered_map<int, dnnl::memory> args_ab = {
+            {DNNL_ARG_SRC, src_mem}, {DNNL_ARG_WEIGHTS, w_ab_mem}, {DNNL_ARG_DST, dst_mem}
+        };
+
+        const int64_t total_values = int64_t(s.N) * s.K;
+        const int64_t in_f = s.K, out_f = s.N;
+        const size_t words = packed_bytes / 4;
+        const size_t wg = 256;
+        const size_t global = ((words + wg - 1) / wg) * wg;
+        // Verify bitwise identity of word-wise dequant vs byte-wise dequant
+        Tensor w_ref = Tensor::allocate(ctx, {s.K, s.N}, dnnl::memory::data_type::bf16);
+        auto* w_ref_ptr = w_ref.data_as<bf16>();
+        ctx.queue().parallel_for(sycl::range<1>(packed_bytes), [=](sycl::id<1> idx) {
+            const int64_t byte_index = static_cast<int64_t>(idx[0]);
+            const uint8_t p = packed_ptr[byte_index];
+            const int64_t flat0 = byte_index * 2;
+            const int64_t row0 = flat0 / in_f, col0 = flat0 % in_f;
+            w_ref_ptr[col0 * out_f + row0] = bf16(qmap_ptr[(p >> 4) & 0x0F] * absmax_ptr[flat0 / Block]);
+            const int64_t flat1 = flat0 + 1;
+            const int64_t row1 = flat1 / in_f, col1 = flat1 % in_f;
+            w_ref_ptr[col1 * out_f + row1] = bf16(qmap_ptr[p & 0x0F] * absmax_ptr[flat1 / Block]);
+        });
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(global, wg),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t lid = item.get_local_id(0);
+                    if (lid < 16) qmap_slm[lid] = qmap_ptr[lid];
+                    item.barrier(sycl::access::fence_space::local_space);
+                    const size_t w = item.get_global_id(0);
+                    if (w >= words) return;
+                    const uint32_t u = reinterpret_cast<const uint32_t*>(packed_ptr)[w];
+                    const int64_t flat0 = static_cast<int64_t>(w) * 8;
+                    const int64_t row = flat0 / in_f;
+                    const int64_t col0 = flat0 % in_f;
+                    const float am = absmax_ptr[flat0 / Block];
+                    int64_t out_idx = col0 * out_f + row;
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const uint8_t byte = static_cast<uint8_t>((u >> (b * 8)) & 0xFFu);
+                        w_ptr[out_idx] = bf16(qmap_slm[(byte >> 4) & 0x0Fu] * am);
+                        out_idx += out_f;
+                        w_ptr[out_idx] = bf16(qmap_slm[byte & 0x0Fu] * am);
+                        out_idx += out_f;
+                    }
+                });
+        });
+        ctx.synchronize();
+        std::vector<uint8_t> h_ref(size_t(s.K) * s.N * 2), h_new(size_t(s.K) * s.N * 2);
+        ctx.memcpy_d2h(h_ref.data(), w_ref.data(), h_ref.size());
+        ctx.memcpy_d2h(h_new.data(), weight_bf16.data(), h_new.size());
+        if (h_ref != h_new) {
+            std::cerr << "Bitwise mismatch in word-wise ab dequant!\n";
+            return 1;
+        }
+
+        const double t_onednn_ab = time_fn([&] {
+            ctx.queue().submit([&](sycl::handler& cgh) {
+                sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+                cgh.parallel_for(sycl::nd_range<1>(global, wg),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                        const size_t lid = item.get_local_id(0);
+                        if (lid < 16) qmap_slm[lid] = qmap_ptr[lid];
+                        item.barrier(sycl::access::fence_space::local_space);
+                        const size_t w = item.get_global_id(0);
+                        if (w >= words) return;
+                        const uint32_t u = reinterpret_cast<const uint32_t*>(packed_ptr)[w];
+                        const int64_t flat0 = static_cast<int64_t>(w) * 8;
+                        const int64_t row = flat0 / in_f;
+                        const int64_t col0 = flat0 % in_f;
+                        const float am = absmax_ptr[flat0 / Block];
+                        int64_t out_idx = col0 * out_f + row;
+                        #pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const uint8_t byte = static_cast<uint8_t>((u >> (b * 8)) & 0xFFu);
+                            w_ptr[out_idx] = bf16(qmap_slm[(byte >> 4) & 0x0Fu] * am);
+                            out_idx += out_f;
+                            w_ptr[out_idx] = bf16(qmap_slm[byte & 0x0Fu] * am);
+                            out_idx += out_f;
+                        }
+                    });
+            });
+            if (pd_ab.scratchpad_desc().get_size())
+                args_ab[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(pd_ab.scratchpad_desc());
+            prim_ab.execute(ctx.stream(), args_ab);
+        });
+
+        // oneDNN ba + vectorized block-64 contiguous dequant (zero transpose!)
+        auto w_ba_md = dnnl::memory::desc({s.K, s.N}, dnnl::memory::data_type::bf16, dnnl::memory::format_tag::ba);
+        auto pd_ba = dnnl::matmul::primitive_desc(ctx.engine(), src_md, w_ba_md, dst_md, attr);
+        auto prim_ba = dnnl::matmul(pd_ba);
+        auto w_ba_mem = dnnl::sycl_interop::make_memory(w_ba_md, ctx.engine(), dnnl::sycl_interop::memory_kind::usm, weight_bf16.data());
+        std::unordered_map<int, dnnl::memory> args_ba = {
+            {DNNL_ARG_SRC, src_mem}, {DNNL_ARG_WEIGHTS, w_ba_mem}, {DNNL_ARG_DST, dst_mem}
+        };
+        const double t_onednn_ba = time_fn([&] {
+            ctx.queue().parallel_for(sycl::nd_range<1>(((words + 255) / 256) * 256, 256),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t w = item.get_global_id(0);
+                    if (w >= words) return;
+                    const uint32_t u = reinterpret_cast<const uint32_t*>(packed_ptr)[w];
+                    const float am = absmax_ptr[w / 8];
+                    sycl::vec<bf16, 8> out;
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const uint8_t byte = static_cast<uint8_t>((u >> (b * 8)) & 0xFFu);
+                        out[b * 2 + 0] = bf16(qmap_ptr[(byte >> 4) & 0x0Fu] * am);
+                        out[b * 2 + 1] = bf16(qmap_ptr[byte & 0x0Fu] * am);
+                    }
+                    reinterpret_cast<sycl::vec<bf16, 8>*>(w_ptr)[w] = out;
+                });
+            if (pd_ba.scratchpad_desc().get_size())
+                args_ba[DNNL_ARG_SCRATCHPAD] = ctx.scratchpad_memory(pd_ba.scratchpad_desc());
+            prim_ba.execute(ctx.stream(), args_ba);
+        });
+
+        sum_jm32 += t_jm32 * s.count_in_pass;
+        sum_jm64 += t_jm64 * s.count_in_pass;
+        sum_onednn_ab += t_onednn_ab * s.count_in_pass;
+        sum_onednn_ba += t_onednn_ba * s.count_in_pass;
+        std::cout << "[Q4E DenseProj] " << s.tag << " (" << s.M << "x" << s.N << "x" << s.K
+                  << " x" << s.count_in_pass << "): jm32=" << t_jm32 << "ms"
+                  << " jm64=" << t_jm64 << "ms"
+                  << " onednn_ab=" << t_onednn_ab << "ms"
+                  << " onednn_ba=" << t_onednn_ba << "ms\n";
+    }
+    std::cout << "[Q4E DenseProj PassTotal (97 calls)] jm32=" << sum_jm32 << "ms"
+              << " jm64=" << sum_jm64 << "ms"
+              << " onednn_ab=" << sum_onednn_ab << "ms"
+              << " onednn_ba=" << sum_onednn_ba << "ms\n";
+    return 0;
+}
+
 }  // namespace
 
 int main() {
+    if (aila::env::read_flag("AILA_BNB4_Q4E_BENCH", false)) {
+        return bench_q4e_prefill_shapes();
+    }
     if (aila::env::read_flag("AILA_BNB4_GEOM_BENCH", false)) {
         return bench_gemm_geometries();
     }

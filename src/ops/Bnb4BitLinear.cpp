@@ -2262,6 +2262,39 @@ void Bnb4BitLinear::dequantize_weight(Context& ctx, Tensor& weight_bf16_view) {
     const int64_t out_features = weight_.logical_out_features();
     const int blocksize = weight_.quant_state.blocksize;
 
+    if ((packed_bytes % 4 == 0) && (in_features % 8 == 0) && (blocksize >= 8) && (blocksize % 8 == 0)) {
+        const size_t words = static_cast<size_t>(packed_bytes / 4);
+        const size_t wg = 256;
+        const size_t global = ((words + wg - 1) / wg) * wg;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> qmap_slm(sycl::range<1>(16), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<1>(global, wg),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t lid = item.get_local_id(0);
+                    if (lid < 16) qmap_slm[lid] = quant_map_ptr[lid];
+                    item.barrier(sycl::access::fence_space::local_space);
+                    const size_t w = item.get_global_id(0);
+                    if (w >= words) return;
+                    const uint32_t u = reinterpret_cast<const uint32_t*>(packed_ptr)[w];
+                    const int64_t flat0 = static_cast<int64_t>(w) * 8;
+                    const int64_t row = flat0 / in_features;
+                    const int64_t col0 = flat0 % in_features;
+                    const float am = absmax_ptr[flat0 / blocksize];
+                    int64_t out_idx = col0 * out_features + row;
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b) {
+                        const uint8_t byte = static_cast<uint8_t>((u >> (b * 8)) & 0xFFu);
+                        out_ptr[out_idx] = bf16(qmap_slm[(byte >> 4) & 0x0Fu] * am);
+                        out_idx += out_features;
+                        out_ptr[out_idx] = bf16(qmap_slm[byte & 0x0Fu] * am);
+                        out_idx += out_features;
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().parallel_for(sycl::range<1>(static_cast<size_t>(packed_bytes)), [=](sycl::id<1> idx) {
         const int64_t byte_index = static_cast<int64_t>(idx[0]);
         const uint8_t packed = packed_ptr[byte_index];
@@ -2591,10 +2624,13 @@ void Bnb4BitLinear::forward(Context& ctx,
                device_name.find("Arc A770") != std::string::npos;
     }();
 
+    static const int s_onednn_min_m =
+        aila::env::read_int_raw("AILA_BNB4_ONEDNN_MIN_M", 128);
     const bool xmx_allowed = force_dense_xmx_ ||
                              (s_xmx_explicit ? s_xmx_override : allow_dense_xmx_);
     const bool shape_prefers_onednn = !force_dense_xmx_ &&
                                       ((out_features_ <= 1280) ||
+                                       (s_onednn_min_m > 0 && seq_len >= s_onednn_min_m) ||
                                        (seq_len >= 64 && out_features_ > 8192));
     const bool use_fused_prefill = s_is_a770 &&
                                    ((fused_prefill_mode == 1) ||

@@ -681,6 +681,7 @@ add_test(
 add_executable(AilaBnb4BitLinearKernelTests
     tests/ops/Bnb4BitLinearKernelTests.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
@@ -696,6 +697,7 @@ add_executable(AilaQsaAttentionProbe
     tests/ops/QsaAttentionProbe.cpp
     src/profile/Profiling.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaQsaAttentionProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQsaAttentionProbe PRIVATE
@@ -723,6 +725,7 @@ target_link_libraries(AilaH2DBandwidthProbe PRIVATE
 add_executable(AilaKernelSubmitProbe
     tests/ops/KernelSubmitProbe.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp
     src/profile/Profiling.cpp)
 target_compile_definitions(AilaKernelSubmitProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -736,6 +739,7 @@ target_link_libraries(AilaKernelSubmitProbe PRIVATE
 add_executable(AilaConvOpsKernelTests
     tests/ops/ConvOpsKernelTests.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaConvOpsKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaConvOpsKernelTests PRIVATE
@@ -758,6 +762,7 @@ target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
 add_executable(AilaDiffusionGemmaNf4InferRefAdapter
     tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -772,6 +777,7 @@ target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
 add_executable(AilaQwen4ExpInferRefAdapter
     tests/inferref/Qwen4ExpInferRefAdapter.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaQwen4ExpInferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
