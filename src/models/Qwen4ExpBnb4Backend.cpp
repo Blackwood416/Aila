@@ -1069,6 +1069,17 @@ bool Qwen4ExpBnb4Backend::load(
     adaptive_cache_.FinishInitialLoad(ctx.queue());
     load_mark("FinishInitialLoad");
     copy_q_=std::make_unique<sycl::queue>(ctx.queue().get_context(),ctx.queue().get_device(),
+        [](sycl::exception_list exceptions) noexcept {
+            for (const auto& e : exceptions) {
+                try {
+                    if (e) std::rethrow_exception(e);
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr, "[copy_q_ async exception] %s\n", ex.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[copy_q_ async exception] unknown\n");
+                }
+            }
+        },
         sycl::property_list{sycl::property::queue::in_order()});
     prefill_expert_uses_.assign(cfg_.num_experts,0);
     prefill_unique_.reserve(cfg_.num_experts);
