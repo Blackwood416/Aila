@@ -113,6 +113,6 @@ void moe_expert_xmx_scratch_destroy(Context& ctx, MoeExpertXmxScratch& s);
 sycl::event moe_expert_xmx_prefill_chunk(
     Context& ctx, MoeExpertXmxScratch& scratch, const MoeExpertXmxChunk& chunk, int bank,
     const bf16* x, float* down_acc, int hidden, int intermediate, int blocksize,
-    const sycl::event* ready);
+    const sycl::event* ready, sycl::event* dequant_done = nullptr);
 
 }  // namespace ops

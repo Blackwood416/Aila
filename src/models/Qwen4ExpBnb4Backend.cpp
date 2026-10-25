@@ -455,7 +455,9 @@ Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     if (context_ && xmx_scratch_.impl) ops::moe_expert_xmx_scratch_destroy(*context_, xmx_scratch_);
     if (context_) {
         for (int b = 0; b < 2; ++b) {
+            if (xmx_plan_pinned_[b]) context_->free_host(xmx_plan_pinned_[b]);
             if (xmx_plan_dev_[b]) context_->free_device(xmx_plan_dev_[b]);
+            xmx_plan_pinned_[b] = nullptr;
             xmx_plan_dev_[b] = nullptr;
         }
     }
@@ -555,6 +557,12 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     expert_map_token_dev_ = nullptr;
     expert_map_rank_dev_ = nullptr;
     expert_map_slot_dev_ = nullptr;
+    for (int b = 0; b < 2; ++b) {
+        if (xmx_plan_pinned_[b]) context_->free_host(xmx_plan_pinned_[b]);
+        if (xmx_plan_dev_[b]) context_->free_device(xmx_plan_dev_[b]);
+        xmx_plan_pinned_[b] = nullptr;
+        xmx_plan_dev_[b] = nullptr;
+    }
 }
 
 // ============================================================================
@@ -1424,18 +1432,22 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             const size_t ranks_off = bases_bytes + rows_bytes;
             const size_t slots_off = (ranks_off + rows_bytes + 63u) & ~size_t(63u);
             const size_t slots_bytes = size_t(16) * sizeof(ops::MoeExpertSlotDev);
-            xmx_plan_bytes_ = int(slots_off + slots_bytes);
+            const size_t per_chunk_hdr = ((bases_bytes + slots_bytes + 127u) & ~size_t(63u));
+            xmx_plan_bytes_ = int(slots_off + slots_bytes + 128u * per_chunk_hdr);
             xmx_tokens_off_ = int(bases_bytes);
             xmx_ranks_off_ = int(ranks_off);
             xmx_slots_off_ = int(slots_off);
             if (s_prefill_expert_xmx) {
                 xmx_plan_host_[0].assign(size_t(xmx_plan_bytes_), 0);
                 xmx_plan_host_[1].assign(size_t(xmx_plan_bytes_), 0);
+                xmx_plan_pinned_[0] = static_cast<unsigned char*>(ctx.alloc_host(size_t(xmx_plan_bytes_)));
+                xmx_plan_pinned_[1] = static_cast<unsigned char*>(ctx.alloc_host(size_t(xmx_plan_bytes_)));
                 xmx_plan_dev_[0] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
                 xmx_plan_dev_[1] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
-                if (xmx_plan_dev_[0] && xmx_plan_dev_[1] &&
+                const bool scratch_ok = (xmx_scratch_.impl != nullptr) ||
                     ops::moe_expert_xmx_scratch_create(ctx, xmx_scratch_, 4096,
-                        hidden_size_, cfg_.moe_intermediate_size)) {
+                        hidden_size_, cfg_.moe_intermediate_size);
+                if (xmx_plan_dev_[0] && xmx_plan_dev_[1] && scratch_ok) {
                     prefill_expert_xmx_ = true;
                     const int c1_f32 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", 0);
                     const int w_f16 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_F16", 0);
@@ -1923,6 +1935,30 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
         if (e<0 || e>=cfg_.num_experts) throw std::runtime_error("Invalid Qwen4Exp route");
         ++prefill_expert_uses_[e];
     }
+    xmx_plan_cursor_ = 0;
+    xmx_route_bucketed_ = false;
+    static const bool s_bucket_route = aila::env::read_flag("AILA_Q4E_XMX_BUCKET_ROUTE", true);
+    static const int s_prefill_xmx_gate_rows_top =
+        std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS", 4096));
+    if (s_bucket_route && prefill_expert_xmx_ && count >= s_prefill_xmx_gate_rows_top &&
+        expert_offsets_host_ && expert_curr_pos_host_ &&
+        expert_map_token_host_ && expert_map_rank_host_) {
+        int off = 0;
+        for (int e = 0; e < cfg_.num_experts; ++e) {
+            expert_offsets_host_[e] = off;
+            expert_curr_pos_host_[e] = off;
+            off += prefill_expert_uses_[e];
+        }
+        expert_offsets_host_[cfg_.num_experts] = off;
+        const int routed_rows = count * top_k;
+        for (int i = 0; i < routed_rows; ++i) {
+            const int e = router_host_ids_[i];
+            const int pos = expert_curr_pos_host_[e]++;
+            expert_map_token_host_[pos] = i / top_k;
+            expert_map_rank_host_[pos] = i % top_k;
+        }
+        xmx_route_bucketed_ = true;
+    }
     const auto& metadata=host_arena_.GetLayerNestedMetadata(layer);
     for (int e=0;e<cfg_.num_experts;++e) {
         const int slot=adaptive_cache_.GetSlot(layer,e);
@@ -2017,14 +2053,20 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     // from "the device is genuinely serialised by dependencies".
     static const bool s_prefill_expert_timing =
         aila::env::read_flag("AILA_Q4E_PREFILL_EXPERT_TIMING", false);
+    static const bool s_stage_dequant_fence =
+        aila::env::read_flag("AILA_Q4E_STAGE_DEQUANT_FENCE", true);
     for (int c=0;c<lookahead&&c<num_chunks;++c) stage_chunk(c);
     for (int c=0;c<num_chunks;++c) {
         const auto& batch=staged_window[c%aila::AdaptiveCacheConfig::kMaxStagingBanks];
         const auto t_gemm0 = std::chrono::steady_clock::now();
-        last=RunGroupedExperts(ctx,layer,count,chunk_begin(c),chunk_count(c),act_start,tile_start,min_rows,batch.ready_event);
+        sycl::event staging_consumer{};
+        last=RunGroupedExperts(ctx,layer,count,chunk_begin(c),chunk_count(c),act_start,tile_start,min_rows,batch.ready_event,
+                               0,0,nullptr,nullptr,nullptr,nullptr,&staging_consumer);
         const double gemm_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_gemm0).count();
-        adaptive_cache_.RecordStagingConsumer(batch.ping_pong_index,last);
+        adaptive_cache_.RecordStagingConsumer(
+            batch.ping_pong_index,
+            (s_stage_dequant_fence && staging_consumer != sycl::event{}) ? staging_consumer : last);
         const int next_chunk=c+lookahead;
         double stage_ms = 0.0;
         if (next_chunk<num_chunks) {
@@ -2050,7 +2092,8 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     Context& ctx, int layer, int count, int firstUnique, int numUnique,
     int& actStart, int& tileStart, int minRows, const sycl::event& ready,
     int route_base, int token_base, const int* use_counts,
-    const bf16* x_base, bf16* moe_h_base, float* down_acc_base) {
+    const bf16* x_base, bf16* moe_h_base, float* down_acc_base,
+    sycl::event* staging_consumer_out) {
     const int top_k = cfg_.num_experts_per_tok;
     const int* uses = use_counts ? use_counts : prefill_expert_uses_.data();
     const bf16* x_dev = x_base ? x_base : buf_.x.data_as<bf16>();
@@ -2072,7 +2115,8 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
     if (prefill_expert_xmx_ && count >= s_prefill_xmx_gate_rows &&
         use_counts == nullptr && x_base == nullptr && moe_h_base == nullptr &&
         down_acc_base == nullptr && route_base == 0 && token_base == 0) {
-        return RunGroupedExpertsXmx(ctx, layer, count, firstUnique, numUnique, actStart, ready);
+        return RunGroupedExpertsXmx(ctx, layer, count, firstUnique, numUnique, actStart, ready,
+                                    staging_consumer_out);
     }
     static const bool reuse = aila::env::read_flag("AILA_Q4E_WEIGHT_REUSE", true);
     static const bool quads = aila::env::read_flag("AILA_Q4E_4TOKEN_REUSE", true);
@@ -2192,7 +2236,8 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
 }
 
 sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, int count,
-    int firstUnique, int numUnique, int& actStart, const sycl::event& ready) {
+    int firstUnique, int numUnique, int& actStart, const sycl::event& ready,
+    sycl::event* staging_consumer_out) {
     (void)layer;
     const int top_k = cfg_.num_experts_per_tok;
     const int hidden = hidden_size_;
@@ -2202,21 +2247,13 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
     float* down_dev = buf_.moe_down_acc.data_as<float>();
     static const int rows_budget =
         std::max(16, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_ROWS", 4096));
-    // Optional minimum pad band: (16,96)-shaped batched GEMMs are less
-    // efficient per weight byte than the probe's larger-M chunks, and padded A
-    // rows are nearly free while the GEMM is weight-bandwidth bound. The band is
-    // also the oneDNN batched-GEMM M, so its value selects the tiling: round 4
-    // measured 192 (20,221 ms at 7764 tokens) over 160 (20,496), 128 (20,586) and
-    // the old 256 (20,734 / 20,975), even though 192 pads more rows than 160.
+    static const bool s_single_plan_copy =
+        aila::env::read_flag("AILA_Q4E_XMX_SINGLE_PLAN_COPY", true);
     static const int min_band_env =
         std::max(0, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M", 192));
     const int min_band = min_band_env > 0 ? ((min_band_env + 15) & ~15) : 0;
     const int max_band_rows = xmx_scratch_.max_chunk_rows;
 
-    // 1. Collect this segment's experts as (expert, slice offset, rows)
-    //    members, usage-descending. A member larger than the scratch band
-    //    (never observed: histogram max is 2437) is sliced so each slice fits
-    //    its own chunk; the last slice may join a packed chunk.
     xmx_members_.clear();
     int total_rows = 0;
     for (int u = firstUnique; u < firstUnique + numUnique; ++u) {
@@ -2237,14 +2274,15 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
         });
 
     sycl::event last = ready;
+    sycl::event last_dequant = ready;
     size_t mi = 0;
     while (mi < xmx_members_.size()) {
         const size_t chunk_begin = mi;
-        int b_count = 0, max_rows = 0;
+        int b_count = 0, max_rows = 0, total_chunk_rows = 0;
         if (xmx_members_[mi].rows > rows_budget) {
-            // Oversized single-expert slice: its own chunk, up to the band cap.
             b_count = 1;
             max_rows = xmx_members_[mi].rows;
+            total_chunk_rows = xmx_members_[mi].rows;
             ++mi;
         } else {
             while (mi < xmx_members_.size() && b_count < 16) {
@@ -2252,6 +2290,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
                 const int m_try = std::max((std::max(max_rows, n) + 15) & ~15, min_band);
                 if (b_count > 0 && size_t(b_count + 1) * size_t(m_try) > size_t(rows_budget)) break;
                 max_rows = std::max(max_rows, n);
+                total_chunk_rows += n;
                 ++b_count;
                 ++mi;
             }
@@ -2261,56 +2300,91 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
             throw std::runtime_error("Qwen4Exp: XMX chunk exceeds scratch capacity");
         }
 
-        // 2. Build this chunk's plan tables on the host and upload them. Two
-        //    plan buffers ping-pong with the weight banks, so a host rewrite
-        //    can never race the previous chunk's async H2D.
         const int bank = xmx_bank_;
-        auto* bases = reinterpret_cast<int*>(xmx_plan_host_[bank].data());
-        auto* tokens = reinterpret_cast<int*>(xmx_plan_host_[bank].data() + xmx_tokens_off_);
-        auto* ranks = reinterpret_cast<int*>(xmx_plan_host_[bank].data() + xmx_ranks_off_);
-        auto* slots = reinterpret_cast<ops::MoeExpertSlotDev*>(
-            xmx_plan_host_[bank].data() + xmx_slots_off_);
-        std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
+        const size_t c_bases_bytes = size_t(17) * sizeof(int);
+        const size_t c_rows_bytes = size_t(total_chunk_rows) * sizeof(int);
+        const size_t c_ranks_off = c_bases_bytes + c_rows_bytes;
+        const size_t c_slots_off = (c_ranks_off + c_rows_bytes + 63u) & ~size_t(63u);
+        const size_t c_slots_bytes = size_t(b_count) * sizeof(ops::MoeExpertSlotDev);
+        const size_t c_total_bytes = (c_slots_off + c_slots_bytes + 63u) & ~size_t(63u);
+        const bool use_compact_pinned = s_single_plan_copy && xmx_plan_pinned_[0] != nullptr &&
+            (size_t(xmx_plan_cursor_) + c_total_bytes <= size_t(xmx_plan_bytes_));
+
+        unsigned char* host_base = use_compact_pinned
+            ? (xmx_plan_pinned_[0] + xmx_plan_cursor_)
+            : (xmx_plan_pinned_[bank] ? xmx_plan_pinned_[bank] : xmx_plan_host_[bank].data());
+        unsigned char* dev_base = use_compact_pinned
+            ? (xmx_plan_dev_[0] + xmx_plan_cursor_)
+            : xmx_plan_dev_[bank];
+        const size_t tok_off = use_compact_pinned ? c_bases_bytes : size_t(xmx_tokens_off_);
+        const size_t rnk_off = use_compact_pinned ? c_ranks_off : size_t(xmx_ranks_off_);
+        const size_t slt_off = use_compact_pinned ? c_slots_off : size_t(xmx_slots_off_);
+
+        auto* bases = reinterpret_cast<int*>(host_base);
+        auto* tokens = reinterpret_cast<int*>(host_base + tok_off);
+        auto* ranks = reinterpret_cast<int*>(host_base + rnk_off);
+        auto* slots = reinterpret_cast<ops::MoeExpertSlotDev*>(host_base + slt_off);
+
         int packed = 0;
-        for (int b = 0; b < b_count; ++b) {
-            const auto& m = xmx_members_[chunk_begin + b];
-            bases[b] = packed;
-            slots[b] = adaptive_prefill_slots_[m.expert];
-            expert_offsets_host_[m.expert] = b;
-            expert_curr_pos_host_[m.expert] = 0;
-            packed += m.rows;
+        if (xmx_route_bucketed_) {
+            for (int b = 0; b < b_count; ++b) {
+                const auto& m = xmx_members_[chunk_begin + b];
+                bases[b] = packed;
+                slots[b] = adaptive_prefill_slots_[m.expert];
+                const int src_off = expert_offsets_host_[m.expert] + m.offset;
+                std::memcpy(tokens + packed, expert_map_token_host_ + src_off, size_t(m.rows) * sizeof(int));
+                std::memcpy(ranks + packed, expert_map_rank_host_ + src_off, size_t(m.rows) * sizeof(int));
+                packed += m.rows;
+            }
+            bases[b_count] = packed;
+        } else {
+            std::fill_n(expert_offsets_host_, cfg_.num_experts, -1);
+            for (int b = 0; b < b_count; ++b) {
+                const auto& m = xmx_members_[chunk_begin + b];
+                bases[b] = packed;
+                slots[b] = adaptive_prefill_slots_[m.expert];
+                expert_offsets_host_[m.expert] = b;
+                expert_curr_pos_host_[m.expert] = 0;
+                packed += m.rows;
+            }
+            bases[b_count] = packed;
+            for (int i = 0; i < routed_rows; ++i) {
+                const int e = router_host_ids_[i];
+                const int b = expert_offsets_host_[e];
+                if (b < 0) continue;
+                const auto& m = xmx_members_[chunk_begin + b];
+                const int k = expert_curr_pos_host_[e]++;
+                if (k < m.offset || k >= m.offset + m.rows) continue;
+                const int pos = bases[b] + (k - m.offset);
+                tokens[pos] = i / top_k;
+                ranks[pos] = i % top_k;
+            }
         }
-        bases[b_count] = packed;
-        for (int i = 0; i < routed_rows; ++i) {
-            const int e = router_host_ids_[i];
-            const int b = expert_offsets_host_[e];
-            if (b < 0) continue;
-            const auto& m = xmx_members_[chunk_begin + b];
-            const int k = expert_curr_pos_host_[e]++;
-            if (k < m.offset || k >= m.offset + m.rows) continue;
-            const int pos = bases[b] + (k - m.offset);
-            tokens[pos] = i / top_k;
-            ranks[pos] = i % top_k;
+
+        if (use_compact_pinned) {
+            ctx.queue().memcpy(dev_base, host_base, c_slots_off + c_slots_bytes);
+            xmx_plan_cursor_ += int(c_total_bytes);
+        } else {
+            ctx.queue().memcpy(dev_base, bases, size_t(b_count + 1) * sizeof(int));
+            ctx.queue().memcpy(dev_base + tok_off, tokens, size_t(packed) * sizeof(int));
+            ctx.queue().memcpy(dev_base + rnk_off, ranks, size_t(packed) * sizeof(int));
+            ctx.queue().memcpy(dev_base + slt_off, slots,
+                               size_t(b_count) * sizeof(ops::MoeExpertSlotDev));
         }
-        ctx.queue().memcpy(xmx_plan_dev_[bank], bases, size_t(b_count + 1) * sizeof(int));
-        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_tokens_off_, tokens, size_t(packed) * sizeof(int));
-        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_ranks_off_, ranks, size_t(packed) * sizeof(int));
-        ctx.queue().memcpy(xmx_plan_dev_[bank] + xmx_slots_off_, slots,
-                           size_t(b_count) * sizeof(ops::MoeExpertSlotDev));
 
         ops::MoeExpertXmxChunk chunk{};
         chunk.num_experts = b_count;
         chunk.top_k = top_k;
         chunk.rows_per_band = rows_per_band;
-        chunk.member_row_base = reinterpret_cast<const int*>(xmx_plan_dev_[bank]);
-        chunk.member_token_ids = reinterpret_cast<const int*>(xmx_plan_dev_[bank] + xmx_tokens_off_);
-        chunk.member_ranks = reinterpret_cast<const int*>(xmx_plan_dev_[bank] + xmx_ranks_off_);
-        chunk.slots = reinterpret_cast<const ops::MoeExpertSlotDev*>(
-            xmx_plan_dev_[bank] + xmx_slots_off_);
+        chunk.member_row_base = reinterpret_cast<const int*>(dev_base);
+        chunk.member_token_ids = reinterpret_cast<const int*>(dev_base + tok_off);
+        chunk.member_ranks = reinterpret_cast<const int*>(dev_base + rnk_off);
+        chunk.slots = reinterpret_cast<const ops::MoeExpertSlotDev*>(dev_base + slt_off);
         last = ops::moe_expert_xmx_prefill_chunk(ctx, xmx_scratch_, chunk, bank, x_dev, down_dev,
-                                                 hidden, intermediate, 64, &ready);
+                                                 hidden, intermediate, 64, &ready, &last_dequant);
         xmx_bank_ ^= 1;
     }
+    if (staging_consumer_out != nullptr) *staging_consumer_out = last_dequant;
     actStart += total_rows;
     return last;
 }
@@ -2555,12 +2629,16 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
 
     DenseLinear(ctx, hc.input_mix_weight_up, hc.mix_up_w, buf_.hc_mix_down, buf_.hc_mix_up,
                 count, hc_dim, lowrank);
-    apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * hc_dim);
+    static const bool s_hc_fused_sigmoid =
+        aila::env::read_flag("AILA_Q4E_HC_FUSED_SIGMOID", true);
+    if (!s_hc_fused_sigmoid) {
+        apply_sigmoid(ctx, buf_.hc_mix_up, static_cast<size_t>(count) * hc_dim);
+    }
 
     ops::hc_mix_reduce(ctx, static_cast<const bf16*>(buf_.hc_N.data()),
                        static_cast<const bf16*>(buf_.hc_mix_up.data()),
                        static_cast<bf16*>(buf_.x.data()),
-                       count, hidden_size_, 4);
+                       count, hidden_size_, 4, s_hc_fused_sigmoid);
 
     if (with_inject) {
         DenseLinear(ctx, hc.block_inject_weight, hc.inject_w, buf_.hc_N, buf_.hc_inject_buf,
@@ -3591,7 +3669,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         interior->length = position;
     }
     if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
-        CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
+        static const bool s_skip_redundant_end_snapshot =
+            aila::env::read_flag("AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT", true);
+        if (!(s_skip_redundant_end_snapshot && interior != nullptr && count > 64 && !options.capture_snapshot)) {
+            CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
+        }
     }
     session.currentLength_ = cached_len;
     if (!use_adaptive_pipeline_) {
@@ -4247,9 +4329,13 @@ Tensor& Qwen4ExpBnb4Backend::forward(
 
 bool Qwen4ExpBnb4Backend::CanCaptureInteriorCheckpoint(
     const Session& session, int count, int checkpointAfter) const {
-    if (count < 4 || count > 64 || checkpointAfter < 2 || checkpointAfter > count - 2 ||
+    const bool allow_long = aila::env::read_flag("AILA_Q4E_LONG_INLINE_CHECKPOINT", false) &&
+                            prefill_attention_tile_ == 0;
+    const int max_count = allow_long ? session.Capacity() : 64;
+    if (count < 4 || count > max_count || checkpointAfter < 2 || checkpointAfter > count - 2 ||
         session.snapshots_.size() < 2 || count > session.Capacity() - session.CurrentLength() ||
         !session.embeddingOverridePositions_.empty() || session.mropePosT_.valid()) return false;
+    if (allow_long) return true;
     // Match ForwardImpl's sparse-prefill predicate exactly. At the default ratio/budget,
     // 2052 is already sparse (513 complete blocks); the final dense position is 2051.
     const int ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;

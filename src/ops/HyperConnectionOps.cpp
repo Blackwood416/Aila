@@ -150,7 +150,7 @@ void grouped_rms_norm(
 
 
     ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg / 16), cgh);
 
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(total_groups) * wg),
@@ -193,22 +193,12 @@ void grouped_rms_norm(
                         sum_sq += v * v;
                     }
                 }
-                red_slm[lid] = sum_sq;
-                item.barrier(sycl::access::fence_space::local_space);
-
-                // Reduce with sub-group shuffles and two work-group barriers
-                // instead of an eight-step SLM tree. The tree paid one full
-                // work-group barrier per level, which is the remaining
-                // candidate explanation for a 10240-element normalisation
-                // costing tens of microseconds once vectorised loads had been
-                // ruled out. The summation order changes; the operator does
-                // not.
                 auto reduction_sg = item.get_sub_group();
                 constexpr int kSubGroups = wg / 16;
                 const int reduction_sg_id = lid / 16;
                 const int reduction_lane = lid % 16;
                 const float sg_sum = sycl::reduce_over_group(
-                    reduction_sg, red_slm[lid], sycl::plus<>());
+                    reduction_sg, sum_sq, sycl::plus<>());
                 if (reduction_lane == 0) {
                     red_slm[reduction_sg_id] = sg_sum;
                 }
@@ -939,6 +929,16 @@ void hc_decode_down_inject_rows(
     bf16* act, float* inj, int lowrank, int group_dim, int groups, int rows, int down_work_group) {
     if (rows < 1 || rows > 4 || groups < 1 || groups > 8 || lowrank < 1 || group_dim < 1)
         throw std::invalid_argument("hc_decode_down_inject_rows: unsupported shape");
+    static const bool wgrow = [] {
+        const char* raw = std::getenv("AILA_Q4E_HC_DOWN_WGROW");
+        if (raw == nullptr || raw[0] == '\0') return true;
+        return raw[0] != '0';
+    }();
+    if (wgrow && down_work_group == 256) {
+        hc_decode_down_inject_wgrow_impl<true, 256>(
+            ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows);
+        return;
+    }
     hc_decode_down_inject_dispatch<true>(ctx, N, w_down, w_inject, act, inj, lowrank, group_dim, groups, rows, down_work_group);
 }
 

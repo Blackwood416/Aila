@@ -5326,6 +5326,35 @@ void moe_silu_gate_up_mul_flat(
     int intermediate_size) {
     const size_t total_elements = static_cast<size_t>(total_tokens) * intermediate_size;
     constexpr size_t wg = 256;
+    if ((intermediate_size % 8) == 0) {
+        const size_t vecs_per_row = static_cast<size_t>(intermediate_size / 8);
+        const size_t total_vecs = static_cast<size_t>(total_tokens) * vecs_per_row;
+        const size_t num_wgs = (total_vecs + wg - 1) / wg;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t v_idx = item.get_global_id(0);
+                    if (v_idx < total_vecs) {
+                        const size_t t = v_idx / vecs_per_row;
+                        const size_t c8 = (v_idx - t * vecs_per_row) * 8;
+                        const size_t row_base = t * static_cast<size_t>(2 * intermediate_size);
+                        const auto g8 = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up + row_base + c8);
+                        const auto u8 = *reinterpret_cast<const sycl::vec<bf16, 8>*>(gate_up + row_base + intermediate_size + c8);
+                        sycl::vec<bf16, 8> res;
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            const float g_f = static_cast<float>(g8[k]);
+                            const float u_f = static_cast<float>(u8[k]);
+                            const float silu_g = g_f / (1.0f + sycl::native::exp(-g_f));
+                            res[k] = bf16(silu_g * u_f);
+                        }
+                        *reinterpret_cast<sycl::vec<bf16, 8>*>(out + v_idx * 8) = res;
+                    }
+                });
+        });
+        return;
+    }
     const size_t num_wgs = (total_elements + wg - 1) / wg;
 
     ctx.queue().submit([&](sycl::handler& cgh) {

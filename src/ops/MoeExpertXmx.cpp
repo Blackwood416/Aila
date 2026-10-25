@@ -93,50 +93,107 @@ sycl::event submit_dequant(Context& ctx, const MoeExpertXmxScratch& s,
     const bool w_kn = s.w_kn;
     const bool have_ready = ready != nullptr && *ready != sycl::event{};
     const sycl::event ready_event = have_ready ? *ready : sycl::event{};
+    constexpr size_t kWg = 256;
+    if (!w_kn && block_size == 64 && (gu_words % 4 == 0) && (dn_words % 4 == 0)) {
+        const size_t gu_qwords = gu_words / 4;
+        const size_t per_expert_q = per_expert / 4;
+        const size_t per_expert_q_padded = ((per_expert_q + kWg - 1) / kWg) * kWg;
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (have_ready) cgh.depends_on(ready_event);
+            sycl::local_accessor<float, 1> qm_slm(sycl::range<1>(16), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(size_t(experts), per_expert_q_padded),
+                                  sycl::range<2>(1, kWg)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    constexpr float qm[16] = {
+                        -1.f, -.6961928009986877f, -.5250730514526367f, -.39491748809814453f,
+                        -.28444138169288635f, -.18477343022823334f, -.09105003625154495f, 0.f,
+                        .07958029955625534f, .16093020141124725f, .24611230194568634f, .33791524171829224f,
+                        .4407079219818115f, .5626170039176941f, .7229568362236023f, 1.f};
+                    const size_t lid = item.get_local_id(1);
+                    if (lid < 16) qm_slm[lid] = qm[lid];
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    const int expert = static_cast<int>(item.get_global_id(0));
+                    size_t qword = item.get_global_id(1);
+                    if (qword >= per_expert_q) return;
+                    const bool gate_up = qword < gu_qwords;
+                    if (!gate_up) qword -= gu_qwords;
+                    const size_t word_base = qword * 4;
+                    const MoeExpertSlotDev& slot = slots[expert];
+                    const MoeNestedScaleDev& nested = gate_up ? slot.gate_up_nested : slot.down_nested;
+                    const float* absmax = gate_up ? slot.gate_up_absmax : slot.down_absmax;
+                    const uint8_t* packed = (gate_up ? slot.gate_up_packed : slot.down_packed) + word_base * 4;
+                    const sycl::vec<uint32_t, 4> codes4 =
+                        *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(packed);
+                    const float scale = slot_scale(nested, absmax, qword >> 1);
+                    w_t* out = (gate_up ? wgu + size_t(expert) * gu_elems
+                                        : wdn + size_t(expert) * dn_elems) + word_base * 8;
+#pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        const uint32_t codes = codes4[w];
+                        sycl::vec<w_t, 8> decoded;
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const uint32_t byte = (codes >> (8 * b)) & 0xFFu;
+                            decoded[2 * b] = w_t(qm_slm[byte >> 4] * scale);
+                            decoded[2 * b + 1] = w_t(qm_slm[byte & 15u] * scale);
+                        }
+                        *reinterpret_cast<sycl::vec<w_t, 8>*>(out + size_t(w) * 8) = decoded;
+                    }
+                });
+        });
+    }
+    const size_t per_expert_padded = ((per_expert + kWg - 1) / kWg) * kWg;
     return ctx.queue().submit([&](sycl::handler& cgh) {
         if (have_ready) cgh.depends_on(ready_event);
-        cgh.parallel_for(sycl::range<1>(size_t(experts) * per_expert), [=](sycl::id<1> idx) {
-            constexpr float qm[16] = {
-                -1.f, -.6961928009986877f, -.5250730514526367f, -.39491748809814453f,
-                -.28444138169288635f, -.18477343022823334f, -.09105003625154495f, 0.f,
-                .07958029955625534f, .16093020141124725f, .24611230194568634f, .33791524171829224f,
-                .4407079219818115f, .5626170039176941f, .7229568362236023f, 1.f};
-            const size_t i = idx[0];
-            const int expert = static_cast<int>(i / per_expert);
-            size_t word = i - size_t(expert) * per_expert;
-            const bool gate_up = word < gu_words;
-            if (!gate_up) word -= gu_words;
-            const MoeExpertSlotDev& slot = slots[expert];
-            const MoeNestedScaleDev& nested = gate_up ? slot.gate_up_nested : slot.down_nested;
-            const float* absmax = gate_up ? slot.gate_up_absmax : slot.down_absmax;
-            const uint8_t* packed = (gate_up ? slot.gate_up_packed : slot.down_packed) + word * 4;
-            const uint32_t codes = *reinterpret_cast<const uint32_t*>(packed);
-            const float scale = slot_scale(nested, absmax, (word * 8) / block_size);
-            sycl::vec<w_t, 8> decoded;
+        sycl::local_accessor<float, 1> qm_slm(sycl::range<1>(16), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(size_t(experts), per_expert_padded),
+                              sycl::range<2>(1, kWg)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                constexpr float qm[16] = {
+                    -1.f, -.6961928009986877f, -.5250730514526367f, -.39491748809814453f,
+                    -.28444138169288635f, -.18477343022823334f, -.09105003625154495f, 0.f,
+                    .07958029955625534f, .16093020141124725f, .24611230194568634f, .33791524171829224f,
+                    .4407079219818115f, .5626170039176941f, .7229568362236023f, 1.f};
+                const size_t lid = item.get_local_id(1);
+                if (lid < 16) qm_slm[lid] = qm[lid];
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const int expert = static_cast<int>(item.get_global_id(0));
+                size_t word = item.get_global_id(1);
+                if (word >= per_expert) return;
+                const bool gate_up = word < gu_words;
+                if (!gate_up) word -= gu_words;
+                const MoeExpertSlotDev& slot = slots[expert];
+                const MoeNestedScaleDev& nested = gate_up ? slot.gate_up_nested : slot.down_nested;
+                const float* absmax = gate_up ? slot.gate_up_absmax : slot.down_absmax;
+                const uint8_t* packed = (gate_up ? slot.gate_up_packed : slot.down_packed) + word * 4;
+                const uint32_t codes = *reinterpret_cast<const uint32_t*>(packed);
+                const size_t block_idx = (block_size == 64) ? (word >> 3) : ((word * 8) / block_size);
+                const float scale = slot_scale(nested, absmax, block_idx);
+                sycl::vec<w_t, 8> decoded;
 #pragma unroll
-            for (int b = 0; b < 4; ++b) {
-                const uint32_t byte = (codes >> (8 * b)) & 0xFFu;
-                decoded[2 * b] = w_t(qm[byte >> 4] * scale);
-                decoded[2 * b + 1] = w_t(qm[byte & 15u] * scale);
-            }
-            w_t* out = gate_up ? wgu + size_t(expert) * gu_elems
-                               : wdn + size_t(expert) * dn_elems;
-            if (w_kn) {
-                // [K][N] store with N contiguous: the eight decoded values are
-                // consecutive in k, so they land n_dim apart in memory.  The
-                // default writes the packed [N][K] order, which oneDNN can only
-                // consume through a strided descriptor.
-                const int n_dim = gate_up ? 2 * intermediate : hidden;
-                const int k8_per_row = gate_up ? (hidden / 8) : (intermediate / 8);
-                const int n = static_cast<int>(word / size_t(k8_per_row));
-                const int k8 = static_cast<int>(word - size_t(n) * size_t(k8_per_row));
-                w_t* base = out + size_t(k8) * 8 * size_t(n_dim) + size_t(n);
+                for (int b = 0; b < 4; ++b) {
+                    const uint32_t byte = (codes >> (8 * b)) & 0xFFu;
+                    decoded[2 * b] = w_t(qm_slm[byte >> 4] * scale);
+                    decoded[2 * b + 1] = w_t(qm_slm[byte & 15u] * scale);
+                }
+                w_t* out = gate_up ? wgu + size_t(expert) * gu_elems
+                                   : wdn + size_t(expert) * dn_elems;
+                if (w_kn) {
+                    const int n_dim = gate_up ? 2 * intermediate : hidden;
+                    const int k8_per_row = gate_up ? (hidden / 8) : (intermediate / 8);
+                    const int n = static_cast<int>(word / size_t(k8_per_row));
+                    const int k8 = static_cast<int>(word - size_t(n) * size_t(k8_per_row));
+                    w_t* base = out + size_t(k8) * 8 * size_t(n_dim) + size_t(n);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) base[size_t(j) * size_t(n_dim)] = decoded[j];
-            } else {
-                *reinterpret_cast<sycl::vec<w_t, 8>*>(out + word * 8) = decoded;
-            }
-        });
+                    for (int j = 0; j < 8; ++j) base[size_t(j) * size_t(n_dim)] = decoded[j];
+                } else {
+                    *reinterpret_cast<sycl::vec<w_t, 8>*>(out + word * 8) = decoded;
+                }
+            });
     });
 }
 
@@ -154,6 +211,38 @@ sycl::event submit_gather(Context& ctx, const MoeExpertXmxScratch& s,
     const int rows_per_band = chunk.rows_per_band;
     x_t* a1 = static_cast<x_t*>(s.a1);
     const size_t vecs_per_row = size_t(hidden) / 8;
+    if (vecs_per_row % 32 == 0) {
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.depends_on(dep);
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(size_t(experts), size_t(rows_per_band), vecs_per_row),
+                                  sycl::range<3>(1, 1, 32)),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int expert = static_cast<int>(item.get_global_id(0));
+                    const int m = static_cast<int>(item.get_global_id(1));
+                    const size_t k8 = item.get_global_id(2);
+                    const size_t row = size_t(expert) * size_t(rows_per_band) + size_t(m);
+                    const int begin = bases[expert];
+                    using v8 = sycl::vec<x_t, 8>;
+                    v8 value = v8(x_t(0.f));
+                    if (m < bases[expert + 1] - begin) {
+                        const int token = tokens[begin + m];
+                        const sycl::vec<bf16, 8> xrow =
+                            *reinterpret_cast<const sycl::vec<bf16, 8>*>(
+                                x + size_t(token) * size_t(hidden) + k8 * 8);
+                        if constexpr (std::is_same_v<x_t, bf16>) {
+                            value = xrow;
+                        } else {
+#pragma unroll
+                            for (int k = 0; k < 8; ++k) {
+                                value[k] = x_t(static_cast<float>(xrow[k]));
+                            }
+                        }
+                    }
+                    *reinterpret_cast<v8*>(a1 + row * size_t(hidden) + k8 * 8) = value;
+                });
+        });
+    }
     return ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.depends_on(dep);
         cgh.parallel_for(
@@ -228,6 +317,28 @@ sycl::event submit_scatter(Context& ctx, const MoeExpertXmxScratch& s,
     const int top_k = chunk.top_k;
     const float* c2 = static_cast<const float*>(s.c2);
     const size_t vecs_per_row = size_t(hidden) / 4;
+    if (vecs_per_row % 64 == 0) {
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.depends_on(dep);
+            cgh.parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(size_t(experts), size_t(rows_per_band), vecs_per_row),
+                                  sycl::range<3>(1, 1, 64)),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int expert = static_cast<int>(item.get_global_id(0));
+                    const int m = static_cast<int>(item.get_global_id(1));
+                    const size_t k4 = item.get_global_id(2);
+                    const int begin = bases[expert];
+                    if (m >= bases[expert + 1] - begin) return;
+                    const size_t row = size_t(expert) * size_t(rows_per_band) + size_t(m);
+                    const int act = begin + m;
+                    const size_t dst_row =
+                        size_t(tokens[act]) * size_t(top_k) + size_t(ranks[act]);
+                    using f4 = sycl::vec<float, 4>;
+                    *reinterpret_cast<f4*>(down_acc + dst_row * size_t(hidden) + k4 * 4) =
+                        *reinterpret_cast<const f4*>(c2 + row * size_t(hidden) + k4 * 4);
+                });
+        });
+    }
     return ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.depends_on(dep);
         cgh.parallel_for(
@@ -257,10 +368,12 @@ template <typename xmx_t>
 sycl::event run_prefill_chunk_typed(Context& ctx, MoeExpertXmxScratch& scratch,
                                     const MoeExpertXmxChunk& chunk, int bank, const bf16* x,
                                     float* down_acc, int hidden, int intermediate, int blocksize,
-                                    const sycl::event* ready, XmxPrim& prim) {
+                                    const sycl::event* ready, XmxPrim& prim,
+                                    sycl::event* dequant_done) {
     const int rows = chunk.num_experts * chunk.rows_per_band;
     sycl::event last =
         submit_dequant<xmx_t>(ctx, scratch, chunk, bank, hidden, intermediate, blocksize, ready);
+    if (dequant_done != nullptr) *dequant_done = last;
     last = submit_gather<xmx_t>(ctx, scratch, chunk, x, hidden, last);
     last = dnnl::sycl_interop::execute(prim.mm1, ctx.stream(), prim.args1[bank], {last});
     if constexpr (std::is_same_v<xmx_t, bf16>) {
@@ -472,7 +585,8 @@ sycl::event moe_expert_xmx_prefill_chunk(Context& ctx, MoeExpertXmxScratch& scra
                                          const MoeExpertXmxChunk& chunk, int bank,
                                          const bf16* x, float* down_acc, int hidden,
                                          int intermediate, int blocksize,
-                                         const sycl::event* ready) {
+                                         const sycl::event* ready,
+                                         sycl::event* dequant_done) {
     if (scratch.impl == nullptr || scratch.wgu_bf16[0] == nullptr ||
         scratch.wdn_bf16[0] == nullptr) {
         throw std::runtime_error("moe_expert_xmx_prefill_chunk: scratch is not created");
@@ -516,10 +630,10 @@ sycl::event moe_expert_xmx_prefill_chunk(Context& ctx, MoeExpertXmxScratch& scra
     // The storage element type is latched per scratch, so dispatch once here.
     if (scratch.w_f16) {
         return run_prefill_chunk_typed<sycl::half>(ctx, scratch, chunk, bank, x, down_acc, hidden,
-                                                   intermediate, blocksize, ready, prim);
+                                                   intermediate, blocksize, ready, prim, dequant_done);
     }
     return run_prefill_chunk_typed<bf16>(ctx, scratch, chunk, bank, x, down_acc, hidden,
-                                         intermediate, blocksize, ready, prim);
+                                         intermediate, blocksize, ready, prim, dequant_done);
 }
 
 }  // namespace ops

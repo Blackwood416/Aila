@@ -626,7 +626,14 @@ StagingBatch Qwen4ExpAdaptiveCache::StageColdExpertsAsync(
         throw std::invalid_argument("Invalid Qwen4Exp cold staging batch");
     const int pp=(index%config_.staging_banks+config_.staging_banks)%config_.staging_banks;
     const auto wait_begin = work_time_ns();
-    if (staging_pending_[pp]) staging_copy_[pp].wait_and_throw();
+    // When direct_arena is true, staging_host_[pp] is never written by the CPU
+    // and staging_dev_[pp] is ordered on the in-order copy queue behind
+    // staging_reader_[pp], so host-waiting on staging_copy_[pp] only stalls the
+    // submitting thread (~4.7 s per prefill pass).
+    static const bool s_direct_skip_host_wait =
+        aila::env::read_flag("AILA_Q4E_DIRECT_STAGE_NO_HOST_WAIT", true);
+    if ((!direct_arena || !s_direct_skip_host_wait) && staging_pending_[pp])
+        staging_copy_[pp].wait_and_throw();
     const auto fill_begin = work_time_ns();
     stats_.staging_wait_ns += fill_begin - wait_begin;
     StagingBatch batch{};

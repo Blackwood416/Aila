@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -102,17 +104,29 @@ const Api& api() {
 std::atomic<uint64_t> g_import_bytes{0};
 std::atomic<uint64_t> g_import_failures{0};
 std::atomic<uint64_t> g_import_calls{0};
+std::mutex g_import_mutex;
+std::unordered_map<void*, size_t> g_imported_ranges;
 
 // Opt-in while the engine-side behaviour is still being validated. Read with a
 // plain cached getenv so this translation unit keeps no util-library dependency
 // (the probe targets link it without the env module).
 bool import_enabled() {
-    static const bool enabled = [] {
-        const char* raw = std::getenv("AILA_Q4E_L0_IMPORT_HOST");
-        if (!raw || !*raw) return false;
-        return !(raw[0] == '0' && raw[1] == '\0');
-    }();
-    return enabled;
+    const char* raw = std::getenv("AILA_Q4E_L0_IMPORT_HOST");
+    if (!raw || !*raw) return false;
+    return !(raw[0] == '0' && raw[1] == '\0');
+}
+
+size_t import_max_bytes() {
+    const char* raw = std::getenv("AILA_Q4E_L0_IMPORT_MAX_MB");
+    if (raw && *raw) {
+        const long long mb = std::atoll(raw);
+        if (mb > 0) return static_cast<size_t>(mb) << 20;
+    }
+    // WDDM Shared GPU Memory cap on a 64 GiB Windows host is ~32 GiB (and the
+    // engine also pins ~12 GiB of VRAM); importing 52.6 GiB caused
+    // UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY (error 39) on the first copy_q_
+    // submission. Default to a safe 20 GiB cap unless overridden.
+    return size_t(20480ULL) << 20;
 }
 
 } // namespace
@@ -123,6 +137,11 @@ bool ImportHostRangeForLevelZero(void* ptr, size_t bytes) {
     if (!ptr || !bytes || !import_enabled()) return false;
     const Api& a = api();
     if (!a.import) return false;
+    const size_t max_bytes = import_max_bytes();
+    std::lock_guard<std::mutex> lock(g_import_mutex);
+    if (g_import_bytes.load(std::memory_order_relaxed) + bytes > max_bytes) {
+        return false;
+    }
     const ZeResult status = a.import(a.driver, ptr, bytes);
     if (status != kZeResultSuccess) {
         const uint64_t failures = g_import_failures.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -131,13 +150,14 @@ bool ImportHostRangeForLevelZero(void* ptr, size_t bytes) {
                          static_cast<unsigned>(status));
         return false;
     }
+    g_imported_ranges[ptr] = bytes;
     g_import_bytes.fetch_add(bytes, std::memory_order_relaxed);
     const uint64_t calls = g_import_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     // One line proves the path is live without flooding startup: the host arena
     // allocates one range per 256 MB (127 ranges for the 32 GiB default).
     if (calls == 1)
-        std::fprintf(stderr, "[L0HostImport] first range imported (%zu bytes); later ranges log only on failure\n",
-                     bytes);
+        std::fprintf(stderr, "[L0HostImport] first range imported (%zu bytes, max_mb=%zu); later ranges log only on failure\n",
+                     bytes, max_bytes >> 20);
     return true;
 }
 
@@ -145,6 +165,12 @@ void ReleaseHostRangeFromLevelZero(void* ptr) noexcept {
     if (!ptr) return;
     const Api& a = api();
     if (!a.release) return;
+    std::lock_guard<std::mutex> lock(g_import_mutex);
+    auto it = g_imported_ranges.find(ptr);
+    if (it == g_imported_ranges.end()) return;
+    const size_t bytes = it->second;
+    g_imported_ranges.erase(it);
+    g_import_bytes.fetch_sub(bytes, std::memory_order_relaxed);
     a.release(a.driver, ptr);
 }
 

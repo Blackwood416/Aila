@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -490,10 +491,106 @@ void run_pipeline_test() {
     set_w_f16_env("");
 }
 
+void run_production_bench() {
+    Context ctx;
+    set_c1_f32_env("0");
+    set_w_f16_env("0");
+    constexpr int kH = 2560;
+    constexpr int kI = 640;
+    constexpr int kB = 16;
+    constexpr int kBand = 192;
+    constexpr int kRealPerExp = 121;
+    constexpr int kTokens = 7760;
+    constexpr int kTopK = 8;
+    const size_t gu_packed_bytes = size_t(2) * kI * kH / 2;
+    const size_t dn_packed_bytes = size_t(kH) * kI / 2;
+    const size_t gu_blocks = size_t(2) * kI * kH / 64;
+    const size_t dn_blocks = size_t(kH) * kI / 64;
+
+    Tensor gu_pack = Tensor::allocate(ctx, {int64_t(kB * gu_packed_bytes)}, dnnl::memory::data_type::u8);
+    Tensor dn_pack = Tensor::allocate(ctx, {int64_t(kB * dn_packed_bytes)}, dnnl::memory::data_type::u8);
+    Tensor gu_codes = Tensor::allocate(ctx, {int64_t(kB * gu_blocks)}, dnnl::memory::data_type::u8);
+    Tensor dn_codes = Tensor::allocate(ctx, {int64_t(kB * dn_blocks)}, dnnl::memory::data_type::u8);
+    Tensor gu_nabs = Tensor::allocate(ctx, {int64_t(kB * (gu_blocks / 256))}, dnnl::memory::data_type::f32);
+    Tensor dn_nabs = Tensor::allocate(ctx, {int64_t(kB * (dn_blocks / 256))}, dnnl::memory::data_type::f32);
+    std::vector<float> qmap(256, 0.01f);
+    Tensor qmap_dev = upload(ctx, qmap);
+    ctx.queue().fill<uint8_t>(gu_pack.data_as<uint8_t>(), 0x53u, kB * gu_packed_bytes);
+    ctx.queue().fill<uint8_t>(dn_pack.data_as<uint8_t>(), 0x53u, kB * dn_packed_bytes);
+    ctx.queue().fill<uint8_t>(gu_codes.data_as<uint8_t>(), 7u, kB * gu_blocks);
+    ctx.queue().fill<uint8_t>(dn_codes.data_as<uint8_t>(), 7u, kB * dn_blocks);
+    ctx.queue().fill<float>(gu_nabs.data_as<float>(), 0.125f, kB * (gu_blocks / 256));
+    ctx.queue().fill<float>(dn_nabs.data_as<float>(), 0.125f, kB * (dn_blocks / 256));
+
+    std::vector<ops::MoeExpertSlotDev> slots_h(kB);
+    for (int b = 0; b < kB; ++b) {
+        slots_h[b].gate_up_packed = gu_pack.data_as<uint8_t>() + b * gu_packed_bytes;
+        slots_h[b].down_packed = dn_pack.data_as<uint8_t>() + b * dn_packed_bytes;
+        slots_h[b].gate_up_nested = {gu_codes.data_as<uint8_t>() + b * gu_blocks,
+                                     gu_nabs.data_as<float>() + b * (gu_blocks / 256),
+                                     qmap_dev.data_as<float>(), 0.0f, 256};
+        slots_h[b].down_nested = {dn_codes.data_as<uint8_t>() + b * dn_blocks,
+                                  dn_nabs.data_as<float>() + b * (dn_blocks / 256),
+                                  qmap_dev.data_as<float>(), 0.0f, 256};
+    }
+    Tensor slots_d = upload(ctx, slots_h);
+    std::vector<int> bases(kB + 1);
+    std::vector<int> tok_ids(kB * kRealPerExp);
+    std::vector<int> ranks(kB * kRealPerExp);
+    for (int b = 0; b <= kB; ++b) bases[b] = b * kRealPerExp;
+    for (int i = 0; i < kB * kRealPerExp; ++i) {
+        tok_ids[i] = (i * 19) % kTokens;
+        ranks[i] = i % kTopK;
+    }
+    Tensor bases_d = upload(ctx, bases);
+    Tensor tok_d = upload(ctx, tok_ids);
+    Tensor rank_d = upload(ctx, ranks);
+    Tensor x_d = Tensor::allocate(ctx, {int64_t(kTokens) * kH}, dnnl::memory::data_type::bf16);
+    Tensor acc_d = Tensor::allocate(ctx, {int64_t(kTokens) * kTopK * kH}, dnnl::memory::data_type::f32);
+    ctx.queue().fill<bf16>(x_d.data_as<bf16>(), bf16(0.05f), size_t(kTokens) * kH);
+    ctx.queue().fill<float>(acc_d.data_as<float>(), 0.0f, size_t(kTokens) * kTopK * kH);
+
+    ops::MoeExpertXmxScratch scratch;
+    expect(ops::moe_expert_xmx_scratch_create(ctx, scratch, 4096, kH, kI), "bench scratch failed");
+    ops::MoeExpertXmxChunk chunk{};
+    chunk.num_experts = kB;
+    chunk.top_k = kTopK;
+    chunk.rows_per_band = kBand;
+    chunk.member_row_base = bases_d.data_as<int>();
+    chunk.member_token_ids = tok_d.data_as<int>();
+    chunk.member_ranks = rank_d.data_as<int>();
+    chunk.slots = reinterpret_cast<const ops::MoeExpertSlotDev*>(slots_d.data());
+
+    for (int w = 0; w < 3; ++w) {
+        ops::moe_expert_xmx_prefill_chunk(ctx, scratch, chunk, w & 1, x_d.data_as<bf16>(),
+                                          acc_d.data_as<float>(), kH, kI, 64, nullptr);
+    }
+    ctx.synchronize();
+    constexpr int kChunks = 60;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int c = 0; c < kChunks; ++c) {
+        ops::moe_expert_xmx_prefill_chunk(ctx, scratch, chunk, c & 1, x_d.data_as<bf16>(),
+                                          acc_d.data_as<float>(), kH, kI, 64, nullptr);
+    }
+    ctx.synchronize();
+    const double ms_per_chunk =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / kChunks;
+    std::cout << "[MoeExpertXmxBench] B=" << kB << " band=" << kBand
+              << " ms_per_chunk=" << ms_per_chunk
+              << " extrap_2945_s=" << (ms_per_chunk * 2945.0 / 1000.0) << "\n";
+    ops::moe_expert_xmx_scratch_destroy(ctx, scratch);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--bench") {
+                run_production_bench();
+                return 0;
+            }
+        }
         run_pipeline_test();
     } catch (const std::exception& error) {
         std::cerr << "AilaMoeExpertXmxTests: failed: " << error.what() << "\n";
