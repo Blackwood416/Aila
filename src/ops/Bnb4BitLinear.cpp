@@ -1914,23 +1914,24 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
 } // namespace
 
 void Bnb4BitLinearScratch::ensure(Context& ctx, int seq_len, int in_features, int out_features, bool need_weight) {
-    const bool grow_seq = seq_len > seq_capacity;
-    const bool grow_input = in_features > input_dim_capacity;
-    const bool grow_output = out_features > output_dim_capacity;
-    const bool grow_weight = in_features > weight_in_capacity || out_features > weight_out_capacity;
+    const bool need_io = seq_len > 0;
+    const bool grow_seq = need_io && (seq_len > seq_capacity);
+    const bool grow_input = need_io && (in_features > input_dim_capacity);
+    const bool grow_output = need_io && (out_features > output_dim_capacity);
+    const int64_t needed_weight_elems = static_cast<int64_t>(in_features) * static_cast<int64_t>(out_features);
+    const int64_t curr_weight_elems = weight_bf16.valid() ? weight_bf16.numel() : 0;
+    const bool grow_weight = need_weight && (needed_weight_elems > curr_weight_elems);
 
-    const int new_seq_cap = grow_seq ? round_up_seq(seq_len, 64) : seq_capacity;
-    const int new_input_dim_cap = std::max(input_dim_capacity, in_features);
-    const int new_output_dim_cap = std::max(output_dim_capacity, out_features);
-    const int new_weight_in_cap = std::max(weight_in_capacity, in_features);
-    const int new_weight_out_cap = std::max(weight_out_capacity, out_features);
+    const int new_seq_cap = need_io ? (grow_seq ? round_up_seq(seq_len, 64) : seq_capacity) : seq_capacity;
+    const int new_input_dim_cap = need_io ? std::max(input_dim_capacity, in_features) : input_dim_capacity;
+    const int new_output_dim_cap = need_io ? std::max(output_dim_capacity, out_features) : output_dim_capacity;
 
     // Tensor move-assignment frees the old USM allocation immediately.  Make
     // sure an earlier in-order kernel is no longer using a buffer before a
     // growth operation replaces it.
     if ((grow_seq || grow_input) && input_bf16.valid() ||
         (grow_seq || grow_output) && output_bf16.valid() ||
-        (need_weight && grow_weight && weight_bf16.valid())) {
+        (grow_weight && weight_bf16.valid())) {
         ctx.synchronize();
     }
 
@@ -1946,19 +1947,17 @@ void Bnb4BitLinearScratch::ensure(Context& ctx, int seq_len, int in_features, in
                                       dnnl::memory::data_type::bf16);
     }
 
-    if (need_weight && grow_weight) {
+    if (grow_weight) {
         weight_bf16 = Tensor::allocate(ctx,
-                                      {(int64_t)new_weight_in_cap, (int64_t)new_weight_out_cap},
+                                      {(int64_t)in_features, (int64_t)out_features},
                                       dnnl::memory::data_type::bf16);
+        weight_in_capacity = in_features;
+        weight_out_capacity = out_features;
     }
 
     seq_capacity = new_seq_cap;
     input_dim_capacity = new_input_dim_cap;
     output_dim_capacity = new_output_dim_cap;
-    if (need_weight) {
-        weight_in_capacity = new_weight_in_cap;
-        weight_out_capacity = new_weight_out_cap;
-    }
 }
 
 bool Bnb4BitLinear::init(Context& ctx, const Bnb4BitWeightRef& weight, std::string* error_message) {
@@ -2682,7 +2681,7 @@ void Bnb4BitLinear::forward(Context& ctx,
 
     const bool need_scratch_weight = !cache_dequantized_weight_;
 
-    scratch.ensure(ctx, seq_len, in_features_, out_features_, need_scratch_weight);
+    scratch.ensure(ctx, direct_io ? 0 : seq_len, in_features_, out_features_, need_scratch_weight);
     if (direct_io) g_prefill_dispatch_stats.direct_io.fetch_add(1, std::memory_order_relaxed);
     Tensor input_bf16 = Tensor::view(ctx, direct_io ? input.data() : scratch.input_bf16.data(),
                                     {seq_len, (int64_t)in_features_},

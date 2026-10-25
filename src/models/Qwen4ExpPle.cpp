@@ -647,8 +647,10 @@ void Qwen4ExpPle::ensure_compute_capacity(Context& ctx, int rows) {
     query_normed_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
     gv_buf_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
     gv_normed_ = Tensor::allocate(ctx, {rows, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
-    scratch_key_.ensure(ctx, rows, EMBED_DIM, HC_HIDDEN_SIZE, false);
-    scratch_val_.ensure(ctx, rows, EMBED_DIM, EMBED_DIM, false);
+    static const bool s_direct_prefill_io =
+        aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
+    scratch_key_.ensure(ctx, s_direct_prefill_io ? 0 : rows, EMBED_DIM, HC_HIDDEN_SIZE, false);
+    scratch_val_.ensure(ctx, s_direct_prefill_io ? 0 : rows, EMBED_DIM, EMBED_DIM, false);
     compute_capacity_ = rows;
 }
 

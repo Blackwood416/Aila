@@ -26,6 +26,7 @@ inline void ApplyQwen38A770Preset() {
     // 171 / 194 tok/s at 8192 as at 4096 because they already fit one chunk.
     {"AILA_Q35_PREFILL_CHUNK", "8192"},
         {"AILA_Q4E_INLINE_CHECKPOINT", "1"},
+        {"AILA_Q4E_LONG_INLINE_CHECKPOINT", "1"},
         {"AILA_Q4E_STATIC_PINNING", "0"},
         {"AILA_Q4E_GROUPED_XMX_MIN_ROWS", "0"},
         // Expert-XMX padded band height. Round 4 sweep at the shipped 8192 chunk,

@@ -298,8 +298,8 @@ void finish(Context& ctx,DeltaNetGeometry g,DeltaNetWeights w,const bf16* input,
 }
 } // namespace
 
-void GdnChunkScratch::Reserve(Context& ctx,int tokens,int valueHeads) {
-    if(tokens<=capacity && valueHeads==heads) return;
+void GdnChunkScratch::Reserve(Context& ctx,int tokens,int valueHeads,void* external_raw_ptr) {
+    if(tokens<=capacity && valueHeads==heads && (external_raw_ptr==nullptr || raw.data()==external_raw_ptr)) return;
     if(tokens<=0 || valueHeads<=0) throw std::invalid_argument("Invalid GDN chunk capacity");
     ctx.synchronize(); // growth is outside the execution hot path
     using f32=dnnl::memory::data_type;
@@ -308,7 +308,9 @@ void GdnChunkScratch::Reserve(Context& ctx,int tokens,int valueHeads) {
     delta=Tensor::allocate(ctx,{valueHeads,T,D},f32::f32);
     base=Tensor::allocate(ctx,{valueHeads,T,D},f32::f32);
     decay=Tensor::allocate(ctx,{valueHeads},f32::f32);
-    raw=Tensor::allocate(ctx,{tokens,valueHeads,D},f32::f32);
+    raw=external_raw_ptr
+        ? Tensor::view(ctx,external_raw_ptr,{tokens,valueHeads,D},f32::f32)
+        : Tensor::allocate(ctx,{tokens,valueHeads,D},f32::f32);
     capacity=tokens;heads=valueHeads;
 }
 

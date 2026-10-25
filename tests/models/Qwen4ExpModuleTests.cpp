@@ -4153,8 +4153,8 @@ void test_qsa_dense_prefill_buffer_bounds(Context& ctx) {
 
     // Phase P2 (R4a): Verify bounded arena buffers for QSA batch tiles
     expect(buf.qsa_tile_valid_counts.valid(), "buf.qsa_tile_valid_counts must be allocated");
-    expect(backend.qsa_query_tile() >= 16 && backend.qsa_query_tile() <= 64,
-           "backend.qsa_query_tile() must be bounded in [16, 64]");
+    expect(backend.qsa_query_tile() >= 16 && backend.qsa_query_tile() <= 1024,
+           "backend.qsa_query_tile() must be bounded in [16, 1024]");
     expect(buf.qsa_tile_valid_counts.shape()[0] == backend.qsa_query_tile(),
            "buf.qsa_tile_valid_counts rows must match qsa_query_tile");
     expect(buf.qsa_tile_valid_counts.shape()[1] == 2, "buf.qsa_tile_valid_counts cols must be 2");

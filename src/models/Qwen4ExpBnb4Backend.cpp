@@ -1338,8 +1338,16 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             buf_.attn_xs = Tensor::allocate(ctx, {quantized_capacity / 64}, dnnl::memory::data_type::f32);
         }
     }
-    if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
-        gdn_chunk_scratch_.Reserve(ctx, attn_cap, linear_kv_heads_);
+    if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_) {
+        void* ext_raw = nullptr;
+        const size_t lin_bytes = (size_t(attn_cap) * linear_all_dim_ * sizeof(bf16) + 255u) & ~size_t(255u);
+        const size_t raw_bytes = size_t(attn_cap) * size_t(linear_kv_heads_) * 128u * sizeof(float);
+        if (s_phase_scratch && buf_.phase_scratch.valid() &&
+            lin_bytes + raw_bytes <= buf_.phase_scratch.size_bytes()) {
+            ext_raw = buf_.phase_scratch.data_as<uint8_t>() + lin_bytes;
+        }
+        gdn_chunk_scratch_.Reserve(ctx, attn_cap, linear_kv_heads_, ext_raw);
+    }
 
     // MoE buffers
     buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
