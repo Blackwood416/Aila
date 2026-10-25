@@ -3682,3 +3682,66 @@ The remaining 1.12x is not reachable by moving work between threads or by any co
 exposes. It requires making the staged work itself cheaper, i.e. reducing the 42.6 GB that prefill must
 move - which the routing saturates (section 79) - or a materially faster transfer path than the 8.3 GB/s
 the arena achieves today.
+
+## 82. Fresh attribution on the current build: the GDN chunked path is 35k tiny launches, and its block size is already optimal
+
+The 22.1 s figure had been decomposed using a trace taken *before* the GDN, QSA-tile and direct-arena
+changes, so a new prefill-only `xpu-offload` trace was taken on the shipped build (25.4 s of device time,
+698 rows):
+
+| kernel | device time | instances |
+|---|---:|---:|
+| `zeCommandListAppendMemoryCopy` | 6.48 s | 37,465 |
+| `packed_nf4_gemm_bf16_joint_matrix_wide` (experts) | 3.18 s | 97 |
+| **`solve_chunk`** | **3.08 s** | **17,800** |
+| `attention_prefill_qsa_batched_impl` (QSA) | 2.50 s | 84 |
+| `zeCommandListAppendMemoryCopy` (second row) | 0.77 s | 3,817 |
+| **`product_f32`** | **0.74 s** | **17,632** |
+| `gemm_kernel` rows (three shapes) | 0.69 s | 338 |
+
+### 82.1 The GDN chunked path launches two kernels per 16 rows
+
+`solve_chunk` and `product_f32` are the two halves of `try_linear_delta_prefill_chunked`
+(`src/ops/GdnChunkOps.cpp:180-196`), which walks the sequence in fixed blocks:
+
+```cpp
+constexpr int D=128, T=16, P=3*D+2, M=T+D;      // :6
+for(int start=0;start<count;start+=T) {
+    solve_chunk(...);                            // 0.17 ms
+    product(...);                                // 0.04 ms
+}
+```
+
+With `count=7878` and `T=16` that is 493 dependent steps per GDN layer, times 36 layers, times two
+kernels = **35,432 launches**, which matches the observed 17,800 + 17,632. This is the path
+`AILA_Q4E_GDN_CHUNK_MODE=1` (section 68) enabled, and it is what replaced the 5.24 s recurrence.
+
+### 82.2 The block size is already at its optimum
+
+Since the cost is launch-dominated (0.21 ms per step for only 16 rows), enlarging the block should cut the
+launch count proportionally:
+
+```text
+T=16 (shipped)   22,059.1 ms   357.1 tok/s
+T=32             25,382.1 ms   310.4 tok/s    (half the launches, but 13% slower)
+T=64             allocation failure - UR_RESULT_ERROR_OUT_OF_RESOURCES
+```
+
+Larger blocks are worse, not better, because `solve_chunk`'s per-step work is **O(T^2)** in the delta-rule
+matrix solve, and that quadratic term grows faster than the linear launch saving. T=64 does not even fit
+(the scratch grows with T^2 as well). So the 3.8 s in this path cannot be recovered by block size: 16 is
+the balance point, and both directions were measured.
+
+### 82.3 What the fresh trace says about where the goal's 1.12x would have to come from
+
+```text
+copies          7.25 s  (28%)   37k transfers of staged experts
+experts         3.18 s  (13%)   packed_nf4 joint-matrix GEMM, 97 calls
+GDN chunked     3.82 s  (15%)   35k launches, block size optimal (this section)
+QSA attention   2.50 s  (10%)   84 calls
+small GEMMs     0.69 s  ( 3%)
+rest            ~8 s    (31%)   spread over ~600 rows
+```
+
+Every one of these has now been attacked and measured: copies (sections 71-81), experts (58, 62, 64),
+GDN (68, this section), QSA (67), and the remainder is small-kernel spread that no single change moves.
