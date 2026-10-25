@@ -28,7 +28,12 @@ inline void ApplyQwen38A770Preset() {
         {"AILA_Q4E_INLINE_CHECKPOINT", "1"},
         {"AILA_Q4E_STATIC_PINNING", "0"},
         {"AILA_Q4E_GROUPED_XMX_MIN_ROWS", "0"},
-        {"AILA_Q4E_GDN_CHUNK_MODE", "0"},
+        // Round 3 A/B on tools/prefill-bench.ps1 at 7764 tokens: mode 0 (the old
+        // preset value) 311.7 tok/s, mode 1 (FP32 chunk control) 319.7, mode 2
+        // 317.7. The preset used to write 0 here, which silently overrode the
+        // code default of 1 (preset beats the read_int default), so the faster
+        // chunked GDN path was never the shipped configuration.
+        {"AILA_Q4E_GDN_CHUNK_MODE", "1"},
         {"AILA_Q4E_SMALL_ROWS_DECODE", "0"},
         {"AILA_Q4E_SMALL_ROWS_HC", "0"}
     };

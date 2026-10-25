@@ -11,6 +11,7 @@
 #include <typeindex>
 #include "memory/AllocationBudget.hpp"
 #include "memory/LargePages.hpp"
+#include "memory/L0HostImport.hpp"
 #include "core/AsyncErrorState.hpp"
 #include "core/ExecutionTrace.hpp"
 #include "core/UncachedHostAllocation.hpp"
@@ -115,6 +116,12 @@ public:
             alloc_bytes_.emplace(
                 ptr, Allocation{bytes, AllocationKind::LargePageHost});
             host_budget_.Acquire(bytes, "Large-page host");
+            // The 32 GiB expert arena is the DMA source for every expert copy, so
+            // tell Level Zero the range is host-resident once instead of letting
+            // NEO register each slice on every queue::memcpy. Failure is benign
+            // and leaves the previous (un-imported) cost in place. The knob is read
+            // inside the importer so this header stays free of env dependencies.
+            aila::memory::ImportHostRangeForLevelZero(ptr, bytes);
             return ptr;
         } catch (...) {
             alloc_bytes_.erase(ptr);
@@ -145,6 +152,7 @@ public:
         }
         switch (kind) {
         case AllocationKind::LargePageHost:
+            aila::memory::ReleaseHostRangeFromLevelZero(ptr);
             aila::memory::FreeLargePages(ptr);
             break;
         case AllocationKind::UncachedHost:

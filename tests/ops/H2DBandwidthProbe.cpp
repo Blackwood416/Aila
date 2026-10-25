@@ -27,6 +27,7 @@ static double ms_since(Clock::time_point t0) {
 int main(int argc, char** argv) {
     const size_t total_mb = (argc > 1) ? static_cast<size_t>(std::max(16, std::atoi(argv[1]))) : 512;
     const size_t chunk_kb = (argc > 2) ? static_cast<size_t>(std::max(4, std::atoi(argv[2]))) : 2400;
+    const int arena_mb = (argc > 3) ? std::max(64, std::atoi(argv[3])) : 512;
     const size_t total_bytes = total_mb * 1024ULL * 1024ULL;
     const size_t chunk_bytes = chunk_kb * 1024ULL;
     const size_t chunks = (total_bytes + chunk_bytes - 1) / chunk_bytes;
@@ -265,6 +266,74 @@ int main(int argc, char** argv) {
                         (con_ms < 0.85 * (kernel_ms + seq_copy_ms)) ? "OVERLAPS" : "SERIALISED");
             ctx.free_device(seq_burn.second);
             ctx.free_device(con_burn.second);
+        }
+
+        // Engine-shaped import check. The prefill staging loop copies 2.42 MB
+        // expert slices out of interior offsets of a MEM_LARGE_PAGES arena, on a
+        // dedicated in-order copy queue, while kernels run on the main queue.
+        // Context::alloc_large_host imports each range into Level Zero; this block
+        // proves the bytes survive that and are visible to device code, which the
+        // older enqueue-timing block above never checked.
+        {
+            const size_t arena_bytes = static_cast<size_t>(arena_mb) * 1024ULL * 1024ULL;
+            const size_t slot_bytes = 2536000;             // one compact NF4 expert slot
+            const size_t slot_stride = (slot_bytes + 4095) & ~size_t(4095);
+            const size_t slots = arena_bytes / slot_stride;
+            void* arena = ctx.alloc_large_host(arena_bytes);
+            auto* bytes = static_cast<uint8_t*>(arena);
+            if (arena) {
+                // Importing tens of GiB is the engine's real shape (32 GiB arena
+                // behind 128 ranges), and it is the only condition the engine
+                // crash reproduced under, so it is the interesting one to check.
+                std::printf("imported arena: %zu MB requested, %zu slots of %zu bytes\n",
+                            arena_mb, slots, slot_bytes);
+                const size_t verify_stride = slots > 256 ? slots / 256 : 1;
+                for (size_t s = 0; s < slots; ++s)
+                    std::memset(bytes + s * slot_stride, static_cast<int>(s & 0xff), slot_bytes);
+
+                void* dev_slot = ctx.alloc_device(slot_bytes);
+                void* host_slot = ctx.alloc_host(slot_bytes);
+                sycl::queue copy_q(ctx.queue().get_device(),
+                                   sycl::property_list{sycl::property::queue::in_order()});
+                size_t mismatches = 0;
+                const auto t0 = Clock::now();
+                for (size_t s = 0; s < slots; s += verify_stride) {
+                    copy_q.memcpy(dev_slot, bytes + s * slot_stride, slot_bytes).wait_and_throw();
+                    ctx.memcpy_d2h(host_slot, dev_slot, slot_bytes);
+                    const auto* got = static_cast<const uint8_t*>(host_slot);
+                    const uint8_t want = static_cast<uint8_t>(s & 0xff);
+                    if (got[0] != want || got[slot_bytes / 2] != want || got[slot_bytes - 1] != want)
+                        ++mismatches;
+                }
+                const double ms = ms_since(t0);
+                std::printf("imported arena round trip: %zu sampled slots x %zu bytes in %.1f ms, mismatches=%zu\n",
+                            (slots + verify_stride - 1) / verify_stride, slot_bytes, ms, mismatches);
+
+                // Device-side read of an interior offset: proves the bytes the copy
+                // engine delivered are what a kernel consumes.
+                int* dev_ok = static_cast<int*>(ctx.alloc_device(sizeof(int)));
+                const uint8_t want = static_cast<uint8_t>((slots - 1) & 0xff);
+                copy_q.memcpy(dev_slot, bytes + (slots - 1) * slot_stride, slot_bytes).wait_and_throw();
+                ctx.queue().submit([&](sycl::handler& h) {
+                    const auto* p = static_cast<const uint8_t*>(dev_slot);
+                    int* ok = dev_ok;
+                    const size_t n = slot_bytes;
+                    h.single_task([=]() {
+                        int bad = 0;
+                        for (size_t i = 0; i < n; i += 4096)
+                            if (p[i] != want) ++bad;
+                        ok[0] = bad;
+                    });
+                });
+                ctx.synchronize();
+                int bad = -1;
+                ctx.memcpy_d2h(&bad, dev_ok, sizeof(int));
+                std::printf("imported arena device read: bad=%d (want 0)\n", bad);
+                ctx.free_device(dev_ok);
+                ctx.free_device(dev_slot);
+                ctx.free_host(host_slot);
+                ctx.free_host(arena);
+            }
         }
         std::printf("PROBE_OK\n");
         return 0;

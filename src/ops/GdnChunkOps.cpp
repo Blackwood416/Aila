@@ -1,4 +1,6 @@
 #include "GdnChunkOps.hpp"
+#include "utils/EnvUtils.hpp"
+#include <algorithm>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 namespace ops {
@@ -148,6 +150,136 @@ void product_xmx(Context& ctx,const float* a,const float* d,const float* base,
     });
 }
 
+// Fused chunk scan. One work-group per value head walks every T-token chunk in
+// order, so the head's recurrent state column stays with the thread that owns it
+// and the per-chunk launch pair disappears. On a 7878-token prompt the old shape
+// issued (7878/16) * 36 layers * 2 = ~35.4k launches of 48 work-groups each, and
+// an observer-free trace priced them at 3.82 s (solve_chunk 3.08 s across 17,820
+// calls at 0.173 ms each, product_f32 0.74 s) against roughly 1.4 TFLOP of real
+// arithmetic - the launches, not the math, were the cost.
+//
+// The arithmetic order is unchanged: each iteration of the chunk loop performs
+// exactly the operations solve_chunk followed by product_f32 performed, in the
+// same reduction order. The only deviation is FP32 last-bit codegen (different
+// FMA contraction inside a loop body); AilaGdnChunkTests --scan-parity pins it.
+//
+// q/k, the causal matrix and the triangular factor live in SLM (26 KB total). The
+// first version re-read q/k from `prepared` and measured 0.36 ms per chunk at
+// v_heads=48 against 0.30 ms for the two-launch pair, because the T*D*2 broadcast
+// reads in the S0 projections and the T*T*D dot products are issue-bound even
+// when they hit L1.
+void chunk_scan(Context& ctx, const float* p, float* state, float* raw,
+    int heads, int count) {
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float,1> l(T*T,cgh), mat(M*T,cgh);
+        sycl::local_accessor<float,1> qt(T*D,cgh), kt(T*D,cgh);
+        sycl::local_accessor<float,1> a(T,cgh), beta(T,cgh), prefix(T,cgh);
+        sycl::local_accessor<float,1> decay(1,cgh);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(heads)*D,D),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int h=int(item.get_group(0)), v=int(item.get_local_id(0));
+                float* col=state+size_t(h)*D*D;
+                for(int start=0;start<count;start+=T) {
+                    const int n=(count-start)<T?(count-start):T;
+                    // `base` is this chunk's prepared tile for head h; the first D
+                    // floats are q, the next D are k, then v, beta and log-decay.
+                    const auto* base=p+size_t(start)*heads*P+size_t(h)*P;
+                    const auto row=[&](int t) { return base+size_t(t)*heads*P; };
+                    // Tail rows are zero-filled exactly like solve_chunk, which is
+                    // what keeps the t>=n matrix rows and S0 projections neutral.
+                    for(int t=0;t<T;++t) {
+                        if(t<n) {
+                            const auto* r=base+size_t(t)*heads*P;
+                            qt[t*D+v]=r[v]; kt[t*D+v]=r[D+v];
+                        } else {qt[t*D+v]=0.f;kt[t*D+v]=0.f;}
+                    }
+                    if(v<T) {
+                        if(v<n) {
+                            const auto* r=row(v);
+                            a[v]=r[3*D+1]; beta[v]=r[3*D];
+                        } else {a[v]=1.f;beta[v]=0.f;}
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    if(v==0) {
+                        float prod=1.f; for(int t=0;t<T;++t) {prod*=a[t];prefix[t]=prod;}
+                        decay[0]=prod;
+                    }
+                    for(int ij=v;ij<T*T;ij+=D) {
+                        const int i=ij/T,j=ij%T;
+                        float kk=0.f,qk=0.f,ratio=1.f;
+                        if(j<=i && i<n) {
+                            const int ib=i*D, jb=j*D;
+                            for(int d=0;d<D;++d) {kk+=kt[ib+d]*kt[jb+d];qk+=qt[ib+d]*kt[jb+d];}
+                            for(int t=j+1;t<=i;++t) ratio*=a[t];
+                        }
+                        l[ij]=j<i?beta[i]*ratio*kk:0.f;
+                        mat[i*T+j]=ratio*qk;
+                    }
+                    // Decayed K^T forms the lower block of the final matrix product.
+                    for(int t=0;t<T;++t) {
+                        float ratio=1.f; for(int j=t+1;j<n;++j) ratio*=a[j];
+                        mat[(T+v)*T+t]=kt[t*D+v]*ratio;
+                    }
+                    item.barrier(sycl::access::fence_space::local_space);
+                    float ks[T]={},qs[T]={},d[T]={},bse[T]={};
+                    // The S0 projections touch one strided element of the state
+                    // column per j, so a naive j loop serialises on 128 separate
+                    // L2 round trips. Eight independent loads are issued per block
+                    // to keep that latency pipeline full.
+                    constexpr int kPrefetch=8;
+                    for(int j0=0;j0<D;j0+=kPrefetch) {
+                        float sv[kPrefetch];
+                        #pragma unroll
+                        for(int u=0;u<kPrefetch;++u) sv[u]=col[size_t(j0+u)*D+v];
+                        #pragma unroll
+                        for(int u=0;u<kPrefetch;++u) {
+                            #pragma unroll
+                            for(int t=0;t<T;++t) {
+                                ks[t]+=kt[t*D+j0+u]*sv[u]; qs[t]+=qt[t*D+j0+u]*sv[u];
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for(int t=0;t<T;++t) {
+                        const float val=t<n?row(t)[2*D+v]:0.f;
+                        float dv=beta[t]*(val-prefix[t]*ks[t]);
+                        for(int j=0;j<t;++j) dv-=l[t*T+j]*d[j];
+                        d[t]=dv;
+                        bse[t]=prefix[t]*qs[t];
+                    }
+                    #pragma unroll
+                    for(int m=0;m<T;++m) {
+                        float sum=0.f;
+                        #pragma unroll
+                        for(int t=0;t<T;++t) sum+=mat[m*T+t]*d[t];
+                        if(m<n) raw[(size_t(start+m)*heads+h)*D+v]=sum+bse[m];
+                    }
+                    // The state update is a strided read-modify-write; four rows
+                    // in flight hide the round trip the same way.
+                    constexpr int kUpdateBlock=4;
+                    for(int m0=T;m0<M;m0+=kUpdateBlock) {
+                        float sv[kUpdateBlock], sum[kUpdateBlock];
+                        #pragma unroll
+                        for(int u=0;u<kUpdateBlock;++u) {
+                            sv[u]=col[size_t(m0-T+u)*D+v];
+                            float acc=0.f;
+                            #pragma unroll
+                            for(int t=0;t<T;++t) acc+=mat[(m0+u)*T+t]*d[t];
+                            sum[u]=acc;
+                        }
+                        const float dec=decay[0];
+                        #pragma unroll
+                        for(int u=0;u<kUpdateBlock;++u)
+                            col[size_t(m0-T+u)*D+v]=dec*sv[u]+sum[u];
+                    }
+                    // SLM tiles and scalars are reused by the next chunk; no thread
+                    // may rewrite them while another still reads them.
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+            });
+    });
+}
+
 void finish(Context& ctx,DeltaNetGeometry g,DeltaNetWeights w,const bf16* input,
     const float* raw,bf16* output,int count) {
     ctx.queue().parallel_for(sycl::nd_range<1>(size_t(count)*g.v_heads*D,D),
@@ -186,13 +318,22 @@ bool try_linear_delta_prefill_chunked(Context& ctx,const DeltaNetGeometry& g,
         return false;
     const int head=((state.conv_head%3)+3)%3;
     prepare_inputs(ctx,g,w,state.conv_state,head,input,s.prepared.data_as<float>(),count);
-    for(int start=0;start<count;start+=T) {
-        const int n=std::min(T,count-start);
-        solve_chunk(ctx,s.prepared.data_as<float>(),state.state,s.matrix.data_as<float>(),s.delta.data_as<float>(),
-            s.base.data_as<float>(),s.decay.data_as<float>(),g.v_heads,start,n);
-        auto product=xmx?product_xmx:product_f32;
-        product(ctx,s.matrix.data_as<float>(),s.delta.data_as<float>(),s.base.data_as<float>(),s.decay.data_as<float>(),
-            state.state,s.raw.data_as<float>(),g.v_heads,start,n);
+    // AILA_Q4E_GDN_FUSED_SCAN=0 restores the per-chunk solve_chunk/product_f32
+    // launches, which is the A/B arm for this kernel. Read per call (not cached)
+    // so a test can flip it inside one process. Mode 2 keeps the XMX product and
+    // therefore the launched shape.
+    const bool s_fused_scan=aila::env::read_flag("AILA_Q4E_GDN_FUSED_SCAN",true);
+    if(s_fused_scan && !xmx) {
+        chunk_scan(ctx,s.prepared.data_as<float>(),state.state,s.raw.data_as<float>(),g.v_heads,count);
+    } else {
+        for(int start=0;start<count;start+=T) {
+            const int n=std::min(T,count-start);
+            solve_chunk(ctx,s.prepared.data_as<float>(),state.state,s.matrix.data_as<float>(),s.delta.data_as<float>(),
+                s.base.data_as<float>(),s.decay.data_as<float>(),g.v_heads,start,n);
+            auto product=xmx?product_xmx:product_f32;
+            product(ctx,s.matrix.data_as<float>(),s.delta.data_as<float>(),s.base.data_as<float>(),s.decay.data_as<float>(),
+                state.state,s.raw.data_as<float>(),g.v_heads,start,n);
+        }
     }
     commit_linear_conv_history(ctx,input,g.all_dim,state.conv_state,g.qkv_dim,3,head,count);
     finish(ctx,g,w,input,s.raw.data_as<float>(),output,count);

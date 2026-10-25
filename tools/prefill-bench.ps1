@@ -24,6 +24,11 @@ Value for AILA_Q35_PREFILL_CHUNK. The qwen38-a770 preset sets 512; 2048 keeps a
 param(
     [int[]]$Tokens = @(1024, 2048, 4096),
     [int]$Chunk = 2048,
+    # Must exceed the largest prompt: the CLI rejects a prompt longer than the
+    # context window instead of truncating it. max-seq also sizes the KV cache
+    # and therefore the admitted resident expert pool, so it is part of the
+    # measurement identity and must stay fixed across arms.
+    [int]$MaxSeq = 12288,
     [string]$Model = 'C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [string]$Exe = 'build-refactor/Aila.exe'
 )
@@ -52,9 +57,10 @@ foreach ($target in $Tokens) {
         ConvertTo-Json -Depth 5 -Compress
     Set-Content -Path $prompt -Value $body -Encoding UTF8
 
-    $out = & $Exe -m $Model --performance-preset qwen38-a770 --max-seq 4096 --greedy `
+    $out = & $Exe -m $Model --performance-preset qwen38-a770 --max-seq $MaxSeq --greedy `
         --thinking-budget 0 --max-tokens 1 --messages-json $prompt `
         --no-stream --chat-output-json --log-level info 2>&1 | Out-String
+    Set-Content -Path (Join-Path $work "engine-$target.log") -Value $out -Encoding UTF8
 
     $n = 0; $ms = 0.0
     if ($out -match 'Full prefill: (\d+) tokens') { $n = [int]$Matches[1] }

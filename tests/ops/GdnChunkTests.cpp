@@ -3,12 +3,14 @@
 #include "utils/EnvUtils.hpp"
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -248,7 +250,7 @@ void mlp_parity(Context& ctx) {
     }
 }
 void chunk_bench(Context& ctx) {
-    for(int n:{30,256}) {
+    for(int n:{30,256,2048}) {
         Fixture f(ctx,n,16,48); auto w=f.weights();
         const auto p=prepare_cpu(f); const auto ref=recurrent_cpu(f,p);
         auto run=[&](int mode,ops::DeltaNetState& st) {
@@ -277,6 +279,59 @@ void chunk_bench(Context& ctx) {
                     <<" cv="<<cv<<" noisy="<<(cv>.1)<<'\n';
             }
         }
+    }
+}
+void scan_parity(Context& ctx) {
+    // The fused scan is meant to be a pure reordering of the per-chunk launches:
+    // same operations, same reduction order. Any deviation must stay at FP32
+    // last-bit scale, far below the BF16 output's own quantisation.
+    struct Geom { int qh, vh; };
+    const std::vector<Geom> geoms{{2,6},{16,48}};
+    const std::vector<int> n_list{1,2,3,14,15,16,17,32,35,256,1024};
+    for(const auto& gm:geoms) for(int n:n_list) {
+        Fixture f(ctx,n,gm.qh,gm.vh); auto w=f.weights();
+        const auto run_once=[&](bool fused,std::vector<float>& st,
+                                std::vector<float>& hist,std::vector<bf16>& out) {
+            const char* prev=std::getenv("AILA_Q4E_GDN_FUSED_SCAN");
+            const std::string saved=prev?prev:"";
+            _putenv_s("AILA_Q4E_GDN_FUSED_SCAN",fused?"1":"0");
+            auto s=f.reset();
+            ops::try_linear_delta_prefill_chunked(ctx,f.g,w,s,f.scratch,f.in.data_as<bf16>(),
+                f.out.data_as<bf16>(),n,false);
+            ctx.synchronize();
+            _putenv_s("AILA_Q4E_GDN_FUSED_SCAN",saved.c_str());
+            st.resize(f.initial.size()); hist.resize(f.history.size()); out.resize(f.out.numel());
+            ctx.memcpy_d2h(st.data(),f.state.data(),f.state.size_bytes());
+            ctx.memcpy_d2h(hist.data(),f.conv_state.data(),f.conv_state.size_bytes());
+            ctx.memcpy_d2h(out.data(),f.out.data(),f.out.size_bytes());
+        };
+        const auto first_diff=[](const auto& a,const auto& b)->long long {
+            for(size_t i=0;i<a.size();++i) if(std::memcmp(&a[i],&b[i],sizeof(a[0]))!=0) return (long long)i;
+            return -1;
+        };
+        std::vector<float> st0,st1,hist0,hist1; std::vector<bf16> out0,out1;
+        run_once(false,st0,hist0,out0);
+        run_once(true,st1,hist1,out1);
+        const long long ds=first_diff(st0,st1),dh=first_diff(hist0,hist1),do_=first_diff(out0,out1);
+        // Not bitwise: the fused loop body is one extra scope inside a work-group
+        // kernel, and icx contracts a different subset of the inner products into
+        // FMAs there, so the two arms differ in the last FP32 bit. The check that
+        // matters is that the difference stays at that scale - it must never reach
+        // the BF16 output's own quantisation.
+        const auto nrmse=[](const auto& a,const auto& b) {
+            double err=0,ref=0;
+            for(size_t i=0;i<a.size();++i) {
+                const double d=double(float(a[i]))-double(float(b[i]));
+                err+=d*d; ref+=double(float(a[i]))*double(float(a[i]));
+            }
+            return std::sqrt(err/std::max(ref,1e-30));
+        };
+        const double state_err=nrmse(st0,st1),out_err=nrmse(out0,out1);
+        std::cout<<"[X4 SCAN PARITY] qh="<<gm.qh<<" vh="<<gm.vh<<" n="<<n
+            <<" state_nrmse="<<state_err<<" out_nrmse="<<out_err
+            <<" first_diff_state="<<ds<<" first_diff_out="<<do_<<'\n';
+        require(dh<0,"Fused chunk scan changed the conv history");
+        require(state_err<1e-6 && out_err<2e-3,"Fused chunk scan diverged from the launched scan");
     }
 }
 void correctness(Context& ctx) {
@@ -318,9 +373,9 @@ void correctness(Context& ctx) {
             std::cout<<"[X4 CONTINUATION] xmx="<<xmx<<" cut="<<cut<<" restore_replay=bitwise guards=pass\n";
         }
     }
+    scan_parity(ctx);
     auto invalid=f.g;invalid.head_k_dim=64;
-    require(!ops::try_linear_delta_prefill_chunked(ctx,invalid,w,st,f.scratch,f.in.data_as<bf16>(),f.out.data_as<bf16>(),f.count,true),"Unsupported geometry accepted");
-    require(!ops::try_linear_delta_prefill_chunked(ctx,f.g,w,st,f.scratch,f.in.data_as<bf16>(),f.out.data_as<bf16>(),f.count+1,true),"Insufficient scratch accepted");
+    require(!ops::try_linear_delta_prefill_chunked(ctx,invalid,w,st,f.scratch,f.in.data_as<bf16>(),f.out.data_as<bf16>(),f.count,true),"Unsupported geometry accepted");    require(!ops::try_linear_delta_prefill_chunked(ctx,f.g,w,st,f.scratch,f.in.data_as<bf16>(),f.out.data_as<bf16>(),f.count+1,true),"Insufficient scratch accepted");
     // Equal Q/K and V head counts, SiLU output gate, and both vanishing and
     // near-unit decay. These catch inverse-prefix and ring-history mistakes.
     for(float alog:{10.f,-20.f}) {
@@ -356,6 +411,7 @@ int main(int argc,char** argv) {
         else if(argc==2 && std::string(argv[1])=="--mlp-parity") mlp_parity(ctx);
         else if(argc==2 && std::string(argv[1])=="--bench") chunk_bench(ctx);
         else if(argc==2 && std::string(argv[1])=="--profile-chunk") profile_chunk(ctx);
+        else if(argc==2 && std::string(argv[1])=="--scan-parity") scan_parity(ctx);
         else correctness(ctx);
         return 0;
     } catch(const std::exception& e) {std::cerr<<"[X4 FAIL] "<<e.what()<<'\n'; return 1;}

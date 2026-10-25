@@ -182,8 +182,9 @@ set(LIB_SOURCES
     src/ops/MoeExpertXmx.cpp
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
-    src/memory/KVCache.cpp
     src/memory/LargePages.cpp
+    src/memory/L0HostImport.cpp
+    src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp
     src/inference/Model.cpp
     src/inference/Session.cpp
@@ -708,6 +709,7 @@ add_executable(AilaH2DBandwidthProbe
     tests/ops/H2DBandwidthProbe.cpp
     src/profile/Profiling.cpp
     src/core/ExecutionTrace.cpp
+    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaH2DBandwidthProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaH2DBandwidthProbe PRIVATE
