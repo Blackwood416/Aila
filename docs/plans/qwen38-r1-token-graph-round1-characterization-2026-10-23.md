@@ -3601,3 +3601,40 @@ And the ones that did not: weight layout, `MIN_M`, `LARGE_PAGE_PIPELINE`, `GDN_H
 
 One item remains unimplemented - moving the staging enqueue off the submitting thread - and it is the only
 place the last 1.12x can come from.
+
+## 80. W_F16 re-measured on the current stack: still worse
+
+`AILA_Q4E_PREFILL_EXPERT_XMX_W_F16` had only been measured before the GDN, QSA-tile and direct-arena
+changes, so it was re-tested against the shipped 357.1 tok/s:
+
+```text
+W_F16=1   22,297.4 ms   2.83 ms/token   353.3 tok/s
+default   22,059.1 ms   2.79 ms/token   357.1 tok/s
+```
+
+Slightly worse, so it stays off. That closes the last untested knob: with it, **every environment variable
+the prefill path reads has been measured at least once against the shipped configuration**, and only the
+five listed in section 79.1 pay.
+
+### 80.1 Why the last 1.12x is not being attempted here
+
+The only remaining item is moving the staging enqueue off the submitting thread. The narrower version of
+that idea - deeper banks - was measured neutral (section 78), and the reason is now clear: with
+`lookahead = banks - 1` the host can run ahead, but it still performs the same enqueues on the same thread,
+so no time is recovered. Making it pay requires the enqueue itself to happen on a worker while the main
+thread submits the previous chunk's GEMMs, which means `stage_chunk` (and therefore
+`AdaptiveCache::StageColdExpertsAsync`) runs concurrently with `RunGroupedExperts` and
+`RecordStagingConsumer` on the same `adaptive_cache_` object.
+
+Both sides touch that object: the staging path updates `stats_`
+(`staging_fill_ns`, `cold_bytes_transferred`, `cold_experts_staged`) and the staging-bank fences, while the
+consumer path updates per-bank consumer events. Sequencing them requires lock discipline that the class
+does not currently have, and it is shared with the decode path. A torn counter would be harmless, but a
+race on the bank state would produce wrong weights rather than a crash, which is exactly the failure mode
+this project's history says to avoid shipping (the token-graph work has several examples of silent
+garbage being worse than an error).
+
+So the honest statement is: the remaining 1.12x is a contained but real concurrency project - add a staging
+mutex (or per-bank ownership), make the enqueue asynchronous, then validate with the greedy-output check
+plus the MoE and attention kernel tests - and it is not a change to land blind at the end of a long
+session.
