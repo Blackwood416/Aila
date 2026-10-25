@@ -4043,3 +4043,67 @@ dead          pre-router expert prefetch; deeper staging banks; AILA_Q4E_LAYER_S
 Tests: `AilaGdnChunkTests` (17 CPU canaries plus 22 scan-parity cells), `AilaQwen4ExpToleranceTests`,
 `AilaQwen4ExpAdaptiveCacheTests`, `AilaQwen4ExpArenaVerifyTests`, `AilaQwen4ExpHostArenaTests`,
 `AilaQwen4ExpDmaTimingTests` - all green (`ctest -L qwen4_exp`, 172 s).
+
+---
+
+## 85. Round 5: Dense-NF4 Reroute, 4-Head Block-Batched QSA, Staging-Pump Decoupling, Long Interior Checkpointing, and Scratch VRAM Reclamation (379.3 -> 498.2 tok/s)
+
+### 85.1 Dense-NF4 `N = 2560` Projections Rerouted to oneDNN (`baafc67`)
+
+All 97 instances of `packed_nf4_gemm_bf16_joint_matrix_wide` in the Round 4 trace (3.27 s total, 3.142 s in the main 7760-token slice) had `Work Size:Global = 2,498,560, Local = 512` (`4,880 = ceil(7760/64) * ceil(2560/64)` work-groups): 36 `linear_o_proj` (`K = 6144`), 12 QSA `o_proj` (`K = 6144`), 48 `shared_down_proj` (`K = 640`), and 1 PLE `value_proj` (`K = 2560`). Because `Bnb4BitLinear::shape_prefers_onednn` only selected oneDNN for `out_features_ <= 1280 || (seq_len >= 64 && out_features_ > 8192)`, every `N = 2560` prefill projection fell into the custom wide joint-matrix kernel, which re-dequantized weights inside every work-group at ~4.2 TFLOP/s (3.2% of XMX peak).
+
+- `shape_prefers_onednn` now routes `seq_len >= AILA_BNB4_ONEDNN_MIN_M` (default `128`) to `dequantize_weight` + oneDNN `ab` GEMM while keeping short sequences (`count = 4` tail / `count <= 64`) on `packed_nf4_gemm_bf16_joint_matrix_wide`.
+- `dequantize_weight` gained a bit-identical vectorized fast path (`packed_bytes % 4 == 0 && in_features % 8 == 0 && blocksize % 8 == 0`): one work-item per `uint32_t` (8 NF4 codes), `quant_map` staged in 16-float SLM, and one `absmax` lookup per 8 weights.
+- Measured in `AilaBnb4BitLinearKernelTests` (`AILA_BNB4_Q4E_BENCH=1`) across the 97-call production shape population: `jm32 = 3,148.4 ms`, `jm64 = 3,887.4 ms`, `onednn_ab = 196.3 ms` (**16.0x speedup, −2.95 s in probe**), with 0 bitwise mismatches against the legacy byte-wise `ab` dequant.
+
+### 85.2 4-Head Block-Batched QSA Prefill Attention and 8-Block Sub-Group Indexer Scoring (`39b6d5e`)
+
+In `AilaQsaAttentionProbe --prefill` (1024-row sparse production tile, 24 Q heads / 2 KV heads, `head_dim = 256`, `block_topk = 512`, `compress_ratio = 4`, x84 sparse tiles in prefill):
+- Naive multi-head work-group modes regressed (`mode 2 = 33.70 ms`, `mode 4 = 53.94 ms`, `mode 8 = 64.95 ms`, `mode 12 = 169.88 ms`) because they multiplied whole-work-group reductions/barriers per token; a GQA-12 XMX FlashAttention prototype (`mode 16`) measured `34.44 ms` and failed accuracy (`nrmse = 2.68e-2`) due to serial 12-row softmax and register pressure.
+- Replacing the per-token work-group reduction with 4 sixteen-lane sub-groups, contiguous `vec<bf16, 4>` K/V/gate loads (`d_base = lid * 4`), Q held in registers (`q_r[4][4]`), and a double-buffered parity-indexed SLM partial-sum array (`dot_slm[2 * 4 * 4 * 4]`) that charges **one work-group barrier per 4-token compressed block (0.25 barriers/token)** produced a clean progression:
+  - `mode 2` (shipped baseline): `33.68 ms/tile` (`84x = 2.83 s`)
+  - `mode 20` (register Q + vec4, per-token WG reduction): `29.82 ms/tile` (`1.13x`)
+  - `mode 22` (2 heads, 1 barrier/token): `20.57 ms/tile` (`1.64x`)
+  - `mode 24` (4 heads, 1 barrier/token): `15.92 ms/tile` (`2.12x`)
+  - **`mode 25` (4 heads, 1 barrier per 4-token block, new default `AILA_QSA_HEADS_PER_WG=25`)**: **`15.10–15.18 ms/tile` (`84x = 1.27 s`, `2.22x`, `nrmse = 1.20e-5`, `max_abs = 0.0000`)**.
+  - `mode 26` (6 heads, 1 barrier/block): `20.96 ms/tile` (`1.61x`, register spill; deleted).
+- `ops::qsa_compute_block_scores_compressed_batched` (`AILA_QSA_FAST_BLOCK_SCORES=1`, default on) now packs 8 compressed blocks per 128-thread work-group (one 16-lane sub-group per block, Q staged once in SLM, `vec<bf16, 8>` `compressed_k` loads, pure sub-group shuffle reductions, `max_diff = 8.94e-8 < 1e-3`).
+- `Qwen4ExpPrefill.cpp` (`AILA_QSA_SKIP_DENSE_SCORES=1`, default on) skips `qsa_compute_block_scores_compressed_batched` on wholly dense tiles (`tile_max_blocks <= block_topk`, tiles 0 and 1 of every QSA layer).
+
+### 85.3 Direct-Arena Host-Wait Removal, Dequant Bank-Release Fence, Single Pinned XMX Plan Upload, and Fused HC/Shared Epilogues (`c75d741`, `48da3e6`, `42f4c87`)
+
+- **Direct-arena staging host-wait removal (`AILA_Q4E_DIRECT_STAGE_NO_HOST_WAIT=1`)**: `StageColdExpertsAsync` previously executed `staging_copy_[pp].wait_and_throw()` on every chunk even when `direct_arena = true` (where `staging_host_[pp]` is unused and `staging_dev_[pp]` is ordered on the in-order `copy_q_` behind `staging_reader_[pp]`), stalling the host submit thread on DMA.
+- **Dequant staging-bank fence (`AILA_Q4E_STAGE_DEQUANT_FENCE=1`)**: `ops::moe_expert_xmx_prefill_chunk` now exports the `submit_dequant` completion event (`dequant_done`), and `RunAdaptivePrefill` binds `RecordStagingConsumer` to `dequant_done` instead of `submit_scatter`, freeing each staging bank ~2.5 ms earlier per chunk.
+- **Per-layer O(N) routing bucket sort & single contiguous pinned-USM plan upload (`AILA_Q4E_XMX_BUCKET_ROUTE=1`, `AILA_Q4E_XMX_SINGLE_PLAN_COPY=1`)**: `RunAdaptivePrefill` buckets `(token, rank)` by expert once per layer in `O(count * top_k)` instead of rescanning `router_host_ids_` (62,080 entries) on every XMX chunk, and `RunGroupedExpertsXmx` packs `bases + tokens + ranks + slots` into a per-chunk disjoint slice of pinned host USM (`xmx_plan_pinned_[0]`), replacing 4 pageable `memcpy` calls per chunk (~11,780 in-order copy commands per prefill) with 1 pinned USM copy per chunk. Also fixed `ensure_runtime_buffers` to avoid recreating/leaking `xmx_scratch_` on capacity growth.
+- **MoE XMX & epilogue vectorization**: `submit_dequant` uses 128-bit `vec<uint32_t, 4>` packed loads (32 NF4 weights per work-item, 1 `slot_scale` lookup per 32 weights); `submit_gather` and `submit_scatter` use division-free 3D `nd_range` grids (`1.457 -> 1.433 ms/chunk` in `AilaMoeExpertXmxTests --bench`); `moe_silu_gate_up_mul_flat` uses `vec<bf16, 8>`; `moe_ordered_accumulate_down_rows` uses 2D `vec<float, 4>` / `vec<bf16, 4>` loads/stores; `AILA_Q4E_MOE_SHARED_FUSED=1` and `AILA_Q4E_HC_FUSED_SIGMOID=1` are enabled by default, eliminating 48 `add_shared_expert_to_y` and 96 `apply_sigmoid` launches (~36 GB of DRAM traffic per prefill).
+- **Bug fix in `ops::grouped_rms_norm`**: `red_slm[lid]` was overwritten by lane 0 of subgroup 0 (`red_slm[0] = sg_sum`) while subgroups 1..15 were still reading `red_slm[lid]` into `sycl::reduce_over_group` without an intervening barrier, causing non-deterministic corruption in `AilaQwen4ExpModuleTests --ple-only` and `AilaQwen4ExpKernelTests`. Passing `sum_sq` directly into `reduce_over_group` and shrinking `red_slm` to 16 floats fixed both tests deterministically.
+
+### 85.4 Long Interior Checkpointing and 886 MB Prefill Scratch VRAM Reclamation (`8abbc4b`)
+
+1. **Collapsing the `7760 + 4` snapshot split (`AILA_Q4E_LONG_INLINE_CHECKPOINT=1` in `qwen38-a770` preset, `AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT=1`)**:
+   - `CanCaptureInteriorCheckpoint` previously hard-capped `count <= 64` and `(CurrentLength + count) / ratio <= blockTopK`, forcing `EngineGeneration::forward_prompt_tokens` to split a 7764-token prompt into a 7760-token slice + a 4-token slice (each paying 48 router host waits and a full 48-layer D2H snapshot).
+   - Because `ForwardImpl`'s interior checkpoint path already supports arbitrary untiled lengths (GDN layers split `run_range(0, checkpoint_after)` + async D2H + `run_range(checkpoint_after, tail)`, QSA layers clamp `interior->layers[i].num_compressed_blocks = min(num_compressed_blocks, position / ratio)`, and PLE captures at `checkpoint_after`), enabling `AILA_Q4E_LONG_INLINE_CHECKPOINT=1` in the `qwen38-a770` preset runs all 7764 tokens in a single `[Q4E PrefillSlice] start=0 count=7764 checkpoint_after=7760` forward and skips the redundant end-of-slice `CaptureSnapshot`.
+   - On the 7764-token benchmark, this reduced wall time from `18,502.5 ms (419.6 tok/s)` to `17,134.6 ms (453.1 tok/s)` (**−1.37 s**).
+2. **Eliminating 886 MB of dead prefill scratch VRAM and Layer-0 queue drains**:
+   - `Bnb4BitLinearScratch::ensure` previously allocated `input_bf16` (`[7808, 6144]` = 96 MB) and `output_bf16` (`[7808, 16480]` = 257 MB) in the main backend scratch plus 280 MB in `Qwen4ExpPle`'s `scratch_key_`/`scratch_val_` even when `direct_io == true` (where neither buffer is ever used). Worse, because it tracked `weight_in_capacity` and `weight_out_capacity` separately, routing `linear_o_proj` (`6144 x 2560` = 31.5 MB) to oneDNN after `linear_all_proj` (`2560 x 16480` = 84.4 MB) triggered `grow_weight` mid-Layer 0, calling `ctx.synchronize()` and reallocating `weight_bf16` to `{6144, 16480}` (202.5 MB, +118 MB wasted).
+   - Passing `seq_len = 0` when `direct_io == true`, sizing `weight_bf16` by total elements (`needed_weight_elems > curr_weight_elems`), and aliasing `GdnChunkScratch::raw` (191 MB) into the unused upper region of `buf_.phase_scratch` after `buf_.linear_all` reclaimed **886 MB of VRAM** and eliminated two mid-layer `ctx.synchronize()` calls.
+   - This kept peak VRAM comfortably below the 15,932 MB physical ceiling (preventing WDDM page eviction across back-to-back runs) and dropped the 7764-token prefill from `17,134.6 ms` to **`15,584.3 ms (498.2 tok/s)`** (**−1.55 s further**).
+
+### 85.5 Negative / Deferred Switches
+
+- `AILA_Q4E_RUNTIME_MIN_CAP=8192`: Measured `23,954.6 ms (324.1 tok/s)` vs `18,502.5 ms` with default `0`. Pre-allocating the 8192-token buffers before `Warmup` pushes VRAM to 14.7 GB during the 49-module JIT compilation in `Warmup`, causing WDDM to demote device allocations to system RAM. Left at default `0`.
+- `AILA_Q4E_L0_IMPORT_HOST=1`: With the 20 GiB quota (`AILA_Q4E_L0_IMPORT_MAX_MB=20480`) and `copy_q_` async handler, the CLI process hung during full-engine execution (exceeding 300 s timeout). Left at default `0` (off).
+- `chunk_scan_fast` / `chunk_scan_vtiled` GDN variants: All three variants (`vtiled` 51.4 ms, `fast v1` 45.4 ms, `fast v3` 23.1 ms at `count = 2048`) were slower than the Round 4 fused `chunk_scan` (`18.865 ms`) due to register spill or replicated chunk-local work; reverted to `chunk_scan`.
+
+### 85.6 Final Scoreboard (`tools/prefill-bench.ps1 -Tokens @(2026, 4952, 7878) -Chunk 8192`)
+
+| Prompt Tokens | Round 3 Wall / Tok/s | Round 4 Wall / Tok/s | Round 5 Wall | Round 5 ms/tok | Round 5 Tok/s | Delta vs Round 4 |
+|---:|---:|---:|---:|---:|---:|---:|
+| **2007** | 11,588 ms / 173.2 | 11,217 ms / 178.9 | **10,338.0 ms** | 5.151 | **194.1 tok/s** | −879 ms (+8.5%) |
+| **4895** | 16,355 ms / 299.3 | 15,318 ms / 319.6 | **11,894.0 ms** | 2.430 | **411.6 tok/s** | −3,424 ms (+28.8%) |
+| **7764** | 22,059 ms / 357.1 | 20,467 ms / 379.3 | **15,584.3 ms** | 2.007 | **498.2 tok/s** | **−4,883 ms (+31.3%)** |
+
+- **Linear fit**: `8,509 ms fixed + 0.91 ms/token marginal` (**1,097 tok/s marginal throughput** vs Round 4's `1.61 ms/token` / `622 tok/s`).
+- **Target status**: The 400 tok/s goal at 8K (`19,410 ms` at 7764 tokens) is exceeded by **+98.2 tok/s (−3,826 ms ahead of target)**, and even the 4895-token point (`411.6 tok/s`) exceeds 400 tok/s.
+- **Verification**: All 13 `ctest --test-dir build-refactor -L qwen4_exp` suites pass (`100% tests passed`).
+
