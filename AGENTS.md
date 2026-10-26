@@ -92,6 +92,7 @@ Artifacts produced in `build-refactor-server/`:
 - `Qwen3Bnb4Backend`: Dense Qwen3 models (0.6B, 4B) with BNB NF4 weights and GQA full attention.
 - `Qwen35HybridBnb4Backend`: Qwen3.5 Hybrid models (0.8B, 4B) with alternating GQA full attention (`head_dim=256`) and DeltaNet linear attention (`head_dim=128`).
 - `Qwen35HybridTextBackend`: Qwen3.5 Hybrid with unquantized BF16 weights.
+- `Qwen4ExpBnb4Backend`: Qwen3.8-Flash-Next (48-layer Hybrid: 36 Gated DeltaNet + 12 Query-Sparse Attention, 512 routed NF4 experts top-8 + 1 shared expert, 4-stream Hyper-Connection, Layer-1 PLE, 2-tier `Qwen4ExpAdaptiveCache` + `Qwen4ExpHostArena` residency). See `docs/Qwen38FlashNext_A770_Handoff.md`.
 - `DiffusionGemmaBnb4Backend`: DiffusionGemma 26B A4B MoE Block Diffusion Model.
 - `Gemma4VisionEncoder` / `YOLO26`: Vision tower and object detection modules.
 
@@ -106,6 +107,23 @@ Artifacts produced in `build-refactor-server/`:
 ---
 
 ## 5. Verification & Testing Guide
+
+### 0. Unified 3-Tier Verification Entry Point (`tools/verify-q4e.ps1`)
+All incremental target builds, operator tests, CTest suites, and real-model acceptance runs for `Qwen4Exp` go through `tools/verify-q4e.ps1` (which automatically configures MSVC + Intel oneAPI library paths and sanitizes SYCL/Level Zero runtime environment variables):
+
+```powershell
+# Incremental build of specific target(s) only:
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier build -Targets Aila,AilaQwen4ExpKernelTests
+
+# Tier 1 (Fast Inner Loop, ~2 min): Operator & kernel unit suites (Bnb4BitLinear, GDN, MoeExpertXmx, HostArena, ArenaVerify, ExpertReader)
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier fast
+
+# Tier 2 (Pre-Commit Gate, ~6 min): Tier 1 + Qwen4ExpKernelTests + CTest 'qwen4_exp' (11 suites) + CTest 'cpu|abi' (20 suites)
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier ctest
+
+# Tier 3 (Real-Model & Preset Promotion Gate, ~5 min): Real-model E2E tolerance (--model), preset interior-checkpoint parity (--preset-model), and 8K prefill benchmark
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier real
+```
 
 ### 1. CPU & ABI Unit Tests (Fast CI)
 ```powershell
@@ -158,4 +176,33 @@ Documented regressions to avoid:
 - **uint64 weight loads**: Intel SIMD hardware is heavily optimized for uint32 vector loads.
 - **QMAP in private registers instead of SLM**: Reduces throughput from 58 to 45 tok/s.
 - **Fused residual add in GEMV**: -1.5% due to register bloat.
+
+---
+
+## 8. Development, Hygiene & Anti-Entropy Specification
+
+To keep the codebase lean, deterministic, and free of dead experimental baggage, all contributors and coding agents must follow these six rules:
+
+1. **Mandatory Verification Tiers (`tools/verify-q4e.ps1`)**:
+   - Run `-Tier fast` during inner-loop operator/kernel iteration.
+   - Run `-Tier ctest` (`qwen4_exp` + `cpu|abi` 100% green) before every code commit.
+   - Run `-Tier real` (real-model E2E tolerance + `--preset-model` checkpoint parity + `tools/prefill-bench.ps1` back-to-back A/B) before changing any production default or `Qwen38A770Preset.hpp` entry.
+2. **Zero Dead-Experiment Retention (Test-Then-Prune)**:
+   - Develop candidate kernels or schedules behind a default-OFF flag or inside the subsystem's existing `--bench` harness (`AilaBnb4BitLinearKernelTests`, `AilaGdnChunkTests`, `AilaMoeExpertXmxTests`, `AilaQsaAttentionProbe`).
+   - Measure paired back-to-back A/B in a single session. If a candidate wins and passes Tier 2 + Tier 3, promote it and **delete the superseded branch**. If it is neutral or negative, **revert/delete it immediately**—never leave losing or superseded kernel modes parked behind environment flags in production files.
+3. **No Ad-Hoc Probe Headers or One-Off Campaign Scripts**:
+   - Do not add new `tests/models/*Probe.hpp` or `*Acceptance.hpp` files included into `Qwen4ExpToleranceTests.cpp`. Add unit/operator tests to the canonical test binary for that subsystem.
+   - Do not commit one-off `.py` or `.ps1` campaign wrappers into `perf/qwen4exp/`. Temporary scripts, CSVs, and logs belong exclusively in gitignored `tmp/`.
+4. **Single-Source Documentation (`docs/`)**:
+   - `docs/Qwen38FlashNext_A770_Handoff.md` is the **single authoritative architecture and performance reference** for `Qwen4Exp`.
+   - `docs/Environment_Variables.md` is the **single authoritative registry** of active environment variables.
+   - Do not create chronological session diaries, process plans, or JSON result dumps in `docs/plans/`. Update the authoritative reference in place when architecture or scoreboard numbers change.
+5. **Environment Variable & Preset Precedence Discipline**:
+   - Effective precedence is strictly: `Explicit Environment Variable > Qwen38A770Preset.hpp > Code Default`.
+   - Before modifying a code default, check whether `src/utils/Qwen38A770Preset.hpp` pins that variable. Any flag promotion or retirement must update the code default, `Qwen38A770Preset.hpp`, and `docs/Environment_Variables.md` in the same commit.
+6. **Hardware & Numeric Safety Invariants**:
+   - **VRAM Headroom**: Maintain >= 2.5 GB VRAM headroom on 16 GB Arc A770; never pre-allocate full-context scratch buffers at model load (`AILA_Q4E_RUNTIME_MIN_CAP` causes severe WDDM eviction stalls).
+   - **Two-Level SLM Reductions**: Any two-level reduction staged through SLM must include an explicit `item.barrier(sycl::access::fence_space::local_space)` between the per-subgroup write and the second-level read.
+   - **Single-Row vs. Multi-Row Symmetry**: Single-row and batched (`_rows`) entry points for the same operator must dispatch to numerically symmetric kernel variants so verification and interior-checkpoint canaries stay aligned.
+
 

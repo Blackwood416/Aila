@@ -96,14 +96,17 @@ The following decode and experimental subsystems are actively maintained and cov
 - `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M=192`, `AILA_Q4E_GDN_CHUNK_MODE=1`
 - `AILA_Q4E_HOT_RAM_MB=32768`, `AILA_Q4E_EXPERT_READER=readfile`, `AILA_Q4E_CPU_EXPERT_DISPATCH=0`
 
-### Verification & Benchmarking
+### Unified Verification & Benchmarking (`tools/verify-q4e.ps1`)
 ```powershell
-# Incremental build of main binary and Qwen4Exp test suites
-cmd /c "tmp\build-aila.bat Aila AilaGdnChunkTests AilaQwen4ExpModuleTests AilaQwen4ExpGenerationTests AilaQwen4ExpToleranceTests AilaQwen4ExpKernelTests AilaQwen4ExpExpertReaderTests AilaQwen4ExpHostArenaTests AilaQwen4ExpAdaptiveCacheTests AilaQwen4ExpArenaVerifyTests AilaMoeExpertXmxTests"
+# Tier 1: Fast operator/kernel inner loop (~2 min)
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier fast
 
-# Run CTest suite
-ctest --test-dir build-refactor -L qwen4_exp --output-on-failure
+# Tier 2: Pre-commit CTest gate (qwen4_exp 11/11 + cpu|abi 20/20, ~6 min)
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier ctest
 
-# Run Prefill Scoreboard (2K / 5K / 8K)
-& .\tools\prefill-bench.ps1 -Tokens @(2026, 4952, 7878) -Chunk 8192
+# Tier 3: Real-model E2E tolerance, preset interior-checkpoint parity, and 8K prefill benchmark (~5 min)
+pwsh -NoProfile -File tools/verify-q4e.ps1 -Tier real
+
+# Full 3-point Prefill Scoreboard (2K / 5K / 8K)
+pwsh -NoProfile -File tools/prefill-bench.ps1 -Tokens @(2026, 4952, 7878) -Chunk 8192
 ```

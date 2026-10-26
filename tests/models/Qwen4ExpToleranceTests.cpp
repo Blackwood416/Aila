@@ -131,7 +131,7 @@ struct Qwen4ExpGenerationTestAccess {
         return dynamic_cast<Qwen4ExpBnb4Backend&>(*engine.backend_);
     }
     static Qwen4ExpBnb4Backend::Session& Session(InferenceEngine& engine) {
-        return *Backend(engine).defaultSession_;
+        return Backend(engine).DefaultSession(*engine.ctx_);
     }
     static void Grouped(Qwen4ExpBnb4Backend& b, int minRows) { b.grouped_xmx_min_rows_override_ = minRows; }
     static void Histogram(Qwen4ExpBnb4Backend& b) { b.expert_histogram_enabled_ = true; b.expert_histogram_ = {}; }
