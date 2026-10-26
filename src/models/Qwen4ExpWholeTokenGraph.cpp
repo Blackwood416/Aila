@@ -163,7 +163,7 @@ bool Qwen4ExpBnb4Backend::WholeTokenGraphEligible(
     }
     if (verify_rows_alignment_ || gpuNf4Q8ReferenceForTest_ ||
         decodeHcReferenceForTest_ || attentionNf4Q8Enabled_ ||
-        gpuNf4Q8Supported_ || !use_adaptive_pipeline_ ||
+        gpuNf4Q8Supported_ ||
         !adaptive_cache_.IsAllocated() ||
         adaptive_cache_.NumLayers() < kWholeTokenGraphLayers ||
         !adaptive_cache_.DeviceSlotTable() ||

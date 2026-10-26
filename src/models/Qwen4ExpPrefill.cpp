@@ -1172,7 +1172,7 @@ sycl::event Qwen4ExpBnb4Backend::RunCompactExpertDown(Context& ctx, int first, i
             expert_map_token_dev_+begin,expert_map_rank_dev_+begin,nullptr,
             buf_.moe_h.data_as<bf16>(),buf_.moe_down_acc.data_as<float>(),n,
             cfg_.num_experts_per_tok,cfg_.moe_intermediate_size,hidden_size_,64,&last,
-            expert_cache_.uses_nested_codes(),widths[section]==2?n/2:0,widths[section]==4?n/4:0,true);
+            true,widths[section]==2?n/2:0,widths[section]==4?n/4:0,true);
         last=ops::moe_merge_compact_down(ctx,buf_.moe_down_acc.data_as<float>(),expert_map_token_dev_,
             buf_.moe_inverse_map.data_as<int>(),batch_weights_dev_,buf_.moe_window_sum.data_as<int64_t>(),buf_.moe_compact_invalid.data_as<int>(),
             begin,n,cfg_.num_experts_per_tok,hidden_size_,&last);

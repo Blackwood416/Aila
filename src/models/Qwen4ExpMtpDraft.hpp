@@ -3,20 +3,21 @@
 // Checkpoint-backed Qwen4Exp MTP (multi-token prediction) draft head.
 // Semantics source: vLLM qwen4_exp/nvidia/mtp.py, residual_linear_shared,
 // scheme A. Target and draft share the embedding table and LM head, but never
-// KV state. The shared instance owns the draft weights, projections, expert
-// cache and reusable decode scratch; each State owns only the draft KV and
-// indexer tensors.
+// KV state. The shared instance owns the draft weights, projections, its own
+// 64-slot GPU expert cache and reusable decode scratch; each State owns only
+// the draft KV and indexer tensors.
 
 #include "../core/Context.hpp"
 #include "../core/Tensor.hpp"
 #include "../ops/Bnb4BitLinear.hpp"
+#include "../ops/MoeExpertOps.hpp"
 #include "../ops/Ops.hpp"
 #include "../utils/SafeTensors.hpp"
 #include "Qwen4ExpBnb4Backend.hpp"
-#include "Qwen4ExpExpertCache.hpp"
 
-#include <cstddef>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,17 +33,38 @@ public:
 
     std::unique_ptr<State> CreateState(int capacity);
 
-    // Input hidden is [4,H] produced by the target (or a prior draft step)
-    // BEFORE its final mixer, at the hidden's own position; the input token ID
-    // is shifted by one. The caller supplies the visible position every step,
-    // so an attention-only suffix overwrite implements draft rollback: the
-    // visible length is always position+1, never the state capacity. Writes the
-    // draft logits into the target's logits buffer unless kvOnly is set, in
-    // which case it returns after the persistent KV/indexer rows are updated.
     void Step(State& state, const sycl::ext::oneapi::bfloat16* hidden, int token,
               int position, bool kvOnly = false);
 
 private:
+    static constexpr int kMtpExperts = 512;
+    static constexpr int kMtpExpertSlots = 64;
+    static constexpr int kMtpExpertsPerStep = 10;
+    static constexpr int kMtpHidden = 2560;
+    static constexpr int kMtpIntermediate = 640;
+    static constexpr int kMtpBlocksize = 64;
+    static constexpr int kMtpNestedBlocksize = 256;
+    static constexpr size_t kMtpExpertSlotBytes = 2534400;
+
+    struct SlotLayout {
+        size_t gu_packed_bytes = 0;
+        size_t gu_absmax_bytes = 0;
+        size_t dn_packed_bytes = 0;
+        size_t dn_absmax_bytes = 0;
+        size_t gu_packed_offset = 0;
+        size_t gu_absmax_offset = 0;
+        size_t dn_packed_offset = 0;
+        size_t dn_absmax_offset = 0;
+        size_t slot_bytes = 0;
+    };
+
+    struct SlotEntry {
+        int expert = -1;
+        uint64_t last_used = 0;
+        sycl::event reader{};
+        bool reader_valid = false;
+    };
+
     static void Require(bool ok, const std::string& message);
     Tensor Allocate(int rows, int cols,
                     dnnl::memory::data_type type = dnnl::memory::data_type::bf16);
@@ -50,6 +72,13 @@ private:
     void Quant(const std::string& name, Bnb4BitLinear& projection);
     void EraseFusedSource(const std::string& name);
     void Hc(const std::string& prefix, Qwen4ExpHyperConnectionLayer& hc, bool inject);
+
+    void InitExpertCache();
+    void ReleaseExpertCache() noexcept;
+    sycl::event AcquireExperts(const int* expert_ids, int count, int* out_slots);
+    void StageExpert(uint8_t* dst, int expert) const;
+    void BuildSlotDev(int slot, int expert, ops::MoeExpertSlotDev& out) const;
+    void RecordSlotReaders(const int* slots, int count, const sycl::event& consumer);
 
     Context& ctx_;
     Qwen4ExpBnb4Backend& target_;
@@ -65,12 +94,30 @@ private:
     Tensor embedNorm_;
     Tensor embedFc_;
     Tensor hiddenNorm_;
-    Qwen4ExpExpertCache experts_;
     std::vector<bf16> hostEmbed_;
     HostTensorView embeddingTable_;
 
-    // Route-scoped descriptors retained across the asynchronous expert submit;
-    // the kernels read these slot pointers after Step returns.
-    std::array<ops::MoeExpertSlotDev, 10> slots_{};
-    std::array<int, 10> slotIds_{};
+    SlotLayout layout_{};
+    Bnb4BitHostWeightRef gu_{};
+    Bnb4BitHostWeightRef dn_{};
+    uint8_t* slot_pool_dev_ = nullptr;
+    uint8_t* slot_staging_host_ = nullptr;
+    float* gu_nested_absmax_dev_ = nullptr;
+    float* dn_nested_absmax_dev_ = nullptr;
+    float* gu_nested_quant_map_dev_ = nullptr;
+    float* dn_nested_quant_map_dev_ = nullptr;
+    size_t gu_nested_per_expert_ = 0;
+    size_t dn_nested_per_expert_ = 0;
+    float gu_nested_offset_ = 0.0f;
+    float dn_nested_offset_ = 0.0f;
+    std::array<SlotEntry, kMtpExpertSlots> slot_pool_{};
+    std::array<sycl::event, kMtpExpertsPerStep> staging_copy_{};
+    std::array<bool, kMtpExpertsPerStep> staging_copy_valid_{};
+    std::unique_ptr<sycl::queue> copy_q_;
+    uint64_t tick_ = 0;
+
+    std::array<ops::MoeExpertSlotDev, kMtpExpertsPerStep> slots_{};
+    std::array<int, kMtpExpertsPerStep> slotIds_{};
+    sycl::event slot_ready_{};
+    bool slot_ready_valid_ = false;
 };

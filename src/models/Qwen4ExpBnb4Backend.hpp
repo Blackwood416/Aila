@@ -9,11 +9,9 @@
 #include "../ops/MoeExpertXmx.hpp"
 #include "../ops/Ops.hpp"
 #include "../core/Tensor.hpp"
-#include "Qwen4ExpExpertCache.hpp"
 #include "Qwen4ExpExpertExecutor.hpp"
 #include "Qwen4ExpHostArena.hpp"
 #include "Qwen4ExpAdaptiveCache.hpp"
-#include "Qwen4ExpLayerStage.hpp"
 #include "Qwen4ExpPle.hpp"
 #include "Qwen4ExpTokenGraph.hpp"
 #include "Qwen4ExpTokenGraphRuntime.hpp"
@@ -494,7 +492,6 @@ public:
     aila::Qwen4ExpHostArena& host_arena() noexcept { return host_arena_; }
     const aila::Qwen4ExpAdaptiveCache& adaptive_cache() const noexcept { return adaptive_cache_; }
     aila::Qwen4ExpAdaptiveCache& adaptive_cache() noexcept { return adaptive_cache_; }
-    bool use_adaptive_pipeline() const noexcept { return use_adaptive_pipeline_; }
 
 private:
     bool decodeHcReferenceForTest_ = false;
@@ -507,17 +504,6 @@ private:
     std::array<uint64_t, 4> attentionNf4Q8ProjectionCounts_{};
     bool moeFrontFusedGpu_ = false;
     bool moeFrontFusedLogged_ = false;
-    // Owns the resident CPU job until Join, including exceptions between its
-    // early submission and the later GPU/cold merge. Declare after route leases.
-    struct ResidentColdWork {
-        aila::Qwen4ExpExpertExecutor& executor;
-        bool active = false;
-        bool completed = false;
-        explicit ResidentColdWork(aila::Qwen4ExpExpertExecutor& value) : executor(value) {}
-        ResidentColdWork(const ResidentColdWork&) = delete;
-        ResidentColdWork& operator=(const ResidentColdWork&) = delete;
-        ~ResidentColdWork() noexcept;
-    };
     // One forward owns this ticket. y/inject remain in their existing buffers
     // until the next HC norm consumes them on the in-order compute queue.
     struct DecodePendingMlpResidual {
@@ -549,14 +535,6 @@ private:
     Tensor& ForwardImpl(Context& ctx, Session& session,
                         const int* tokenIdsDevice, int count, bool lastTokenOnly,
                         const ForwardOptions& options);
-    // Layer-major prefill prototype (AILA_Q4E_LAYER_MAJOR=1). Only the exact
-    // two-full-chunk prefill shape is accepted; everything else falls back to
-    // the chunk-major ForwardImpl path unchanged.
-    bool LayerMajorPrefillEligible(const Session& session, int count,
-                                   const ForwardOptions& options) const;
-    Tensor& ForwardLayerMajorPrefill(Context& ctx, Session& session,
-                                     const int* tokenIdsDevice, int count,
-                                     bool lastTokenOnly, const ForwardOptions& options);
     sycl::event RunCompactExpertDown(Context& ctx, int first, int acts,
         int pairs, int quads, const sycl::event& ready);
     void RunAttentionLayerTile(Context& ctx, Session& session, int layer,
@@ -656,19 +634,6 @@ private:
     sycl::event RunGroupedExpertsXmx(Context& ctx, int layer, int count,
         int firstUnique, int numUnique, int& actStart, const sycl::event& ready,
         sycl::event* staging_consumer_out = nullptr);
-    // Layer-major variant of RunAdaptivePrefill: same union/resident ordering
-    // and staging ping-pong, but every expert launch is split into two
-    // 4096-row halves that share one staged bank, and resident hits are
-    // processed in bounded microbatches so a single large launch cannot stall
-    // the staging pipeline.
-    sycl::event RunAdaptivePrefillLayerMajor(Context& ctx, int layer,
-        bool fuse_shared, int count,
-        const sycl::ext::oneapi::bfloat16* x_base = nullptr,
-        sycl::ext::oneapi::bfloat16* y_base = nullptr,
-        sycl::ext::oneapi::bfloat16* moe_h_base = nullptr,
-        float* down_acc_base = nullptr,
-        const sycl::ext::oneapi::bfloat16* shared_out_base = nullptr,
-        const sycl::ext::oneapi::bfloat16* shared_gate_base = nullptr);
     // Writes count embedding rows into buf_.x, from VRAM or gathered from the host mmap.
     void EmbedTokens(
         Context& ctx, const int* tokenIdsDevice, int count,
@@ -747,18 +712,10 @@ private:
     Qwen4ExpPle ple_;
     PleTicket ple_ticket_;
     PleTicket ple_next_ticket_;
-    Qwen4ExpExpertCache expert_cache_;
     aila::Qwen4ExpExpertExecutor expert_executor_;
     aila::Qwen4ExpHostArena host_arena_;
     aila::Qwen4ExpAdaptiveCache adaptive_cache_;
     std::unique_ptr<sycl::queue> copy_q_;
-    // V3 whole-layer staging (role G3, 2026-10-15): one device arena holding
-    // whole-layer nonresident experts, filled during the attention window.
-    // Allocated only when AILA_Q4E_LAYER_STAGE=1; empty otherwise.
-    aila::Qwen4ExpLayerStage layer_stage_;
-    std::vector<int> layer_stage_ids_;
-    uint64_t layer_stage_epoch_ = 0;
-    const bool use_adaptive_pipeline_ = true;
     int ping_pong_index_ = 0;
     void* resident_embedding_ = nullptr;
     std::vector<ops::MoeExpertSlotDev> adaptive_prefill_slots_;
@@ -778,14 +735,10 @@ private:
     // PrepareDecodeVerification, so ordinary decode never grows device memory.
     Tensor verify_down_, verify_weights_;
     int* resident_selected_host_ = nullptr;
-    sycl::event resident_hot_reader_{};
     void* resident_probe_data_ = nullptr;
     void (*resident_probe_)(void*,Qwen4ExpBnb4Backend&,int) = nullptr;
     sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared, int count,
                                   bool verify_rows = false);
-    sycl::event RunResidentDecode(Context& ctx, int layer, bool fuse_shared,
-                                  GpuReadyLease* device_lease = nullptr,
-                                  ResidentColdWork* early_cold = nullptr);
 
     Tensor* embed_weight_ = nullptr; // resident copy, only when AILA_Q4E_HOST_EMBED=0
     // Otherwise rows are gathered from the mmap per forward: decode needs one 5 KB row, and the
@@ -806,18 +759,6 @@ private:
     uint64_t lmHeadQ8ForwardCount_ = 0, lmHeadQ8RowCount_ = 0;
     Tensor lastTokenLogits_;
     Tensor unusedLogits_; // Invalid output for forwards that only advance cached state.
-    // Layer-major v3 carries: 8192-row activation/window buffers that must
-    // outlive the two 4096-row halves while the standard runtime scratch stays
-    // at 4096 rows. Allocated on the first layer-major prefill and reused.
-    Tensor lm_hidden_, lm_x_, lm_y_, lm_inject_, lm_moe_h_, lm_down_;
-    Tensor lm_shared_out_, lm_shared_gate_;
-    std::vector<int> lm_ids_host_;
-    int layer_major_map_capacity_ = 0;
-    void EnsureLayerMajorCarries(Context& ctx, int count);
-    // The layer-major expert pass indexes activations over the full 8192-row
-    // window, so the route/map host and device mirrors need count slots even
-    // when the standard runtime scratch stays at the 4096-row chunk size.
-    void EnsureLayerMajorMaps(Context& ctx, int count);
 
     Qwen4ExpBuffers buf_;
     ops::GdnChunkScratch gdn_chunk_scratch_;

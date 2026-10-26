@@ -133,7 +133,6 @@ struct Qwen4ExpGenerationTestAccess {
     static Qwen4ExpBnb4Backend::Session& Session(InferenceEngine& engine) {
         return *Backend(engine).defaultSession_;
     }
-    static Qwen4ExpExpertCache& Cache(InferenceEngine& engine) { return Backend(engine).expert_cache_; }
     static void Grouped(Qwen4ExpBnb4Backend& b, int minRows) { b.grouped_xmx_min_rows_override_ = minRows; }
     static void Histogram(Qwen4ExpBnb4Backend& b) { b.expert_histogram_enabled_ = true; b.expert_histogram_ = {}; }
     static void ResidentSplit(Qwen4ExpBnb4Backend& b, bool enabled) { b.small_rows_resident_split_override_ = enabled ? 1 : 0; }
@@ -156,12 +155,10 @@ struct Qwen4ExpGenerationTestAccess {
     };
     static ExpertView Experts(Qwen4ExpBnb4Backend& b) {
         return {*b.context_, b.buf_.x.data_as<bf16>(), b.expert_map_token_host_, b.expert_map_rank_host_,
-            b.expert_map_slot_host_, b.expert_tiles_host_, b.expert_cache_.uses_nested_codes()};
+            b.expert_map_slot_host_, b.expert_tiles_host_, true};
     }
 };
 using Access = Qwen4ExpGenerationTestAccess;
-
-#include "Qwen4ExpMtpProbe.hpp"
 
 namespace {
 
@@ -605,20 +602,10 @@ void test_real_model_tolerance(const std::string& model_dir) {
 
 #include "Qwen4ExpCheckpointAcceptance.hpp"
 #include "Qwen4ExpPresetAcceptance.hpp"
-#include "Qwen4ExpAttentionTileAcceptance.hpp"
-#include "Qwen4ExpMatureGemmProbe.hpp"
-#include "Qwen4ExpCompactMoeProbe.hpp"
 #include "Qwen4ExpIntegerMoeProbe.hpp"
 #include "Qwen4ExpIntegerQualityAcceptance.hpp"
-#include "Qwen4ExpResidentAcceptance.hpp"
 #include "Qwen4ExpCpuDiagnostic.hpp"
-#include "Qwen4ExpColdAcceptance.hpp"
 #include "Qwen4ExpGroupedXmxAcceptance.hpp"
-#include "Qwen4ExpGdnChunkAcceptance.hpp"
-#include "Qwen4ExpFrontGraphProbe.hpp"
-#include "Qwen4ExpDecodeProbe.hpp"
-#include "Qwen4ExpHeadProbe.hpp"
-#include "Qwen4ExpMtpAcceptance.hpp"
 #include "Qwen4ExpMtpAlign.hpp"
 
 } // namespace
@@ -640,19 +627,12 @@ int main(int argc, char** argv) {
 #endif
     aila::env::enable_l0_copy_engine();
     try {
-        if(argc==3 && (std::string(argv[1])=="--cold-model" || std::string(argv[1])=="--cold-bench")) {
-            test_cold_model(argv[2],std::string(argv[1])=="--cold-bench");return 0;
-        }
         if (argc == 2 && std::string(argv[1]) == "--grouped-kernel") {
             test_grouped_xmx_kernel();
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--grouped-model") {
             test_grouped_xmx_model(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--gdn-chunk-model") {
-            test_gdn_chunk_model(argv[2]);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--checkpoint-model") {
@@ -667,53 +647,17 @@ int main(int argc, char** argv) {
             test_qwen38_window_quality(argv[2]);
             return 0;
         }
-        if (argc == 3 && std::string(argv[1]) == "--compact-model") {
-            test_compact_moe(argv[2]); return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--integer-model") {
-            test_integer_moe(argv[2]); return 0;
-        }
         if (argc == 2 && std::string(argv[1]) == "--dpas-smoke") {
             test_integer_dpas_smoke(); return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--dpas-model") {
-            test_integer_moe(argv[2],true); return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--integer-state") {
             test_integer_quality(argv[2],true); return 0;
         }
-        if (argc == 3 && std::string(argv[1]) == "--resident-model") {
-            test_resident_model(argv[2]); return 0;
-        }
         if (argc == 3 && std::string(argv[1]) == "--integer-quality") {
             test_integer_quality(argv[2]); return 0;
         }
-        if (argc == 3 && std::string(argv[1]) == "--tile-model") {
-            test_attention_tile_acceptance(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--mature-moe-model") {
-            test_mature_moe_gemm(argv[2]);
-            return 0;
-        }
         if (argc == 3 && std::string(argv[1]) == "--memory-model") {
             test_prefill_memory(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--front-graph-model") {
-            test_front_graph(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--head-kernel-model") {
-            test_head_kernel(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--decode-model") {
-            test_decode_probe(argv[2]);
-            return 0;
-        }
-        if (argc == 3 && std::string(argv[1]) == "--mtp-model") {
-            test_mtp_probe(argv[2]);
             return 0;
         }
         if (argc == 3 && std::string(argv[1]) == "--mtp-align") {

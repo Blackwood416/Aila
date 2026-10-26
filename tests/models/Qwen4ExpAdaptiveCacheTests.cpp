@@ -87,9 +87,8 @@ static int run_staging_copy_microbench() {
         ~HostRelease() { if (ptr) ctx.free_host(ptr); }
     } release{ctx,destination};
 
-    Qwen4ExpExpertCache cpu_cache;
     aila::Qwen4ExpExpertExecutor executor;
-    executor.init(ctx,cpu_cache,1,1,H,I);
+    executor.init(ctx,1,1,H,I);
     require(executor.cpu_overlap_enabled(),"bounded CPU worker arena must be enabled");
 
     auto run=[&](bool parallel) {
@@ -233,8 +232,7 @@ int main(int argc,char** argv) {
         ctx.memcpy_d2h(expected.data(),down,expected.size()*4);
         const auto& meta=arena.GetLayerNestedMetadata(0);
         aila::Qwen4ExpExpertExecutor cpu;
-        Qwen4ExpExpertCache retired_cache;
-        cpu.init(ctx,retired_cache,1,E,H,I);
+        cpu.init(ctx,1,E,H,I);
         for (int round=0;round<2;++round) {
             const int cold[2]={round ? 3:2,round ? 2:3};
             const auto before_stage_residency=cache.ResidencyGeneration();

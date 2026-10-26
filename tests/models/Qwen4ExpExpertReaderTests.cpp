@@ -1,6 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "models/Qwen4ExpExpertReader.hpp"
-#include "models/Qwen4ExpExpertCache.hpp"
 #include "utils/SafeTensors.hpp"
 
 #include <chrono>

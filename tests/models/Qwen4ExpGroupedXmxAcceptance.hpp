@@ -335,7 +335,7 @@ void test_grouped_xmx_model(const std::string& directory) {
             }
         }
         std::cout << "[X3 MEMORY] count=" << ids.size() << " device_bytes=" << ctx.current_allocated_bytes()
-                  << " host_bytes=" << ctx.current_pinned_host_bytes() << " cache_slots=" << Access::Cache(engine).num_slots() << '\n';
+                  << " host_bytes=" << ctx.current_pinned_host_bytes() << " cache_slots=" << backend.adaptive_cache().NumGpuSlots() << '\n';
     }
     Access::Probe(backend, nullptr);
     x3_probe_scratch = nullptr;

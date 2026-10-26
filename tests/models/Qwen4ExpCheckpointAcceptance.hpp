@@ -260,16 +260,12 @@ void test_prefill_memory(const std::string& directory) {
     expect(engine.init(directory, std::max(512, count + tailCount)), "Memory canary initialization failed");
     auto& ctx = Access::Ctx(engine);
     auto& backend = Access::Backend(engine);
-    auto& cache = Access::Cache(engine);
     Tokenizer tokenizer;
     expect(tokenizer.load(directory), "Cannot load memory canary tokenizer");
     auto report = [&](const char* stage) {
         std::cout << "[X2 MEMORY] stage=" << stage << " device_bytes=" << ctx.current_allocated_bytes()
                   << " peak_device_bytes=" << ctx.peak_allocated_bytes()
-                  << " pinned_host_bytes=" << ctx.current_pinned_host_bytes()
-                  << " host_pool_bytes=" << cache.host_pool_bytes()
-                  << " reader=" << cache.reader()->name()
-                  << " mmap_fallbacks=" << cache.reader()->stats().fallback_mmap_reads << '\n';
+                  << " pinned_host_bytes=" << ctx.current_pinned_host_bytes() << '\n';
     };
     report("warmup");
     std::string text;

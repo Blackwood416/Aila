@@ -183,7 +183,6 @@ set(LIB_SOURCES
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
     src/memory/LargePages.cpp
-    src/memory/L0HostImport.cpp
     src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp
     src/inference/Model.cpp
@@ -200,10 +199,8 @@ set(LIB_SOURCES
     src/models/Qwen3ForceAlignerBnb4Backend.cpp
     src/models/Qwen3TTSBackend.cpp
     src/models/DiffusionGemmaBnb4Backend.cpp
-    src/models/Qwen4ExpExpertCache.cpp
     src/models/Qwen4ExpPle.cpp
     src/models/Qwen4ExpBnb4Backend.cpp
-    src/models/Qwen4ExpLayerMajor.cpp
     src/models/Qwen4ExpDecodeFusion.cpp
     src/models/Qwen4ExpMtpDraft.cpp
     src/models/Qwen4ExpMtpRuntime.cpp
@@ -213,7 +210,6 @@ set(LIB_SOURCES
     src/models/Qwen4ExpExpertReader.cpp
     src/models/Qwen4ExpHostArena.cpp
     src/models/Qwen4ExpAdaptiveCache.cpp
-    src/models/Qwen4ExpLayerStage.cpp
     src/generation/DiffusionGemmaGenerator.cpp
     src/utils/Tokenizer.cpp
     src/utils/ModelConfig.cpp
@@ -681,7 +677,6 @@ add_test(
 add_executable(AilaBnb4BitLinearKernelTests
     tests/ops/Bnb4BitLinearKernelTests.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaBnb4BitLinearKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaBnb4BitLinearKernelTests PRIVATE
@@ -697,7 +692,6 @@ add_executable(AilaQsaAttentionProbe
     tests/ops/QsaAttentionProbe.cpp
     src/profile/Profiling.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaQsaAttentionProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaQsaAttentionProbe PRIVATE
@@ -711,7 +705,6 @@ add_executable(AilaH2DBandwidthProbe
     tests/ops/H2DBandwidthProbe.cpp
     src/profile/Profiling.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaH2DBandwidthProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaH2DBandwidthProbe PRIVATE
@@ -725,7 +718,6 @@ target_link_libraries(AilaH2DBandwidthProbe PRIVATE
 add_executable(AilaKernelSubmitProbe
     tests/ops/KernelSubmitProbe.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp
     src/profile/Profiling.cpp)
 target_compile_definitions(AilaKernelSubmitProbe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -739,7 +731,6 @@ target_link_libraries(AilaKernelSubmitProbe PRIVATE
 add_executable(AilaConvOpsKernelTests
     tests/ops/ConvOpsKernelTests.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaConvOpsKernelTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(AilaConvOpsKernelTests PRIVATE
@@ -762,7 +753,6 @@ target_link_libraries(AilaYolo26InferRefAdapter PRIVATE AilaLib)
 add_executable(AilaDiffusionGemmaNf4InferRefAdapter
     tests/inferref/DiffusionGemmaNf4InferRefAdapter.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -777,7 +767,6 @@ target_link_libraries(AilaDiffusionGemmaNf4InferRefAdapter PRIVATE
 add_executable(AilaQwen4ExpInferRefAdapter
     tests/inferref/Qwen4ExpInferRefAdapter.cpp
     src/core/ExecutionTrace.cpp
-    src/memory/L0HostImport.cpp
     src/memory/LargePages.cpp)
 target_compile_definitions(AilaQwen4ExpInferRefAdapter PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
@@ -872,11 +861,6 @@ target_compile_definitions(AilaQwen4ExpDecodeMiscBench PRIVATE NOMINMAX WIN32_LE
 target_include_directories(AilaQwen4ExpDecodeMiscBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(AilaQwen4ExpDecodeMiscBench PRIVATE AilaLib)
 
-add_executable(AilaQwen4ExpLayerStageBench perf/qwen4exp/q4e_layer_stage_bench.cpp)
-target_compile_definitions(AilaQwen4ExpLayerStageBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_include_directories(AilaQwen4ExpLayerStageBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(AilaQwen4ExpLayerStageBench PRIVATE AilaLib)
-
 add_executable(AilaQwen4ExpCpuMoePrefillBench perf/qwen4exp/q4e_cpu_moe_prefill_bench.cpp)
 target_compile_definitions(AilaQwen4ExpCpuMoePrefillBench PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_include_directories(AilaQwen4ExpCpuMoePrefillBench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -946,19 +930,6 @@ set_tests_properties(AilaQwen4ExpInt8DpasAttention PROPERTIES
 add_test(NAME AilaQwen4ExpGroupedXmxTests COMMAND AilaQwen4ExpToleranceTests --grouped-kernel)
 set_tests_properties(AilaQwen4ExpGroupedXmxTests PROPERTIES LABELS "gpu;ops;qwen4_exp" TIMEOUT 60)
 
-add_executable(AilaQwen4ExpExpertReadinessTests
-    tests/models/Qwen4ExpExpertReadinessTests.cpp
-)
-target_compile_definitions(AilaQwen4ExpExpertReadinessTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_include_directories(AilaQwen4ExpExpertReadinessTests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
-)
-target_link_libraries(AilaQwen4ExpExpertReadinessTests PRIVATE AilaLib)
-add_test(NAME AilaQwen4ExpExpertReadinessTests COMMAND AilaQwen4ExpExpertReadinessTests)
-set_tests_properties(AilaQwen4ExpExpertReadinessTests PROPERTIES LABELS "gpu;models;qwen4_exp;h1" TIMEOUT 120)
-
 add_executable(AilaQwen4ExpCpuExpertTests
     tests/ops/Qwen4ExpCpuExpertTests.cpp
 )
@@ -1019,19 +990,6 @@ target_include_directories(AilaQwen4ExpExpertReaderTests PRIVATE
 target_link_libraries(AilaQwen4ExpExpertReaderTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpExpertReaderTests COMMAND AilaQwen4ExpExpertReaderTests)
 set_tests_properties(AilaQwen4ExpExpertReaderTests PROPERTIES LABELS "cpu;models;qwen4_exp;h4" TIMEOUT 120)
-
-add_executable(AilaQwen4ExpDmaTimingTests
-    tests/models/Qwen4ExpDmaTimingTests.cpp
-)
-target_compile_definitions(AilaQwen4ExpDmaTimingTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
-target_include_directories(AilaQwen4ExpDmaTimingTests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
-)
-target_link_libraries(AilaQwen4ExpDmaTimingTests PRIVATE AilaLib)
-add_test(NAME AilaQwen4ExpDmaTimingTests COMMAND AilaQwen4ExpDmaTimingTests)
-set_tests_properties(AilaQwen4ExpDmaTimingTests PROPERTIES LABELS "gpu;models;qwen4_exp;h5" TIMEOUT 120)
 
 add_executable(AilaQwen4ExpHostArenaTests
     tests/models/Qwen4ExpHostArenaTests.cpp

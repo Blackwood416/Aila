@@ -114,9 +114,8 @@ int main() {
 
         // The executor only needs a bounded CPU worker here; the arena path must
         // never consult the (retired) cache for sources or eligibility.
-        Qwen4ExpExpertCache retired_cache;
         aila::Qwen4ExpExpertExecutor cpu;
-        cpu.init(ctx, retired_cache, 1, top_k, H, I);
+        cpu.init(ctx, 1, top_k, H, I);
         require(cpu.cpu_overlap_enabled(), "arena verifier requires the bounded CPU worker");
 
         struct Case { int rows; const char* name; std::vector<int> ids; };
