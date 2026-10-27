@@ -571,7 +571,7 @@ std::vector<AdaptiveSwapPlan> Qwen4ExpAdaptiveCache::PlanSwaps(
 }
 
 sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
-    Qwen4ExpHostArena& arena, sycl::queue& q, const std::vector<AdaptiveSwapPlan>& plans) {
+    Qwen4ExpHostArena& arena, sycl::queue& q, const std::vector<AdaptiveSwapPlan>& plans, bool direct_arena) {
     if (plans.empty()) return {};
     const auto begin = work_time_ns();
     if (!q.has_property<sycl::property::queue::in_order>())
@@ -588,28 +588,87 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
     }
     // A later plan may fail validation after earlier slots have changed.
     BumpResidentMappingGenerations();
-    for (const auto& p:plans) {
-        if (GetSlot(p.layer,p.victim_expert)!=p.victim_slot || GetSlot(p.layer,p.candidate_expert)>=0)
-            throw std::logic_error("Stale adaptive swap plan");
-        auto* source=arena.GetExpertPointer(p.layer,p.candidate_expert);
-        auto* target=GetSlotDevicePtr(p.victim_slot);
-        if (!source || !target) throw std::logic_error("Adaptive swap has no source/destination owner");
-        std::memcpy(staging_host_[0],source,geom_.slot_bytes);
-        if (!arena.GetExpertPointer(p.layer,p.victim_expert)) {
-            // Preserve the outgoing expert's sole copy in the incoming RAM slot.
-            q.memcpy(staging_host_[1],target,geom_.slot_bytes).wait_and_throw();
-            std::memcpy(source,staging_host_[1],geom_.slot_bytes);
-            arena.ExchangeOwner(p.layer,p.candidate_expert,p.victim_expert);
+    const int max_batch = std::max(1, config_.staging_slots_per_buffer);
+    if (direct_arena && staging_dev_[0] != nullptr) {
+        // Validate all plans and execute in batches up to staging_slots_per_buffer
+        // with zero CPU std::memcpy and one wait per batch.
+        for (size_t b0 = 0; b0 < plans.size(); b0 += static_cast<size_t>(max_batch)) {
+            const size_t b_end = std::min(plans.size(), b0 + static_cast<size_t>(max_batch));
+            for (size_t i = b0; i < b_end; ++i) {
+                const auto& p = plans[i];
+                if (GetSlot(p.layer, p.victim_expert) != p.victim_slot || GetSlot(p.layer, p.candidate_expert) >= 0)
+                    throw std::logic_error("Stale adaptive swap plan");
+                auto* source = arena.GetExpertPointer(p.layer, p.candidate_expert);
+                auto* target = GetSlotDevicePtr(p.victim_slot);
+                if (!source || !target) throw std::logic_error("Adaptive swap has no source/destination owner");
+                uint8_t* stage_slot = staging_dev_[0] + (i - b0) * geom_.slot_bytes;
+                if (!arena.GetExpertPointer(p.layer, p.victim_expert)) {
+                    if (i == b0 && staging_read_[0]) {
+                        q.memcpy(stage_slot, target, geom_.slot_bytes,
+                                 std::vector<sycl::event>{staging_reader_[0]});
+                    } else {
+                        q.memcpy(stage_slot, target, geom_.slot_bytes);
+                    }
+                    q.memcpy(target, source, geom_.slot_bytes);
+                    resident_ready_ = q.memcpy(source, stage_slot, geom_.slot_bytes);
+                } else {
+                    resident_ready_ = q.memcpy(target, source, geom_.slot_bytes);
+                }
+                resident_pending_ = true;
+                const size_t base = size_t(p.layer) * config_.num_experts_per_layer;
+                slot_table_[base + p.victim_expert] = -1;
+                slot_table_[base + p.candidate_expert] = p.victim_slot;
+                slot_to_expert_[p.victim_slot] = {p.layer, p.candidate_expert};
+                stats_.swap_bytes_transferred += geom_.slot_bytes;
+                ++stats_.swaps_executed;
+            }
+            staging_read_[0] = false;
+            resident_ready_.wait_and_throw();
+            for (size_t i = b0; i < b_end; ++i) {
+                const auto& p = plans[i];
+                if (!arena.GetExpertPointer(p.layer, p.victim_expert)) {
+                    arena.ExchangeOwner(p.layer, p.candidate_expert, p.victim_expert);
+                }
+            }
         }
-        resident_ready_=q.memcpy(target,staging_host_[0],geom_.slot_bytes);
-        resident_pending_=true;
-        // This one-slot CPU buffer cannot be overwritten while DMA consumes it.
-        resident_ready_.wait_and_throw();
-        const size_t base=size_t(p.layer)*config_.num_experts_per_layer;
-        slot_table_[base+p.victim_expert]=-1;
-        slot_table_[base+p.candidate_expert]=p.victim_slot;
-        slot_to_expert_[p.victim_slot]={p.layer,p.candidate_expert};
-        stats_.swap_bytes_transferred+=geom_.slot_bytes; ++stats_.swaps_executed;
+    } else {
+        for (const auto& p:plans) {
+            if (GetSlot(p.layer,p.victim_expert)!=p.victim_slot || GetSlot(p.layer,p.candidate_expert)>=0)
+                throw std::logic_error("Stale adaptive swap plan");
+            auto* source=arena.GetExpertPointer(p.layer,p.candidate_expert);
+            auto* target=GetSlotDevicePtr(p.victim_slot);
+            if (!source || !target) throw std::logic_error("Adaptive swap has no source/destination owner");
+            if (!arena.GetExpertPointer(p.layer,p.victim_expert) && staging_dev_[0] != nullptr) {
+                if (staging_read_[0]) {
+                    q.memcpy(staging_dev_[0],target,geom_.slot_bytes,
+                             std::vector<sycl::event>{staging_reader_[0]});
+                } else {
+                    q.memcpy(staging_dev_[0],target,geom_.slot_bytes);
+                }
+                std::memcpy(staging_host_[0],source,geom_.slot_bytes);
+                q.memcpy(target,staging_host_[0],geom_.slot_bytes);
+                resident_ready_=q.memcpy(staging_host_[1],staging_dev_[0],geom_.slot_bytes);
+                resident_pending_=true;
+                resident_ready_.wait_and_throw();
+                std::memcpy(source,staging_host_[1],geom_.slot_bytes);
+                arena.ExchangeOwner(p.layer,p.candidate_expert,p.victim_expert);
+            } else {
+                std::memcpy(staging_host_[0],source,geom_.slot_bytes);
+                if (!arena.GetExpertPointer(p.layer,p.victim_expert)) {
+                    q.memcpy(staging_host_[1],target,geom_.slot_bytes).wait_and_throw();
+                    std::memcpy(source,staging_host_[1],geom_.slot_bytes);
+                    arena.ExchangeOwner(p.layer,p.candidate_expert,p.victim_expert);
+                }
+                resident_ready_=q.memcpy(target,staging_host_[0],geom_.slot_bytes);
+                resident_pending_=true;
+                resident_ready_.wait_and_throw();
+            }
+            const size_t base=size_t(p.layer)*config_.num_experts_per_layer;
+            slot_table_[base+p.victim_expert]=-1;
+            slot_table_[base+p.candidate_expert]=p.victim_slot;
+            slot_to_expert_[p.victim_slot]={p.layer,p.candidate_expert};
+            stats_.swap_bytes_transferred+=geom_.slot_bytes; ++stats_.swaps_executed;
+        }
     }
     resident_ready_=SyncSlotTableToDevice(q);
     resident_pending_=true;

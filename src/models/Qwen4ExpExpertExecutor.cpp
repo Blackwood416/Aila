@@ -161,9 +161,10 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         init_scale_cache();
         if (aila::env::read_flag("AILA_Q4E_CPU_TILE_POOL", true)) {
             tilePool = std::make_unique<ops::cpu::CpuTilePool>(threads);
-            AILA_LOG_INFO("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=4 bounded_spin_us=%d "
+            AILA_LOG_INFO("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=%d bounded_spin_us=%d "
                           "pinned=1 coordinator_core=2 worker_core_begin=3 physical_cores=%d",
-                threads, std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_SPIN_US", 20000), 0, 100000),
+                threads, std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_CLAIM", 1), 1, 16),
+                std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_SPIN_US", 20000), 0, 100000),
                 ops::cpu::PhysicalCoreCount());
         }
         if (spinUs) AILA_LOG_INFO("[Q4E CpuHandoffSpin] spin_us=%d mutex_publication=1 bounded_idle=1", spinUs);

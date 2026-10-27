@@ -2505,12 +2505,25 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
         pending_mlp->ConsumeNorm(hc.hc_norm_weight->data_as<float>(), cfg_.rms_norm_eps,
             buf_.hc_N.data_as<bf16>());
     } else if (pending_y && pending_inj) {
-        ops::hc_inject_add_and_grouped_rms_norm(
-            ctx, static_cast<bf16*>(buf_.hidden4.data()),
-            pending_y, pending_inj,
-            static_cast<const float*>(hc.hc_norm_weight->data()),
-            cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-            count, 4, hidden_size_, true);
+        // The vec8 decode form is the same inject-add plus grouped RMSNorm in
+        // one submission, and it keeps the updated row in private storage
+        // instead of re-reading H for the output pass. A rejected shape falls
+        // back to the reference op below, unchanged.
+        const bool vec_done = count == 1 &&
+            ops::try_hc_decode_inject_add_and_grouped_rms_norm(
+                ctx, static_cast<bf16*>(buf_.hidden4.data()),
+                pending_y, pending_inj,
+                static_cast<const float*>(hc.hc_norm_weight->data()),
+                cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
+                hidden_size_, true);
+        if (!vec_done) {
+            ops::hc_inject_add_and_grouped_rms_norm(
+                ctx, static_cast<bf16*>(buf_.hidden4.data()),
+                pending_y, pending_inj,
+                static_cast<const float*>(hc.hc_norm_weight->data()),
+                cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
+                count, 4, hidden_size_, true);
+        }
     } else {
         ops::grouped_rms_norm(
             ctx, static_cast<const bf16*>(buf_.hidden4.data()),
@@ -2901,6 +2914,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     static const bool s_stagein_hoist = aila::env::read_flag("AILA_Q4E_STAGEIN_HOIST", true);
     static const bool s_stagein_after_route =
         aila::env::read_flag("AILA_Q4E_STAGEIN_AFTER_ROUTE", false);
+    // Decode-only: read back the route launch's execution status before the
+    // shared expert is submitted, so the two submissions do not share the
+    // route kernel's in-flight release point.
+    static const bool s_join_release = aila::env::read_flag("AILA_Q4E_JOIN_RELEASE", true);
     static const bool s_fuse_shared = aila::env::read_flag("AILA_Q4E_MOE_SHARED_FUSED", true);
     auto stage = [&](int s) {
         if (!s_stages && !s_work_summary) return;
@@ -3121,6 +3138,14 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         hsplit_add(host_topk_submit_ms, t_topk);
         dev_mark(kDevRouter);
+        if (s_join_release && count == 1 && !is_prefill) {
+            // Querying the status is non-blocking and takes the route launch out
+            // of the in-flight set before the shared expert enqueues behind it.
+            try {
+                (void)actual_route_event
+                    .get_info<sycl::info::event::command_execution_status>();
+            } catch (...) {}
+        }
         auto bind_actual_route = [&] {
             if (s_route_replay_count && count == 1 && L >= 0 && L < 64 &&
                 adaptive_cache_.IsAllocated()) {
@@ -3286,14 +3311,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             rr_cold ? double(rr_cold_prev) / double(rr_cold) : 0.0);
     }
 
-    if (adaptive_cache_.IsAllocated() && count == 1) {
-        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 0);
-        static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 2);
-        if (s_adaptive_swap_freq > 0 && (cached_len % s_adaptive_swap_freq == 0)) {
+    if (adaptive_cache_.IsAllocated() && count == 1 && !options.decode_verification && !interior) {
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 8);
+        static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 4);
+        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 80);
+        if (s_adaptive_swap_freq > 0 && cached_len >= s_swap_min_pos &&
+            (cached_len % s_adaptive_swap_freq == 0)) {
             auto swap_plans = adaptive_cache_.PlanSwaps(1, s_max_swaps);
             if (!swap_plans.empty()) {
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
-                adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans);
+                adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
             }
         }
     }

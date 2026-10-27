@@ -169,10 +169,12 @@ public:
     }
 private:
     void Consume() noexcept {
+        static const int s_claim_tiles = std::clamp(
+            aila::env::read_int_raw("AILA_Q4E_CPU_POOL_CLAIM", 1), 1, 16);
         while (!failed_.load(std::memory_order_acquire)) {
-            const int first = next_.fetch_add(4, std::memory_order_relaxed);
+            const int first = next_.fetch_add(s_claim_tiles, std::memory_order_relaxed);
             if (first >= tileCount_) return;
-            try { callback_(callbackState_, first, std::min(first + 4, tileCount_)); }
+            try { callback_(callbackState_, first, std::min(first + s_claim_tiles, tileCount_)); }
             catch (...) {
                 std::lock_guard<std::mutex> lock(errorMutex_);
                 if (!error_) error_ = std::current_exception();

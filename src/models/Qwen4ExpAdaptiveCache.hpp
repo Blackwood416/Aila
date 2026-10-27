@@ -292,7 +292,8 @@ public:
     sycl::event ExecuteSwapsAsync(
         Qwen4ExpHostArena& arena,
         sycl::queue& copy_q,
-        const std::vector<AdaptiveSwapPlan>& plans);
+        const std::vector<AdaptiveSwapPlan>& plans,
+        bool direct_arena = false);
 
     // =========================================================================
     // Cold Expert Dual-Buffering Staging (Ping-Pong)

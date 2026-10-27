@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on Intel Arc A770 — Architecture & Handoff
 
-> **Status:** Post-Round-7 Architecture Reference.
+> **Status:** Post-Round-8 Architecture Reference.
 > `docs/plans/` intermediate logs and the legacy `Qwen4ExpExpertCache` / `Qwen4ExpLayerStage` / `Qwen4ExpLayerMajor` / `L0HostImport` modules have been retired.
 > Environment variable reference: [`docs/Environment_Variables.md`](Environment_Variables.md).
 
@@ -61,9 +61,11 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 | **7,764** | 15,584.3 ms (498.2 tok/s) | 15,071.3 ms (515.1 tok/s) | **14,878.8 ms** | 1.916 | **521.8 tok/s** |
 
 - **Linear fit**: `6,822 ms` fixed cost + **`1.04 ms/token` marginal cost (`964 tok/s` marginal throughput; `0.81 ms/token` / `1,230 tok/s` across 2K–8K with fixed `MIN_M=192`)**.
-- **Decode throughput (story 30p+20g, no MTP)**:
-  - **Steady-state decode latency**: **`43.02 ~ 48.86 ms/token` (`20.5 ~ 23.24 tok/s`)**, up **4.5×** from the Round 5 baseline (`~207.5 ms/tok` / `4.82 tok/s`) and **3.4×** from the GPU-only DMA baseline (`~155.3 ms/tok` / `6.44 tok/s`).
-  - **Story 30p + 20g E2E wall time**: improved from `5,563.1 ms` (Round 5) -> `4,531.6 ms` (Round 6) -> **`2,524.5 ms` (Round 7, -54.6%)**.
+- **Decode throughput (single-stream, no MTP)**:
+  - **Short Decode (`story.json` 30p + 20g)**: **`43.02 ~ 45.6 ms/token` (`21.9 ~ 23.24 tok/s`)**, E2E wall time **`2,487.0 ms`** (down from `5,563.1 ms` in Round 5, `-55.3%`).
+  - **Long-Horizon Decode (`tools/decode-bench.ps1`, `essay.json` 40p + 256g / 512g)**:
+    - **256 Generated Tokens**: **`20.5 ~ 20.6 tok/s`** (`mean = 48.48 ~ 48.72 ms/tok`, `p50 = 47.66 ms`, `p90 = 51.35 ms`; intervals `1-64: 20.4–21.0 tok/s`, `65-256: 20.5–20.6 tok/s`).
+    - **512 Generated Tokens**: **`20.5 tok/s`** (`mean = 48.80 ms/tok`, `p50 = 47.44 ms / 21.08 tok/s`, `p90 = 52.11 ms`; intervals `1-64: 20.5 tok/s`, `65-256: 20.6 tok/s`, `257-512: 20.4 tok/s`, cache hit rate dynamically promoted from `32.2%` to `39.4%`).
 
 ### 3.2 Key Prefill Optimizations
 1. **Dense NF4 Projections via Vectorized Dequant + oneDNN (`AILA_BNB4_ONEDNN_MIN_M = 128`)**: Routes all `seq_len >= 128` dense NF4 projections (including the 97 `N = 2560` calls: 36 `linear_o_proj`, 12 QSA `o_proj`, 48 `shared_down_proj`, 1 PLE `value_proj`) to word-vectorized `dequantize_weight` + oneDNN `ab` MatMul (16.0× faster than the custom wide joint-matrix kernel on `N = 2560`, saving ~2.95 s at 8K).
@@ -78,6 +80,10 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 7. **3.14 GB Multi-Phase Scratch VRAM Reclamation & 3× GQA-Grouped GDN `prepare_inputs`**: `buf_.phase_scratch` (1,022 MB at 8K) aliases four mutually exclusive lifetimes on the in-order queue: Layer-1 PLE intermediates (835 MB), Hyper-Connection intermediates (`hc_N`, `hc_mix_down`, `hc_mix_up` = 323 MB), GDN `linear_all + raw + prepared` (1,022 MB), and MoE `moe_down_acc + router_scores + moe_h + shared_*` (952 MB), freeing >1.6 GB of VRAM to expand resident GPU experts from 2,800 to 3,360 slots while keeping ~1.3–1.4 GB free VRAM headroom. GDN `prepare_inputs` groups 3 V heads per Q/K head (3× fewer work-groups and barrier reductions).
 8. **Adaptive Expert-XMX Band Sizing (`GATE_ROWS = 1024`, `MIN_M = 64` for `< 4K` and `192` for `>= 4K`), Process-Wide oneDNN Primitive Sharing & Prefill Warmup**: Lowering the expert-XMX gate to 1,024 rows with a 64-row minimum band below 4,096 tokens eliminates 3× padding waste at 2K tokens (`10,191 ms -> 8,904.9 ms`, **+16.1%**), while process-wide `dnnl::matmul` primitive caches in `Bnb4BitLinear` and `Linear` plus `WarmupPrefillKernels` remove ~570 redundant primitive creations per prefill (`7,764 tokens -> 14,878.8 ms / 521.8 tok/s`).
 9. **Disjoint Physical-Core Pinned CPU/GPU Decode Pipeline & Fused `bf16_moe_front_fused` Host Stage-In**: Reserves Core 0 for the GPU host submission thread, Core 1 for the PLE worker, Core 2 for `CpuWorker`, and Cores 3..17 for 15 `CpuTilePool` workers with a 20 ms lock-free `sleepers_`-gated spin window. Fuses the 5 KB `x_host_` stage-in into the idle work-group of `bf16_moe_front_fused` and carries route weights by value into the `vec4`-vectorized `moe_ordered_accumulate_cpu_host_rows` merge kernel, eliminating all per-layer Level Zero waits on `CpuWorker` and all 48 per-layer 40 B weight DMA copies.
+10. **4-Row AVX2 A64 Dot Products with Software Prefetch, Inline Per-Expert `h` Quantization, Batched Zero-Memcpy Adaptive Swaps & Long-Context Decode Attention Tuning (Round 8)**:
+    - `nf4_q8_dot_activation64_rows4` shares quantized activation loads across 4 rows simultaneously with L1 software prefetching, while `CpuTilePool` claims 1 tile at a time (`AILA_Q4E_CPU_POOL_CLAIM=1`) and quantizes each expert's intermediate `h` inline as soon as its 40th gate tile finishes.
+    - `GatedDeltaNetOps` caches the 128-element recurrent column `s_col[128]` in registers across the two decode passes (saving 108 MB/tok of global DRAM reads), `HyperConnectionOps` hoists `a_row` into registers in `hc_decode_up_mix`, unrolls `hc_decode_down_inject_wgrow`, and routes single-token `mlp_hc` through `try_hc_decode_inject_add_and_grouped_rms_norm` with in-register `v_reg`.
+    - `AttentionOps` unrolls the baseline `V` accumulation 8-way and lowers the `head_dim=256` exact tiled decode threshold from 1,024 to 256 tokens (`AILA_Q4E_DECODE_EXACT256_MIN_LEN=256`), while `ExecuteSwapsAsync` batches swaps through `staging_dev_[0]` with zero CPU `std::memcpy` (`AILA_Q4E_ADAPTIVE_SWAP_FREQ=8`, `AILA_Q4E_MAX_SWAPS=4`, `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS=80`), sustaining >20.4 tok/s through 512+ decode tokens.
 
 ---
 

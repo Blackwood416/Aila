@@ -686,6 +686,78 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows2(
     output[1] = hsum256_ps(accumulator1);
 }
 
+template <int Columns, A64ScaleMode Mode>
+#if defined(_MSC_VER)
+static __forceinline void nf4_q8_dot_activation64_rows4(const uint8_t* packed, const float* absmax,
+#else
+static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(const uint8_t* packed, const float* absmax,
+#endif
+    const MoeNestedScaleHost& nested, size_t row0, size_t row1, size_t row2, size_t row3,
+    const int8_t* input, const float* input_scales, __m128i lut, float lut_scale,
+    bool nf4_scale_shift, float* output) {
+    static_assert(Columns > 0 && Columns % 64 == 0, "NF4Q8 A64 requires complete 64-weight blocks");
+    const auto mask = _mm256_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    const auto table = _mm256_broadcastsi128_si256(lut);
+    auto accumulator0 = _mm256_setzero_ps();
+    auto accumulator1 = _mm256_setzero_ps();
+    auto accumulator2 = _mm256_setzero_ps();
+    auto accumulator3 = _mm256_setzero_ps();
+    constexpr size_t stride = Columns / 2;
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+    for (int b = 0; b < Columns / 64; ++b) {
+        if ((b & 1) == 0 && b + 4 < Columns / 64) {
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row0 * stride + b * 32 + 128), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row1 * stride + b * 32 + 128), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row2 * stride + b * 32 + 128), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row3 * stride + b * 32 + 128), _MM_HINT_T0);
+        }
+        const auto activation0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64));
+        const auto activation1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + 32));
+        const auto in_scale_ss = _mm_set_ss(input_scales[b]);
+        const auto lut_scale_ss = _mm_set_ss(lut_scale);
+        auto step_row = [&](size_t row, __m256 acc) -> __m256 {
+            const size_t scale_index = row * (Columns / 64) + b;
+            float scale;
+            if constexpr (Mode == A64ScaleMode::FlatF32) {
+                scale = absmax[scale_index];
+            } else if constexpr ((Mode == A64ScaleMode::Nested256 || Mode == A64ScaleMode::Nested256ByteShuffle)) {
+                volatile float product = nested.nested_quant_map[nested.codes[scale_index]] *
+                                         nested.nested_absmax[scale_index >> 8];
+                scale = product + nested.offset;
+            } else if constexpr (Mode == A64ScaleMode::Nested256Register) {
+                scale = a64_nested_scale_register(nested, scale_index);
+            } else {
+                scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
+            }
+            auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * stride + b * 32));
+            if constexpr (Mode == A64ScaleMode::Nested256ByteShuffle) bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+            const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+            const auto low = _mm256_and_si256(bytes, mask);
+            const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+            const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
+            const auto weights0 = Mode == A64ScaleMode::Nested256ByteShuffle ? wlo : _mm256_permute2x128_si256(wlo, whi, 0x20);
+            const auto weights1 = Mode == A64ScaleMode::Nested256ByteShuffle ? whi : _mm256_permute2x128_si256(wlo, whi, 0x31);
+            const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
+            const auto pairs1 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights1), _mm256_sign_epi8(activation1, weights1));
+            const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
+            const auto scale_input = _mm_mul_ss(_mm_set_ss(scale), in_scale_ss);
+            const float factor = _mm_cvtss_f32(_mm_mul_ss(scale_input, lut_scale_ss));
+            return _mm256_fmadd_ps(_mm256_set1_ps(factor), _mm256_cvtepi32_ps(dot), acc);
+        };
+        accumulator0 = step_row(row0, accumulator0);
+        accumulator1 = step_row(row1, accumulator1);
+        accumulator2 = step_row(row2, accumulator2);
+        accumulator3 = step_row(row3, accumulator3);
+    }
+    output[0] = hsum256_ps(accumulator0);
+    output[1] = hsum256_ps(accumulator1);
+    output[2] = hsum256_ps(accumulator2);
+    output[3] = hsum256_ps(accumulator3);
+}
+
 inline void mark_a64_row2_enabled() {
     static std::atomic<bool> reported{false};
     if (!reported.load(std::memory_order_relaxed) &&
@@ -705,15 +777,21 @@ static void dispatch_a64_gate_tile(const MoeExpertSlotHost& slot,
 #if defined(__clang__)
 #pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
 #endif
-    for (int row = begin; row < begin + 16; ++row) {
-        float dots[2];
-        nf4_q8_dot_activation64_rows2<kHiddenDim, Mode>(slot.gate_up_packed,
-            slot.gate_up_absmax, slot.gate_up_nested, row, row + kIntermediateDim,
+    for (int row = begin; row < begin + 16; row += 2) {
+        float dots[4];
+        nf4_q8_dot_activation64_rows4<kHiddenDim, Mode>(slot.gate_up_packed,
+            slot.gate_up_absmax, slot.gate_up_nested,
+            row, row + kIntermediateDim, row + 1, row + 1 + kIntermediateDim,
             values, scales, lut, lut_scale, nf4_scale_shift, dots);
-        const float gate = dots[0], up = dots[1];
-        const float denominator = 1.0f + std::exp(-gate);
-        const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
-        h[row] = bf16(silu * up);
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+        for (int r = 0; r < 2; ++r) {
+            const float gate = dots[r * 2], up = dots[r * 2 + 1];
+            const float denominator = 1.0f + std::exp(-gate);
+            const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+            h[row + r] = bf16(silu * up);
+        }
     }
     mark_a64_row2_enabled();
 }
@@ -727,9 +805,9 @@ static void dispatch_a64_down_tile(const MoeExpertSlotHost& slot,
             lut, lut_scale, nf4_scale_shift, out);
         return;
     }
-    for (int row = begin; row < begin + 32; row += 2)
-        nf4_q8_dot_activation64_rows2<kIntermediateDim, Mode>(slot.down_packed,
-            slot.down_absmax, slot.down_nested, row, row + 1, values, scales,
+    for (int row = begin; row < begin + 32; row += 4)
+        nf4_q8_dot_activation64_rows4<kIntermediateDim, Mode>(slot.down_packed,
+            slot.down_absmax, slot.down_nested, row, row + 1, row + 2, row + 3, values, scales,
             lut, lut_scale, nf4_scale_shift, out + row);
     mark_a64_row2_enabled();
 }
@@ -1047,37 +1125,6 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                     h[c * kIntermediateDim + row] = bf16(silu * up);
                 }
     };
-    const int gate_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * gate_tile_cols,
-        [&](const tbb::blocked_range<int>& range) {
-            for (int tile = range.begin(); tile < range.end(); ++tile) {
-                const int unit = tile / gate_tile_cols;
-                const int begin = tile % gate_tile_cols * gate_tile;
-                if (group_count <= 0) { nf4_q8_gate_tile_body(unit, begin); continue; }
-                const int member_begin = groups[unit].member_begin;
-                const int member_count = groups[unit].member_count;
-                for (int mi = 0; mi < member_count; ++mi)
-                    nf4_q8_gate_tile_body(members[member_begin + mi], begin);
-            }
-        });
-    if (timings) {
-        const uint64_t now = nf4_q8_phase_ns();
-        timings->gate_up_ns = now - phase_begin;
-        timings->gate_chunks = gate_chunks;
-        phase_begin = now;
-    }
-    // Gate tiles are 16 rows, while quantization scales span 32. Quantize only
-    // after the stage barrier, so no worker reads another tile's unfinished h.
-    for (int c = 0; c < count; ++c) {
-        if (activation64) quantize_bf16_q8_activation64(h + c * kIntermediateDim, kIntermediateDim,
-            intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / activation_block));
-        else quantize_bf16_q8(h + c * kIntermediateDim, kIntermediateDim,
-            intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / activation_block));
-    }
-    if (timings) {
-        const uint64_t now = nf4_q8_phase_ns();
-        timings->quantize_ns += now - phase_begin;
-        phase_begin = now;
-    }
     const int down_tile_cols = kHiddenDim / down_tile;
     auto nf4_q8_down_tile_body = [&](int c, int begin) {
                 const auto& slot = tasks[c].slot;
@@ -1129,6 +1176,59 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                         row, intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32),
                         kIntermediateDim, lut, lut_scale, nf4_scale_shift);
     };
+    struct alignas(64) GateTileCountdown {
+        std::atomic<int> rem{0};
+    };
+    GateTileCountdown gate_countdown[kMaxExpertBatchTasks];
+    const bool inline_gate_quant = activation64 && group_count <= 0 && !timings;
+    if (inline_gate_quant) {
+        for (int c = 0; c < count; ++c) {
+            gate_countdown[c].rem.store(gate_tile_cols, std::memory_order_relaxed);
+        }
+    }
+    const int gate_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * gate_tile_cols,
+        [&](const tbb::blocked_range<int>& range) {
+            for (int tile = range.begin(); tile < range.end(); ++tile) {
+                const int unit = tile / gate_tile_cols;
+                const int begin = tile % gate_tile_cols * gate_tile;
+                if (group_count <= 0) {
+                    nf4_q8_gate_tile_body(unit, begin);
+                    if (inline_gate_quant &&
+                        gate_countdown[unit].rem.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        quantize_bf16_q8_activation64(
+                            h + unit * kIntermediateDim, kIntermediateDim,
+                            intermediate + unit * kIntermediateDim,
+                            intermediate_scales + unit * (kIntermediateDim / 64));
+                    }
+                    continue;
+                }
+                const int member_begin = groups[unit].member_begin;
+                const int member_count = groups[unit].member_count;
+                for (int mi = 0; mi < member_count; ++mi)
+                    nf4_q8_gate_tile_body(members[member_begin + mi], begin);
+            }
+        });
+    if (timings) {
+        const uint64_t now = nf4_q8_phase_ns();
+        timings->gate_up_ns = now - phase_begin;
+        timings->gate_chunks = gate_chunks;
+        phase_begin = now;
+    }
+    // Gate tiles are 16 rows, while quantization scales span 32. Quantize only
+    // after the stage barrier when not already quantized per expert above.
+    if (!inline_gate_quant) {
+        for (int c = 0; c < count; ++c) {
+            if (activation64) quantize_bf16_q8_activation64(h + c * kIntermediateDim, kIntermediateDim,
+                intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / activation_block));
+            else quantize_bf16_q8(h + c * kIntermediateDim, kIntermediateDim,
+                intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / activation_block));
+        }
+    }
+    if (timings) {
+        const uint64_t now = nf4_q8_phase_ns();
+        timings->quantize_ns += now - phase_begin;
+        phase_begin = now;
+    }
     const int down_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * down_tile_cols,
         [&](const tbb::blocked_range<int>& range) {
             for (int tile = range.begin(); tile < range.end(); ++tile) {

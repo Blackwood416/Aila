@@ -263,35 +263,44 @@ void run_linear_delta_decode_gpu_impl(
 
                     if (lid < head_dim) {
                         const int dv = lid;
+                        // This lane owns one column of the state matrix for the
+                        // whole update, so the column is read once into private
+                        // storage and reused by the in-place write instead of
+                        // re-reading it from global memory.
+                        float s_col[head_dim];
                         float acc = 0.0f;
                         for (int j = 0; j < head_dim; j += 8) {
                             const size_t b = static_cast<size_t>(j) * head_dim + dv;
-                            float sv0 = S[b + 0 * head_dim] * decay;
-                            float sv1 = S[b + 1 * head_dim] * decay;
-                            float sv2 = S[b + 2 * head_dim] * decay;
-                            float sv3 = S[b + 3 * head_dim] * decay;
-                            float sv4 = S[b + 4 * head_dim] * decay;
-                            float sv5 = S[b + 5 * head_dim] * decay;
-                            float sv6 = S[b + 6 * head_dim] * decay;
-                            float sv7 = S[b + 7 * head_dim] * decay;
-                            acc += sv0 * k_local[j + 0] + sv1 * k_local[j + 1] +
-                                   sv2 * k_local[j + 2] + sv3 * k_local[j + 3] +
-                                   sv4 * k_local[j + 4] + sv5 * k_local[j + 5] +
-                                   sv6 * k_local[j + 6] + sv7 * k_local[j + 7];
+                            s_col[j + 0] = S[b + 0 * head_dim];
+                            s_col[j + 1] = S[b + 1 * head_dim];
+                            s_col[j + 2] = S[b + 2 * head_dim];
+                            s_col[j + 3] = S[b + 3 * head_dim];
+                            s_col[j + 4] = S[b + 4 * head_dim];
+                            s_col[j + 5] = S[b + 5 * head_dim];
+                            s_col[j + 6] = S[b + 6 * head_dim];
+                            s_col[j + 7] = S[b + 7 * head_dim];
+                            acc += s_col[j + 0] * decay * k_local[j + 0] +
+                                   s_col[j + 1] * decay * k_local[j + 1] +
+                                   s_col[j + 2] * decay * k_local[j + 2] +
+                                   s_col[j + 3] * decay * k_local[j + 3] +
+                                   s_col[j + 4] * decay * k_local[j + 4] +
+                                   s_col[j + 5] * decay * k_local[j + 5] +
+                                   s_col[j + 6] * decay * k_local[j + 6] +
+                                   s_col[j + 7] * decay * k_local[j + 7];
                         }
 
                         float dval = (v_reg - acc) * beta;
                         float out = 0.0f;
                         for (int j = 0; j < head_dim; j += 8) {
                             const size_t b = static_cast<size_t>(j) * head_dim + dv;
-                            float sv0 = S[b + 0 * head_dim] * decay + k_local[j + 0] * dval;
-                            float sv1 = S[b + 1 * head_dim] * decay + k_local[j + 1] * dval;
-                            float sv2 = S[b + 2 * head_dim] * decay + k_local[j + 2] * dval;
-                            float sv3 = S[b + 3 * head_dim] * decay + k_local[j + 3] * dval;
-                            float sv4 = S[b + 4 * head_dim] * decay + k_local[j + 4] * dval;
-                            float sv5 = S[b + 5 * head_dim] * decay + k_local[j + 5] * dval;
-                            float sv6 = S[b + 6 * head_dim] * decay + k_local[j + 6] * dval;
-                            float sv7 = S[b + 7 * head_dim] * decay + k_local[j + 7] * dval;
+                            float sv0 = s_col[j + 0] * decay + k_local[j + 0] * dval;
+                            float sv1 = s_col[j + 1] * decay + k_local[j + 1] * dval;
+                            float sv2 = s_col[j + 2] * decay + k_local[j + 2] * dval;
+                            float sv3 = s_col[j + 3] * decay + k_local[j + 3] * dval;
+                            float sv4 = s_col[j + 4] * decay + k_local[j + 4] * dval;
+                            float sv5 = s_col[j + 5] * decay + k_local[j + 5] * dval;
+                            float sv6 = s_col[j + 6] * decay + k_local[j + 6] * dval;
+                            float sv7 = s_col[j + 7] * decay + k_local[j + 7] * dval;
                             S[b + 0 * head_dim] = sv0;
                             S[b + 1 * head_dim] = sv1;
                             S[b + 2 * head_dim] = sv2;

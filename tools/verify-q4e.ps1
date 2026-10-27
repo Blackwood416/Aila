@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("build", "fast", "ctest", "real", "all")]
+    [ValidateSet("build", "fast", "ctest", "real", "decode", "all")]
     [string]$Tier = "ctest",
     [string[]]$Targets = @(),
     [string]$BuildDir = "build-refactor",
@@ -100,6 +100,8 @@ if (-not $SkipBuild) {
         Invoke-IncrementalBuild -BuildTargets @()
     } elseif ($Tier -eq "fast") {
         Invoke-IncrementalBuild -BuildTargets $fastTargets
+    } elseif ($Tier -eq "decode") {
+        Invoke-IncrementalBuild -BuildTargets @("Aila")
     } else {
         Invoke-IncrementalBuild -BuildTargets $ctestTargets
     }
@@ -176,6 +178,15 @@ if ($Tier -in @("real", "all")) {
     }
     $results += Invoke-Step "Real-Model Prefill Benchmark (7764 tokens, chunk 8192)" {
         pwsh -NoProfile -File "$RepoRoot\tools\prefill-bench.ps1" -Tokens @(7878) -Chunk 8192 -Model $Model -Exe "$BuildDir\Aila.exe"
+    }
+}
+
+if ($Tier -in @("decode", "all")) {
+    if (-not (Test-Path $Model)) {
+        throw "Decode tier requires model directory at '$Model'"
+    }
+    $results += Invoke-Step "Real-Model Decode Benchmark (256 / 512 tokens, greedy)" {
+        pwsh -NoProfile -File "$RepoRoot\tools\decode-bench.ps1" -Model $Model -Exe "$BuildDir\Aila.exe" -MaxTokens @(256, 512)
     }
 }
 

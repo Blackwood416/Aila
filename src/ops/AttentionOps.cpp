@@ -321,20 +321,73 @@ void attention_decode_baseline_impl(Context &ctx, Tensor &q, Tensor &k_cache,
 
           for (int d = lid; d < head_dim; d += wg_size) {
             float acc = 0.0f;
-            for (int t = 0; t < effective_len; t++) {
-              int cache_t = 0;
-              if (active_blocks != nullptr && num_active_blocks > 0) {
-                if (t < num_active_blocks * 4) {
-                  cache_t = active_blocks[t / 4] * 4 + (t % 4);
-                } else {
-                  cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+            if constexpr (!Quantized) {
+              if (active_blocks == nullptr && active_indices == nullptr && sink_len == 0) {
+                const bf16 *v_col = static_cast<const bf16 *>(v_ptr) +
+                    (static_cast<size_t>(kv_head) * max_seq_len + tail_start) * head_dim + d;
+                int t = 0;
+                for (; t + 7 < effective_len; t += 8) {
+                  const float p0 = shared[t + 0];
+                  const float p1 = shared[t + 1];
+                  const float p2 = shared[t + 2];
+                  const float p3 = shared[t + 3];
+                  const float p4 = shared[t + 4];
+                  const float p5 = shared[t + 5];
+                  const float p6 = shared[t + 6];
+                  const float p7 = shared[t + 7];
+                  const float v0 = static_cast<float>(v_col[(t + 0) * head_dim]);
+                  const float v1 = static_cast<float>(v_col[(t + 1) * head_dim]);
+                  const float v2 = static_cast<float>(v_col[(t + 2) * head_dim]);
+                  const float v3 = static_cast<float>(v_col[(t + 3) * head_dim]);
+                  const float v4 = static_cast<float>(v_col[(t + 4) * head_dim]);
+                  const float v5 = static_cast<float>(v_col[(t + 5) * head_dim]);
+                  const float v6 = static_cast<float>(v_col[(t + 6) * head_dim]);
+                  const float v7 = static_cast<float>(v_col[(t + 7) * head_dim]);
+                  acc += p0 * v0;
+                  acc += p1 * v1;
+                  acc += p2 * v2;
+                  acc += p3 * v3;
+                  acc += p4 * v4;
+                  acc += p5 * v5;
+                  acc += p6 * v6;
+                  acc += p7 * v7;
                 }
-              } else if (active_indices) {
-                cache_t = active_indices[t];
+                for (; t < effective_len; ++t) {
+                  acc += shared[t] * static_cast<float>(v_col[t * head_dim]);
+                }
               } else {
-                cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+                for (int t = 0; t < effective_len; t++) {
+                  int cache_t = 0;
+                  if (active_blocks != nullptr && num_active_blocks > 0) {
+                    if (t < num_active_blocks * 4) {
+                      cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                    } else {
+                      cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                    }
+                  } else if (active_indices) {
+                    cache_t = active_indices[t];
+                  } else {
+                    cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+                  }
+                  acc += shared[t] * v_acc.load(kv_head, cache_t, d);
+                }
               }
-              acc += shared[t] * v_acc.load(kv_head, cache_t, d);
+            } else {
+              for (int t = 0; t < effective_len; t++) {
+                int cache_t = 0;
+                if (active_blocks != nullptr && num_active_blocks > 0) {
+                  if (t < num_active_blocks * 4) {
+                    cache_t = active_blocks[t / 4] * 4 + (t % 4);
+                  } else {
+                    cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
+                  }
+                } else if (active_indices) {
+                  cache_t = active_indices[t];
+                } else {
+                  cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
+                }
+                acc += shared[t] * v_acc.load(kv_head, cache_t, d);
+              }
             }
             float val = static_cast<float>(bf16(acc));
             if (gate_ptr != nullptr) {
