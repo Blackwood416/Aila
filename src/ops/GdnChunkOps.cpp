@@ -10,6 +10,45 @@ using namespace sycl::ext::oneapi::experimental::matrix;
 
 void prepare_inputs(Context& ctx, DeltaNetGeometry g, DeltaNetWeights w,
     const float* history, int head, const bf16* input, float* prepared, int count) {
+    const bool group_three = g.q_heads > 0 && (g.v_heads % g.q_heads) == 0 &&
+        (g.v_heads / g.q_heads) == 3;
+    if(group_three) {
+        ctx.queue().parallel_for(sycl::nd_range<1>(size_t(count)*g.q_heads*D,D),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                const int group=int(item.get_group(0)), t=group/g.q_heads, hk=group%g.q_heads;
+                const int j=int(item.get_local_id(0));
+                const auto* row=input+size_t(t)*g.all_dim;
+                const auto conv=[&](int c) {
+                    const auto* weight=w.conv_weight+c*4;
+                    float value=0;
+                    for(int s=0;s<3;++s) {
+                        const int prior=t-3+s;
+                        const float x=prior>=0?float(input[size_t(prior)*g.all_dim+c]):history[((head+prior+3)%3)*g.qkv_dim+c];
+                        value+=x*float(weight[s]);
+                    }
+                    value+=float(row[c])*float(weight[3]);
+                    return value/(1.f+sycl::native::exp(-value));
+                };
+                const float q=conv(hk*D+j), k=conv(g.q_dim+hk*D+j);
+                const float qs=sycl::reduce_over_group(item.get_group(),q*q,sycl::plus<float>());
+                const float ks=sycl::reduce_over_group(item.get_group(),k*k,sycl::plus<float>());
+                const float q_norm=q/sycl::sqrt(qs+g.eps), k_norm=k/sycl::sqrt(ks+g.eps);
+                #pragma unroll
+                for(int u=0;u<3;++u) {
+                    const int h=hk*3+u;
+                    const float v=conv(2*g.q_dim+h*D+j);
+                    auto* dst=prepared+(size_t(t)*g.v_heads+h)*P;
+                    dst[j]=q_norm; dst[D+j]=k_norm; dst[2*D+j]=v;
+                    if(j==0) {
+                        const float a=float(row[g.qkv_dim+g.z_dim+h])+float(w.dt_bias[h]);
+                        const float sp=a>20.f?a:a< -20.f?sycl::native::exp(a):sycl::log1p(sycl::native::exp(a));
+                        dst[3*D]=1.f/(1.f+sycl::native::exp(-float(row[g.qkv_dim+g.z_dim+g.v_heads+h])));
+                        dst[3*D+1]=sycl::native::exp(-sycl::native::exp(w.a_log[h])*sp);
+                    }
+                }
+            });
+        return;
+    }
     ctx.queue().parallel_for(sycl::nd_range<1>(size_t(count)*g.v_heads*D,D),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int group=int(item.get_group(0)), t=group/g.v_heads, h=group%g.v_heads;
@@ -298,12 +337,16 @@ void finish(Context& ctx,DeltaNetGeometry g,DeltaNetWeights w,const bf16* input,
 }
 } // namespace
 
-void GdnChunkScratch::Reserve(Context& ctx,int tokens,int valueHeads,void* external_raw_ptr) {
-    if(tokens<=capacity && valueHeads==heads && (external_raw_ptr==nullptr || raw.data()==external_raw_ptr)) return;
+void GdnChunkScratch::Reserve(Context& ctx,int tokens,int valueHeads,void* external_raw_ptr,
+    void* external_prepared_ptr) {
+    if(tokens<=capacity && valueHeads==heads && (external_raw_ptr==nullptr || raw.data()==external_raw_ptr) &&
+       (external_prepared_ptr==nullptr || prepared.data()==external_prepared_ptr)) return;
     if(tokens<=0 || valueHeads<=0) throw std::invalid_argument("Invalid GDN chunk capacity");
     ctx.synchronize(); // growth is outside the execution hot path
     using f32=dnnl::memory::data_type;
-    prepared=Tensor::allocate(ctx,{tokens,valueHeads,P},f32::f32);
+    prepared=external_prepared_ptr
+        ? Tensor::view(ctx,external_prepared_ptr,{tokens,valueHeads,P},f32::f32)
+        : Tensor::allocate(ctx,{tokens,valueHeads,P},f32::f32);
     matrix=Tensor::allocate(ctx,{valueHeads,M,T},f32::f32);
     delta=Tensor::allocate(ctx,{valueHeads,T,D},f32::f32);
     base=Tensor::allocate(ctx,{valueHeads,T,D},f32::f32);

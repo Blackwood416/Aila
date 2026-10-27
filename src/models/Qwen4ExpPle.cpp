@@ -823,7 +823,9 @@ void Qwen4ExpPle::consume(
     bf16* out,
     bf16* residual,
     int checkpoint_after,
-    Qwen4ExpPleSnapshot* checkpoint) {
+    Qwen4ExpPleSnapshot* checkpoint,
+    void* external_scratch,
+    size_t external_scratch_bytes) {
     if (!ticket.valid || ticket.num_tokens <= 0) return;
     if (state.conv_head_dev.valid()) {
         throw std::logic_error(
@@ -844,48 +846,76 @@ void Qwen4ExpPle::consume(
     }
 
     const int num_tokens = ticket.num_tokens;
-    ensure_compute_capacity(ctx, num_tokens);
+    const size_t h_bytes = (static_cast<size_t>(num_tokens) * HC_HIDDEN_SIZE * sizeof(bf16) + 255u) & ~size_t(255u);
+    const size_t v_bytes = (static_cast<size_t>(num_tokens) * EMBED_DIM * sizeof(bf16) + 255u) & ~size_t(255u);
+    const size_t need_ext_bytes = 5 * h_bytes + v_bytes;
+    const bool use_ext = (external_scratch != nullptr) && (num_tokens > compute_capacity_) &&
+                         (external_scratch_bytes >= need_ext_bytes);
+    if (!use_ext) {
+        ensure_compute_capacity(ctx, num_tokens);
+    } else {
+        static const bool s_direct_prefill_io =
+            aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
+        scratch_key_.ensure(ctx, s_direct_prefill_io ? 0 : num_tokens, EMBED_DIM, HC_HIDDEN_SIZE, false);
+        scratch_val_.ensure(ctx, s_direct_prefill_io ? 0 : num_tokens, EMBED_DIM, EMBED_DIM, false);
+    }
+    uint8_t* ext_base = static_cast<uint8_t*>(external_scratch);
+    Tensor key_buf = use_ext
+        ? Tensor::view(ctx, ext_base, {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, key_buf_.data(), {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    Tensor value_buf = use_ext
+        ? Tensor::view(ctx, ext_base + h_bytes, {num_tokens, EMBED_DIM}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, value_buf_.data(), {num_tokens, EMBED_DIM}, dnnl::memory::data_type::bf16);
+    Tensor key_normed = use_ext
+        ? Tensor::view(ctx, ext_base + h_bytes + v_bytes, {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, key_normed_.data(), {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    Tensor query_normed = use_ext
+        ? Tensor::view(ctx, ext_base + 2 * h_bytes + v_bytes, {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, query_normed_.data(), {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    Tensor gv_buf = use_ext
+        ? Tensor::view(ctx, ext_base + 3 * h_bytes + v_bytes, {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, gv_buf_.data(), {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
+    Tensor gv_normed = use_ext
+        ? Tensor::view(ctx, ext_base + 4 * h_bytes + v_bytes, {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16)
+        : Tensor::view(ctx, gv_normed_.data(), {num_tokens, HC_HIDDEN_SIZE}, dnnl::memory::data_type::bf16);
     Tensor& dev_embed = dev_embed_slots_[ticket.staging_slot];
 
     // 3. Projections
     if (num_tokens == 1 || rows_decode_) {
-        // The multi-row decode GEMV keeps one subgroup per output row and the
-        // original vec8/FMA order, so rows_decode_ makes a 2..4 token window
-        // bit-identical to sequential single-row projections.
-        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf_, num_tokens);
-        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf_, num_tokens);
+        key_proj_.ForwardDecodeRows(ctx, scratch_key_, dev_embed, key_buf, num_tokens);
+        value_proj_.ForwardDecodeRows(ctx, scratch_val_, dev_embed, value_buf, num_tokens);
     } else {
-        key_proj_.forward(ctx, scratch_key_, dev_embed, key_buf_, num_tokens);
-        value_proj_.forward(ctx, scratch_val_, dev_embed, value_buf_, num_tokens);
+        key_proj_.forward(ctx, scratch_key_, dev_embed, key_buf, num_tokens);
+        value_proj_.forward(ctx, scratch_val_, dev_embed, value_buf, num_tokens);
     }
 
     // 4. Grouped RMSNorm
-    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(key_buf_.data()),
+    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(key_buf.data()),
                           static_cast<const float*>(norm_key_w_.data()), eps_,
-                          static_cast<bf16*>(key_normed_.data()),
+                          static_cast<bf16*>(key_normed.data()),
                           num_tokens, HC_COUNT, EMBED_DIM, true);
 
     ops::grouped_rms_norm(ctx, hidden_states,
                           static_cast<const float*>(norm_query_w_.data()), eps_,
-                          static_cast<bf16*>(query_normed_.data()),
+                          static_cast<bf16*>(query_normed.data()),
                           num_tokens, HC_COUNT, EMBED_DIM, true);
 
     // 5. PLE gate-value computation
-    ops::ple_gate_value(ctx, static_cast<const bf16*>(key_normed_.data()),
-                        static_cast<const bf16*>(query_normed_.data()),
-                        static_cast<const bf16*>(value_buf_.data()),
-                        static_cast<bf16*>(gv_buf_.data()),
+    ops::ple_gate_value(ctx, static_cast<const bf16*>(key_normed.data()),
+                        static_cast<const bf16*>(query_normed.data()),
+                        static_cast<const bf16*>(value_buf.data()),
+                        static_cast<bf16*>(gv_buf.data()),
                         num_tokens, HC_COUNT, EMBED_DIM);
 
     // 6. Norm conv
-    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(gv_buf_.data()),
+    ops::grouped_rms_norm(ctx, static_cast<const bf16*>(gv_buf.data()),
                           static_cast<const float*>(norm_conv_w_.data()), eps_,
-                          static_cast<bf16*>(gv_normed_.data()),
+                          static_cast<bf16*>(gv_normed.data()),
                           num_tokens, HC_COUNT, EMBED_DIM, true);
 
     // 7. Dilated Conv1D + SiLU + Residual Add
     if (checkpoint_after > 0) {
-        ops::ple_dilated_conv_silu_add(ctx, gv_normed_.data_as<bf16>(), gv_buf_.data_as<bf16>(),
+        ops::ple_dilated_conv_silu_add(ctx, gv_normed.data_as<bf16>(), gv_buf.data_as<bf16>(),
                                       state.conv_state.data_as<float>(), state.conv_head, conv1d_w_ptr_, out,
                                       checkpoint_after, HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION, residual);
         capture_snapshot(ctx, state, *checkpoint);
@@ -893,15 +923,15 @@ void Qwen4ExpPle::consume(
         checkpoint->prev_tokens = {checkpoint_after == 1 ? ticket.prev_tokens_in[1] : ids[checkpoint_after - 2],
                                    ids[checkpoint_after - 1]};
         const size_t offset = static_cast<size_t>(checkpoint_after) * HC_HIDDEN_SIZE;
-        ops::ple_dilated_conv_silu_add(ctx, gv_normed_.data_as<bf16>() + offset, gv_buf_.data_as<bf16>() + offset,
+        ops::ple_dilated_conv_silu_add(ctx, gv_normed.data_as<bf16>() + offset, gv_buf.data_as<bf16>() + offset,
                                       state.conv_state.data_as<float>(), state.conv_head, conv1d_w_ptr_,
                                       out ? out + offset : nullptr, num_tokens - checkpoint_after,
                                       HC_HIDDEN_SIZE, CONV_KERNEL_SIZE, CONV_DILATION,
                                       residual ? residual + offset : nullptr);
         return;
     }
-    ops::ple_dilated_conv_silu_add(ctx, static_cast<const bf16*>(gv_normed_.data()),
-                                  static_cast<const bf16*>(gv_buf_.data()),
+    ops::ple_dilated_conv_silu_add(ctx, static_cast<const bf16*>(gv_normed.data()),
+                                  static_cast<const bf16*>(gv_buf.data()),
                                   static_cast<float*>(state.conv_state.data()),
                                   state.conv_head,
                                   conv1d_w_ptr_,

@@ -12,7 +12,8 @@ struct GdnChunkScratch {
     Tensor decay;    // [head]: chunk decay product, FP32
     Tensor raw;      // [token, head, 128]: pre-normalization output, FP32
     int capacity = 0, heads = 0;
-    void Reserve(Context& ctx, int tokens, int valueHeads, void* external_raw_ptr = nullptr);
+    void Reserve(Context& ctx, int tokens, int valueHeads, void* external_raw_ptr = nullptr,
+                 void* external_prepared_ptr = nullptr);
 };
 
 // Returns false before submitting work for unsupported geometry or insufficient

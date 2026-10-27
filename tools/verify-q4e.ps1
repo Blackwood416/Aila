@@ -43,10 +43,11 @@ function Invoke-IncrementalBuild {
         throw "Cannot locate Intel oneAPI compiler lib directory."
     }
 
+    $BuildTargets = @($BuildTargets | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
     $targetArg = if ($BuildTargets.Count -gt 0) { "--target " + ($BuildTargets -join " ") } else { "" }
-    $cmdLine = "call `"$vcvars`" >nul 2>&1 && set `"LIB=$oneApiLib;%LIB%`" && cmake --build `"$BuildDir`" $targetArg"
+    $cmdLine = "call `"$vcvars`" >nul 2>&1 && set `"LIB=$oneApiLib;!LIB!`" && cmake --build `"$BuildDir`" $targetArg"
     Write-Host "[Verify] Building targets: $(if ($BuildTargets.Count -gt 0) { $BuildTargets -join ', ' } else { '<ALL>' })" -ForegroundColor Cyan
-    cmd /c $cmdLine
+    cmd /v:on /c $cmdLine
     if ($LASTEXITCODE -ne 0) {
         throw "Incremental build failed with exit code $LASTEXITCODE"
     }

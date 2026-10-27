@@ -131,7 +131,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             const bf16* a_ptr = linear_all_ptr + linear_qkv_dim_ + linear_z_dim_;
             const bf16* b_ptr = linear_all_ptr + linear_qkv_dim_ + linear_z_dim_ + linear_kv_heads_;
 
-            static const bool s_gdn_history_fused = aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", false);
+            static const bool s_gdn_history_fused = aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", true);
             const bool defer_history =
                 s_gdn_history_fused && allowQ8 && !use_device_conv_head &&
                 !attention_q8 && !interior &&

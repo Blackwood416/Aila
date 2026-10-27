@@ -765,13 +765,15 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
                     const size_t gate_block_base = static_cast<size_t>(row) * blocks_per_row;
                     const size_t up_byte_base = static_cast<size_t>(row + intermediate_size) * packed_bytes_per_row;
                     const size_t up_block_base = static_cast<size_t>(row + intermediate_size) * blocks_per_row;
+                    const uint8_t* gate_packed_row = slot.gate_up_packed + gate_byte_base;
+                    const uint8_t* up_packed_row = slot.gate_up_packed + up_byte_base;
+                    const int token = token_ptrs[static_cast<size_t>(expert_idx)];
+                    const bf16* token_x = x + static_cast<size_t>(token) * in_features;
 
                     int byte_offset = sg_lane * 4;
                     for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
-                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
-                            slot.gate_up_packed + gate_byte_base + byte_offset);
-                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
-                            slot.gate_up_packed + up_byte_base + byte_offset);
+                        const uint32_t g4 = *reinterpret_cast<const uint32_t*>(gate_packed_row + byte_offset);
+                        const uint32_t u4 = *reinterpret_cast<const uint32_t*>(up_packed_row + byte_offset);
                         const size_t gate_scale_index = gate_block_base + (byte_offset / (blocksize / 2));
                         const size_t up_scale_index = up_block_base + (byte_offset / (blocksize / 2));
                         float ga;
@@ -805,8 +807,6 @@ sycl::event launch_moe_decode_gate_up_swiglu_grouped(
                             ua = load_expert_absmax<UseNested, FixedNested256>(
                                 slot.gate_up_absmax, slot.gate_up_nested, up_scale_index);
                         }
-                        const int token = token_ptrs[static_cast<size_t>(expert_idx)];
-                        const bf16* token_x = x + static_cast<size_t>(token) * in_features;
                         const vec8 in_v = *reinterpret_cast<const vec8*>(token_x + byte_offset * 2);
 
                         const uint8_t gb0 = static_cast<uint8_t>(g4);
@@ -1145,6 +1145,7 @@ sycl::event launch_moe_decode_down_to_rank_f32(
                 item.barrier(sycl::access::fence_space::local_space);
 
                 float expert_acc = 0.0f;
+                size_t out_pos = 0;
                 if (global_row < total_rows) {
                     const int expert_idx = static_cast<int>(global_row / out_features);
                     const int row = static_cast<int>(global_row % out_features);
@@ -1152,14 +1153,15 @@ sycl::event launch_moe_decode_down_to_rank_f32(
                     const int token = token_ptrs[static_cast<size_t>(expert_idx)];
                     const int rank = rank_ptrs[static_cast<size_t>(expert_idx)];
                     const bf16* in_expert = h + static_cast<size_t>(expert_idx) * in_features;
+                    out_pos = (static_cast<size_t>(token) * top_k + rank) * out_features + row;
 
                     const size_t byte_base = static_cast<size_t>(row) * packed_bytes_per_row;
                     const size_t block_base = static_cast<size_t>(row) * blocks_per_row;
+                    const uint8_t* down_packed_row = slot.down_packed + byte_base;
 
                     int byte_offset = sg_lane * 4;
                     for (; byte_offset + 3 < packed_bytes_per_row; byte_offset += stride) {
-                        const uint32_t d4 = *reinterpret_cast<const uint32_t*>(
-                            slot.down_packed + byte_base + byte_offset);
+                        const uint32_t d4 = *reinterpret_cast<const uint32_t*>(down_packed_row + byte_offset);
                         const size_t scale_index = block_base + (byte_offset / (blocksize / 2));
                         float da;
                         if (blocksize == 64) {
@@ -1196,11 +1198,6 @@ sycl::event launch_moe_decode_down_to_rank_f32(
 
                 float expert_sum = sycl::reduce_over_group(item.get_sub_group(), expert_acc, sycl::plus<>());
                 if (sg_lane == 0 && global_row < total_rows) {
-                    const int expert_idx = static_cast<int>(global_row / out_features);
-                    const int row = static_cast<int>(global_row % out_features);
-                    const int token = token_ptrs[static_cast<size_t>(expert_idx)];
-                    const int rank = rank_ptrs[static_cast<size_t>(expert_idx)];
-                    const size_t out_pos = (static_cast<size_t>(token) * top_k + rank) * out_features + row;
                     down_acc[out_pos] = expert_sum;
                 }
             });
@@ -5088,8 +5085,9 @@ sycl::event moe_decode_gate_up_swiglu_grouped(
     if (num_active_experts <= 0) return {};
 
     bool is_nested = use_nested;
-    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
-    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    const bool host_descriptors = nested_fixed256 && num_active_experts <= 16;
+    const bool is_device = !host_descriptors &&
+        (sycl::get_pointer_type(slots, ctx.queue().get_context()) == sycl::usm::alloc::device);
     if (!is_nested && slots != nullptr && !is_device) {
         is_nested = (slots[0].gate_up_nested.codes != nullptr);
     }
@@ -5188,8 +5186,9 @@ sycl::event moe_decode_down_to_rank_f32(
     if (num_active_experts <= 0 || out_features <= 0 || in_features <= 0) return {};
 
     bool is_nested = use_nested;
-    const auto alloc_type = sycl::get_pointer_type(slots, ctx.queue().get_context());
-    const bool is_device = (alloc_type == sycl::usm::alloc::device);
+    const bool host_descriptors = nested_fixed256 && num_active_experts <= 16;
+    const bool is_device = !host_descriptors &&
+        (sycl::get_pointer_type(slots, ctx.queue().get_context()) == sycl::usm::alloc::device);
     if (!is_nested && slots != nullptr && !is_device) {
         is_nested = (slots[0].down_nested.codes != nullptr);
     }

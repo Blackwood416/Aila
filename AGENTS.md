@@ -201,7 +201,7 @@ To keep the codebase lean, deterministic, and free of dead experimental baggage,
    - Effective precedence is strictly: `Explicit Environment Variable > Qwen38A770Preset.hpp > Code Default`.
    - Before modifying a code default, check whether `src/utils/Qwen38A770Preset.hpp` pins that variable. Any flag promotion or retirement must update the code default, `Qwen38A770Preset.hpp`, and `docs/Environment_Variables.md` in the same commit.
 6. **Hardware & Numeric Safety Invariants**:
-   - **VRAM Headroom**: Maintain >= 2.5 GB VRAM headroom on 16 GB Arc A770; never pre-allocate full-context scratch buffers at model load (`AILA_Q4E_RUNTIME_MIN_CAP` causes severe WDDM eviction stalls).
+   - **VRAM Headroom**: Maintain 1.0–1.5 GB actual free VRAM headroom at peak 8K prefill on 16 GB Arc A770 (`AILA_Q4E_VRAM_RESERVE_MB=1400`, `AILA_Q4E_MAX_GPU_SLOTS=3360` with multi-phase `buf_.phase_scratch` aliasing); never pre-allocate full-context scratch buffers at model load (`AILA_Q4E_RUNTIME_MIN_CAP` causes severe WDDM eviction stalls).
    - **Two-Level SLM Reductions**: Any two-level reduction staged through SLM must include an explicit `item.barrier(sycl::access::fence_space::local_space)` between the per-subgroup write and the second-level read.
    - **Single-Row vs. Multi-Row Symmetry**: Single-row and batched (`_rows`) entry points for the same operator must dispatch to numerically symmetric kernel variants so verification and interior-checkpoint canaries stay aligned.
 

@@ -276,8 +276,8 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AILA_Q4E_EXPERT_CACHE_MB` | int | `0` (auto) | GPU expert slot pool budget. Auto = device memory minus static weights, session KV/recurrent state for `max_seq_len`, and `AILA_Q4E_VRAM_RESERVE_MB` (floored at 1024 MB). |
-| `AILA_Q4E_VRAM_RESERVE_MB` | int | `2560` | Headroom kept free by the auto cache size for runtime buffers, oneDNN scratchpad, and display. |
-| `AILA_Q4E_MAX_GPU_SLOTS` | int | `2800` | Maximum number of resident expert slots allocated in GPU VRAM. |
+| `AILA_Q4E_VRAM_RESERVE_MB` | int | `1400` | Headroom kept free by the auto cache size for runtime buffers, oneDNN scratchpad, and display (~1.2–1.4 GB free VRAM at peak 8K prefill). |
+| `AILA_Q4E_MAX_GPU_SLOTS` | int | `3360` | Maximum number of resident expert slots allocated in GPU VRAM (70 experts/layer × 48 layers = 3,360 slots ≈ 8.12 GB). |
 | `AILA_Q4E_STAGING_SLOTS` | int | `16` | Number of expert slots per GPU staging bank (2 banks by default). |
 | `AILA_Q4E_HOT_RAM_MB` | int | `32768` (preset) | Host RAM budget for `Qwen4ExpHostArena` large-page complement. |
 | `AILA_Q4E_EXPERT_READER` | string | `readfile` (preset) | Reader backend used during initial model load (`readfile` or `mmap`). |

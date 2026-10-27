@@ -199,7 +199,9 @@ public:
         sycl::ext::oneapi::bfloat16* out,
         sycl::ext::oneapi::bfloat16* residual = nullptr,
         int checkpoint_after = 0,
-        Qwen4ExpPleSnapshot* checkpoint = nullptr);
+        Qwen4ExpPleSnapshot* checkpoint = nullptr,
+        void* external_scratch = nullptr,
+        size_t external_scratch_bytes = 0);
 
     // Builds a fixed-address one-token view. This may allocate/grow workspace
     // and initialize state.conv_head_dev, so call it outside graph recording.

@@ -22,7 +22,7 @@ Value for AILA_Q35_PREFILL_CHUNK. The qwen38-a770 preset sets 512; 2048 keeps a
 2K-token prompt in a single chunk, which avoids paying expert staging twice.
 #>
 param(
-    [int[]]$Tokens = @(1024, 2048, 4096),
+    [object[]]$Tokens = @(1024, 2048, 4096),
     [int]$Chunk = 2048,
     # Must exceed the largest prompt: the CLI rejects a prompt longer than the
     # context window instead of truncating it. max-seq also sizes the KV cache
@@ -49,6 +49,7 @@ $env:SYCL_CACHE_PERSISTENT = '1'
 $env:AILA_Q35_PREFILL_CHUNK = [string]$Chunk
 
 $sentence = 'The quick brown fox jumps over the lazy dog and then writes a long report about inference engines. '
+$Tokens = @($Tokens | ForEach-Object { "$_" -split ',' } | Where-Object { $_ } | ForEach-Object { [int]$_ })
 $rows = @()
 foreach ($target in $Tokens) {
     $reps = [Math]::Max(1, [int][Math]::Round($target / 19.3))

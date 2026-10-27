@@ -511,10 +511,6 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (router_host_weights_) context_->free_host(router_host_weights_);
     router_host_ids_ = nullptr;
     router_host_weights_ = nullptr;
-    if (pred_host_ids_) context_->free_host(pred_host_ids_);
-    if (pred_host_weights_) context_->free_host(pred_host_weights_);
-    pred_host_ids_ = nullptr;
-    pred_host_weights_ = nullptr;
     if (embed_host_ids_) context_->free_host(embed_host_ids_);
     if (embed_host_rows_) context_->free_host(embed_host_rows_);
     embed_host_ids_ = nullptr;
@@ -919,7 +915,7 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
         const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
-            static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 2560))) << 20;
+            static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 1400))) << 20;
         const size_t reserve = max_reserve + total_session_state;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
@@ -961,7 +957,10 @@ bool Qwen4ExpBnb4Backend::load(
     // 4K smoke. Fit the cache after those reservations, including both banks.
     // The hard cap only guards against pathological budgets; raise it when a
     // smaller KV layout (AILA_KV_QUANT_FORMAT=int8) frees device bytes.
-    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", 2800);
+    // 3,456 = 72 slots/layer * 48 layers, so the auto VRAM budget (not the
+    // guard) decides residency; the slot count still clamps to
+    // expert_cache_bytes/slot_bytes minus the staging banks below.
+    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", 3360);
     // Reserve the staging banks by their configured depth (2 buffers).
     const int staging_reserve_slots = 2 * cache_cfg.staging_slots_per_buffer;
     cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-staging_reserve_slots);
@@ -1155,16 +1154,37 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         if(!buf_.moe_compact_invalid.valid())buf_.moe_compact_invalid=Tensor::allocate(ctx,{1},dnnl::memory::data_type::s32);
         buf_.moe_inverse_map = Tensor::allocate(ctx,{cap,cfg_.num_experts_per_tok},dnnl::memory::data_type::s32);
     } else { buf_.moe_window_sum=Tensor{};buf_.moe_inverse_map=Tensor{}; }
+    const auto align256 = [](size_t n) { return (n + 255u) & ~size_t(255u); };
+    const bool alias_prefill_phases = s_phase_scratch && cap > 64;
+    const size_t hc_n_bytes = align256(size_t(cap) * 10240u * sizeof(bf16));
+    const size_t hc_down_bytes = align256(size_t(cap) * 320u * sizeof(bf16));
+    const size_t hc_up_bytes = align256(size_t(cap) * 10240u * sizeof(bf16));
+    const size_t hc_phase_bytes = hc_n_bytes + hc_down_bytes + hc_up_bytes;
+    const size_t moe_down_bytes = align256(size_t(down_rows) * size_t(hidden_size_) * sizeof(float));
+    const size_t moe_router_bytes = align256(size_t(cap) * 512u * sizeof(bf16));
+    const size_t moe_h_bytes = align256(size_t(cap) * size_t(cfg_.num_experts_per_tok) * size_t(cfg_.moe_intermediate_size) * sizeof(bf16));
+    const size_t moe_sh_gu_bytes = align256(size_t(cap) * 1280u * sizeof(bf16));
+    const size_t moe_sh_in_bytes = align256(size_t(cap) * 640u * sizeof(bf16));
+    const size_t moe_sh_out_bytes = align256(size_t(cap) * size_t(hidden_size_) * sizeof(bf16));
+    const size_t moe_phase_bytes = moe_down_bytes +
+        (alias_prefill_phases ? (moe_router_bytes + moe_h_bytes + moe_sh_gu_bytes + moe_sh_in_bytes + moe_sh_out_bytes) : 0u);
     if (s_phase_scratch) {
-        // All five lifetimes are ordered on ctx.queue(): QKV -> split/prepare
-        // -> dense attention, or GDN -> o_proj, then MoE -> accumulation.
-        // scores/incr_scores are exclusive start_pos==0/!=0 branches. PLE,
-        // prediction, staging, persistent state and attn_out never alias here.
+        // Disjoint per-layer lifetimes on the in-order compute queue:
+        //   (0) Layer-1 PLE intermediates (key/val/norm/gv)
+        //   (1) Hyper-Connection mixer intermediates (hc_N, hc_mix_down, hc_mix_up)
+        //   (2) Attention (full_qkv / dense scores, or GDN linear_all + raw + prepared)
+        //   (3) MoE (moe_down_acc + router_scores + moe_h + shared expert intermediates)
+        const size_t gdn_lin_bytes = align256(size_t(attn_cap)*linear_all_dim_*sizeof(bf16));
+        const size_t gdn_raw_bytes = size_t(attn_cap)*size_t(linear_kv_heads_)*128u*sizeof(float);
+        const size_t gdn_prep_bytes = size_t(attn_cap)*size_t(linear_kv_heads_)*386u*sizeof(float);
         const size_t bytes[] = {size_t(attn_cap)*full_fused_qkv_dim_*sizeof(bf16),
-            size_t(attn_cap)*linear_all_dim_*sizeof(bf16),
+            (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
+                ? gdn_lin_bytes + gdn_raw_bytes + gdn_prep_bytes
+                : size_t(attn_cap)*linear_all_dim_*sizeof(bf16),
             size_t(full_q_heads_)*dense_cap*dense_cap*sizeof(float),
             size_t(full_q_heads_)*dense_cap*dense_kv_cap*sizeof(float),
-            s_expert_major ? size_t(down_rows)*hidden_size_*sizeof(float) : 0};
+            s_expert_major ? moe_phase_bytes : 0,
+            alias_prefill_phases ? hc_phase_bytes : 0};
         size_t peak=0,total=0;for(size_t n:bytes){peak=std::max(peak,n);total+=n;}
         buf_.phase_scratch=Tensor::allocate(ctx,{int64_t(peak)},dnnl::memory::data_type::u8);
         AILA_LOG_INFO("[Q4E PhaseScratch] cap=%d bytes=%zu separate_bytes=%zu saved_bytes=%zu",
@@ -1174,11 +1194,16 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         return s_phase_scratch ? Tensor::view(ctx,buf_.phase_scratch.data(),shape,type)
                                : Tensor::allocate(ctx,shape,type);
     };
+    auto phase_at = [&](size_t byte_offset, const std::vector<int64_t>& shape, dnnl::memory::data_type type) {
+        return alias_prefill_phases
+            ? Tensor::view(ctx, buf_.phase_scratch.data_as<uint8_t>() + byte_offset, shape, type)
+            : Tensor::allocate(ctx, shape, type);
+    };
 
     buf_.hidden4 = Tensor::allocate(ctx, {cap, 10240}, dnnl::memory::data_type::bf16);
-    buf_.hc_N = Tensor::allocate(ctx, {cap, 10240}, dnnl::memory::data_type::bf16);
-    buf_.hc_mix_down = Tensor::allocate(ctx, {cap, 320}, dnnl::memory::data_type::bf16);
-    buf_.hc_mix_up = Tensor::allocate(ctx, {cap, 10240}, dnnl::memory::data_type::bf16);
+    buf_.hc_N = phase_at(0, {cap, 10240}, dnnl::memory::data_type::bf16);
+    buf_.hc_mix_down = phase_at(hc_n_bytes, {cap, 320}, dnnl::memory::data_type::bf16);
+    buf_.hc_mix_up = phase_at(hc_n_bytes + hc_down_bytes, {cap, 10240}, dnnl::memory::data_type::bf16);
     buf_.hc_inject_buf = Tensor::allocate(ctx, {cap, 4}, dnnl::memory::data_type::bf16);
     buf_.hc_inject_f32 = Tensor::allocate(ctx, {cap, 4}, dnnl::memory::data_type::f32);
     buf_.x = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
@@ -1256,23 +1281,28 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     }
     if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_) {
         void* ext_raw = nullptr;
+        void* ext_prep = nullptr;
         const size_t lin_bytes = (size_t(attn_cap) * linear_all_dim_ * sizeof(bf16) + 255u) & ~size_t(255u);
         const size_t raw_bytes = size_t(attn_cap) * size_t(linear_kv_heads_) * 128u * sizeof(float);
+        const size_t prep_bytes = size_t(attn_cap) * size_t(linear_kv_heads_) * 386u * sizeof(float);
         if (s_phase_scratch && buf_.phase_scratch.valid() &&
-            lin_bytes + raw_bytes <= buf_.phase_scratch.size_bytes()) {
+            lin_bytes + raw_bytes + prep_bytes <= buf_.phase_scratch.size_bytes()) {
             ext_raw = buf_.phase_scratch.data_as<uint8_t>() + lin_bytes;
+            ext_prep = buf_.phase_scratch.data_as<uint8_t>() + lin_bytes + raw_bytes;
         }
-        gdn_chunk_scratch_.Reserve(ctx, attn_cap, linear_kv_heads_, ext_raw);
+        gdn_chunk_scratch_.Reserve(ctx, attn_cap, linear_kv_heads_, ext_raw, ext_prep);
     }
 
-    // MoE buffers
-    buf_.router_scores = Tensor::allocate(ctx, {cap, 512}, dnnl::memory::data_type::bf16);
-    pred_scores_ = Tensor::allocate(ctx, {cap, cfg_.num_experts}, dnnl::memory::data_type::bf16);
+    // MoE buffers (aliased into the upper tail of phase_scratch after moe_down_acc when cap > 64)
+    const size_t off_router = moe_down_bytes;
+    const size_t off_moe_h = off_router + moe_router_bytes;
+    const size_t off_sh_gu = off_moe_h + moe_h_bytes;
+    const size_t off_sh_in = off_sh_gu + moe_sh_gu_bytes;
+    const size_t off_sh_out = off_sh_in + moe_sh_in_bytes;
+    buf_.router_scores = phase_at(off_router, {cap, 512}, dnnl::memory::data_type::bf16);
     free_pinned_host_buffers();
     router_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
     router_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
-    pred_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(int)));
-    pred_host_weights_ = static_cast<float*>(ctx.alloc_host(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(float)));
     embed_host_ids_ = static_cast<int*>(ctx.alloc_host(static_cast<size_t>(cap) * sizeof(int)));
     if (embed_host_.valid()) {
         embed_host_rows_ = static_cast<uint8_t*>(ctx.alloc_host(static_cast<size_t>(cap) * hidden_size_ * sizeof(bf16)));
@@ -1289,7 +1319,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         batch_slots_dev_ = static_cast<ops::MoeExpertSlotDev*>(
             ctx.alloc_device(static_cast<size_t>(cap) * cfg_.num_experts_per_tok * sizeof(ops::MoeExpertSlotDev)));
     }
-    buf_.moe_h = Tensor::allocate(ctx, {cap, cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
+    buf_.moe_h = phase_at(off_moe_h, {cap, cfg_.num_experts_per_tok, cfg_.moe_intermediate_size}, dnnl::memory::data_type::bf16);
     static const bool s_gpu_nf4_q8 = aila::env::read_flag("AILA_Q4E_GPU_NF4_Q8", false);
     moeFrontFusedGpu_ = ctx.queue().get_device().is_gpu();
     gpuNf4Q8Supported_ = s_gpu_nf4_q8 && hidden_size_ == 2560 && cfg_.moe_intermediate_size == 640 &&
@@ -1304,9 +1334,9 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         buf_.moe_h_q8_scale = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, cfg_.moe_intermediate_size / 64}, dnnl::memory::data_type::f32);
     }
     buf_.shared_gate_buf = Tensor::allocate(ctx, {cap, 1}, dnnl::memory::data_type::bf16);
-    buf_.shared_gate_up_buf = Tensor::allocate(ctx, {cap, 1280}, dnnl::memory::data_type::bf16);
-    buf_.shared_inter_buf = Tensor::allocate(ctx, {cap, 640}, dnnl::memory::data_type::bf16);
-    buf_.shared_out_buf = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
+    buf_.shared_gate_up_buf = phase_at(off_sh_gu, {cap, 1280}, dnnl::memory::data_type::bf16);
+    buf_.shared_inter_buf = phase_at(off_sh_in, {cap, 640}, dnnl::memory::data_type::bf16);
+    buf_.shared_out_buf = phase_at(off_sh_out, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
 
     if (s_expert_major) {
         buf_.moe_down_acc = phase({down_rows, hidden_size_}, dnnl::memory::data_type::f32);
@@ -1624,7 +1654,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // overlap the already submitted shared expert and resident kernels.
             if (d1_stash_valid && d1_stash_layer != layer) d1_stash_valid=false;
             int cpu_count=0;
-            bool direct_stage_for_row=false;
+            bool direct_stage_for_row=direct_arena_stage_;
             // The multi-row gate falls back to the unchanged all-GPU staging
             // path whenever a routed miss has no native RAM owner, mirroring
             // the per-rank ownership the count==1 branch would have required.
@@ -2730,11 +2760,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     const bool is_prefill = !options.decode_verification && (options.prefill_remaining >= 0 || count > 1);
     cold_split_this_forward_ = cold_split_num_ > 0 && direct_arena_stage_ &&
         count == 1 && !is_prefill && copy_q_ != nullptr;
-    static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", false);
+    static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", true);
     const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp && count == 1 && !is_prefill && !interior;
     DecodePendingMlpResidual pending_mlp(ctx, buf_.hidden4.data_as<bf16>(),
         buf_.y.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(), hidden_size_);
-    static const bool s_moe_front_fused = aila::env::read_flag("AILA_Q4E_MOE_FRONT_FUSED", false);
+    static const bool s_moe_front_fused = aila::env::read_flag("AILA_Q4E_MOE_FRONT_FUSED", true);
     static const bool s_front_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
     // D1 layer-boundary experiments (see the file-scope stash above).
     static const bool s_cpu_route_early = aila::env::read_flag("AILA_Q4E_CPU_ROUTE_EARLY", false);
@@ -2829,7 +2859,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
             ple_.consume(ctx, ple_ticket_, session.ple_state_,
                          hidden4_ptr, nullptr, hidden4_ptr, checkpoint_after,
-                         interior ? &interior->ple_snapshot : nullptr);
+                         interior ? &interior->ple_snapshot : nullptr,
+                         buf_.phase_scratch.valid() ? buf_.phase_scratch.data() : nullptr,
+                         buf_.phase_scratch.valid() ? buf_.phase_scratch.size_bytes() : 0);
             ple_.commit(ple_ticket_, session.ple_state_);
         }
 

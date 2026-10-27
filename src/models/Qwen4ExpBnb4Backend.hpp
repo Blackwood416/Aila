@@ -833,10 +833,7 @@ private:
     std::vector<int> prefill_pred_uses_;
     std::vector<int> sort_scratch_;
 
-    // AILA_Q4E_PREDICT_STATS diagnostic: next-layer expert prediction quality.
-    Tensor pred_scores_;
-    int* pred_host_ids_ = nullptr;
-    float* pred_host_weights_ = nullptr;
+    // AILA_Q4E_PREDICT_STATS diagnostic counters (no buffers are owned here).
     uint64_t pred_total_ = 0, pred_overlap_ = 0, pred_miss_total_ = 0, pred_miss_hit_ = 0;
     Bnb4BitLinearScratch linear_scratch_;
     int runtime_seq_capacity_ = 0;
