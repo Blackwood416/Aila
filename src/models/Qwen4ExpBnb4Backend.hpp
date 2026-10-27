@@ -117,6 +117,7 @@ struct Qwen4ExpBuffers {
     Tensor hc_mix_up;     // [max_seq, 10240]
     Tensor hc_inject_buf; // [max_seq, 4]
     Tensor hc_inject_f32; // [max_seq, 4]
+    Tensor hc_inject_prev_f32; // [max_seq, 4] f32
     Tensor x;             // [max_seq, 2560]
     Tensor y;             // [max_seq, 2560]
 
@@ -401,6 +402,7 @@ public:
     void Reset(Session& session);
     int Truncate(Session& session, int newLength);
     void PrepareDecodeVerification(Context& ctx);
+    void WarmupPrefillKernels(Context& ctx);
 
     void init_for_testing(Context& ctx, int num_layers = 4, int max_seq_len = 64) {
         context_ = &ctx;

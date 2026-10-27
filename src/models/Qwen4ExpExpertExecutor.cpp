@@ -113,7 +113,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
     // Distinct cache lines keep the reader and writer polling independent.
     alignas(64) std::atomic<bool> pendingSignal{false};
     alignas(64) std::atomic<bool> doneSignal{false};
-    const int spinUs = std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_HANDOFF_SPIN_US", 0), 0, 5000);
+    const int spinUs = std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_HANDOFF_SPIN_US", 20000), 0, 50000);
     Job job;
     Result result;
     tbb::task_arena arena;
@@ -155,13 +155,16 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         verify_a64(aila::env::read_flag("AILA_Q4E_CPU_A64_VERIFY", false)),
         verify_h((verify_q8 || verify_a64) ? ops::cpu::kMaxExpertBatchTasks * ops::cpu::kIntermediateDim : 0),
         verify_out((verify_q8 || verify_a64) ? ops::cpu::kMaxExpertBatchTasks * ops::cpu::kHiddenDim : 0) {
-        if (verify_a64 && (!aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false) ||
-                          !aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", false)))
+        if (verify_a64 && (!aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", true) ||
+                          !aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", true)))
             throw std::invalid_argument("CPU A64 verification requires the NF4Q8 Activation64 primary backend");
         init_scale_cache();
-        if (aila::env::read_flag("AILA_Q4E_CPU_TILE_POOL", false)) {
+        if (aila::env::read_flag("AILA_Q4E_CPU_TILE_POOL", true)) {
             tilePool = std::make_unique<ops::cpu::CpuTilePool>(threads);
-            AILA_LOG_INFO("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=4 bounded_spin_us=1000", threads);
+            AILA_LOG_INFO("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=4 bounded_spin_us=%d "
+                          "pinned=1 coordinator_core=2 worker_core_begin=3 physical_cores=%d",
+                threads, std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_SPIN_US", 20000), 0, 100000),
+                ops::cpu::PhysicalCoreCount());
         }
         if (spinUs) AILA_LOG_INFO("[Q4E CpuHandoffSpin] spin_us=%d mutex_publication=1 bounded_idle=1", spinUs);
         thread = std::thread([this] { run(); });
@@ -430,11 +433,11 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                     throw std::invalid_argument("CPU batch requires real Q4E geometry");
                 static const bool gpu_order = aila::env::read_flag("AILA_Q4E_CPU_GPU_ORDER", false);
                 static const bool prepared = aila::env::read_flag("AILA_Q4E_CPU_PREPARED_INPUT", false);
-                static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", false);
+                static const bool nf4_q8 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8", true);
                 static const bool nf4_q8_block64 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_BLOCK64", false);
                 static const bool nf4_q8_row4 = aila::env::read_flag("AILA_Q4E_CPU_NF4_Q8_ROW4", false);
-                static const bool nf4_scale_shift = aila::env::read_flag("AILA_Q4E_CPU_SCALE_SHIFT", false);
-                static const bool nf4_q8_activation64 = aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", false);
+                static const bool nf4_scale_shift = aila::env::read_flag("AILA_Q4E_CPU_SCALE_SHIFT", true);
+                static const bool nf4_q8_activation64 = aila::env::read_flag("AILA_Q4E_CPU_Q8_ACTIVATION64", true);
                 if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && verify_q8)
                     throw std::invalid_argument("Activation64 uses different Q8 arithmetic; H8 bitwise verification is incompatible");
                 if (verify_a64 && (!nf4_q8 || !nf4_q8_activation64))
@@ -502,6 +505,9 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         execute_compute(current, completed);
     }
     void run() {
+        if (ops::cpu::TilePoolPinningEnabled()) {
+            ops::cpu::PinCurrentThreadToCore(ops::cpu::PhysicalCoreCount() >= 4 ? 2 : -1);
+        }
         for (;;) {
             Job current;
             if (spinUs) spin_until(pendingSignal);
@@ -543,7 +549,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                     std::copy_n(current.tasks.begin(), current.count, original_tasks.begin());
                 prepare_cached_scales(current, completed);
                 const auto begin = steady_ns();
-                current.activation.wait_and_throw();
+                if (current.activation != sycl::event{}) current.activation.wait_and_throw();
                 completed.activation_ns = steady_ns() - begin;
                 // Host direct-read merge may still own this output arena. Wait
                 // on the worker, after route/input publication, never on the
@@ -644,13 +650,13 @@ void Qwen4ExpExpertExecutor::init(
     hidden_size_ = hidden_size > 0 ? hidden_size : 2560;
     intermediate_size_ = intermediate_size > 0 ? intermediate_size : 640;
 
-    const int env_max_cpu = aila::env::read_int_raw("AILA_Q4E_CPU_MAX_EXPERTS", 2);
+    const int env_max_cpu = aila::env::read_int_raw("AILA_Q4E_CPU_MAX_EXPERTS", 10);
     max_cpu_credits_ = std::clamp(env_max_cpu, 0, ops::cpu::kMaxExpertBatchTasks);
     const int env_max_tokens = aila::env::read_int("AILA_Q4E_CPU_MAX_TOKENS", 4);
     max_cpu_tokens_ = std::max(1, std::min(4, env_max_tokens));
 
     static const bool result_packet=aila::env::read_flag("AILA_Q4E_CPU_RESULT_PACKET",false);
-    static const bool result_host_read=aila::env::read_flag("AILA_Q4E_CPU_RESULT_HOST_READ",false);
+    static const bool result_host_read=aila::env::read_flag("AILA_Q4E_CPU_RESULT_HOST_READ",!result_packet);
     if (result_packet && result_host_read)
         throw std::invalid_argument("CPU_RESULT_HOST_READ and CPU_RESULT_PACKET are mutually exclusive");
     cpu_result_host_read_=result_host_read && top_k_>0 && top_k_<=16 &&
@@ -670,8 +676,10 @@ void Qwen4ExpExpertExecutor::init(
     stats_.reset();
     straggler_penalty_active_ = false;
     cpu_retry_countdown_ = 0;
-    if (aila::env::read_flag("AILA_Q4E_CPU_OVERLAP", false) || aila::env::read_int("AILA_Q4E_COLD_MODE",0)>0) {
-        const int threads = std::clamp(aila::env::read_int("AILA_Q4E_CPU_THREADS", 2), 1, 18);
+    if (aila::env::read_flag("AILA_Q4E_CPU_OVERLAP", true) || aila::env::read_int("AILA_Q4E_COLD_MODE",0)>0) {
+        const int threads = std::clamp(
+            aila::env::read_int("AILA_Q4E_CPU_THREADS", std::clamp(ops::cpu::PhysicalCoreCount() - 2, 1, 16)),
+            1, 18);
         cpu_worker_ = std::make_unique<CpuWorker>(threads);
     }
     initialized_ = true;
@@ -737,8 +745,8 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         job.output_reader=cpu_output_reader_event_;
         job.transfer_reader=transfer_reader;
         job.activation=resident_input_event_!=sycl::event{} ? resident_input_event_ :
-            q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
-                size_t(hidden_size_)*size_t(tokens)*sizeof(bf16));
+            (x_dev ? q4e::submit_host_copy(*ctx_,copy_queue(),x_host_,x_dev,
+                size_t(hidden_size_)*size_t(tokens)*sizeof(bf16)) : sycl::event{});
         for (int c=0;c<cold_count_;++c) {
             const auto source=arena.GetExpertSlotHost(layer,ids[c]);
             if (!source.gate_up_packed || !source.down_packed || ranks[c]<0 || ranks[c]>=top_k_)

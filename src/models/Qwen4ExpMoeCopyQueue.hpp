@@ -22,7 +22,7 @@ namespace q4e {
 
 inline bool moe_copy_via_copyq() {
     static const bool enabled =
-        aila::env::read_flag("AILA_Q4E_MOE_COPY_VIA_COPYQ", false);
+        aila::env::read_flag("AILA_Q4E_MOE_COPY_VIA_COPYQ", true);
     return enabled;
 }
 

@@ -63,6 +63,7 @@ static int run_staging_copy_microbench() {
     _putenv_s("AILA_Q4E_COLD_MODE","1");
     _putenv_s("AILA_Q4E_CPU_THREADS","18");
     _putenv_s("AILA_Q4E_CPU_TILE_POOL","0");
+    _putenv_s("AILA_Q4E_CPU_RESULT_HOST_READ","0");
     constexpr int H=2560,I=640,count=16;
     Context ctx;
     aila::HostArenaConfig hc; hc.num_layers=1; hc.num_experts_per_layer=count;
@@ -131,6 +132,7 @@ int main(int argc,char** argv) {
         if (argc!=1) throw std::invalid_argument("Unknown AdaptiveCacheTests option");
         _putenv_s("AILA_Q4E_STAGE_COPY_PARALLEL","1");
         _putenv_s("AILA_Q4E_CPU_TILE_POOL","0");
+        _putenv_s("AILA_Q4E_CPU_RESULT_HOST_READ","0");
         _putenv_s("AILA_Q4E_COLD_MODE","2");
         _putenv_s("AILA_Q4E_CPU_MAX_EXPERTS","16");
         _putenv_s("AILA_Q4E_CPU_THREADS","18");

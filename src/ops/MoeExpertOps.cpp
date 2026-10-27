@@ -6516,21 +6516,79 @@ sycl::event moe_ordered_accumulate_cpu_host_rows(
     if (tokens != 1 || top_k <= 0 || top_k > 16 || out_features <= 0 ||
         !cpu_host_rows.values || cpu_host_rows.rows <= 0 || cpu_host_rows.rows > 16)
         throw std::invalid_argument("CPU host rows require one token and at most 16 ranks");
+    if (!cpu_host_rows.has_host_weights && !weights)
+        throw std::invalid_argument("CPU host rows need host or device route weights");
     for (int k = 0; k < top_k; ++k)
         if (cpu_host_rows.rank_to_row[k] < -1 || cpu_host_rows.rank_to_row[k] >= cpu_host_rows.rows)
             throw std::invalid_argument("CPU host row mapping is out of range");
+    const MoeCpuHostDownRows host_rows = cpu_host_rows;
+    const bool vec4_aligned = (out_features % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(host_rows.values) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(down_acc) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(y) % 8 == 0) &&
+        (shared_out == nullptr || reinterpret_cast<uintptr_t>(shared_out) % 8 == 0);
+    if (vec4_aligned) {
+        const size_t vecs_per_row = static_cast<size_t>(out_features) / 4;
+        constexpr size_t wg_col = 64;
+        const size_t padded_cols = ((vecs_per_row + wg_col - 1) / wg_col) * wg_col;
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (dep_event && *dep_event != sycl::event{}) cgh.depends_on(*dep_event);
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(1, padded_cols),
+                                  sycl::range<2>(1, wg_col)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t c4 = item.get_global_id(1);
+                    if (c4 >= vecs_per_row) return;
+                    const size_t row0 = c4 * 4;
+                    sycl::vec<float, 4> total_val(0.0f);
+                    for (int k = 0; k < top_k; ++k) {
+                        const float w_exp = host_rows.has_host_weights
+                            ? host_rows.host_weights[k] : weights[k];
+                        const int cpu_row = host_rows.rank_to_row[k];
+                        const float* src = cpu_row >= 0
+                            ? host_rows.values + size_t(cpu_row) * out_features + row0
+                            : down_acc + size_t(k) * out_features + row0;
+                        const sycl::vec<float, 4> v =
+                            *reinterpret_cast<const sycl::vec<float, 4>*>(src);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            total_val[j] += w_exp * v[j];
+                        }
+                    }
+                    sycl::vec<bf16, 4> out4;
+                    if (shared_out && shared_gate) {
+                        const float gate = static_cast<float>(shared_gate[0]);
+                        const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                        const sycl::vec<bf16, 4> sh4 =
+                            *reinterpret_cast<const sycl::vec<bf16, 4>*>(shared_out + row0);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const bf16 routed = bf16(total_val[j]);
+                            out4[j] = bf16(static_cast<float>(routed) +
+                                           gate_act * static_cast<float>(sh4[j]));
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            out4[j] = bf16(total_val[j]);
+                        }
+                    }
+                    *reinterpret_cast<sycl::vec<bf16, 4>*>(y + row0) = out4;
+                });
+        });
+    }
     constexpr size_t wg_size = 256;
     const size_t num_wgs = (static_cast<size_t>(out_features) + wg_size - 1) / wg_size;
-    const MoeCpuHostDownRows host_rows = cpu_host_rows;
     return ctx.queue().submit([&](sycl::handler& cgh) {
         if (dep_event && *dep_event != sycl::event{}) cgh.depends_on(*dep_event);
         cgh.parallel_for(sycl::nd_range<1>(num_wgs * wg_size, wg_size),
-            [=](sycl::nd_item<1> item) {
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
                 const size_t row = item.get_global_id(0);
                 if (row >= static_cast<size_t>(out_features)) return;
                 float total_val = 0.0f;
                 for (int k = 0; k < top_k; ++k) {
-                    const float w_exp = weights[k];
+                    const float w_exp = host_rows.has_host_weights
+                        ? host_rows.host_weights[k] : weights[k];
                     const int cpu_row = host_rows.rank_to_row[k];
                     const float val = cpu_row >= 0 ? host_rows.values[size_t(cpu_row) * out_features + row]
                                                    : down_acc[size_t(k) * out_features + row];

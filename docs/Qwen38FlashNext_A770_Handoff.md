@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on Intel Arc A770 — Architecture & Handoff
 
-> **Status:** Post-Round-6 Architecture Reference.
+> **Status:** Post-Round-7 Architecture Reference.
 > `docs/plans/` intermediate logs and the legacy `Qwen4ExpExpertCache` / `Qwen4ExpLayerStage` / `Qwen4ExpLayerMajor` / `L0HostImport` modules have been retired.
 > Environment variable reference: [`docs/Environment_Variables.md`](Environment_Variables.md).
 
@@ -50,18 +50,20 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 
 ---
 
-## 3. Prefill Architecture & Round 6 Scoreboard
+## 3. Prefill & Decode Architecture & Round 7 Scoreboard
 
-### 3.1 Measured Scoreboard (`tools/prefill-bench.ps1 -Chunk 8192`, `max-seq 12288`)
+### 3.1 Measured Prefill Scoreboard (`tools/prefill-bench.ps1 -Chunk 8192`, `max-seq 12288`)
 
-| Prompt Tokens | Round 4 | Round 5 | **Round 6 Wall** | **ms/token** | **Round 6 Tok/s** |
+| Prompt Tokens | Round 5 | Round 6 | **Round 7 Wall** | **ms/token** | **Round 7 Tok/s** |
 |---:|---:|---:|---:|---:|---:|
-| **2,007** | 11,217 ms (178.9 tok/s) | 10,338.0 ms (194.1 tok/s) | **10,177.8 ms** | 5.071 | **197.2 tok/s** |
-| **4,895** | 15,318 ms (319.6 tok/s) | 11,894.0 ms (411.6 tok/s) | **11,701.2 ms** | 2.390 | **418.3 tok/s** |
-| **7,764** | 20,467 ms (379.3 tok/s) | 15,584.3 ms (498.2 tok/s) | **15,071.3 ms** | 1.941 | **515.1 tok/s** |
+| **2,007** | 10,338.0 ms (194.1 tok/s) | 10,177.8 ms (197.2 tok/s) | **8,904.9 ms** | 4.437 | **225.4 tok/s** |
+| **4,895** | 11,894.0 ms (411.6 tok/s) | 11,701.2 ms (418.3 tok/s) | **11,456.6 ms** | 2.340 | **427.3 tok/s** |
+| **7,764** | 15,584.3 ms (498.2 tok/s) | 15,071.3 ms (515.1 tok/s) | **14,878.8 ms** | 1.916 | **521.8 tok/s** |
 
-- **Linear fit**: `8,472 ms` fixed cost + **`0.85 ms/token` marginal cost (`1,176 tok/s` marginal throughput)**.
-- **Decode throughput (story 30p+48g / 20g)**: E2E 48-token generation improved from `11,432 ms` to **`8,752 ms`** (-23.4%); pure single-stream decode latency improved from `~207.5 ms/tok` (`4.82 tok/s`) to **`~155.3 ms/tok` (`6.44 tok/s`, +33.6%)** with `fill_ms` reduced from `~90 ms/tok` to `0.02 ms/tok` via direct-arena DMA staging, fused MoE front (`bf16_moe_front_fused`), deferred MLP residual (`AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL=1`), and fused GDN conv history commit (`AILA_Q4E_GDN_HISTORY_FUSED=1`).
+- **Linear fit**: `6,822 ms` fixed cost + **`1.04 ms/token` marginal cost (`964 tok/s` marginal throughput; `0.81 ms/token` / `1,230 tok/s` across 2K–8K with fixed `MIN_M=192`)**.
+- **Decode throughput (story 30p+20g, no MTP)**:
+  - **Steady-state decode latency**: **`43.02 ~ 48.86 ms/token` (`20.5 ~ 23.24 tok/s`)**, up **4.5×** from the Round 5 baseline (`~207.5 ms/tok` / `4.82 tok/s`) and **3.4×** from the GPU-only DMA baseline (`~155.3 ms/tok` / `6.44 tok/s`).
+  - **Story 30p + 20g E2E wall time**: improved from `5,563.1 ms` (Round 5) -> `4,531.6 ms` (Round 6) -> **`2,524.5 ms` (Round 7, -54.6%)**.
 
 ### 3.2 Key Prefill Optimizations
 1. **Dense NF4 Projections via Vectorized Dequant + oneDNN (`AILA_BNB4_ONEDNN_MIN_M = 128`)**: Routes all `seq_len >= 128` dense NF4 projections (including the 97 `N = 2560` calls: 36 `linear_o_proj`, 12 QSA `o_proj`, 48 `shared_down_proj`, 1 PLE `value_proj`) to word-vectorized `dequantize_weight` + oneDNN `ab` MatMul (16.0× faster than the custom wide joint-matrix kernel on `N = 2560`, saving ~2.95 s at 8K).
@@ -74,6 +76,8 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 5. **Fused HC Sigmoid & Fused Shared Expert Accumulation**: `AILA_Q4E_HC_FUSED_SIGMOID = 1` folds sigmoid into `ops::hc_mix_reduce` (eliminating 96 launches and ~30.5 GB DRAM traffic per prefill); `AILA_Q4E_MOE_SHARED_FUSED = 1` folds the shared expert addition into vectorized `ops::moe_ordered_accumulate_down_rows`.
 6. **Long Interior Checkpointing (`AILA_Q4E_LONG_INLINE_CHECKPOINT = 1`)**: Captures the reusable prefix checkpoint inline at `checkpoint_after` inside a single 7,764-token forward and skips the redundant end-of-slice snapshot (`AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT = 1`), eliminating the `7760 + 4` tail split (-1.37 s).
 7. **3.14 GB Multi-Phase Scratch VRAM Reclamation & 3× GQA-Grouped GDN `prepare_inputs`**: `buf_.phase_scratch` (1,022 MB at 8K) aliases four mutually exclusive lifetimes on the in-order queue: Layer-1 PLE intermediates (835 MB), Hyper-Connection intermediates (`hc_N`, `hc_mix_down`, `hc_mix_up` = 323 MB), GDN `linear_all + raw + prepared` (1,022 MB), and MoE `moe_down_acc + router_scores + moe_h + shared_*` (952 MB), freeing >1.6 GB of VRAM to expand resident GPU experts from 2,800 to 3,360 slots while keeping ~1.3–1.4 GB free VRAM headroom. GDN `prepare_inputs` groups 3 V heads per Q/K head (3× fewer work-groups and barrier reductions).
+8. **Adaptive Expert-XMX Band Sizing (`GATE_ROWS = 1024`, `MIN_M = 64` for `< 4K` and `192` for `>= 4K`), Process-Wide oneDNN Primitive Sharing & Prefill Warmup**: Lowering the expert-XMX gate to 1,024 rows with a 64-row minimum band below 4,096 tokens eliminates 3× padding waste at 2K tokens (`10,191 ms -> 8,904.9 ms`, **+16.1%**), while process-wide `dnnl::matmul` primitive caches in `Bnb4BitLinear` and `Linear` plus `WarmupPrefillKernels` remove ~570 redundant primitive creations per prefill (`7,764 tokens -> 14,878.8 ms / 521.8 tok/s`).
+9. **Disjoint Physical-Core Pinned CPU/GPU Decode Pipeline & Fused `bf16_moe_front_fused` Host Stage-In**: Reserves Core 0 for the GPU host submission thread, Core 1 for the PLE worker, Core 2 for `CpuWorker`, and Cores 3..17 for 15 `CpuTilePool` workers with a 20 ms lock-free `sleepers_`-gated spin window. Fuses the 5 KB `x_host_` stage-in into the idle work-group of `bf16_moe_front_fused` and carries route weights by value into the `vec4`-vectorized `moe_ordered_accumulate_cpu_host_rows` merge kernel, eliminating all per-layer Level Zero waits on `CpuWorker` and all 48 per-layer 40 B weight DMA copies.
 
 ---
 

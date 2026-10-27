@@ -48,6 +48,7 @@ bool run_hc_norm_down_fused(
     if (slm_bytes > kMaxSlmBytes) return false;
 
     const bool do_update = (y != nullptr && inj != nullptr);
+    if (do_update && inj == inj_out) return false;
     if (reinterpret_cast<uintptr_t>(H) % alignof(vec8) != 0) return false;
     if (do_update) {
         if (reinterpret_cast<uintptr_t>(y) % alignof(vec8) != 0) return false;
@@ -197,7 +198,7 @@ bool run_hc_norm_down_fused(
     return true;
 }
 
-void run_hc_up_mix_with_hidden_update(
+sycl::event run_hc_up_mix_with_hidden_update(
     Context& ctx,
     const bf16* act,
     const bf16* w_up,
@@ -222,7 +223,7 @@ void run_hc_up_mix_with_hidden_update(
         (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
-    ctx.queue().submit([&](sycl::handler& cgh) {
+    return ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * kWorkGroup), sycl::range<1>(kWorkGroup)),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSubGroup)]] {

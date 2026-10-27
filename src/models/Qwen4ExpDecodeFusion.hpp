@@ -78,7 +78,7 @@ bool run_hc_norm_down_fused(
 // Each element of H is read and written by exactly one sub-group, so the
 // relocation is race-free as long as nothing else writes H between the fused
 // kernel above and this one.
-void run_hc_up_mix_with_hidden_update(
+sycl::event run_hc_up_mix_with_hidden_update(
     Context& ctx,
     const bf16* act,         // [lowrank]
     const bf16* w_up,        // [groups * group_dim, lowrank]

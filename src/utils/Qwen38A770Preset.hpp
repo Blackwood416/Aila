@@ -46,7 +46,13 @@ inline void ApplyQwen38A770Preset() {
         // chunked GDN path was never the shipped configuration.
         {"AILA_Q4E_GDN_CHUNK_MODE", "1"},
         {"AILA_Q4E_SMALL_ROWS_DECODE", "0"},
-        {"AILA_Q4E_SMALL_ROWS_HC", "0"}
+        {"AILA_Q4E_SMALL_ROWS_HC", "0"},
+        {"AILA_Q4E_CPU_OVERLAP", "1"},
+        {"AILA_Q4E_MOE_COPY_VIA_COPYQ", "1"},
+        {"AILA_Q4E_STAGEIN_HOIST", "1"},
+        {"AILA_Q4E_CPU_ROUTE_EARLY", "1"},
+        {"AILA_Q4E_JOIN_RELEASE", "1"},
+        {"AILA_Q4E_CPU_RESULT_HOST_READ", "1"}
     };
     auto set = [](const char* name, const char* value) {
 #ifdef _WIN32
@@ -62,7 +68,6 @@ inline void ApplyQwen38A770Preset() {
         std::fprintf(stderr, "[PerformancePreset] %s=%s source=%s\n", setting.name,
             inherited.empty() ? setting.value : inherited.c_str(), inherited.empty() ? "preset" : "environment");
     }
-    set("AILA_Q4E_CPU_EXPERT_DISPATCH", "0");
     set("AILA_Q4E_ACTIVE_PRESET", "qwen38-a770");
 }
 } // namespace aila

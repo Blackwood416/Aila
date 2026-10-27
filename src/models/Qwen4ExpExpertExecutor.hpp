@@ -112,6 +112,11 @@ public:
                                      const sycl::event* order_dep = nullptr);
     void StageResidentInput(const bf16* x_dev, int rows = 1,
                             const sycl::event* producer = nullptr);
+    bf16* x_host_ptr() const { return x_host_; }
+    void MarkComputeQueueSyncedAfterRoute() noexcept {
+        resident_input_event_ = sycl::event{};
+        cpu_output_reader_event_ = sycl::event{};
+    }
     sycl::event JoinResidentCold(float* rank_output, const sycl::event* order_dep = nullptr);
     const void* ResidentCpuResultPacket() const { return cpu_result_packet_active_ ? cpu_result_packet_dev_ : nullptr; }
     const ops::MoeCpuHostDownRows* ResidentCpuHostRows() const { return cpu_host_result_active_ ? &cpu_host_rows_ : nullptr; }

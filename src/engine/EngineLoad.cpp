@@ -601,16 +601,25 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
             // trigger the prefill path with a 2×2 score buffer (~tens of bytes),
             // exercising the same allocation path as a real prefill at minimal cost.
             int warmup_token_id = (config_.bos_token_id >= 0) ? config_.bos_token_id : 0;
-            int warmup_arr[2] = {warmup_token_id, warmup_token_id};
-            int* warmup_token_ids = static_cast<int*>(ctx_->alloc_device(2 * sizeof(int)));
-            ctx_->memcpy_h2d_async(warmup_token_ids, warmup_arr, 2 * sizeof(int));
+            const int warmup_prefill_len = q4e_warmup_backend ? 16 : 2;
+            int warmup_arr[16] = {};
+            for (int i = 0; i < warmup_prefill_len; ++i) warmup_arr[i] = warmup_token_id;
+            int* warmup_token_ids = static_cast<int*>(
+                ctx_->alloc_device(static_cast<size_t>(warmup_prefill_len) * sizeof(int)));
+            ctx_->memcpy_h2d_async(warmup_token_ids, warmup_arr,
+                                   static_cast<size_t>(warmup_prefill_len) * sizeof(int));
 
             int* warmup_argmax = nullptr;
             try {
-                Tensor& warmup_logits = backend_->forward(*ctx_, warmup_token_ids, 2);
+                Tensor& warmup_logits =
+                    backend_->forward(*ctx_, warmup_token_ids, warmup_prefill_len);
                 warmup_argmax = static_cast<int*>(ctx_->alloc_device(sizeof(int)));
                 ops::argmax(*ctx_, warmup_logits, config_.vocab_size, warmup_argmax);
                 ctx_->synchronize();
+
+                if (q4e_warmup_backend) {
+                    q4e_warmup_backend->WarmupPrefillKernels(*ctx_);
+                }
 
                 // H0: exercise count=1 decode step while session has cached tokens,
                 // compiling decode GEMV, decode attention / JM, decode MoE, and LM head.
@@ -625,7 +634,7 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                 warmup_token_ids = nullptr;
                 backend_->reset();
 
-                AILA_LOG_INFO("[Warmup Manifest] reached: 2-token prefill (gemm, score buf), 1-token decode (gemv, decode attn, moe), state reset");
+                AILA_LOG_INFO("[Warmup Manifest] reached: %d-token prefill (gemm, score buf), prefill kernel warmup, 1-token decode (gemv, decode attn, moe), state reset", warmup_prefill_len);
             } catch (const std::exception& e) {
                 AILA_LOG_ERROR("[Warmup] Lightweight warmup failed: %s", e.what());
                 try { ctx_->queue().wait_and_throw(); } catch (...) {}

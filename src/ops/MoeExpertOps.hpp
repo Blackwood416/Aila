@@ -626,12 +626,15 @@ sycl::event moe_expert_major_prefill_down_8token(
     bool nested_fixed256 = false);
 
 // Single-token CPU output in this queue's USM host context. The caller keeps
-// values immutable until the returned merge event completes. The rank map is
-// copied into the kernel arguments, so it needs no device allocation or fence.
+// values immutable until the returned merge event completes. The rank map and
+// optional route weights are copied into the kernel arguments, so neither
+// needs a device allocation or a copy-queue fence.
 struct MoeCpuHostDownRows {
     const float* values = nullptr;
     int rows = 0;
     std::array<int, 16> rank_to_row{};
+    std::array<float, 16> host_weights{};
+    bool has_host_weights = false;
 };
 
 sycl::event moe_ordered_accumulate_down_rows(

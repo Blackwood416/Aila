@@ -1,5 +1,7 @@
 #pragma once
 
+#include "utils/EnvUtils.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -11,20 +13,112 @@
 #include <vector>
 #include <immintrin.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace ops::cpu {
+
+inline const std::vector<int>& PhysicalCoreIds() {
+    static const std::vector<int> cores = [] {
+        std::vector<int> ids;
+#ifdef _WIN32
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        if (length != 0) {
+            std::vector<char> buffer(length);
+            if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()), &length)) {
+                for (DWORD offset = 0; offset < length;) {
+                    const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                        buffer.data() + offset);
+                    if (entry->Size == 0) break;
+                    if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount > 0) {
+                        const GROUP_AFFINITY& group = entry->Processor.GroupMask[0];
+                        for (int bit = 0; bit < 64; ++bit)
+                            if (group.Mask & (KAFFINITY(1) << bit)) {
+                                ids.push_back(int(group.Group) * 64 + bit);
+                                break;
+                            }
+                    }
+                    offset += entry->Size;
+                }
+            }
+        }
+        if (ids.empty())
+            for (WORD group = 0; group < GetActiveProcessorGroupCount(); ++group) {
+                const DWORD count = GetActiveProcessorCount(group);
+                for (DWORD index = 0; index < count && index < 64; ++index)
+                    ids.push_back(int(group) * 64 + int(index));
+            }
+#else
+        for (unsigned index = 0; index < std::thread::hardware_concurrency(); ++index)
+            ids.push_back(int(index));
+#endif
+        return ids;
+    }();
+    return cores;
+}
+
+inline int PhysicalCoreCount() { return int(PhysicalCoreIds().size()); }
+
+inline void PinCurrentThreadToCore(int core_index) {
+    if (core_index < 0) return;
+#if defined(_WIN32)
+    const auto& ids = PhysicalCoreIds();
+    const int logical_cpu = (core_index < int(ids.size())) ? ids[size_t(core_index)] : core_index;
+    GROUP_AFFINITY target{};
+    target.Group = WORD(unsigned(logical_cpu) / 64u);
+    target.Mask = KAFFINITY(1) << (unsigned(logical_cpu) & 63u);
+    SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr);
+#else
+    (void)core_index;
+#endif
+}
+
+inline int TilePoolWorkerCore(int worker_index, int first_core) {
+    if (worker_index < 0) return -1;
+    const int total = PhysicalCoreCount();
+    if (total < 6) return -1;
+    const int begin = std::clamp(first_core, 2, total - 1);
+    return begin + (worker_index % (total - begin));
+}
+
+inline bool TilePoolPinningEnabled() {
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_CPU_POOL_PIN", true);
+    return enabled;
+}
+
+inline int TilePoolSpinMicroseconds() {
+    static const int spin_us = std::clamp(
+        aila::env::read_int_raw("AILA_Q4E_CPU_POOL_SPIN_US", 20000), 0, 100000);
+    return spin_us;
+}
 
 // Session-owned synchronous tile executor. All workers are created before
 // inference; the caller also claims work. A published callback and its stack
 // scratch remain borrowed until every worker acknowledges the generation.
 class CpuTilePool {
 public:
-    explicit CpuTilePool(int threads) {
+    explicit CpuTilePool(int threads, int first_core = 3) {
         if (threads < 1 || threads > 18) throw std::invalid_argument(
             "CPU tile pool requires 1..18 threads");
+        const bool pin = TilePoolPinningEnabled();
         try {
             workers_.reserve(threads - 1);
-            for (int i = 1; i < threads; ++i)
-                workers_.emplace_back([this] { Worker(); });
+            for (int i = 1; i < threads; ++i) {
+                const int core = pin ? TilePoolWorkerCore(i - 1, first_core) : -1;
+                workers_.emplace_back([this, core] {
+                    PinCurrentThreadToCore(core);
+                    Worker();
+                });
+            }
         } catch (...) { Stop(); throw; }
     }
     ~CpuTilePool() { Stop(); }
@@ -46,19 +140,22 @@ public:
         next_.store(0, std::memory_order_relaxed);
         remaining_.store(static_cast<int>(workers_.size()) + 1,
             std::memory_order_relaxed);
-        {
-            // Pair with the wait mutex to prevent a missed wake-up between
-            // predicate inspection and parking. Release publishes job fields.
+        generation_.fetch_add(1, std::memory_order_seq_cst);
+        if (sleepers_.load(std::memory_order_seq_cst) != 0) {
             std::lock_guard<std::mutex> lock(waitMutex_);
-            generation_.fetch_add(1, std::memory_order_release);
+            workCv_.notify_all();
         }
-        workCv_.notify_all();
         Consume();
         Complete();
+        const int spin_us = TilePoolSpinMicroseconds();
         auto deadline = std::chrono::steady_clock::now() +
-            std::chrono::microseconds(1000);
-        while (remaining_.load(std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < deadline) _mm_pause();
+            std::chrono::microseconds(std::max(1000, spin_us));
+        unsigned wait_iter = 0;
+        while (remaining_.load(std::memory_order_acquire)) {
+            _mm_pause();
+            if ((++wait_iter & 63u) == 0 &&
+                std::chrono::steady_clock::now() >= deadline) break;
+        }
         if (remaining_.load(std::memory_order_acquire)) {
             std::unique_lock<std::mutex> lock(waitMutex_);
             doneCv_.wait(lock, [&] {
@@ -91,20 +188,30 @@ private:
         }
     }
     void Worker() noexcept {
+        const int spin_us = TilePoolSpinMicroseconds();
         uint64_t seen = 0;
         while (true) {
-            auto deadline = std::chrono::steady_clock::now() +
-                std::chrono::microseconds(1000);
-            uint64_t generation;
-            while ((generation = generation_.load(std::memory_order_acquire)) == seen &&
-                   !stopping_.load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < deadline) _mm_pause();
-            if (generation == seen) {
+            uint64_t generation = generation_.load(std::memory_order_acquire);
+            if (generation == seen && spin_us > 0 &&
+                !stopping_.load(std::memory_order_acquire)) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(spin_us);
+                unsigned iteration = 0;
+                while ((generation = generation_.load(std::memory_order_acquire)) == seen &&
+                       !stopping_.load(std::memory_order_acquire)) {
+                    _mm_pause();
+                    if ((++iteration & 63u) == 0 &&
+                        std::chrono::steady_clock::now() >= deadline) break;
+                }
+            }
+            if (generation == seen && !stopping_.load(std::memory_order_acquire)) {
                 std::unique_lock<std::mutex> lock(waitMutex_);
+                sleepers_.fetch_add(1, std::memory_order_seq_cst);
                 workCv_.wait(lock, [&] {
                     return stopping_.load(std::memory_order_acquire) ||
-                        generation_.load(std::memory_order_acquire) != seen;
+                        generation_.load(std::memory_order_seq_cst) != seen;
                 });
+                sleepers_.fetch_sub(1, std::memory_order_relaxed);
                 generation = generation_.load(std::memory_order_acquire);
             }
             if (stopping_.load(std::memory_order_acquire)) return;
@@ -116,9 +223,10 @@ private:
     void Stop() noexcept {
         {
             std::lock_guard<std::mutex> lock(waitMutex_);
-            stopping_.store(true, std::memory_order_release);
+            stopping_.store(true, std::memory_order_seq_cst);
+            generation_.fetch_add(1, std::memory_order_seq_cst);
+            workCv_.notify_all();
         }
-        workCv_.notify_all();
         for (auto& worker : workers_) if (worker.joinable()) worker.join();
     }
     std::vector<std::thread> workers_;
@@ -127,6 +235,7 @@ private:
     alignas(64) std::atomic<uint64_t> generation_{0};
     alignas(64) std::atomic<int> next_{0};
     alignas(64) std::atomic<int> remaining_{0};
+    alignas(64) std::atomic<int> sleepers_{0};
     std::atomic<bool> stopping_{false}, active_{false}, failed_{false};
     int tileCount_ = 0;
     const void* callbackState_ = nullptr;

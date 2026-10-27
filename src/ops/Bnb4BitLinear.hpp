@@ -35,7 +35,8 @@ void bf16_moe_front_fused(
     const sycl::ext::oneapi::bfloat16* input,
     sycl::ext::oneapi::bfloat16* router_scores,
     sycl::ext::oneapi::bfloat16* shared_gate,
-    int8_t* optional_xq, float* optional_xs, int hidden, int experts);
+    int8_t* optional_xq, float* optional_xs, int hidden, int experts,
+    sycl::ext::oneapi::bfloat16* optional_x_host = nullptr);
 }
 
 struct LoraAttachment {

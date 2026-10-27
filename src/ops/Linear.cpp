@@ -2,6 +2,10 @@
 #include "../utils/EnvUtils.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -22,6 +26,66 @@ dnnl::memory::desc linear_weight_md(bool preprocessed, int in_features,
 uint64_t fused_linear_key(int seq_len, dnnl::memory::data_type bias_dtype) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(seq_len)) << 32) |
            static_cast<uint32_t>(static_cast<int>(bias_dtype));
+}
+
+struct SharedLinearPrim {
+    dnnl::engine engine;
+    dnnl::matmul prim;
+    dnnl::memory::desc src_md;
+    dnnl::memory::desc weight_md;
+    dnnl::memory::desc dst_md;
+    dnnl::memory::desc scratchpad_md;
+};
+
+struct SharedLinearKey {
+    uintptr_t engine = 0;
+    int seq_len = 0;
+    int in_features = 0;
+    int out_features = 0;
+    int variant = 0;
+    bool operator<(const SharedLinearKey& other) const {
+        return std::tie(engine, seq_len, in_features, out_features, variant) <
+               std::tie(other.engine, other.seq_len, other.in_features,
+                        other.out_features, other.variant);
+    }
+};
+
+std::mutex& shared_linear_prim_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<SharedLinearKey, SharedLinearPrim>& shared_linear_prims() {
+    static auto* prims = new std::map<SharedLinearKey, SharedLinearPrim>();
+    return *prims;
+}
+
+constexpr size_t kMaxSharedLinearPrims = 256;
+
+SharedLinearKey make_shared_linear_key(Context& ctx, int seq_len, int in_features,
+                                       int out_features, int variant) {
+    SharedLinearKey key;
+    key.engine = reinterpret_cast<uintptr_t>(ctx.engine().get(true));
+    key.seq_len = seq_len;
+    key.in_features = in_features;
+    key.out_features = out_features;
+    key.variant = variant;
+    return key;
+}
+
+bool lookup_shared_linear_prim(const SharedLinearKey& key, SharedLinearPrim& out) {
+    std::lock_guard<std::mutex> lock(shared_linear_prim_mutex());
+    const auto& prims = shared_linear_prims();
+    const auto it = prims.find(key);
+    if (it == prims.end()) return false;
+    out = it->second;
+    return true;
+}
+
+void store_shared_linear_prim(const SharedLinearKey& key, const SharedLinearPrim& prim) {
+    std::lock_guard<std::mutex> lock(shared_linear_prim_mutex());
+    auto& prims = shared_linear_prims();
+    if (prims.size() < kMaxSharedLinearPrims) prims.emplace(key, prim);
 }
 
 } // namespace
@@ -79,6 +143,20 @@ void Linear::init(Context& ctx, Tensor& weight, int in_features,
 void Linear::ensure_primitive(Context& ctx, int seq_len) {
     if (seq_len == 1 && decode_inited_) return;
     if (prim_cache_.count(seq_len)) return;
+    const SharedLinearKey shared_key = make_shared_linear_key(
+        ctx, seq_len, in_features_, out_features_, preprocessed_ ? 1 : 0);
+    SharedLinearPrim shared_prim{};
+    if (lookup_shared_linear_prim(shared_key, shared_prim)) {
+        ctx.make_primitive_cache_room(prim_cache_);
+        CachedPrimitive cp;
+        cp.prim = shared_prim.prim;
+        cp.src_md = shared_prim.src_md;
+        cp.weight_md = shared_prim.weight_md;
+        cp.dst_md = shared_prim.dst_md;
+        cp.scratchpad_md = shared_prim.scratchpad_md;
+        prim_cache_.emplace(seq_len, std::move(cp));
+        return;
+    }
     ctx.make_primitive_cache_room(prim_cache_);
 
     auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
@@ -100,6 +178,9 @@ void Linear::ensure_primitive(Context& ctx, int seq_len) {
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
     cp.scratchpad_md = pd.scratchpad_desc();
+    store_shared_linear_prim(shared_key,
+        SharedLinearPrim{ctx.engine(), cp.prim, cp.src_md, cp.weight_md,
+                         cp.dst_md, cp.scratchpad_md});
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 

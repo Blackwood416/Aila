@@ -76,6 +76,7 @@ static ops::cpu::CpuExpertTask original_task(const Weight& gu, const Weight& dn,
 int main() {
     try {
         _putenv_s("AILA_Q4E_ARENA_VERIFY_ROWS", "1");
+        _putenv_s("AILA_Q4E_CPU_RESULT_HOST_READ", "0");
         _putenv_s("AILA_Q4E_COLD_MODE", "2");
         _putenv_s("AILA_Q4E_CPU_MAX_EXPERTS", "16");
         _putenv_s("AILA_Q4E_CPU_THREADS", "18");

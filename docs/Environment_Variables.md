@@ -293,7 +293,12 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_BNB4_ONEDNN_MIN_M` | int | `128` | Minimum sequence length `M` at which dense NF4 projections (`N = 2560` etc.) route to vectorized `dequantize_weight` + oneDNN `ab` MatMul. |
 | `AILA_Q4E_DIRECT_PREFILL_IO` | bool | `true` (preset) | Read/write prefill projection inputs and outputs directly without intermediate scratch copies. |
 | `AILA_Q4E_PHASE_SCRATCH` | bool | `true` (preset) | Share one phase-multiplexed device buffer across non-overlapping attention, GDN (`raw`), and MoE (`moe_down_acc`) prefill tensors. |
-| `AILA_Q4E_PREFILL_EXPERT_XMX` | bool | `true` | Use batched oneDNN XMX GEMM for prefill MoE chunks (`count >= AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS`, default `4096`). |
+| `AILA_Q4E_PREFILL_EXPERT_XMX` | bool | `true` | Use batched oneDNN XMX GEMM for prefill MoE chunks (`count >= AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS`, default `1024`; adaptive band `MIN_M = 64` for `count < 4096` and `192` for `count >= 4096`). |
+| `AILA_Q4E_CPU_OVERLAP` | bool | `true` | Enable CPU/GPU heterogeneous decode MoE execution: GPU computes resident hot experts while the physical-core-pinned CPU pool computes cold experts from `Qwen4ExpHostArena`. |
+| `AILA_Q4E_CPU_POOL_PIN` | bool | `true` | Pin host decode thread to Core 0, PLE worker to Core 1, `CpuWorker` to Core 2, and `CpuTilePool` workers to Cores 3..N-1. |
+| `AILA_Q4E_CPU_POOL_SPIN_US` | int | `20000` | Spin duration in microseconds before `CpuTilePool` workers sleep on `workCv_`. |
+| `AILA_Q4E_CPU_RESULT_HOST_READ` | bool | `true` | Read CPU cold-expert down outputs directly from pinned host USM inside `moe_ordered_accumulate_cpu_host_rows` with by-value route weights. |
+| `AILA_Q4E_MOE_COPY_VIA_COPYQ` | bool | `true` | Route CPU-complement host copies through the dedicated in-order copy queue. |
 | `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` | int | `192` (preset) | Minimum padded band height `M` for prefill expert XMX batched GEMMs. |
 | `AILA_Q4E_XMX_BUCKET_ROUTE` | bool | `true` | Bucket `(token, rank)` by expert once per layer in `O(count * top_k)` instead of rescanning routes per chunk. |
 | `AILA_Q4E_XMX_SINGLE_PLAN_COPY` | bool | `true` | Pack each XMX chunk's `bases + tokens + ranks + slots` into a disjoint slice of pinned host USM and upload in a single `memcpy`. |

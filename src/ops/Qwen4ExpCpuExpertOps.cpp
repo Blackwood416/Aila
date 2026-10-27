@@ -493,7 +493,7 @@ inline float a64_nested_scale_register(const MoeNestedScaleHost& nested, size_t 
 
 inline A64ScaleMode a64_scale_mode(const float* absmax,
     const MoeNestedScaleHost& nested, bool nf4_scale_shift) {
-    static const bool registerScale = aila::env::read_flag("AILA_Q4E_CPU_SCALE_REGISTER", false);
+    static const bool registerScale = aila::env::read_flag("AILA_Q4E_CPU_SCALE_REGISTER", true);
     static const bool byteShuffle = aila::env::read_flag("AILA_Q4E_CPU_BYTE_SHUFFLE", false);
     if (nested.codes == nullptr && absmax != nullptr) return A64ScaleMode::FlatF32;
     if (nf4_scale_shift && nested.codes != nullptr && nested.blocksize == 256 &&
@@ -1622,8 +1622,8 @@ void cpu_expert_batch_forward(const CpuExpertTask* tasks, int count,
 #if defined(__AVX2__)
     if (backend == CpuKernelBackend::Nf4Q8Activation64Avx2 || backend == CpuKernelBackend::Nf4Q8Avx2 || backend == CpuKernelBackend::Nf4Q8Row4Avx2 ||
         backend == CpuKernelBackend::Nf4Q8Block64Avx2) {
-        static const bool a64_specialize = aila::env::read_flag("AILA_Q4E_CPU_A64_SPECIALIZE", false);
-        static const bool a64_row2 = aila::env::read_flag("AILA_Q4E_CPU_A64_ROW2", false);
+        static const bool a64_specialize = aila::env::read_flag("AILA_Q4E_CPU_A64_SPECIALIZE", true);
+        static const bool a64_row2 = aila::env::read_flag("AILA_Q4E_CPU_A64_ROW2", true);
         static const bool per_expert_dag = aila::env::read_flag("AILA_Q4E_CPU_PER_EXPERT_DAG", false);
         nf4_q8_batch_forward(tasks, count, x, tokens, h, out, resolve_quant_map(quant_map),
             backend == CpuKernelBackend::Nf4Q8Row4Avx2, backend == CpuKernelBackend::Nf4Q8Block64Avx2,
@@ -1736,8 +1736,8 @@ void cpu_expert_batch_forward_groups(const CpuExpertGroup* groups, int group_cou
         cpu_expert_batch_forward(tasks, pair_count, x, tokens, h, out, quant_map, backend, timings, nf4_scale_shift);
         return;
     }
-    static const bool a64_specialize = aila::env::read_flag("AILA_Q4E_CPU_A64_SPECIALIZE", false);
-    static const bool a64_row2 = aila::env::read_flag("AILA_Q4E_CPU_A64_ROW2", false);
+    static const bool a64_specialize = aila::env::read_flag("AILA_Q4E_CPU_A64_SPECIALIZE", true);
+    static const bool a64_row2 = aila::env::read_flag("AILA_Q4E_CPU_A64_ROW2", true);
     static const bool per_expert_dag = aila::env::read_flag("AILA_Q4E_CPU_PER_EXPERT_DAG", false);
     nf4_q8_batch_forward(tasks, pair_count, x, tokens, h, out, resolve_quant_map(quant_map),
         backend == CpuKernelBackend::Nf4Q8Row4Avx2, backend == CpuKernelBackend::Nf4Q8Block64Avx2,

@@ -13,7 +13,9 @@
 #include <exception>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -2226,6 +2228,37 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     }
     ctx.make_primitive_cache_room(prim_cache_);
 
+    using SharedKey = std::tuple<uintptr_t, int, int, int>;
+    struct SharedEntry {
+        dnnl::engine engine;
+        dnnl::matmul prim;
+        dnnl::memory::desc src_md;
+        dnnl::memory::desc weight_md;
+        dnnl::memory::desc dst_md;
+        dnnl::memory::desc scratchpad_md;
+    };
+    static std::mutex s_prim_mutex;
+    static auto* s_shared_prims = new std::map<SharedKey, SharedEntry>();
+    constexpr size_t kMaxSharedPrims = 256;
+
+    const SharedKey shared_key{reinterpret_cast<uintptr_t>(ctx.engine().get(true)),
+                               seq_len, in_features_, out_features_};
+    {
+        std::lock_guard<std::mutex> lock(s_prim_mutex);
+        const auto it = s_shared_prims->find(shared_key);
+        if (it != s_shared_prims->end()) {
+            const SharedEntry& shared = it->second;
+            CachedPrimitive cp;
+            cp.prim = shared.prim;
+            cp.src_md = shared.src_md;
+            cp.weight_md = shared.weight_md;
+            cp.dst_md = shared.dst_md;
+            cp.scratchpad_md = shared.scratchpad_md;
+            prim_cache_.emplace(seq_len, std::move(cp));
+            return;
+        }
+    }
+
     auto src_md = dnnl::memory::desc({seq_len, in_features_}, dnnl::memory::data_type::bf16,
                                      dnnl::memory::format_tag::ab);
     auto weight_md = dnnl::memory::desc({in_features_, out_features_}, dnnl::memory::data_type::bf16,
@@ -2234,9 +2267,6 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
                                      dnnl::memory::format_tag::ab);
 
     dnnl::primitive_attr attr;
-    // Share one tracked scratch allocation across sequential primitives. A
-    // scratchpad per weight/shape exhausts memory on large models; library
-    // scratch hides payload from the execution-domain admission counter.
     attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
     auto pd = dnnl::matmul::primitive_desc(ctx.engine(), src_md, weight_md, dst_md, attr);
 
@@ -2246,6 +2276,14 @@ void Bnb4BitLinear::ensure_primitive(Context& ctx, int seq_len) {
     cp.weight_md = weight_md;
     cp.dst_md = dst_md;
     cp.scratchpad_md = pd.scratchpad_desc();
+    {
+        std::lock_guard<std::mutex> lock(s_prim_mutex);
+        if (s_shared_prims->size() < kMaxSharedPrims) {
+            s_shared_prims->emplace(shared_key,
+                SharedEntry{ctx.engine(), cp.prim, cp.src_md, cp.weight_md,
+                            cp.dst_md, cp.scratchpad_md});
+        }
+    }
     prim_cache_.emplace(seq_len, std::move(cp));
 }
 
@@ -2979,7 +3017,8 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
 
 void bf16_moe_front_fused(Context& ctx, const bf16* router_weight,
     const bf16* shared_gate_weight, const bf16* input, bf16* router_scores,
-    bf16* shared_gate, int8_t* optional_xq, float* optional_xs, int hidden, int experts) {
+    bf16* shared_gate, int8_t* optional_xq, float* optional_xs, int hidden, int experts,
+    bf16* optional_x_host) {
     if (hidden != 2560 || experts != 512 || !router_weight || !shared_gate_weight ||
         !input || !router_scores || !shared_gate || bool(optional_xq) != bool(optional_xs)) {
         throw std::invalid_argument("bf16_moe_front_fused: unsupported decode shape or buffers");
@@ -3046,6 +3085,13 @@ void bf16_moe_front_fused(Context& ctx, const bf16* router_weight,
                 float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
                 if (lane == 0 && row < experts) router_scores[row] = bf16(total);
                 if (lane == 0 && row == experts) shared_gate[0] = bf16(total);
+                if (optional_x_host && group == projection_groups - 1) {
+                    const int lid = static_cast<int>(item.get_local_id(0));
+                    for (int k8 = lid; k8 < K8; k8 += WG) {
+                        *reinterpret_cast<vec8*>(optional_x_host + k8 * 8) =
+                            *reinterpret_cast<const vec8*>(input + k8 * 8);
+                    }
+                }
             });
     });
 }
