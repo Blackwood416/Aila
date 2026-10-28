@@ -961,7 +961,7 @@ bool Qwen4ExpBnb4Backend::load(
     // 3,456 = 72 slots/layer * 48 layers, so the auto VRAM budget (not the
     // guard) decides residency; the slot count still clamps to
     // expert_cache_bytes/slot_bytes minus the staging banks below.
-    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", 3360);
+    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", lmHeadQ8Enabled_ ? 3456 : 3360);
     // Reserve the staging banks by their configured depth (2 buffers).
     const int staging_reserve_slots = 2 * cache_cfg.staging_slots_per_buffer;
     cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-staging_reserve_slots);
@@ -1896,12 +1896,15 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // P1: release the queued kernels before the host blocks on the CPU
             // join (a condvar wait, not a SYCL wait), so the GPU executes the
             // resident/cold expert kernels while the CPU finishes its rows.
+            bool device_event_live = hit_count > 0 || staging.count > 0;
             if (s_join_release) {
+                if (!device_event_live) {
+                    last = ctx.queue().ext_oneapi_submit_barrier();
+                    device_event_live = true;
+                }
                 try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
                 catch (...) {}
             }
-
-            const bool device_event_live = hit_count > 0 || staging.count > 0;
             const sycl::event device_last = last;
             static const bool s_defer_cpu_join = [] {
                 const int l0_batch = std::max(
@@ -3387,15 +3390,22 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             rr_cold ? double(rr_cold_prev) / double(rr_cold) : 0.0);
     }
 
-    complete_deferred_cpu_join();
-
+    bool run_adaptive_swap_now = false;
+    int adaptive_max_swaps = 4;
     if (adaptive_cache_.IsAllocated() && count == 1 && !options.decode_verification && !interior) {
-        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 16);
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 12);
         static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 4);
-        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 64);
+        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 60);
+        adaptive_max_swaps = s_max_swaps;
         if (s_adaptive_swap_freq > 0 && cached_len >= s_swap_min_pos &&
             (cached_len % s_adaptive_swap_freq == 0)) {
-            auto swap_plans = adaptive_cache_.PlanSwaps(1, s_max_swaps);
+            run_adaptive_swap_now = true;
+        }
+    }
+    if (run_adaptive_swap_now || !options.need_logits || !s_dump_dir.empty()) {
+        complete_deferred_cpu_join();
+        if (run_adaptive_swap_now) {
+            auto swap_plans = adaptive_cache_.PlanSwaps(1, adaptive_max_swaps);
             if (!swap_plans.empty()) {
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
                 adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
@@ -3448,6 +3458,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
         }
 
+        complete_deferred_cpu_join();
         stage(kStageHead);
         dev_mark(kDevHead);
 
@@ -3456,6 +3467,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             dump_hidden_row(ctx, logits_path, buf_.logits, 0, cfg_.vocab_size);
         }
     }
+    complete_deferred_cpu_join();
 
     // No-logits forwards must also leave a materialized stack before snapshot,
     // state publication or return. This is a no-op after the final mixer.
@@ -3479,7 +3491,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (options.snapshot_policy == SnapshotPolicy::ReusablePrefix) {
         static const bool s_skip_redundant_end_snapshot =
             aila::env::read_flag("AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT", true);
-        if (!(s_skip_redundant_end_snapshot && interior != nullptr && count > 64 && !options.capture_snapshot)) {
+        static const bool s_decode_stride_snapshot =
+            aila::env::read_flag("AILA_Q4E_DECODE_STRIDE_SNAPSHOT", false);
+        const bool is_unforced_decode_step =
+            (count == 1 && !options.capture_snapshot && options.prefill_remaining < 0);
+        if ((!is_unforced_decode_step || s_decode_stride_snapshot) &&
+            !(s_skip_redundant_end_snapshot && interior != nullptr && count > 64 && !options.capture_snapshot)) {
             CaptureSnapshot(ctx, session, cached_len, count, options.capture_snapshot);
         }
     }

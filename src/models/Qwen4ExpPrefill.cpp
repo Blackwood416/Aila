@@ -173,7 +173,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             const auto run_range = [&](int offset, int length) {
                 const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
                 bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
-                if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_ &&
+                if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_ && count > 64 &&
                     ops::try_linear_delta_prefill_chunked(ctx, layer.geom, d_weights, d_state,
                         gdn_chunk_scratch_, input, output, length, gdn_chunk_mode_ == 2)) {
                     ++gdn_chunk_calls_;

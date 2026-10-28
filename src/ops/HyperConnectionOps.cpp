@@ -714,54 +714,84 @@ sycl::event hc_decode_up_mix_impl(
                     if (lane < 8)
                         a2 = *reinterpret_cast<const vec8*>(a_row + (lane + 32) * 8);
                 }
-                for (int g = 0; g < groups && g < kMaxGroups; ++g) {
-                    const size_t row = static_cast<size_t>(g) * group_dim + d;
-                    const bf16* w_row = w_up + row * lowrank;
-                    float acc = 0.0f;
-                    const bool is_aligned = (reinterpret_cast<uintptr_t>(w_row) % 16 == 0) &&
-                                            (reinterpret_cast<uintptr_t>(a_row) % 16 == 0);
-                    if (is_aligned) {
-                        if (k320_aligned) {
-                            const vec8 w0 = *reinterpret_cast<const vec8*>(w_row + lane * 8);
+                if (k320_aligned && groups == 4 && (group_dim % 8 == 0)) {
+#pragma unroll
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t row = static_cast<size_t>(g) * group_dim + d;
+                        const bf16* w_row = w_up + row * lowrank;
+                        float acc = 0.0f;
+                        const vec8 w0 = *reinterpret_cast<const vec8*>(w_row + lane * 8);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            acc = sycl::fma(static_cast<float>(w0[v]), static_cast<float>(a0[v]), acc);
+                        }
+                        const vec8 w1 = *reinterpret_cast<const vec8*>(w_row + (lane + 16) * 8);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            acc = sycl::fma(static_cast<float>(w1[v]), static_cast<float>(a1[v]), acc);
+                        }
+                        if (lane < 8) {
+                            const vec8 w2 = *reinterpret_cast<const vec8*>(w_row + (lane + 32) * 8);
 #pragma unroll
                             for (int v = 0; v < 8; ++v) {
-                                acc = sycl::fma(static_cast<float>(w0[v]), static_cast<float>(a0[v]), acc);
+                                acc = sycl::fma(static_cast<float>(w2[v]), static_cast<float>(a2[v]), acc);
                             }
-                            const vec8 w1 = *reinterpret_cast<const vec8*>(w_row + (lane + 16) * 8);
-#pragma unroll
-                            for (int v = 0; v < 8; ++v) {
-                                acc = sycl::fma(static_cast<float>(w1[v]), static_cast<float>(a1[v]), acc);
-                            }
-                            if (lane < 8) {
-                                const vec8 w2 = *reinterpret_cast<const vec8*>(w_row + (lane + 32) * 8);
+                        }
+                        const float dot = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                        const float u = static_cast<float>(bf16(dot));
+                        const float m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u))));
+                        mixed += m * static_cast<float>(n_row[row]);
+                    }
+                } else {
+                    for (int g = 0; g < groups && g < kMaxGroups; ++g) {
+                        const size_t row = static_cast<size_t>(g) * group_dim + d;
+                        const bf16* w_row = w_up + row * lowrank;
+                        float acc = 0.0f;
+                        const bool is_aligned = (reinterpret_cast<uintptr_t>(w_row) % 16 == 0) &&
+                                                (reinterpret_cast<uintptr_t>(a_row) % 16 == 0);
+                        if (is_aligned) {
+                            if (k320_aligned) {
+                                const vec8 w0 = *reinterpret_cast<const vec8*>(w_row + lane * 8);
 #pragma unroll
                                 for (int v = 0; v < 8; ++v) {
-                                    acc = sycl::fma(static_cast<float>(w2[v]), static_cast<float>(a2[v]), acc);
+                                    acc = sycl::fma(static_cast<float>(w0[v]), static_cast<float>(a0[v]), acc);
+                                }
+                                const vec8 w1 = *reinterpret_cast<const vec8*>(w_row + (lane + 16) * 8);
+#pragma unroll
+                                for (int v = 0; v < 8; ++v) {
+                                    acc = sycl::fma(static_cast<float>(w1[v]), static_cast<float>(a1[v]), acc);
+                                }
+                                if (lane < 8) {
+                                    const vec8 w2 = *reinterpret_cast<const vec8*>(w_row + (lane + 32) * 8);
+#pragma unroll
+                                    for (int v = 0; v < 8; ++v) {
+                                        acc = sycl::fma(static_cast<float>(w2[v]), static_cast<float>(a2[v]), acc);
+                                    }
+                                }
+                            } else {
+                                for (int i = lane; i < k8; i += sg_size) {
+                                    const vec8 w = *reinterpret_cast<const vec8*>(w_row + i * 8);
+                                    const vec8 a = *reinterpret_cast<const vec8*>(a_row + i * 8);
+#pragma unroll
+                                    for (int v = 0; v < 8; ++v) {
+                                        acc = sycl::fma(static_cast<float>(w[v]), static_cast<float>(a[v]), acc);
+                                    }
+                                }
+                                const int tail_start = k8 * 8;
+                                for (int i = tail_start + lane; i < lowrank; i += sg_size) {
+                                    acc = sycl::fma(static_cast<float>(w_row[i]), static_cast<float>(a_row[i]), acc);
                                 }
                             }
                         } else {
-                            for (int i = lane; i < k8; i += sg_size) {
-                                const vec8 w = *reinterpret_cast<const vec8*>(w_row + i * 8);
-                                const vec8 a = *reinterpret_cast<const vec8*>(a_row + i * 8);
-#pragma unroll
-                                for (int v = 0; v < 8; ++v) {
-                                    acc = sycl::fma(static_cast<float>(w[v]), static_cast<float>(a[v]), acc);
-                                }
-                            }
-                            const int tail_start = k8 * 8;
-                            for (int i = tail_start + lane; i < lowrank; i += sg_size) {
+                            for (int i = lane; i < lowrank; i += sg_size) {
                                 acc = sycl::fma(static_cast<float>(w_row[i]), static_cast<float>(a_row[i]), acc);
                             }
                         }
-                    } else {
-                        for (int i = lane; i < lowrank; i += sg_size) {
-                            acc = sycl::fma(static_cast<float>(w_row[i]), static_cast<float>(a_row[i]), acc);
-                        }
+                        const float dot = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                        const float u = static_cast<float>(bf16(dot));
+                        const float m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u))));
+                        mixed += m * static_cast<float>(n_row[row]);
                     }
-                    const float dot = sycl::reduce_over_group(sg, acc, sycl::plus<>());
-                    const float u = static_cast<float>(bf16(dot));
-                    const float m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u))));
-                    mixed += m * static_cast<float>(n_row[row]);
                 }
                 if (lane == 0) {
                     x[batch * group_dim + d] = bf16(mixed * inv_groups);

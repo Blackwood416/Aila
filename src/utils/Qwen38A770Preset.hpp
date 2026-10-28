@@ -15,7 +15,8 @@ inline void ApplyQwen38A770Preset() {
         {"AILA_Q4E_DEMAND_MICROBATCH", "32"},
         {"AILA_Q4E_PHASE_SCRATCH", "1"},
         {"AILA_Q4E_VRAM_RESERVE_MB", "1400"},
-        {"AILA_Q4E_MAX_GPU_SLOTS", "3360"},
+        {"AILA_Q4E_LM_HEAD_Q8", "1"},
+        {"AILA_Q4E_MAX_GPU_SLOTS", "3456"},
         {"AILA_Q4E_HOT_RAM_MB", "32768"},
         {"AILA_Q4E_EXPERT_READER", "readfile"},
         // Round 2: 512 forces a 3K-token prompt through six chunks, and expert

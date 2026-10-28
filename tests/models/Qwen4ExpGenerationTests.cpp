@@ -21,7 +21,7 @@ struct Qwen4ExpGenerationTestAccess {
         return dynamic_cast<Qwen4ExpBnb4Backend&>(*engine.backend_);
     }
     static Qwen4ExpBnb4Backend::Session& Session(InferenceEngine& engine) {
-        return *Backend(engine).defaultSession_;
+        return Backend(engine).DefaultSession(*engine.ctx_);
     }
     static const std::vector<int>& CachedIds(InferenceEngine& engine) { return engine.cached_ids_; }
     static int* Staging(InferenceEngine& engine) { return engine.token_input_staging_.data_as<int>(); }

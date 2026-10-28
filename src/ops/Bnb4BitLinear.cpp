@@ -1401,6 +1401,8 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
             if (row < intermediate_size) {
                 const int row_byte_base = row * packed_bytes_per_row;
                 const int row_block_base = row * blocks_per_row;
+                const int packed_bytes_per_block = blocksize / 2;
+                const bool bs64 = (packed_bytes_per_block == 32);
                 int byte_offset = sg_lane * 4;
                 for (; byte_offset + 3 < packed_bytes_per_row;
                      byte_offset += stride) {
@@ -1409,17 +1411,14 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                             gate_packed + row_byte_base + byte_offset + stride);
                         sycl::ext::oneapi::experimental::prefetch(
                             up_packed + row_byte_base + byte_offset + stride);
-                        sycl::ext::oneapi::experimental::prefetch(
-                            input_ptr + (byte_offset + stride) * 2);
                     }
                     const uint32_t g4 = *reinterpret_cast<const uint32_t*>(
                         gate_packed + row_byte_base + byte_offset);
                     const uint32_t u4 = *reinterpret_cast<const uint32_t*>(
                         up_packed + row_byte_base + byte_offset);
-                    const float ga = gate_absmax[row_block_base +
-                        (byte_offset / (blocksize / 2))];
-                    const float ua = up_absmax[row_block_base +
-                        (byte_offset / (blocksize / 2))];
+                    const int blk_off = bs64 ? (byte_offset >> 5) : (byte_offset / packed_bytes_per_block);
+                    const float ga = gate_absmax[row_block_base + blk_off];
+                    const float ua = up_absmax[row_block_base + blk_off];
                     const int ib = byte_offset * 2;
                     const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
                     const uint8_t gb0 = static_cast<uint8_t>(g4);
@@ -1684,8 +1683,9 @@ void packed_nf4_gemv_bf16_impl(Context& ctx,
                     }
                     const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
                         packed_ptr + row_byte_base + byte_offset);
-                    const float am = absmax_ptr[row_block_base +
-                        (byte_offset / packed_bytes_per_block)];
+                    const int blk_off = (packed_bytes_per_block == 32)
+                        ? (byte_offset >> 5) : (byte_offset / packed_bytes_per_block);
+                    const float am = absmax_ptr[row_block_base + blk_off];
                     const int ib = byte_offset * 2;
                     const uint8_t b0 = static_cast<uint8_t>(p4);
                     const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
@@ -1735,7 +1735,7 @@ void packed_nf4_gemv_bf16_impl(Context& ctx,
 }
 
 bool packed_nf4_gemv_input_prefetch_off() {
-    static const bool enabled = aila::env::read_flag("AILA_BNB4_GEMV_INPUT_PREFETCH_OFF", false);
+    static const bool enabled = aila::env::read_flag("AILA_BNB4_GEMV_INPUT_PREFETCH_OFF", true);
     return enabled;
 }
 
@@ -1825,13 +1825,12 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     if (byte_offset + stride + 3 < packed_bytes_per_row) {
                         sycl::ext::oneapi::experimental::prefetch(
                             packed_ptr + row_byte_base + byte_offset + stride);
-                        sycl::ext::oneapi::experimental::prefetch(
-                            input_ptr + (byte_offset + stride) * 2);
                     }
                     const uint32_t p4 = *reinterpret_cast<const uint32_t*>(
                         packed_ptr + row_byte_base + byte_offset);
-                    const float am = absmax_ptr[row_block_base +
-                        (byte_offset / packed_bytes_per_block)];
+                    const int blk_off = (packed_bytes_per_block == 32)
+                        ? (byte_offset >> 5) : (byte_offset / packed_bytes_per_block);
+                    const float am = absmax_ptr[row_block_base + blk_off];
                     const int ib = byte_offset * 2;
                     const uint8_t b0 = static_cast<uint8_t>(p4);
                     const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
@@ -2999,13 +2998,15 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
                     const int8_t* w = weights + size_t(row) * hidden;
                     const float* ws = weight_scales + size_t(row) * blocks_per_row;
                     float acc = 0.0f;
+                    #pragma unroll 4
                     for (int k = lane * 8; k < hidden; k += sg_size * 8) {
                         const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
                         const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
                         const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + k);
                         const int32_t x1 = *reinterpret_cast<const int32_t*>(input_codes + k + 4);
                         const int32_t dot = bf16_head_signed_dot4(w0, x0) + bf16_head_signed_dot4(w1, x1);
-                        acc = sycl::fma(static_cast<float>(dot), ws[k / 64] * input_scales[k / 64], acc);
+                        const int blk = k >> 6;
+                        acc = sycl::fma(static_cast<float>(dot), ws[blk] * input_scales[blk], acc);
                     }
                     const float sum = sycl::reduce_over_group(item.get_sub_group(), acc, sycl::plus<float>());
                     if (lane == 0) destination[row] = bf16(sum);

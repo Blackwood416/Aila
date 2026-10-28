@@ -1202,13 +1202,53 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
     };
     struct alignas(64) GateTileCountdown {
         std::atomic<int> rem{0};
+        std::atomic<int> ready_unit{-1};
     };
     GateTileCountdown gate_countdown[kMaxExpertBatchTasks];
+    std::atomic<int> ready_write{0};
     const bool inline_gate_quant = activation64 && group_count <= 0 && !timings;
+    static const bool s_completion_single_pass =
+        aila::env::read_int_raw("AILA_Q4E_CPU_COMPLETION_SINGLE_PASS", 1) != 0;
+    const bool use_completion_single_pass =
+        inline_gate_quant && s_completion_single_pass && currentTilePool != nullptr && count > 1;
     if (inline_gate_quant) {
         for (int c = 0; c < count; ++c) {
             gate_countdown[c].rem.store(gate_tile_cols, std::memory_order_relaxed);
+            gate_countdown[c].ready_unit.store(-1, std::memory_order_relaxed);
         }
+    }
+    if (use_completion_single_pass) {
+        const int total_gate_tiles = count * gate_tile_cols;
+        const int total_tiles = total_gate_tiles + count * down_tile_cols;
+        nf4_q8_parallel_tiles(total_tiles,
+            [&](const tbb::blocked_range<int>& range) {
+                for (int tile = range.begin(); tile < range.end(); ++tile) {
+                    if (tile < total_gate_tiles) {
+                        const int unit = tile / gate_tile_cols;
+                        const int begin = (tile % gate_tile_cols) * gate_tile;
+                        nf4_q8_gate_tile_body(unit, begin);
+                        if (gate_countdown[unit].rem.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            quantize_bf16_q8_activation64(
+                                h + unit * kIntermediateDim, kIntermediateDim,
+                                intermediate + unit * kIntermediateDim,
+                                intermediate_scales + unit * (kIntermediateDim / 64));
+                            const int slot = ready_write.fetch_add(1, std::memory_order_relaxed);
+                            gate_countdown[slot].ready_unit.store(unit, std::memory_order_release);
+                        }
+                    } else {
+                        const int down_tile_idx = tile - total_gate_tiles;
+                        const int slot = down_tile_idx / down_tile_cols;
+                        const int begin = (down_tile_idx % down_tile_cols) * down_tile;
+                        int unit = gate_countdown[slot].ready_unit.load(std::memory_order_acquire);
+                        while (unit < 0) {
+                            _mm_pause();
+                            unit = gate_countdown[slot].ready_unit.load(std::memory_order_acquire);
+                        }
+                        nf4_q8_down_tile_body(unit, begin);
+                    }
+                }
+            });
+        return;
     }
     const int gate_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * gate_tile_cols,
         [&](const tbb::blocked_range<int>& range) {

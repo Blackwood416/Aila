@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on Intel Arc A770 — Architecture & Handoff
 
-> **Status:** Post-Round-9 Architecture Reference.
+> **Status:** Post-Round-10 Architecture Reference.
 > `docs/plans/` intermediate logs and the legacy `Qwen4ExpExpertCache` / `Qwen4ExpLayerStage` / `Qwen4ExpLayerMajor` / `L0HostImport` modules have been retired.
 > Environment variable reference: [`docs/Environment_Variables.md`](Environment_Variables.md).
 
@@ -35,13 +35,13 @@ Model geometry (`qwen4_exp`):
 Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights cannot fit in 16 GB VRAM, `Qwen4ExpBnb4Backend` partitions all 24,576 experts across two complementary tiers with zero checkpoint mmap fallback at runtime:
 
 ### 2.1 `Qwen4ExpAdaptiveCache` (GPU Resident Tier)
-- **3,360 GPU resident expert slots (~8.12 GB payload)** allocated in bounded device chunks, seeded at load from the 48×72 multi-domain hotset table (`Qwen4ExpHotExperts.hpp`).
-- Sized automatically at model load from available VRAM after subtracting static weights (4,320 MB), session KV/recurrent state (445 MB at `max_seq = 12288`), and headroom reserve (`AILA_Q4E_VRAM_RESERVE_MB = 1400`, `AILA_Q4E_MAX_GPU_SLOTS = 3360`), maintaining ~1.3–1.4 GB free physical VRAM at peak 8K prefill.
+- **3,456 GPU resident expert slots (~8.35 GB payload, full 48×72 hotset table)** under the `qwen38-a770` preset (3,360 slots when `AILA_Q4E_LM_HEAD_Q8=0`), allocated in bounded device chunks and seeded at load from `Qwen4ExpHotExperts.hpp`.
+- Sized automatically at model load from available VRAM after subtracting static weights (3,751.8 MB with `AILA_Q4E_LM_HEAD_Q8=1`, saving 568.4 MiB vs. BF16 `lm_head`), session KV/recurrent state (445 MB at `max_seq = 12288`), and headroom reserve (`AILA_Q4E_VRAM_RESERVE_MB = 1400`, `AILA_Q4E_MAX_GPU_SLOTS = 3456`), maintaining ~1.6–1.7 GB free physical VRAM at peak 8K prefill.
 - Each slot stores compact packed NF4 `gate_up` (1,638,400 B) + `gate_up` u8 absmax codes (51,200 B) + `down` packed (819,200 B) + `down` u8 absmax codes (25,600 B) = **2,534,400 bytes**.
 
 ### 2.2 `Qwen4ExpHostArena` (Large-Page Host Complement)
-- **21,216 cold experts (50.11 GiB)** held in Windows large-page (`MEM_LARGE_PAGES`) host memory, storing the exact complement of the 3,360 GPU-resident experts plus per-layer nested scale metadata (`LayerNestedMetadata`).
-- Together, `3,360 + 21,216 = 24,576` experts are 100% memory-resident after load.
+- **21,120 cold experts (49.89 GiB)** held in Windows large-page (`MEM_LARGE_PAGES`) host memory, storing the exact complement of the 3,456 GPU-resident experts plus per-layer nested scale metadata (`LayerNestedMetadata`).
+- Together, `3,456 + 21,120 = 24,576` experts are 100% memory-resident after load.
 
 ### 2.3 Direct-Arena DMA Staging via `copy_q_`
 - Cold experts routed during prefill are streamed directly from `Qwen4ExpHostArena` into a **2-bank × 16-slot** GPU staging ring over a dedicated in-order `copy_q_`.
@@ -50,22 +50,21 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 
 ---
 
-## 3. Prefill & Decode Architecture & Round 9 Scoreboard
+## 3. Prefill & Decode Architecture & Round 10 Scoreboard
 
 ### 3.1 Measured Prefill Scoreboard (`tools/prefill-bench.ps1 -Chunk 8192`, `max-seq 12288`)
 
-| Prompt Tokens | Round 6 | Round 7 / 8 | **Round 9 Wall** | **ms/token** | **Round 9 Tok/s** |
-|---:|---:|---:|---:|---:|---:|
-| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,904.9 ms (225.4 tok/s) | **8,277.9 ms** | 4.125 | **242.5 tok/s** |
-| **4,895** | 11,701.2 ms (418.3 tok/s) | 10,165.4 ms (481.5 tok/s) | **9,847.4 ms** | 2.012 | **497.1 tok/s** |
-| **7,764** | 15,071.3 ms (515.1 tok/s) | 14,878.8 ms (521.8 tok/s) | **12,282.8 ms** | 1.582 | **632.1 tok/s** |
+| Prompt Tokens | Round 6 | Round 8 | Round 9 | **Round 10 Wall** | **ms/token** | **Round 10 Tok/s** |
+|---:|---:|---:|---:|---:|---:|---:|
+| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,904.9 ms (225.4 tok/s) | 8,277.9 ms (242.5 tok/s) | **8,056.8 ms** | 4.014 | **249.1 tok/s** |
+| **4,895** | 11,701.2 ms (418.3 tok/s) | 10,165.4 ms (481.5 tok/s) | 9,847.4 ms (497.1 tok/s) | **9,843.5 ms** | 2.011 | **497.3 tok/s** |
+| **7,764** | 15,071.3 ms (515.1 tok/s) | 14,878.8 ms (521.8 tok/s) | **12,282.8 ms** (632.1 tok/s) | **12,367.1 ms** | 1.593 | **627.8 tok/s** |
 
-- **Linear fit**: `6,882 ms` fixed cost + **`0.70 ms/token` marginal cost (`1,437 tok/s` marginal throughput across 2K–8K)**.
+- **Linear fit**: `~6,800 ms` fixed cost + **`0.70 ms/token` marginal cost (`~1,430 tok/s` marginal throughput across 2K–8K)**.
 - **Decode throughput (single-stream, no MTP)**:
-  - **Short Decode (`story.json` 30p + 20g)**: **`43.02 ~ 44.5 ms/token` (`22.4 ~ 23.24 tok/s`)**, E2E wall time **`2,487.0 ms`** (down from `5,563.1 ms` in Round 5, `-55.3%`).
   - **Long-Horizon Decode (`tools/decode-bench.ps1`, `essay.json` 40p + 256g / 512g)**:
-    - **256 Generated Tokens**: **`22.4 tok/s`** (`mean = 44.60 ms/tok`, `p50 = 43.50 ms`, `p90 = 47.25 ms`; intervals `1-64: 22.4 tok/s`, `65-256: 22.4 tok/s`, cache hit `36.4%`).
-    - **512 Generated Tokens**: **`22.3 tok/s`** (`mean = 44.81 ms/tok`, `p50 = 43.82 ms`, `p90 = 46.69 ms`; intervals `1-64: 22.3 tok/s`, `65-256: 22.3 tok/s`, `257-512: 22.3 tok/s`, cache hit `36.5%`).
+    - **256 Generated Tokens**: **`23.7 tok/s`** (`mean = 42.22 ms/tok`, **`p50 = 41.87 ms`**, `p90 = 44.60 ms`; intervals `1-64: 23.9 tok/s`, `65-256: 23.6 tok/s`, cache hit `37.7%`).
+    - **512 Generated Tokens**: **`23.2 tok/s`** (`mean = 43.10 ms/tok`, **`p50 = 42.67 ms`**, `p90 = 46.08 ms`; intervals `1-64: 23.7 tok/s`, `65-256: 23.2 tok/s`, `257-512: 23.1 tok/s`, cache hit `37.7%`).
 
 ### 3.2 Key Prefill Optimizations
 1. **Dense NF4 Projections via Vectorized Dequant + oneDNN (`AILA_BNB4_ONEDNN_MIN_M = 128`)**: Routes all `seq_len >= 128` dense NF4 projections (including the 97 `N = 2560` calls: 36 `linear_o_proj`, 12 QSA `o_proj`, 48 `shared_down_proj`, 1 PLE `value_proj`) to word-vectorized `dequantize_weight` + oneDNN `ab` MatMul (16.0× faster than the custom wide joint-matrix kernel on `N = 2560`, saving ~2.95 s at 8K).
@@ -89,6 +88,11 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
     - **Unconditional AVX2 `_mm256_permute4x64_epi64` Byte Shuffle & Coarse `steady_clock` Polling**: VTune hotspot profiling exposed two cross-lane `_mm256_permute2x128_si256` merges per weight vector on the default `Nested256` scale mode and `3.7%` total CPU time in `Query_perf_counter` inside spin loops. Enabling `_mm256_permute4x64_epi64` across all scale modes with precomputed `_mm256_abs_epi8(activation)`, widening spin-loop clock polling from `& 63u` to `& 1023u`, and boosting pinned decode threads to `THREAD_PRIORITY_HIGHEST` eliminate both bottlenecks.
     - **2-Barrier Subgroup-Reduced Fused HC Inject + RMSNorm (`try_hc_decode_inject_add_and_grouped_rms_norm`)**: Replaces the 8-barrier full-workgroup SLM tree reduction and scalar strided loop with `vec8` loads cached in registers (`vh_reg[2]`) plus a 2-barrier `sycl::reduce_over_group` subgroup reduction that is bitwise identical to `hc_inject_add + grouped_rms_norm`.
     - **QSA Attention Intermediate Aliasing into `buf_.phase_scratch`**: Aliases `buf_.q`, `buf_.z`, `buf_.k`, `buf_.v`, `buf_.indexer_qk`, and `buf_.indexer_q` into `buf_.phase_scratch` above `qsa_base_bytes`, increasing 8K prefill scratch savings from `2.31 GB` to **`2.94 GB`** without growing `phase_scratch` (`1,022 MB`) and lifting 8K prefill from `14,878.8 ms (521.8 tok/s)` to **`12,282.8 ms (632.1 tok/s)`**.
+12. **Completion-Ordered Single-Pass CPU Cold-Expert Pipeline, Q8 LM Head + Full 3,456-Slot Hotset Residency, Decode-Stride Snapshot Suppression & Division-Free GEMV/HC Unrolling (Round 10)**:
+    - **Completion-Ordered Single-Pass `CpuTilePool` Dispatch (`AILA_Q4E_CPU_COMPLETION_SINGLE_PASS=1`)**: Replaces the two-pass (`gate_up` barrier + `down` barrier) `ParallelFor` in `nf4_q8_batch_forward` with a single `ParallelFor` over `count * (gate_tile_cols + down_tile_cols)`. The thread finishing an expert's 40th gate tile quantizes `h` inline and publishes the expert ID into a completion-ordered queue (`gate_countdown[slot].ready_unit`), so `down` tiles immediately drain finished experts in completion order without a mid-layer thread-pool barrier or straggler stall.
+    - **Q8 Quantized LM Head (`AILA_Q4E_LM_HEAD_Q8=1`) & Full 3,456-Slot GPU Hotset (`AILA_Q4E_MAX_GPU_SLOTS=3456`)**: Quantizes the `[248320, 2560]` LM head to block-64 INT8 under `qwen38-a770`, reclaiming **568.4 MiB of static VRAM**, expanding GPU resident experts from 3,360 to the full **3,456 slots (72 experts/layer × 48 layers)**, and halving `lm_head` decode bandwidth while deferring Layer-47 `complete_deferred_cpu_join()` behind host-side `mixer_ + lm_head_` recording (`head_host_ms = 0.00 ms` on non-swap tokens).
+    - **Unforced Decode-Stride Snapshot Suppression (`AILA_Q4E_DECODE_STRIDE_SNAPSHOT=0`)**: Prevents unforced single-token decode steps from firing `CaptureSnapshot` every 64 tokens (`cached_len % 64 == 0`), eliminating a `35.6 ms` 112.2 MB D2H GDN state copy stall every 64 tokens and preserving the 2-slot reusable prompt prefix checkpoints across long generations.
+    - **Division-Free NF4 GEMV Scales, Redundant Input-Prefetch Elimination & 4-Stream HC Up-Mix Unrolling**: Replaces signed integer division `byte_offset / packed_bytes_per_block` with `byte_offset >> 5` on `blocksize == 64`, disables redundant per-subgroup LSC input prefetches (`AILA_BNB4_GEMV_INPUT_PREFETCH_OFF=1`), unrolls the 4-stream `hc_decode_up_mix` loop on `lowrank == 320`, and gates chunked GDN prefill on `count > 64` for exact interior-checkpoint bitwise parity on short prompts.
 
 ---
 
@@ -110,7 +114,7 @@ The following decode and experimental subsystems are actively maintained and cov
 - `AILA_Q4E_PREFILL_XMX=1`, `AILA_Q4E_DIRECT_PREFILL_IO=1`, `AILA_Q4E_PHASE_SCRATCH=1`
 - `AILA_Q35_PREFILL_CHUNK=8192`, `AILA_Q4E_INLINE_CHECKPOINT=1`, `AILA_Q4E_LONG_INLINE_CHECKPOINT=1`
 - `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M=192`, `AILA_Q4E_GDN_CHUNK_MODE=1`
-- `AILA_Q4E_VRAM_RESERVE_MB=1400`, `AILA_Q4E_MAX_GPU_SLOTS=3360`, `AILA_Q4E_HOT_RAM_MB=32768`, `AILA_Q4E_EXPERT_READER=readfile`
+- `AILA_Q4E_VRAM_RESERVE_MB=1400`, `AILA_Q4E_LM_HEAD_Q8=1`, `AILA_Q4E_MAX_GPU_SLOTS=3456`, `AILA_Q4E_HOT_RAM_MB=32768`, `AILA_Q4E_EXPERT_READER=readfile`
 - `AILA_Q4E_CPU_OVERLAP=1`, `AILA_Q4E_MOE_COPY_VIA_COPYQ=1`, `AILA_Q4E_STAGEIN_HOIST=1`, `AILA_Q4E_CPU_ROUTE_EARLY=1`, `AILA_Q4E_JOIN_RELEASE=1`, `AILA_Q4E_CPU_RESULT_HOST_READ=1`
 - `UR_L0_BATCH_SIZE=64`, `SYCL_PI_LEVEL_ZERO_BATCH_SIZE=64`
 
