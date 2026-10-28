@@ -120,6 +120,16 @@ public:
     sycl::event JoinResidentCold(float* rank_output, const sycl::event* order_dep = nullptr);
     const void* ResidentCpuResultPacket() const { return cpu_result_packet_active_ ? cpu_result_packet_dev_ : nullptr; }
     const ops::MoeCpuHostDownRows* ResidentCpuHostRows() const { return cpu_host_result_active_ ? &cpu_host_rows_ : nullptr; }
+    bool PrepareDeferredHostReadRows(ops::MoeCpuHostDownRows& out_rows) const noexcept {
+        if (!cpu_result_host_read_ || cold_count_ <= 0 || cpu_observer_ != nullptr) return false;
+        out_rows.values = cpu_out_host_;
+        out_rows.rows = cold_count_;
+        out_rows.rank_to_row.fill(-1);
+        for (int c = 0; c < cold_count_; ++c) {
+            out_rows.rank_to_row[cold_ranks_[c]] = c;
+        }
+        return true;
+    }
     void FinishResidentCpuRead(const sycl::event& merge);
     void AbortResidentCold() noexcept;
 

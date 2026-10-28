@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Model = 'C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
+    [string]$Model = 'D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [int]$Port = 8080,
     [int]$Context = 32768,
     [int]$PrefillChunk = 4096,

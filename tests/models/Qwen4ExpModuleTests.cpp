@@ -832,6 +832,8 @@ void test_ple_ticket_pipeline(Context& ctx) {
 static std::string resolve_qwen4exp_model_dir() {
     const std::string env_dir = aila::env::read_string("AILA_QWEN4EXP_MODEL_DIR", "");
     if (!env_dir.empty() && fs::exists(env_dir)) return env_dir;
+    const std::string candidate_d = "D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
+    if (std::filesystem::exists(candidate_d)) return candidate_d;
     const std::string candidate_c = "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";
     if (fs::exists(candidate_c)) return candidate_c;
     const std::string candidate_f = "F:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2";

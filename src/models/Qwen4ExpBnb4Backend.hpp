@@ -728,6 +728,8 @@ private:
     int cold_split_num_ = 0;
     bool direct_arena_stage_ = false;
     bool cold_split_this_forward_ = false;
+    bool deferred_cpu_join_pending_ = false;
+    sycl::event deferred_cpu_merge_event_{};
     int cold_mode_ = 0; // 0 dynamic, 1 frozen + GPU cold, 2 frozen + bounded CPU cold
     bool resident_prefill_ = false;
     bool cold_epoch_enabled_ = true; // disabled explicitly during synthetic engine warmup

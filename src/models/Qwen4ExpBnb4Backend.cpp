@@ -1169,23 +1169,38 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     const size_t moe_sh_out_bytes = align256(size_t(cap) * size_t(hidden_size_) * sizeof(bf16));
     const size_t moe_phase_bytes = moe_down_bytes +
         (alias_prefill_phases ? (moe_router_bytes + moe_h_bytes + moe_sh_gu_bytes + moe_sh_in_bytes + moe_sh_out_bytes) : 0u);
+    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+    const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+    const size_t qsa_base_bytes = align256(std::max({
+        size_t(attn_cap) * size_t(full_fused_qkv_dim_) * sizeof(bf16),
+        size_t(full_q_heads_) * size_t(dense_cap) * size_t(dense_cap) * sizeof(float),
+        size_t(full_q_heads_) * size_t(dense_cap) * size_t(dense_kv_cap) * sizeof(float)}));
+    const size_t qsa_q_bytes = align256(size_t(attn_cap) * size_t(full_q_dim_) * sizeof(bf16));
+    const size_t qsa_z_bytes = align256(size_t(attn_cap) * size_t(full_q_dim_) * sizeof(bf16));
+    const size_t qsa_k_bytes = align256(size_t(attn_cap) * size_t(full_kv_dim_) * sizeof(bf16));
+    const size_t qsa_v_bytes = align256(size_t(attn_cap) * size_t(full_kv_dim_) * sizeof(bf16));
+    const size_t qsa_idx_qk_bytes = align256(size_t(attn_cap) * size_t(indexer_out_dim) * sizeof(bf16));
+    const size_t qsa_idx_q_bytes = align256(size_t(attn_cap) * size_t(indexer_q_dim) * sizeof(bf16));
+    const size_t qsa_tail_bytes = qsa_q_bytes + qsa_z_bytes + qsa_k_bytes + qsa_v_bytes + qsa_idx_qk_bytes + qsa_idx_q_bytes;
     if (s_phase_scratch) {
         // Disjoint per-layer lifetimes on the in-order compute queue:
         //   (0) Layer-1 PLE intermediates (key/val/norm/gv)
         //   (1) Hyper-Connection mixer intermediates (hc_N, hc_mix_down, hc_mix_up)
-        //   (2) Attention (full_qkv / dense scores, or GDN linear_all + raw + prepared)
+        //   (2) Attention (full_qkv / dense scores + q/z/k/v/indexer_qk/indexer_q, or GDN linear_all + raw + prepared)
         //   (3) MoE (moe_down_acc + router_scores + moe_h + shared expert intermediates)
         const size_t gdn_lin_bytes = align256(size_t(attn_cap)*linear_all_dim_*sizeof(bf16));
         const size_t gdn_raw_bytes = size_t(attn_cap)*size_t(linear_kv_heads_)*128u*sizeof(float);
         const size_t gdn_prep_bytes = size_t(attn_cap)*size_t(linear_kv_heads_)*386u*sizeof(float);
-        const size_t bytes[] = {size_t(attn_cap)*full_fused_qkv_dim_*sizeof(bf16),
+        const size_t bytes[] = {
+            size_t(attn_cap)*full_fused_qkv_dim_*sizeof(bf16),
             (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
                 ? gdn_lin_bytes + gdn_raw_bytes + gdn_prep_bytes
                 : size_t(attn_cap)*linear_all_dim_*sizeof(bf16),
             size_t(full_q_heads_)*dense_cap*dense_cap*sizeof(float),
             size_t(full_q_heads_)*dense_cap*dense_kv_cap*sizeof(float),
             s_expert_major ? moe_phase_bytes : 0,
-            alias_prefill_phases ? hc_phase_bytes : 0};
+            alias_prefill_phases ? hc_phase_bytes : 0,
+            alias_prefill_phases ? (qsa_base_bytes + qsa_tail_bytes) : 0};
         size_t peak=0,total=0;for(size_t n:bytes){peak=std::max(peak,n);total+=n;}
         buf_.phase_scratch=Tensor::allocate(ctx,{int64_t(peak)},dnnl::memory::data_type::u8);
         AILA_LOG_INFO("[Q4E PhaseScratch] cap=%d bytes=%zu separate_bytes=%zu saved_bytes=%zu",
@@ -1212,11 +1227,17 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.y = Tensor::allocate(ctx, {cap, hidden_size_}, dnnl::memory::data_type::bf16);
 
     // Full Attention buffers
+    const size_t off_qsa_q = qsa_base_bytes;
+    const size_t off_qsa_z = off_qsa_q + qsa_q_bytes;
+    const size_t off_qsa_k = off_qsa_z + qsa_z_bytes;
+    const size_t off_qsa_v = off_qsa_k + qsa_k_bytes;
+    const size_t off_qsa_idx_qk = off_qsa_v + qsa_v_bytes;
+    const size_t off_qsa_idx_q = off_qsa_idx_qk + qsa_idx_qk_bytes;
     buf_.full_qkv = phase({attn_cap, full_fused_qkv_dim_}, dnnl::memory::data_type::bf16);
-    buf_.q = Tensor::allocate(ctx, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
-    buf_.z = Tensor::allocate(ctx, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
-    buf_.k = Tensor::allocate(ctx, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
-    buf_.v = Tensor::allocate(ctx, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
+    buf_.q = phase_at(off_qsa_q, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
+    buf_.z = phase_at(off_qsa_z, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
+    buf_.k = phase_at(off_qsa_k, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
+    buf_.v = phase_at(off_qsa_v, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
     buf_.attn_out = Tensor::allocate(ctx, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
     buf_.decode_scores = Tensor::allocate(ctx, {full_q_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
     constexpr int kDecodeExactTile = 128;
@@ -1233,10 +1254,8 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.incr_scores = phase({full_q_heads_, dense_cap, dense_kv_cap}, dnnl::memory::data_type::f32);
 
     // QSA Indexer buffers (M2, A3, A4)
-    const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
-    const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
-    buf_.indexer_qk = Tensor::allocate(ctx, {attn_cap, indexer_out_dim}, dnnl::memory::data_type::bf16);
-    buf_.indexer_q = Tensor::allocate(ctx, {attn_cap, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    buf_.indexer_qk = phase_at(off_qsa_idx_qk, {attn_cap, indexer_out_dim}, dnnl::memory::data_type::bf16);
+    buf_.indexer_q = phase_at(off_qsa_idx_q, {attn_cap, indexer_q_dim}, dnnl::memory::data_type::bf16);
     const int max_complete_blocks = (max_seq_len_ + 3) / 4;
     buf_.indexer_block_scores = Tensor::allocate(ctx, {max_complete_blocks}, dnnl::memory::data_type::f32);
     buf_.indexer_active_tokens = Tensor::allocate(ctx, {std::max(max_seq_len_, cfg_.indexer_budget + cfg_.indexer_compress_ratio)}, dnnl::memory::data_type::s32);
@@ -1882,16 +1901,32 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 catch (...) {}
             }
 
-            // G1b keeps one job outstanding for the whole window: the first
-            // per-row join waits it, every later row only publishes its own
-            // rank spans into this row's accumulator slice.
-            // AILA_Q4E_MOE_COPY_VIA_COPYQ: when this row submitted expert
-            // kernels, `last` is the compute-queue event they ended with. The
-            // copy-queue H2Ds below take it as their ordering dependency (a
-            // cross-queue dep instead of a same-queue host-pointer copy), and
-            // the merge then consumes the last copy event.
             const bool device_event_live = hit_count > 0 || staging.count > 0;
             const sycl::event device_last = last;
+            static const bool s_defer_cpu_join = [] {
+                const int l0_batch = std::max(
+                    aila::env::read_int_raw("UR_L0_BATCH_SIZE", 0),
+                    aila::env::read_int_raw("SYCL_PI_LEVEL_ZERO_BATCH_SIZE", 0));
+                return l0_batch >= 32 &&
+                    aila::env::read_flag("AILA_Q4E_DECODE_DEFER_CPU_JOIN", true);
+            }();
+            ops::MoeCpuHostDownRows deferred_rows{};
+            if (s_defer_cpu_join && s_join_release && count == 1 && !verify_rows &&
+                !verify_cpu_batch && staging.count == 0 && cpu_count > 0 &&
+                !resident_probe_ &&
+                expert_executor_.PrepareDeferredHostReadRows(deferred_rows)) {
+                deferred_rows.has_host_weights = true;
+                for (int k = 0; k < top_k; ++k)
+                    deferred_rows.host_weights[static_cast<size_t>(k)] = t_weights[k];
+                last = ops::moe_ordered_accumulate_cpu_host_rows(ctx, down, nullptr,
+                    y_t, 1, top_k, hidden_size_, deferred_rows, sh_out_t, sh_gate_t,
+                    device_event_live ? &device_last : nullptr);
+                deferred_cpu_join_pending_ = true;
+                deferred_cpu_merge_event_ = last;
+                cpu_work.active = false;
+                return last;
+            }
+
             const sycl::event* copy_order =
                 (aila::q4e::moe_copy_via_copyq() && device_event_live) ? &device_last : nullptr;
             const auto cpu_ready=verify_cpu_batch
@@ -2985,11 +3020,40 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     d1_stash_valid = false;
     d1_stash_layer = -1;
     d1_stash_cpu_count = -1;
+    deferred_cpu_join_pending_ = false;
+    deferred_cpu_merge_event_ = sycl::event{};
+    auto complete_deferred_cpu_join = [&]() {
+        if (!deferred_cpu_join_pending_) return;
+        const auto t_join0 = (s_stages || s_work_summary) ? prof_clock::now() : prof_clock::time_point{};
+        (void)expert_executor_.JoinResidentCold(resident_down_.data_as<float>(), nullptr);
+        expert_executor_.FinishResidentCpuRead(deferred_cpu_merge_event_);
+        deferred_cpu_join_pending_ = false;
+        deferred_cpu_merge_event_ = sycl::event{};
+        if (s_stages || s_work_summary) {
+            const auto now = prof_clock::now();
+            stage_ms[kStageExperts] += prof_ms(t_join0, now);
+            stage_t = now;
+        }
+    };
+    struct DeferredCpuJoinGuard {
+        Qwen4ExpBnb4Backend& self;
+        ~DeferredCpuJoinGuard() noexcept {
+            if (self.deferred_cpu_join_pending_) {
+                self.expert_executor_.AbortResidentCold();
+                self.deferred_cpu_join_pending_ = false;
+                self.deferred_cpu_merge_event_ = sycl::event{};
+            }
+        }
+    } deferredJoinGuard{*this};
 
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
+        if (L == 1 || !s_dump_dir.empty() || s_stages || dev_trace ||
+            (!layer.is_linear && (start_pos + count) > 2051)) {
+            complete_deferred_cpu_join();
+        }
         // Round 2: layer boundary = queue idle from the previous layer's last
         // marker through this loop header (dump checks, host bookkeeping).
         dev_mark(kDevInter);
@@ -3124,19 +3188,21 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
         // Top-k writes straight into pinned host memory; the event wait is the only readback.
         const auto t_topk = hsplit_begin();
-        const auto t_route_split = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point t_route_split{};
+        if (s_profile && L == 0) t_route_split = std::chrono::steady_clock::now();
         sycl::event actual_route_event = ops::router_softmax_topk_device(
             ctx, static_cast<const bf16*>(buf_.router_scores.data()), nullptr,
             router_host_ids_, router_host_weights_,
             count, cfg_.num_experts, top_k, true);
-        const auto t_after_topk = std::chrono::steady_clock::now();
-        if (L == 0) {
+        if (s_profile && L == 0) {
+            const auto t_after_topk = std::chrono::steady_clock::now();
             AILA_LOG_INFO(
                 "[Q4E RouteSplit] count=%d topk_submit_us=%.1f classify_submit_us=0 (no epoch)",
                 count,
                 std::chrono::duration<double, std::micro>(t_after_topk - t_route_split).count());
         }
         hsplit_add(host_topk_submit_ms, t_topk);
+        complete_deferred_cpu_join();
         dev_mark(kDevRouter);
         if (s_join_release && count == 1 && !is_prefill) {
             // Querying the status is non-blocking and takes the route launch out
@@ -3183,6 +3249,45 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
         // Shared expert only depends on x: submit it before waiting on route_event so the GPU runs it
         // concurrently while the host fills missed routed experts and sets up dispatch.
+        static const bool s_route_before_shared = aila::env::read_flag("AILA_Q4E_ROUTE_BEFORE_SHARED", false);
+        const bool route_early_cold =
+            s_route_before_shared && s_cpu_route_early && count == 1 && !is_prefill &&
+            !options.decode_verification && !decodeHcReferenceForTest_ &&
+            cfg_.num_experts_per_tok <= 16 && expert_executor_.cpu_overlap_enabled() &&
+            adaptive_cache_.IsAllocated() && host_arena_.NumLayers() > 0;
+        auto after_route = [&] {
+            wait_actual_route();
+            if (stagein_after_route)
+                expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
+                    mlp_hc_ev ? &*mlp_hc_ev : nullptr);
+            if (!(s_cpu_route_early && count == 1 && !is_prefill &&
+                  !options.decode_verification && !decodeHcReferenceForTest_ &&
+                  cfg_.num_experts_per_tok <= 16 && expert_executor_.cpu_overlap_enabled() &&
+                  adaptive_cache_.IsAllocated() && host_arena_.NumLayers() > 0)) return;
+            int miss_n = 0;
+            std::array<int, 16> miss_ids{}, miss_ranks{};
+            for (int k = 0; k < top_k; ++k) {
+                const int e = router_host_ids_[k];
+                if (adaptive_cache_.GetSlot(L, e) < 0) {
+                    miss_ids[miss_n] = e;
+                    miss_ranks[miss_n] = k;
+                    ++miss_n;
+                }
+            }
+            int cpu_n = 0;
+            if (miss_n > 0)
+                cpu_n = expert_executor_.StartArenaCold(host_arena_, L, miss_ids.data(),
+                    miss_ranks.data(), miss_n, fused_x_stagein ? nullptr : buf_.x.data_as<bf16>());
+            d1_stash_layer = L;
+            d1_stash_cpu_count = cpu_n;
+            for (int c = 0; c < cpu_n; ++c) {
+                d1_stash_ids[c] = miss_ids[c];
+                d1_stash_ranks[c] = miss_ranks[c];
+            }
+            d1_stash_valid = true;
+        };
+        if (route_early_cold) after_route();
+
         const auto t_shared = hsplit_begin();
         if (!moe_front_fused)
             dense_rows(layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
@@ -3222,36 +3327,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         hsplit_add(host_shared_submit_ms, t_shared);
         dev_mark(kDevShared);
 
-        wait_actual_route();
-        if (stagein_after_route)
-            expert_executor_.StageResidentInput(buf_.x.data_as<bf16>(), count,
-                mlp_hc_ev ? &*mlp_hc_ev : nullptr);
-        if (s_cpu_route_early && count == 1 && !is_prefill &&
-            !options.decode_verification && !decodeHcReferenceForTest_ &&
-            cfg_.num_experts_per_tok <= 16 && expert_executor_.cpu_overlap_enabled() &&
-            adaptive_cache_.IsAllocated() && host_arena_.NumLayers() > 0) {
-            int miss_n = 0;
-            std::array<int, 16> miss_ids{}, miss_ranks{};
-            for (int k = 0; k < top_k; ++k) {
-                const int e = router_host_ids_[k];
-                if (adaptive_cache_.GetSlot(L, e) < 0) {
-                    miss_ids[miss_n] = e;
-                    miss_ranks[miss_n] = k;
-                    ++miss_n;
-                }
-            }
-            int cpu_n = 0;
-            if (miss_n > 0)
-                cpu_n = expert_executor_.StartArenaCold(host_arena_, L, miss_ids.data(),
-                    miss_ranks.data(), miss_n, fused_x_stagein ? nullptr : buf_.x.data_as<bf16>());
-            d1_stash_layer = L;
-            d1_stash_cpu_count = cpu_n;
-            for (int c = 0; c < cpu_n; ++c) {
-                d1_stash_ids[c] = miss_ids[c];
-                d1_stash_ranks[c] = miss_ranks[c];
-            }
-            d1_stash_valid = true;
-        }
+        if (!route_early_cold) after_route();
         stage(kStageRouter);
         if (adaptive_cache_.IsAllocated()) {
             const uint64_t misses_before_moe = static_cast<uint64_t>(adaptive_cache_.Stats().cache_misses);
@@ -3311,10 +3387,12 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             rr_cold ? double(rr_cold_prev) / double(rr_cold) : 0.0);
     }
 
+    complete_deferred_cpu_join();
+
     if (adaptive_cache_.IsAllocated() && count == 1 && !options.decode_verification && !interior) {
-        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 8);
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 16);
         static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 4);
-        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 80);
+        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 64);
         if (s_adaptive_swap_freq > 0 && cached_len >= s_swap_min_pos &&
             (cached_len % s_adaptive_swap_freq == 0)) {
             auto swap_plans = adaptive_cache_.PlanSwaps(1, s_max_swaps);

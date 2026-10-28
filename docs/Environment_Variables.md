@@ -300,10 +300,11 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_CPU_RESULT_HOST_READ` | bool | `true` | Read CPU cold-expert down outputs directly from pinned host USM inside `moe_ordered_accumulate_cpu_host_rows` with by-value route weights. |
 | `AILA_Q4E_MOE_COPY_VIA_COPYQ` | bool | `true` | Route CPU-complement host copies through the dedicated in-order copy queue. |
 | `AILA_Q4E_CPU_POOL_CLAIM` | int | `1` | Number of tiles claimed per atomic fetch in `CpuTilePool::Consume`. |
+| `AILA_Q4E_DECODE_DEFER_CPU_JOIN` | bool | `true` | Defer `JoinResidentCold` / `FinishResidentCpuRead` from layer `L` to layer `L+1` after `router_softmax_topk_device(L+1)` submission (requires `UR_L0_BATCH_SIZE >= 32`, preset to `64`). |
 | `AILA_Q4E_DECODE_EXACT256_MIN_LEN` | int | `256` | Minimum attended length to dispatch `attention_decode_exact_head256_partial_merge` for `head_dim=256`. |
-| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `8` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
+| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `16` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
 | `AILA_Q4E_MAX_SWAPS` | int | `4` | Maximum expert swaps executed per swap interval. |
-| `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS` | int | `80` | Minimum sequence position before online decode expert swaps begin. |
+| `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS` | int | `64` | Minimum sequence position before online decode expert swaps begin. |
 | `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` | int | `192` (preset) | Minimum padded band height `M` for prefill expert XMX batched GEMMs. |
 | `AILA_Q4E_XMX_BUCKET_ROUTE` | bool | `true` | Bucket `(token, rank)` by expert once per layer in `O(count * top_k)` instead of rescanning routes per chunk. |
 | `AILA_Q4E_XMX_SINGLE_PLAN_COPY` | bool | `true` | Pack each XMX chunk's `bases + tokens + ranks + slots` into a disjoint slice of pinned host USM and upload in a single `memcpy`. |

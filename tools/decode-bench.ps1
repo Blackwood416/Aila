@@ -56,7 +56,7 @@ pwsh -NoProfile -File tools/decode-bench.ps1 -MaxTokens @(256, 512)
 #>
 param(
     [string]$Exe = 'build-refactor/Aila.exe',
-    [string]$Model = 'C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
+    [string]$Model = 'D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [string]$Prompt = 'perf/qwen4exp/prompts/essay.json',
     [object[]]$MaxTokens = @(256, 512),
     [int]$MaxSeq = 4096,
@@ -85,6 +85,8 @@ $env:SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE = '1'
 $env:UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'
+$env:UR_L0_BATCH_SIZE = '64'
+$env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
 $env:SYCL_CACHE_PERSISTENT = '1'
 
 # Both flags are read once per process, so they are set before the first run

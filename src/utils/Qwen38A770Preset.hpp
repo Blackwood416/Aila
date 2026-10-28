@@ -52,7 +52,9 @@ inline void ApplyQwen38A770Preset() {
         {"AILA_Q4E_STAGEIN_HOIST", "1"},
         {"AILA_Q4E_CPU_ROUTE_EARLY", "1"},
         {"AILA_Q4E_JOIN_RELEASE", "1"},
-        {"AILA_Q4E_CPU_RESULT_HOST_READ", "1"}
+        {"AILA_Q4E_CPU_RESULT_HOST_READ", "1"},
+        {"UR_L0_BATCH_SIZE", "64"},
+        {"SYCL_PI_LEVEL_ZERO_BATCH_SIZE", "64"}
     };
     auto set = [](const char* name, const char* value) {
 #ifdef _WIN32

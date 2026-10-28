@@ -509,7 +509,7 @@ bool try_hc_decode_inject_add_and_grouped_rms_norm(
     const int dim8 = group_dim / 8;
     const auto hc_t0 = hc_submit_begin();
     ctx.queue().submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg), cgh);
+        sycl::local_accessor<float, 1> red_slm(sycl::range<1>(wg / 16), cgh);
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(groups * wg), sycl::range<1>(wg)),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
@@ -518,52 +518,66 @@ bool try_hc_decode_inject_add_and_grouped_rms_norm(
                 const size_t stream_base = static_cast<size_t>(group_idx) * group_dim;
                 const size_t w_base = static_cast<size_t>(group_idx) * group_dim;
                 const float inj_val = static_cast<float>(inj[group_idx]);
-                // Keep the original standalone vec8 arithmetic and BF16 store.
-                // Each stream has one WG, so its entire update precedes its norm.
-                for (int i = lid; i < dim8; i += wg) {
+                constexpr int kMaxVecSlots = 2;
+                vec8 vh_reg[kMaxVecSlots];
+                float sum_sq = 0.0f;
+                int slot = 0;
+                for (int i = lid; i < dim8; i += wg, ++slot) {
                     const size_t g_offset = stream_base + static_cast<size_t>(i) * 8;
                     const size_t y_offset = static_cast<size_t>(i) * 8;
                     vec8 vh = *reinterpret_cast<const vec8*>(H + g_offset);
                     const vec8 vy = *reinterpret_cast<const vec8*>(y + y_offset);
 #pragma unroll
                     for (int v = 0; v < 8; ++v) {
-                        vh[v] = bf16(static_cast<float>(vh[v]) + inj_val * static_cast<float>(vy[v]));
+                        const float updated = static_cast<float>(vh[v]) + inj_val * static_cast<float>(vy[v]);
+                        const bf16 b = bf16(updated);
+                        vh[v] = b;
+                        const float f = static_cast<float>(b);
+                        sum_sq += f * f;
                     }
                     *reinterpret_cast<vec8*>(H + g_offset) = vh;
+                    if (slot < kMaxVecSlots) vh_reg[slot] = vh;
                 }
-                item.barrier(sycl::access::fence_space::global_and_local);
 
-                // These loads and the lid+256 accumulation/reduction/output
-                // order intentionally match the original grouped_rms_norm.
-                // The updated values are kept in private storage so the output
-                // pass does not read H a third time.
-                constexpr int kMaxElemsPerThread = 16;
-                float v_reg[kMaxElemsPerThread];
-                int reg_idx = 0;
-                float sum_sq = 0.0f;
-                for (int i = lid; i < group_dim; i += wg) {
-                    float v = static_cast<float>(H[stream_base + i]);
-                    if (reg_idx < kMaxElemsPerThread) v_reg[reg_idx++] = v;
-                    sum_sq += v * v;
+                auto reduction_sg = item.get_sub_group();
+                constexpr int kSubGroups = wg / 16;
+                const int reduction_sg_id = lid / 16;
+                const int reduction_lane = lid % 16;
+                const float sg_sum = sycl::reduce_over_group(
+                    reduction_sg, sum_sq, sycl::plus<>());
+                if (reduction_lane == 0) {
+                    red_slm[reduction_sg_id] = sg_sum;
                 }
-                red_slm[lid] = sum_sq;
                 item.barrier(sycl::access::fence_space::local_space);
-                for (int stride = wg / 2; stride > 0; stride >>= 1) {
-                    if (lid < stride) red_slm[lid] += red_slm[lid + stride];
-                    item.barrier(sycl::access::fence_space::local_space);
-                }
-                float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
-                reg_idx = 0;
-                for (int i = lid; i < group_dim; i += wg) {
-                    float v = (reg_idx < kMaxElemsPerThread)
-                        ? v_reg[reg_idx++]
-                        : static_cast<float>(H[stream_base + i]);
-                    float scale = inv_rms;
-                    if (norm_w) {
-                        float w_val = norm_w[w_base + i];
-                        scale *= (plus_one ? (1.0f + w_val) : w_val);
+                if (reduction_sg_id == 0) {
+                    const float partial = reduction_lane < kSubGroups
+                                              ? red_slm[reduction_lane]
+                                              : 0.0f;
+                    const float total = sycl::reduce_over_group(
+                        reduction_sg, partial, sycl::plus<>());
+                    if (reduction_lane == 0) {
+                        red_slm[0] = total;
                     }
-                    out_N[stream_base + i] = bf16(v * scale);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const float inv_rms = 1.0f / sycl::sqrt(red_slm[0] / static_cast<float>(group_dim) + eps);
+                vec8* ov = reinterpret_cast<vec8*>(out_N + stream_base);
+                const vec8* hv = reinterpret_cast<const vec8*>(H + stream_base);
+                slot = 0;
+                for (int i = lid; i < dim8; i += wg, ++slot) {
+                    const vec8 v = (slot < kMaxVecSlots) ? vh_reg[slot] : hv[i];
+                    vec8 r;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        float scale = inv_rms;
+                        if (norm_w) {
+                            const float w_val = norm_w[w_base + i * 8 + j];
+                            scale *= (plus_one ? (1.0f + w_val) : w_val);
+                        }
+                        r[j] = bf16(static_cast<float>(v[j]) * scale);
+                    }
+                    ov[i] = r;
                 }
             });
     });

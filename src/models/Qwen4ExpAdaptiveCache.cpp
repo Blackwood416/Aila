@@ -501,6 +501,41 @@ std::vector<AdaptiveSwapPlan> Qwen4ExpAdaptiveCache::PlanSwaps(
     std::vector<AdaptiveSwapPlan> plans;
     if (!IsAllocated()) return plans;
 
+    if (max_swaps_per_layer == 1) {
+        for (int l = 0; l < config_.num_layers; ++l) {
+            const size_t layer_offset = static_cast<size_t>(l) * static_cast<size_t>(config_.num_experts_per_layer);
+            int min_vic = -1;
+            int max_cand = -1;
+            float u_vic = 0.0f;
+            float u_cand = 0.0f;
+            for (int e = 0; e < config_.num_experts_per_layer; ++e) {
+                const size_t idx = layer_offset + static_cast<size_t>(e);
+                const float u = usage_[idx];
+                if (slot_table_[idx] >= 0) {
+                    if (min_vic < 0 || u < u_vic) { min_vic = e; u_vic = u; }
+                } else if (u >= config_.candidate_min_usage) {
+                    if (max_cand < 0 || u > u_cand) { max_cand = e; u_cand = u; }
+                }
+            }
+            if (min_vic < 0 || max_cand < 0) continue;
+            const float gain = u_cand - u_vic;
+            if (gain <= config_.hysteresis_threshold) continue;
+            const int vic_slot = slot_table_[layer_offset + static_cast<size_t>(min_vic)];
+            plans.push_back(AdaptiveSwapPlan{l, max_cand, min_vic, vic_slot, gain});
+        }
+
+        std::sort(plans.begin(), plans.end(), [](const AdaptiveSwapPlan& a, const AdaptiveSwapPlan& b) {
+            if (a.gain != b.gain) return a.gain > b.gain;
+            return a.layer < b.layer;
+        });
+
+        if (max_total_swaps > 0 && plans.size() > static_cast<size_t>(max_total_swaps)) {
+            plans.resize(max_total_swaps);
+        }
+
+        return plans;
+    }
+
     for (int l = 0; l < config_.num_layers; ++l) {
         std::vector<int> victims;
         std::vector<int> candidates;
@@ -584,7 +619,8 @@ sycl::event Qwen4ExpAdaptiveCache::ExecuteSwapsAsync(
     }
     if (resident_pending_) resident_ready_.wait_and_throw();
     if (resident_read_) {
-        q.submit([&](sycl::handler& cgh) { cgh.depends_on(resident_reader_); cgh.single_task([] {}); });
+        q.ext_oneapi_submit_barrier(std::vector<sycl::event>{resident_reader_});
+        resident_read_ = false;
     }
     // A later plan may fail validation after earlier slots have changed.
     BumpResidentMappingGenerations();

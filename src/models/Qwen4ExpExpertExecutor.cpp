@@ -210,7 +210,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         while (!signal.load(std::memory_order_acquire)) {
             _mm_pause();
             // Amortize clock reads while retaining a bounded idle interval.
-            if ((++iteration & 63u) == 0 && steady_ns() >= deadline) break;
+            if ((++iteration & 1023u) == 0 && steady_ns() >= deadline) break;
         }
     }
     void init_scale_cache() {

@@ -28,7 +28,7 @@
     "server_build_id": "aila-0.2.0-abi1-<hash>",
     "worker_sha256": "<sha256>",
     "server_sha256": "<sha256>",
-    "model": "C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
+    "model": "D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2",
     "profile": "perf/qwen4exp/profiles/qwen38-nf4-h4-v1.profile",
     "env_overrides": ["AILA_Q4E_...=..."],
     "git": { "commit": "<hash>", "dirty": false }

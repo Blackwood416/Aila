@@ -29,7 +29,7 @@ param(
     # and therefore the admitted resident expert pool, so it is part of the
     # measurement identity and must stay fixed across arms.
     [int]$MaxSeq = 12288,
-    [string]$Model = 'C:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
+    [string]$Model = 'D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [string]$Exe = 'build-refactor/Aila.exe'
 )
 
@@ -42,6 +42,8 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # immediate command lists, copy engine on, persistent SYCL cache.
 $env:UR_L0_USE_COPY_ENGINE = '1'
 $env:SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE = '1'
+$env:UR_L0_BATCH_SIZE = '64'
+$env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
 $env:UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'

@@ -483,12 +483,33 @@ inline float a64_nested_scale_register(const MoeNestedScaleHost& nested, size_t 
 #if defined(__clang__)
     // Intrinsic mul/add can still contract after inlining despite local fp
     // pragmas. An opaque register value blocks FMA without stack traffic.
-    __asm__ __volatile__("" : "+x"(product));
+    __asm__("" : "+x"(product));
 #else
     volatile float rounded = _mm_cvtss_f32(product);
     product = _mm_set_ss(rounded);
 #endif
     return _mm_cvtss_f32(_mm_add_ss(product, _mm_set_ss(nested.offset)));
+}
+
+// Same rounding contract as the struct-taking form, but the nested scale
+// pointers arrive as raw arguments so a caller's block loop hoists them once
+// instead of reloading them through the struct reference per block.
+inline float a64_nested_scale_register_ptrs(const uint8_t* codes, const float* nested_absmax,
+    const float* nested_quant_map, float offset, size_t index) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+    auto product = _mm_mul_ss(
+        _mm_set_ss(nested_quant_map[codes[index]]),
+        _mm_set_ss(nested_absmax[index >> 8]));
+#if defined(__clang__)
+    __asm__("" : "+x"(product));
+#else
+    volatile float rounded = _mm_cvtss_f32(product);
+    product = _mm_set_ss(rounded);
+#endif
+    return _mm_cvtss_f32(_mm_add_ss(product, _mm_set_ss(offset)));
 }
 
 inline A64ScaleMode a64_scale_mode(const float* absmax,
@@ -546,13 +567,13 @@ static inline __attribute__((always_inline)) float nf4_q8_dot_activation64(const
             scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
         }
         auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * (Columns / 2) + b * 32));
-        if constexpr (Mode == A64ScaleMode::Nested256ByteShuffle) bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+        // Reordering packed qwords makes unpacklo/unpackhi emit the ordered
+        // weights directly for every Mode; the cross-lane merges were redundant.
+        bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
         const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
         const auto low = _mm256_and_si256(bytes, mask);
-        const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
-        const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
-        const auto weights0 = Mode == A64ScaleMode::Nested256ByteShuffle ? wlo : _mm256_permute2x128_si256(wlo, whi, 0x20);
-        const auto weights1 = Mode == A64ScaleMode::Nested256ByteShuffle ? whi : _mm256_permute2x128_si256(wlo, whi, 0x31);
+        const auto weights0 = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+        const auto weights1 = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
         const auto activation0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64));
         const auto activation1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + 32));
         const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
@@ -633,13 +654,11 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows2(
                 scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
             }
             auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row0 * (Columns / 2) + b * 32));
-            if constexpr (Mode == A64ScaleMode::Nested256ByteShuffle) bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+            bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
             const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
             const auto low = _mm256_and_si256(bytes, mask);
-            const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
-            const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
-            const auto weights0 = Mode == A64ScaleMode::Nested256ByteShuffle ? wlo : _mm256_permute2x128_si256(wlo, whi, 0x20);
-            const auto weights1 = Mode == A64ScaleMode::Nested256ByteShuffle ? whi : _mm256_permute2x128_si256(wlo, whi, 0x31);
+            const auto weights0 = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+            const auto weights1 = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
             const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
             const auto pairs1 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights1), _mm256_sign_epi8(activation1, weights1));
             const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
@@ -665,13 +684,11 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows2(
                 scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
             }
             auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row1 * (Columns / 2) + b * 32));
-            if constexpr (Mode == A64ScaleMode::Nested256ByteShuffle) bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+            bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
             const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
             const auto low = _mm256_and_si256(bytes, mask);
-            const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
-            const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
-            const auto weights0 = Mode == A64ScaleMode::Nested256ByteShuffle ? wlo : _mm256_permute2x128_si256(wlo, whi, 0x20);
-            const auto weights1 = Mode == A64ScaleMode::Nested256ByteShuffle ? whi : _mm256_permute2x128_si256(wlo, whi, 0x31);
+            const auto weights0 = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+            const auto weights1 = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
             const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
             const auto pairs1 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights1), _mm256_sign_epi8(activation1, weights1));
             const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
@@ -704,6 +721,12 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
     auto accumulator2 = _mm256_setzero_ps();
     auto accumulator3 = _mm256_setzero_ps();
     constexpr size_t stride = Columns / 2;
+    // Hoisted nested scale pointers keep the per-block scale expression off the
+    // struct reference, so step_row never reloads them inside the loop.
+    [[maybe_unused]] const uint8_t* const codes = nested.codes;
+    [[maybe_unused]] const float* const nested_absmax = nested.nested_absmax;
+    [[maybe_unused]] const float* const nested_quant_map = nested.nested_quant_map;
+    [[maybe_unused]] const float nested_offset = nested.offset;
 #if defined(__clang__)
 #pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
 #endif
@@ -716,6 +739,8 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
         }
         const auto activation0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64));
         const auto activation1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + 32));
+        const auto ax0 = _mm256_abs_epi8(activation0);
+        const auto ax1 = _mm256_abs_epi8(activation1);
         const auto in_scale_ss = _mm_set_ss(input_scales[b]);
         const auto lut_scale_ss = _mm_set_ss(lut_scale);
         auto step_row = [&](size_t row, __m256 acc) -> __m256 {
@@ -724,24 +749,23 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
             if constexpr (Mode == A64ScaleMode::FlatF32) {
                 scale = absmax[scale_index];
             } else if constexpr ((Mode == A64ScaleMode::Nested256 || Mode == A64ScaleMode::Nested256ByteShuffle)) {
-                volatile float product = nested.nested_quant_map[nested.codes[scale_index]] *
-                                         nested.nested_absmax[scale_index >> 8];
-                scale = product + nested.offset;
+                volatile float product = nested_quant_map[codes[scale_index]] *
+                                         nested_absmax[scale_index >> 8];
+                scale = product + nested_offset;
             } else if constexpr (Mode == A64ScaleMode::Nested256Register) {
-                scale = a64_nested_scale_register(nested, scale_index);
+                scale = a64_nested_scale_register_ptrs(codes, nested_absmax,
+                    nested_quant_map, nested_offset, scale_index);
             } else {
                 scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
             }
             auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * stride + b * 32));
-            if constexpr (Mode == A64ScaleMode::Nested256ByteShuffle) bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+            bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
             const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
             const auto low = _mm256_and_si256(bytes, mask);
-            const auto wlo = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
-            const auto whi = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
-            const auto weights0 = Mode == A64ScaleMode::Nested256ByteShuffle ? wlo : _mm256_permute2x128_si256(wlo, whi, 0x20);
-            const auto weights1 = Mode == A64ScaleMode::Nested256ByteShuffle ? whi : _mm256_permute2x128_si256(wlo, whi, 0x31);
-            const auto pairs0 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights0), _mm256_sign_epi8(activation0, weights0));
-            const auto pairs1 = _mm256_maddubs_epi16(_mm256_abs_epi8(weights1), _mm256_sign_epi8(activation1, weights1));
+            const auto weights0 = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+            const auto weights1 = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
+            const auto pairs0 = _mm256_maddubs_epi16(ax0, _mm256_sign_epi8(weights0, activation0));
+            const auto pairs1 = _mm256_maddubs_epi16(ax1, _mm256_sign_epi8(weights1, activation1));
             const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
             const auto scale_input = _mm_mul_ss(_mm_set_ss(scale), in_scale_ss);
             const float factor = _mm_cvtss_f32(_mm_mul_ss(scale_input, lut_scale_ss));

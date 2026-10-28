@@ -190,6 +190,16 @@ inline void enable_l0_copy_engine() {
     } else {
         _putenv_s("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1");
     }
+    if (_dupenv_s(&existing, &len, "UR_L0_BATCH_SIZE") == 0 && existing) {
+        free(existing);
+    } else {
+        _putenv_s("UR_L0_BATCH_SIZE", "64");
+    }
+    if (_dupenv_s(&existing, &len, "SYCL_PI_LEVEL_ZERO_BATCH_SIZE") == 0 && existing) {
+        free(existing);
+    } else {
+        _putenv_s("SYCL_PI_LEVEL_ZERO_BATCH_SIZE", "64");
+    }
 #else
     if (!std::getenv("UR_L0_USE_COPY_ENGINE")) {
         setenv("UR_L0_USE_COPY_ENGINE", "1", 1);

@@ -76,7 +76,9 @@ inline void PinCurrentThreadToCore(int core_index) {
     GROUP_AFFINITY target{};
     target.Group = WORD(unsigned(logical_cpu) / 64u);
     target.Mask = KAFFINITY(1) << (unsigned(logical_cpu) & 63u);
-    SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr);
+    if (SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr)) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
 #else
     (void)core_index;
 #endif
@@ -153,14 +155,16 @@ public:
         unsigned wait_iter = 0;
         while (remaining_.load(std::memory_order_acquire)) {
             _mm_pause();
-            if ((++wait_iter & 63u) == 0 &&
+            if ((++wait_iter & 1023u) == 0 &&
                 std::chrono::steady_clock::now() >= deadline) break;
         }
         if (remaining_.load(std::memory_order_acquire)) {
             std::unique_lock<std::mutex> lock(waitMutex_);
+            doneWaiters_.fetch_add(1, std::memory_order_seq_cst);
             doneCv_.wait(lock, [&] {
                 return remaining_.load(std::memory_order_acquire) == 0;
             });
+            doneWaiters_.fetch_sub(1, std::memory_order_relaxed);
         }
         callbackState_ = nullptr;
         callback_ = nullptr;
@@ -185,8 +189,10 @@ private:
     }
     void Complete() noexcept {
         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            std::lock_guard<std::mutex> lock(waitMutex_);
-            doneCv_.notify_one();
+            if (doneWaiters_.load(std::memory_order_seq_cst) != 0) {
+                std::lock_guard<std::mutex> lock(waitMutex_);
+                doneCv_.notify_one();
+            }
         }
     }
     void Worker() noexcept {
@@ -202,7 +208,7 @@ private:
                 while ((generation = generation_.load(std::memory_order_acquire)) == seen &&
                        !stopping_.load(std::memory_order_acquire)) {
                     _mm_pause();
-                    if ((++iteration & 63u) == 0 &&
+                    if ((++iteration & 1023u) == 0 &&
                         std::chrono::steady_clock::now() >= deadline) break;
                 }
             }
@@ -238,6 +244,7 @@ private:
     alignas(64) std::atomic<int> next_{0};
     alignas(64) std::atomic<int> remaining_{0};
     alignas(64) std::atomic<int> sleepers_{0};
+    alignas(64) std::atomic<int> doneWaiters_{0};
     std::atomic<bool> stopping_{false}, active_{false}, failed_{false};
     int tileCount_ = 0;
     const void* callbackState_ = nullptr;
