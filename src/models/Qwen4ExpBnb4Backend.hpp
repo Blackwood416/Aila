@@ -474,6 +474,10 @@ public:
     bool LmHeadQ8Enabled() const { return lmHeadQ8Enabled_; }
     uint64_t LmHeadQ8ForwardCount() const { return lmHeadQ8ForwardCount_; }
     uint64_t LmHeadQ8RowCount() const { return lmHeadQ8RowCount_; }
+    // Single LM-head entry point shared by the target forward, the MTP draft and
+    // the 2..4-row verification window. The returned event covers the submitted
+    // head arithmetic; it is empty when the head ran as n single-row GEMVs.
+    sycl::event ForwardLmHead(Context& ctx, Tensor& input, Tensor& output, int rows);
     aila::Qwen4ExpExpertExecutor& expert_executor() { return expert_executor_; }
     void SetColdEpochEnabled(bool enabled) { cold_epoch_enabled_=enabled; }
     // Cold acceptance reference only. Drain GPU/CPU work and stop forwards

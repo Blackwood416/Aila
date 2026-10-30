@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on Intel Arc A770 — Architecture & Handoff
 
-> **Status:** Post-Round-10 Architecture Reference.
+> **Status:** Post-Round-11 Architecture Reference.
 > `docs/plans/` intermediate logs and the legacy `Qwen4ExpExpertCache` / `Qwen4ExpLayerStage` / `Qwen4ExpLayerMajor` / `L0HostImport` modules have been retired.
 > Environment variable reference: [`docs/Environment_Variables.md`](Environment_Variables.md).
 
@@ -50,21 +50,21 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 
 ---
 
-## 3. Prefill & Decode Architecture & Round 10 Scoreboard
+## 3. Prefill & Decode Architecture & Round 11 Scoreboard
 
 ### 3.1 Measured Prefill Scoreboard (`tools/prefill-bench.ps1 -Chunk 8192`, `max-seq 12288`)
 
-| Prompt Tokens | Round 6 | Round 8 | Round 9 | **Round 10 Wall** | **ms/token** | **Round 10 Tok/s** |
+| Prompt Tokens | Round 6 | Round 9 | Round 10 | **Round 11 Wall** | **ms/token** | **Round 11 Tok/s** |
 |---:|---:|---:|---:|---:|---:|---:|
-| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,904.9 ms (225.4 tok/s) | 8,277.9 ms (242.5 tok/s) | **8,056.8 ms** | 4.014 | **249.1 tok/s** |
-| **4,895** | 11,701.2 ms (418.3 tok/s) | 10,165.4 ms (481.5 tok/s) | 9,847.4 ms (497.1 tok/s) | **9,843.5 ms** | 2.011 | **497.3 tok/s** |
-| **7,764** | 15,071.3 ms (515.1 tok/s) | 14,878.8 ms (521.8 tok/s) | **12,282.8 ms** (632.1 tok/s) | **12,367.1 ms** | 1.593 | **627.8 tok/s** |
+| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,277.9 ms (242.5 tok/s) | 8,056.8 ms (249.1 tok/s) | **7,966.9 ms** | 3.970 | **251.9 tok/s** |
+| **4,895** | 11,701.2 ms (418.3 tok/s) | 9,847.4 ms (497.1 tok/s) | 9,843.5 ms (497.3 tok/s) | **9,751.9 ms** | 1.992 | **502.0 tok/s** |
+| **7,764** | 15,071.3 ms (515.1 tok/s) | 12,282.8 ms (632.1 tok/s) | 12,367.1 ms (627.8 tok/s) | **12,317.0 ms** | 1.586 | **630.4 tok/s** |
 
-- **Linear fit**: `~6,800 ms` fixed cost + **`0.70 ms/token` marginal cost (`~1,430 tok/s` marginal throughput across 2K–8K)**.
+- **Linear fit**: `~6,670 ms` fixed cost + **`0.70 ms/token` marginal cost (`~1,430 tok/s` marginal throughput across 2K–8K)**.
 - **Decode throughput (single-stream, no MTP)**:
   - **Long-Horizon Decode (`tools/decode-bench.ps1`, `essay.json` 40p + 256g / 512g)**:
-    - **256 Generated Tokens**: **`23.7 tok/s`** (`mean = 42.22 ms/tok`, **`p50 = 41.87 ms`**, `p90 = 44.60 ms`; intervals `1-64: 23.9 tok/s`, `65-256: 23.6 tok/s`, cache hit `37.7%`).
-    - **512 Generated Tokens**: **`23.2 tok/s`** (`mean = 43.10 ms/tok`, **`p50 = 42.67 ms`**, `p90 = 46.08 ms`; intervals `1-64: 23.7 tok/s`, `65-256: 23.2 tok/s`, `257-512: 23.1 tok/s`, cache hit `37.7%`).
+    - **256 Generated Tokens**: **`23.6–23.7 tok/s`** (`mean = 42.22–42.33 ms/tok`, **`p50 = 41.87–41.97 ms`**, `p90 = 44.60–44.76 ms`; intervals `1-64: 23.8–23.9 tok/s`, `65-256: 23.6 tok/s`).
+    - **512 Generated Tokens**: **`23.4–23.5 tok/s`** (`mean = 42.62–42.78 ms/tok`, **`p50 = 42.34–42.49 ms`**, `p90 = 45.15–45.29 ms`; intervals `1-64: 23.8–23.9 tok/s`, `65-256: 23.5 tok/s`, `257-512: 23.2–23.3 tok/s`).
 
 ### 3.2 Key Prefill Optimizations
 1. **Dense NF4 Projections via Vectorized Dequant + oneDNN (`AILA_BNB4_ONEDNN_MIN_M = 128`)**: Routes all `seq_len >= 128` dense NF4 projections (including the 97 `N = 2560` calls: 36 `linear_o_proj`, 12 QSA `o_proj`, 48 `shared_down_proj`, 1 PLE `value_proj`) to word-vectorized `dequantize_weight` + oneDNN `ab` MatMul (16.0× faster than the custom wide joint-matrix kernel on `N = 2560`, saving ~2.95 s at 8K).
@@ -92,7 +92,12 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
     - **Completion-Ordered Single-Pass `CpuTilePool` Dispatch (`AILA_Q4E_CPU_COMPLETION_SINGLE_PASS=1`)**: Replaces the two-pass (`gate_up` barrier + `down` barrier) `ParallelFor` in `nf4_q8_batch_forward` with a single `ParallelFor` over `count * (gate_tile_cols + down_tile_cols)`. The thread finishing an expert's 40th gate tile quantizes `h` inline and publishes the expert ID into a completion-ordered queue (`gate_countdown[slot].ready_unit`), so `down` tiles immediately drain finished experts in completion order without a mid-layer thread-pool barrier or straggler stall.
     - **Q8 Quantized LM Head (`AILA_Q4E_LM_HEAD_Q8=1`) & Full 3,456-Slot GPU Hotset (`AILA_Q4E_MAX_GPU_SLOTS=3456`)**: Quantizes the `[248320, 2560]` LM head to block-64 INT8 under `qwen38-a770`, reclaiming **568.4 MiB of static VRAM**, expanding GPU resident experts from 3,360 to the full **3,456 slots (72 experts/layer × 48 layers)**, and halving `lm_head` decode bandwidth while deferring Layer-47 `complete_deferred_cpu_join()` behind host-side `mixer_ + lm_head_` recording (`head_host_ms = 0.00 ms` on non-swap tokens).
     - **Unforced Decode-Stride Snapshot Suppression (`AILA_Q4E_DECODE_STRIDE_SNAPSHOT=0`)**: Prevents unforced single-token decode steps from firing `CaptureSnapshot` every 64 tokens (`cached_len % 64 == 0`), eliminating a `35.6 ms` 112.2 MB D2H GDN state copy stall every 64 tokens and preserving the 2-slot reusable prompt prefix checkpoints across long generations.
-    - **Division-Free NF4 GEMV Scales, Redundant Input-Prefetch Elimination & 4-Stream HC Up-Mix Unrolling**: Replaces signed integer division `byte_offset / packed_bytes_per_block` with `byte_offset >> 5` on `blocksize == 64`, disables redundant per-subgroup LSC input prefetches (`AILA_BNB4_GEMV_INPUT_PREFETCH_OFF=1`), unrolls the 4-stream `hc_decode_up_mix` loop on `lowrank == 320`, and gates chunked GDN prefill on `count > 64` for exact interior-checkpoint bitwise parity on short prompts.
+    - **Division-Free NF4 GEMV Scales, Redundant Input-Prefetch Elimination & 4-Stream HC Up-Mix Unrolling**: Replaces signed integer division `byte_offset / packed_bytes_per_block` with `byte_offset >> 5` on `blocksize == 64`, disables redundant per-subgroup LSC input prefetches (`AILA_BNB4_GEMV_INPUT_PREFETCH_OFF=1`), unrolls the 4-stream `hc_decode_up_mix` loop on `lowrank == 320`, and gates chunked GDN prefill on `count > 64 || !cold_epoch_enabled_` so the 16-token load-time warmup compiles `ops::try_linear_delta_prefill_chunked` while short post-warmup prompts preserve exact interior-checkpoint bitwise parity.
+13. **262K-Context QSA Sparse Attention Scaling, Unified Q8/MTP Speculative Runtime & Server Preset Propagation (Round 11)**:
+    - **262K-Context QSA Radix Selector & 8-Block Sub-Group Decode Scoring**: Raises the `qsa_selector_mode` radix-selector threshold from `32,768` blocks (`131,072` tokens) to **`65,536` blocks (`262,144` tokens at `compress_ratio = 4`)**, replaces the single-lane serial scan in the legacy cutoff selector with a 256-lane `sycl::exclusive_scan_over_group` stable compaction, adds the 8-blocks-per-workgroup sub-group shuffle fastpath (`AILA_QSA_FAST_BLOCK_SCORES=1`) to single-token `qsa_compute_block_scores_compressed` past 514 blocks, and retains cross-layer deferred CPU join past `2,051` tokens during block-native single-token decode (`!s_qsa_block_native || count > 1`).
+    - **Unified `ForwardLmHead` Entry Point, 2-Row Q8 Head Weight-Reuse Kernel & MTP Runtime Unblocking**: Unifies target and draft LM-head dispatch through `Qwen4ExpBnb4Backend::ForwardLmHead`, adds a single-launch 2-row weight-reuse fastpath to `ops::bf16_q8_head_forward` alongside default-on 2-row NF4 verification weight reuse (`AILA_Q4E_VERIFY_LINEAR_REUSE=3`, `AILA_Q4E_MTP_HIDDEN_REUSE=1`), and removes the legacy `!lmHeadQ8Enabled_` and `gdn_chunk_mode_ == 0` blocks from `Qwen4ExpMtpRuntime` while bounding MTP session allocations by `EffectiveCapacity(maxSequenceLength)`.
+    - **Sparse QSA & Fused Operators in `Qwen4ExpMtpDraft`**: Upgrades the 1-layer MTP draft head to use `target_.RunHyperConnectionCombined`, `ops::bf16_moe_front_fused`, `target_.ForwardLmHead`, and sparse QSA block selection past 2,048 tokens using `mtp.layers.0.self_attn.indexer.*`.
+    - **Adaptive Cache Warmup Isolation, Usage Decay & Worker Preset Inheritance**: Guards `adaptive_cache_.ObserveRouting` on `cold_epoch_enabled_` so synthetic load-time warmup tokens cannot pollute hotset frequencies, ages `usage_` by `0.85` after each swap interval (`AILA_Q4E_ADAPTIVE_SWAP_DECAY=1`, `AILA_Q4E_ADAPTIVE_SWAP_FREQ=16`), and propagates `AILA_Q4E_ACTIVE_PRESET=qwen38-a770` into `AilaWorker.exe` (`WorkerMain.cpp` + `tools/server/start-qwen38.ps1`).
 
 ---
 

@@ -3,24 +3,33 @@ param(
     [string]$Model = 'D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [int]$Port = 8080,
     [int]$Context = 32768,
-    [int]$PrefillChunk = 4096,
+    [int]$PrefillChunk = 8192,
     [int]$MaxNewTokens = 2048,
+    [switch]$EnableMtp,
     [switch]$DisableReuse
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-$profilePath = Join-Path $repoRoot 'docs/plans/qwen38-server-mtp-2026-10-07.json'
-$profile = Get-Content -LiteralPath $profilePath -Raw | ConvertFrom-Json
-foreach ($entry in $profile.worker_environment.PSObject.Properties) {
-    [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, 'Process')
-}
-# Long-context agent serving uses T1 until MTP's numerical alignment and sparse
-# draft attention are validated. Keep the existing compute optimizations.
-$env:AILA_Q4E_SERVER_MTP = '0'
+# The worker applies the same preset when it sees this marker. The preset only
+# fills flags that are unset, so anything below still wins.
+$env:AILA_Q4E_ACTIVE_PRESET = 'qwen38-a770'
+# MTP stays opt-in: the draft head shares the target's QSA/head arithmetic but
+# has not passed the long-context numerical acceptance gate.
+$env:AILA_Q4E_SERVER_MTP = if ($EnableMtp) { '1' } else { '0' }
 # Measured on A770: leave room for the lazy PLE workspace to grow during
 # long prefill instead of assigning every released byte to expert residency.
 $env:AILA_Q4E_VRAM_RESERVE_MB = '3584'
-$env:AILA_Q4E_HOTSET_PROFILE = Join-Path $repoRoot 'perf/qwen4exp/profiles/qwen38-nf4-h4-v1.profile'
+$hotsetProfile = Join-Path $repoRoot 'perf/qwen4exp/profiles/qwen38-nf4-h4-v1.profile'
+if (Test-Path -LiteralPath $hotsetProfile) {
+    $env:AILA_Q4E_HOTSET_PROFILE = $hotsetProfile
+}
+# Past 64K tokens the bf16 KV cache no longer fits comfortably in 16 GB VRAM
+# next to the expert hotset, so 262K context needs int8 KV unless the caller
+# pinned a format explicitly.
+if ($Context -gt 65536 -and -not (Test-Path Env:AILA_KV_QUANT)) {
+    $env:AILA_KV_QUANT = '1'
+    $env:AILA_KV_QUANT_FORMAT = 'int8'
+}
 # A770/Haswell paired screening: faster short continuations with the same
 # two staging banks. Preserve an explicit caller override (including '0').
 if (-not (Test-Path Env:AILA_Q4E_STAGE_COPY_PARALLEL)) {

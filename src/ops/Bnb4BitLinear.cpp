@@ -2569,11 +2569,14 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
         return;
     }
 
-    static const int verify_reuse = aila::env::read_int_raw("AILA_Q4E_VERIFY_LINEAR_REUSE", 0);
-    static const bool draft_reuse = aila::env::read_flag("AILA_Q4E_MTP_HIDDEN_REUSE", false);
+    static const int verify_reuse = aila::env::read_int_raw("AILA_Q4E_VERIFY_LINEAR_REUSE", 3);
+    static const bool draft_reuse = aila::env::read_flag("AILA_Q4E_MTP_HIDDEN_REUSE", true);
     const bool reuse_shape = (verify_reuse > 0 && in_features_ == 2560 && out_features_ == 16480) ||
         (verify_reuse >= 2 && in_features_ == 6144 && out_features_ == 2560) ||
-        (verify_reuse >= 3 && in_features_ == 2560 && out_features_ == 13312);
+        (verify_reuse >= 3 && in_features_ == 2560 && out_features_ == 13312) ||
+        (verify_reuse >= 3 && in_features_ == 2560 &&
+         (out_features_ == 7168 || out_features_ == 1280)) ||
+        (verify_reuse >= 3 && in_features_ == 640 && out_features_ == 2560);
     // Four MTP hidden streams form two independent pairs; still two accumulators.
     if ((rows == 2 && reuse_shape) ||
         (draft_reuse && rows == 4 && in_features_ == 2560 && out_features_ == 2560))
@@ -2985,6 +2988,53 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
     int8_t* input_codes = xq.data_as<int8_t>();
     float* input_scales = xs.data_as<float>();
     sycl::event last;
+    // Two-token verification fastpath. Each work-group step loads one 64-value
+    // weight block and one block scale once and applies the identical
+    // bf16_head_signed_dot4 / sycl::fma expressions to both activation rows, so
+    // the head pays half the weight traffic of two independent launches.
+    if (rows == 2 && xq.numel() >= int64_t(2) * hidden &&
+        xs.numel() >= int64_t(2) * (hidden / 64)) {
+        quantize_bf16_head_blocks(ctx, input.data_as<bf16>(),
+                                 input_codes, input_scales, size_t(blocks_per_row));
+        quantize_bf16_head_blocks(ctx, input.data_as<bf16>() + size_t(hidden),
+                                 input_codes + hidden, input_scales + blocks_per_row,
+                                 size_t(blocks_per_row));
+        bf16* destination0 = output.data_as<bf16>();
+        bf16* destination1 = destination0 + size_t(vocab);
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(size_t(vocab / rows_per_group) * wg, wg),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const int lane = static_cast<int>(item.get_local_linear_id() % sg_size);
+                    const int row = static_cast<int>(item.get_group(0)) * rows_per_group
+                        + static_cast<int>(item.get_local_linear_id() / sg_size);
+                    const int8_t* w = weights + size_t(row) * hidden;
+                    const float* ws = weight_scales + size_t(row) * blocks_per_row;
+                    float acc0 = 0.0f, acc1 = 0.0f;
+                    #pragma unroll 4
+                    for (int k = lane * 8; k < hidden; k += sg_size * 8) {
+                        const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
+                        const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
+                        const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + k);
+                        const int32_t x1 = *reinterpret_cast<const int32_t*>(input_codes + k + 4);
+                        const int32_t y0 = *reinterpret_cast<const int32_t*>(input_codes + hidden + k);
+                        const int32_t y1 = *reinterpret_cast<const int32_t*>(input_codes + hidden + k + 4);
+                        const int blk = k >> 6;
+                        const float scale = ws[blk];
+                        const int32_t dot0 = bf16_head_signed_dot4(w0, x0) + bf16_head_signed_dot4(w1, x1);
+                        const int32_t dot1 = bf16_head_signed_dot4(w0, y0) + bf16_head_signed_dot4(w1, y1);
+                        acc0 = sycl::fma(static_cast<float>(dot0), scale * input_scales[blk], acc0);
+                        acc1 = sycl::fma(static_cast<float>(dot1),
+                                        scale * input_scales[blocks_per_row + blk], acc1);
+                    }
+                    const float sum0 = sycl::reduce_over_group(item.get_sub_group(), acc0, sycl::plus<float>());
+                    const float sum1 = sycl::reduce_over_group(item.get_sub_group(), acc1, sycl::plus<float>());
+                    if (lane == 0) {
+                        destination0[row] = bf16(sum0);
+                        destination1[row] = bf16(sum1);
+                    }
+                });
+        });
+    }
     for (int token = 0; token < rows; ++token) {
         quantize_bf16_head_blocks(ctx, input.data_as<bf16>() + size_t(token) * hidden,
                                  input_codes, input_scales, size_t(blocks_per_row));

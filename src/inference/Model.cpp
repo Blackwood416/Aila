@@ -218,7 +218,7 @@ public:
     int Capacity() const override { return model->options.maxSequenceLength; }
     int VocabSize() const override { return model->vocabSize; }
     size_t CacheBytes() const override {
-        return cache->CacheBytes() + (model->mtp ? Qwen4ExpMtpRuntime::SessionBytes(Capacity()) : 0);
+        return cache->CacheBytes() + (model->mtp ? Qwen4ExpMtpRuntime::SessionBytes(model->mtp->Capacity()) : 0);
     }
     bool SupportsDecodeWindow() const noexcept override { return model->mtp != nullptr; }
     std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector) override {
@@ -228,7 +228,7 @@ public:
             std::lock_guard<std::mutex> lock(device.mutex);
             device.CheckUsable();
             if (!model->mtp || !mtpState->valid || mtpState->length != cache->CurrentLength() ||
-                cache->CurrentLength() < 1 || cache->CurrentLength() + 2 > Capacity()) return std::nullopt;
+                cache->CurrentLength() < 1 || cache->CurrentLength() + 2 > model->mtp->Capacity()) return std::nullopt;
             try {
                 LogSessionBoundary(device.context, "win-pre", 2, -1, pending);
                 auto window = model->mtp->ForwardWindow(*cache, *mtpState, pending, selector);
@@ -281,14 +281,17 @@ public:
     }
 
     // Prompt-phase entry point. MTP AfterForward needs complete target hidden
-    // rows, so while an MTP runtime is loaded the phase close-out stays off and
-    // the existing path is used unchanged.
+    // rows, so while a chunk lands inside the draft window the phase close-out
+    // stays off and the existing path is used unchanged; a chunk that would
+    // leave the window keeps the close-out and lets the draft invalidate itself.
     ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
                                    const SamplingInput* sampling,
                                    bool captureLogits,
                                    int prefillRemaining,
                                    const int* nextTokens, int nextCount) override {
-        const int remaining = model->mtp ? -1 : prefillRemaining;
+        const int remaining = (model->mtp && mtpState && mtpState->valid &&
+                               cache->CurrentLength() + static_cast<int>(tokenIds.size()) <= model->mtp->Capacity())
+            ? -1 : prefillRemaining;
         return ForwardImpl(tokenIds, sampling, captureLogits, remaining, nextTokens, nextCount);
     }
 
@@ -797,12 +800,14 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         throw Error(ErrorCode::InvalidArgument, error.what());
     }
     loaded->options = options;
-    enableMtp = enableMtp && options.maxSequenceLength >= 2 && options.maxSequenceLength <= 2048 &&
-        aila::env::read_int("AILA_Q4E_GDN_CHUNK_MODE", 0) == 0 &&
-        !aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", false);
+    // The draft window is bounded by AILA_Q4E_MTP_MAX_CONTEXT, not by the
+    // session budget, so admission and reservation both use the draft capacity.
+    const int mtpCapacity = Qwen4ExpMtpRuntime::EffectiveCapacity(options.maxSequenceLength);
+    enableMtp = enableMtp && options.maxSequenceLength >= 2 && mtpCapacity >= 2 &&
+        mtpCapacity <= options.maxSequenceLength;
     if (enableMtp) {
         reservation.deviceBytes = aila::memory::checked_memory_sum(reservation.deviceBytes,
-            Qwen4ExpMtpRuntime::SessionBytes(options.maxSequenceLength));
+            Qwen4ExpMtpRuntime::SessionBytes(mtpCapacity));
     }
     loaded->sessionReservationBytes = reservation.deviceBytes;
     loaded->sessionHostReservationBytes = reservation.hostBytes;
@@ -834,7 +839,7 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
             throw Error(ErrorCode::UnsupportedModel, error);
         }
         if (enableMtp) loaded->mtp = std::make_unique<Qwen4ExpMtpRuntime>(context,
-            static_cast<Qwen4ExpBnb4Backend&>(*loaded->backend), *loaded->weights, options.maxSequenceLength);
+            static_cast<Qwen4ExpBnb4Backend&>(*loaded->backend), *loaded->weights, mtpCapacity);
         loaded->workspace = std::make_unique<detail::ExecutionWorkspace>();
         if (qwen4exp) {
             // Shared execution scratch is owned and budgeted once, before decode.

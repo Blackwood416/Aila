@@ -730,8 +730,10 @@ bool Qwen4ExpBnb4Backend::load(
             throw std::runtime_error("Qwen4Exp Q8 head requires raw BF16 [248320,2560] in model Context");
         lm_head_q8_weight_ = Tensor::allocate(ctx, {cfg_.vocab_size, hidden_size_}, dnnl::memory::data_type::u8);
         lm_head_q8_scale_ = Tensor::allocate(ctx, {cfg_.vocab_size, hidden_size_ / 64}, dnnl::memory::data_type::f32);
-        lm_head_q8_input_ = Tensor::allocate(ctx, {hidden_size_}, dnnl::memory::data_type::u8);
-        lm_head_q8_input_scale_ = Tensor::allocate(ctx, {hidden_size_ / 64}, dnnl::memory::data_type::f32);
+        // Four activation rows so multi-row verification (rows 2..4) quantizes
+        // every row in one pass instead of reusing one row's scratch.
+        lm_head_q8_input_ = Tensor::allocate(ctx, {4 * hidden_size_}, dnnl::memory::data_type::u8);
+        lm_head_q8_input_scale_ = Tensor::allocate(ctx, {4 * (hidden_size_ / 64)}, dnnl::memory::data_type::f32);
         ops::quantize_bf16_weights_q8_64(ctx, raw_lm_head, lm_head_q8_weight_, lm_head_q8_scale_);
         ctx.synchronize(); // Raw BF16 cannot be freed until conversion drains.
         weights.erase("lm_head.weight"); // Keeps host mmap; no transposed BF16 or oneDNN head.
@@ -1661,7 +1663,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     const int slot = adaptive_cache_.GetSlot(layer, t_ids[k]);
                     if (slot >= 0) { hit_slots[hit_count] = slot; hit_ranks[hit_count] = k; ++hit_count; }
                 }
-                adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+                if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
                 if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
                 if (!hit_count) continue;
                 std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
@@ -1778,7 +1780,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             }
 
             // 2. Observe routing for frequency tracking & stats
-            adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
+            if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
             if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
 
             // Native CPU sources remain owned until Join below. CPU work can
@@ -1969,7 +1971,8 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
 sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count) {
     const int top_k=cfg_.num_experts_per_tok;
-    adaptive_cache_.ObserveRouting(layer,router_host_ids_,count*top_k);
+    // Synthetic load-time warmup must not steer the adaptive hotset.
+    if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer,router_host_ids_,count*top_k);
     if (export_enabled_) export_policy_.Observe(layer, router_host_ids_, count, top_k, true);
     std::fill(prefill_expert_uses_.begin(),prefill_expert_uses_.end(),0);
     prefill_unique_.clear();
@@ -2417,6 +2420,34 @@ void Qwen4ExpBnb4Backend::EmbedTokens(
                     embed_host_.ptr + static_cast<size_t>(id) * row_bytes, row_bytes);
     }
     ctx.memcpy_h2d_async(buf_.x.data(), embed_host_rows_, static_cast<size_t>(count) * row_bytes);
+}
+
+sycl::event Qwen4ExpBnb4Backend::ForwardLmHead(
+    Context& ctx, Tensor& input, Tensor& output, int rows) {
+    if (lmHeadQ8Enabled_) {
+        sycl::event ev = ops::bf16_q8_head_forward(ctx, lm_head_q8_weight_, lm_head_q8_scale_,
+            input, output, lm_head_q8_input_, lm_head_q8_input_scale_, rows, hidden_size_, cfg_.vocab_size);
+        ++lmHeadQ8ForwardCount_;
+        lmHeadQ8RowCount_ += static_cast<uint64_t>(rows);
+        if (lmHeadQ8ForwardCount_ == 1)
+            AILA_LOG_INFO("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1 experimental=1",
+                rows, hidden_size_, cfg_.vocab_size);
+        return ev;
+    }
+    if (verify_rows_alignment_ && rows > 1) {
+        // Verify-path alignment: one head GEMV per row so the window matches
+        // sequential B1 logits exactly.
+        for (int r = 0; r < rows; ++r) {
+            auto x_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_,
+                                      {1, hidden_size_});
+            auto y_row = Tensor::view(ctx, output.data_as<bf16>() + size_t(r) * cfg_.vocab_size,
+                                      {1, cfg_.vocab_size});
+            lm_head_.forward(ctx, x_row, y_row, 1);
+        }
+        return sycl::event{};
+    }
+    lm_head_.forward(ctx, input, output, rows);
+    return sycl::event{};
 }
 
 void Qwen4ExpBnb4Backend::DenseLinear(
@@ -3049,12 +3080,18 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
     } deferredJoinGuard{*this};
 
+    // Block-native QSA decode attends 512 selected blocks plus the 4-token
+    // tail, so a single token past the 2,051-token dense budget no longer needs
+    // the deferred CPU join drained at every full-attention layer boundary.
+    static const bool s_qsa_block_native = aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
+
     // 2. 48 Transformer Layers
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
         if (L == 1 || !s_dump_dir.empty() || s_stages || dev_trace ||
-            (!layer.is_linear && (start_pos + count) > 2051)) {
+            (!layer.is_linear && (start_pos + count) > 2051 &&
+             (!s_qsa_block_native || count > 1))) {
             complete_deferred_cpu_join();
         }
         // Round 2: layer boundary = queue idle from the previous layer's last
@@ -3393,7 +3430,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     bool run_adaptive_swap_now = false;
     int adaptive_max_swaps = 4;
     if (adaptive_cache_.IsAllocated() && count == 1 && !options.decode_verification && !interior) {
-        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 12);
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 16);
         static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 4);
         static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 60);
         adaptive_max_swaps = s_max_swaps;
@@ -3410,6 +3447,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
                 adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
             }
+            static const bool s_adaptive_swap_decay =
+                aila::env::read_flag("AILA_Q4E_ADAPTIVE_SWAP_DECAY", true);
+            if (s_adaptive_swap_decay) adaptive_cache_.Decay(0.85f);
         }
     }
 
@@ -3426,35 +3466,16 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
 
         // 4. LM Head (Compute for last token)
-        auto forward_head = [&](Tensor& input, int rows) {
-            if (lmHeadQ8Enabled_) {
-                ops::bf16_q8_head_forward(ctx, lm_head_q8_weight_, lm_head_q8_scale_, input, buf_.logits,
-                    lm_head_q8_input_, lm_head_q8_input_scale_, rows, hidden_size_, cfg_.vocab_size);
-                ++lmHeadQ8ForwardCount_;
-                lmHeadQ8RowCount_ += static_cast<uint64_t>(rows);
-                if (lmHeadQ8ForwardCount_ == 1)
-                    AILA_LOG_INFO("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1 experimental=1",
-                        rows, hidden_size_, cfg_.vocab_size);
-            } else if (verify_rows_alignment_ && rows > 1) {
-                // Verify-path alignment: one head GEMV per row so the window
-                // matches sequential B1 logits exactly.
-                for (int r = 0; r < rows; ++r) {
-                    auto x_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
-                    auto y_row = Tensor::view(ctx, buf_.logits.data_as<bf16>() + size_t(r) * cfg_.vocab_size, {1, cfg_.vocab_size});
-                    lm_head_.forward(ctx, x_row, y_row, 1);
-                }
-            } else lm_head_.forward(ctx, input, buf_.logits, rows);
-        };
         if (lastTokenOnly) {
             const bf16* last_x = static_cast<const bf16*>(buf_.x.data()) + static_cast<size_t>(count - 1) * hidden_size_;
             Tensor x_last_view = Tensor::view(ctx, const_cast<bf16*>(last_x), {1, hidden_size_});
-            forward_head(x_last_view, 1);
+            (void)ForwardLmHead(ctx, x_last_view, buf_.logits, 1);
             lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {1, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
         } else {
             if (buf_.logits.shape(0) < count) {
                 buf_.logits = Tensor::allocate(ctx, {count, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
             }
-            forward_head(buf_.x, count);
+            (void)ForwardLmHead(ctx, buf_.x, buf_.logits, count);
             lastTokenLogits_ = Tensor::view(ctx, buf_.logits.data(), {count, static_cast<int64_t>(cfg_.vocab_size)}, buf_.logits.dtype());
         }
 

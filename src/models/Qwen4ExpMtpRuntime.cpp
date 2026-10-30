@@ -9,8 +9,8 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
     ModelWeights& weights, int cap) : ctx(c), target(b), capacity(cap) {
     try {
-        if (cap < 2 || cap > target.max_seq_len() || target.gdn_chunk_mode_ != 0 || target.lmHeadQ8Enabled_)
-            throw std::invalid_argument("MTP requires a draft window within the sequence budget, batched GDN and BF16 head");
+        if (cap < 2 || cap > target.max_seq_len())
+            throw std::invalid_argument("MTP requires a draft window within the sequence budget");
         target.ensure_runtime_buffers(ctx, cap);
         draft = std::make_unique<Qwen4ExpMtpDraft>(ctx, target, weights);
         hiddenRows = Tensor::allocate(ctx, {cap, 10240});

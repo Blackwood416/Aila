@@ -36,6 +36,7 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
         layer_.index_k_weight = Tensor::view(ctx_, layer_.index_qk_weight->data_as<bf16>() + 512 * 2560,
                                              {128, 2560});
         layer_.index_k_norm_weight = Norm("mtp.layers.0.self_attn.indexer.k_layernorm.weight", true);
+        layer_.index_q_norm_weight = Norm("mtp.layers.0.self_attn.indexer.q_layernorm.weight", true);
         layer_.router_w = &weights_.upload("mtp.layers.0.mlp.gate.weight", ctx_);
         layer_.shared_expert_gate_w = &weights_.upload("mtp.layers.0.mlp.shared_expert_gate.weight", ctx_);
         Quant("mtp.layers.0.mlp.shared_expert.gate_proj.weight", g);
@@ -367,7 +368,7 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     ctx_.queue().parallel_for(sycl::range<1>(10240), [=](sycl::id<1> i) {
         h[i] = bf16(float(h[i]) + float(e[i % 2560]));
     });
-    target_.RunHyperConnection(ctx_, layer_.attn_hc, 1, true);
+    target_.RunHyperConnectionCombined(ctx_, layer_.attn_hc, 1, true, nullptr, nullptr);
     layer_.qkv_proj.ForwardDecodeRows(ctx_, scratch, b.x, b.full_qkv, 1);
     auto* p = b.full_qkv.data_as<bf16>();
     auto q = Tensor::view(ctx_, p, {1, 12288});
@@ -379,28 +380,48 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
                                             11, 10,
                                             cache.k_scale.valid() ? &cache.k_scale : nullptr,
                                             cache.v_scale.valid() ? &cache.v_scale : nullptr);
-    ops::bf16_gemv_bf16(ctx_, layer_.index_k_weight, b.x.data_as<bf16>(),
-                        cache.indexer_k.data_as<bf16>() + size_t(position) * 128, 128, 2560);
-    if ((position + 1) % 4 == 0) {
-        ops::qsa_compress_key_blocks(ctx_, cache.indexer_k, *layer_.index_k_norm_weight,
-                                     cache.indexer_compressed_k, position / 4, 1, 10000000.0f, true, nullptr,
-                                     nullptr, nullptr, 0, 0, 11, 11, 10);
+    const int* active_blocks = nullptr;
+    int num_active_blocks = 0;
+    const bool sparse_qsa = !kvOnly && ((position + 1) / 4 > 512) &&
+                            layer_.index_q_norm_weight != nullptr &&
+                            cache.indexer_compressed_k.valid();
+    if (!sparse_qsa) {
+        ops::bf16_gemv_bf16(ctx_, layer_.index_k_weight, b.x.data_as<bf16>(),
+                            cache.indexer_k.data_as<bf16>() + size_t(position) * 128, 128, 2560);
+        if ((position + 1) % 4 == 0) {
+            ops::qsa_compress_key_blocks(ctx_, cache.indexer_k, *layer_.index_k_norm_weight,
+                                         cache.indexer_compressed_k, position / 4, 1, 10000000.0f, true, nullptr,
+                                         nullptr, nullptr, 0, 0, 11, 11, 10);
+            cache.num_compressed_blocks = (position + 1) / 4;
+        }
+        if (kvOnly) return;
+    } else {
+        ops::bf16_gemv_bf16(ctx_, *layer_.index_qk_weight, b.x.data_as<bf16>(),
+                            b.indexer_qk.data_as<bf16>(), 640, 2560);
+        num_active_blocks = ops::qsa_prepare_causal_query_and_select_blocks(
+            ctx_, b.indexer_qk, *layer_.index_q_norm_weight, *layer_.index_k_norm_weight,
+            cache.indexer_k, b.indexer_q, b.indexer_block_scores, b.indexer_active_blocks,
+            position, 512, 4, 10000000.0f, true, nullptr, nullptr, nullptr, 0, 0, 11, 11, 10,
+            &cache.indexer_compressed_k, &cache.num_compressed_blocks);
+        if (num_active_blocks > 0) {
+            active_blocks = b.indexer_active_blocks.data_as<int>();
+        }
     }
-    if (kvOnly) return;
     ops::attention_decode(ctx_, b.q, cache.k, cache.v, b.attn_out, b.decode_scores, 24, 2, 256, position + 1,
-                          &b.decode_attn_partials, &b.z, nullptr, 0, nullptr, 0,
+                          &b.decode_attn_partials, &b.z, nullptr, 0,
+                          active_blocks, num_active_blocks,
                           cache.k_scale.valid() ? &cache.k_scale : nullptr,
                           cache.v_scale.valid() ? &cache.v_scale : nullptr);
     layer_.o_proj.ForwardDecodeRows(ctx_, scratch, b.attn_out, b.y, 1);
     target_.RunHyperConnectionCombined(ctx_, layer_.mlp_hc, 1, true, b.y.data_as<bf16>(),
                                        b.hc_inject_f32.data_as<float>());
-    ops::bf16_gemv_bf16(ctx_, *layer_.router_w, b.x.data_as<bf16>(), b.router_scores.data_as<bf16>(), 512,
-                        2560);
+    ops::bf16_moe_front_fused(ctx_, layer_.router_w->data_as<bf16>(),
+                              layer_.shared_expert_gate_w->data_as<bf16>(), b.x.data_as<bf16>(),
+                              b.router_scores.data_as<bf16>(), b.shared_gate_buf.data_as<bf16>(),
+                              nullptr, nullptr, 2560, 512);
     auto route = ops::router_softmax_topk_device(ctx_, b.router_scores.data_as<bf16>(), nullptr,
                                                  target_.router_host_ids_, target_.router_host_weights_, 1, 512,
                                                  10, true);
-    ops::bf16_gemv_bf16(ctx_, *layer_.shared_expert_gate_w, b.x.data_as<bf16>(),
-                        b.shared_gate_buf.data_as<bf16>(), 1, 2560);
     if (!Bnb4BitLinear::try_forward_decode_gate_up_swiglu(ctx_, layer_.shared_gate_up_proj, b.x,
                                                           b.shared_inter_buf, 640)) {
         layer_.shared_gate_up_proj.ForwardDecodeRows(ctx_, scratch, b.x, b.shared_gate_up_buf, 1);
@@ -421,6 +442,6 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     RecordSlotReaders(slotIds_.data(), kMtpExpertsPerStep, done);
     ops::hc_inject_add(ctx_, b.hidden4.data_as<bf16>(), b.y.data_as<bf16>(),
                        b.hc_inject_f32.data_as<float>(), 1, 2560, 4);
-    target_.RunHyperConnection(ctx_, mixer_, 1, false);
-    target_.lm_head_.forward(ctx_, b.x, b.logits, 1);
+    target_.RunHyperConnectionCombined(ctx_, mixer_, 1, false, nullptr, nullptr);
+    target_.ForwardLmHead(ctx_, b.x, b.logits, 1);
 }

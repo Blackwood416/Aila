@@ -303,9 +303,14 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_CPU_POOL_CLAIM` | int | `1` | Number of tiles claimed per atomic fetch in `CpuTilePool::Consume`. |
 | `AILA_Q4E_DECODE_DEFER_CPU_JOIN` | bool | `true` | Defer `JoinResidentCold` / `FinishResidentCpuRead` from layer `L` to layer `L+1` after `router_softmax_topk_device(L+1)` submission (requires `UR_L0_BATCH_SIZE >= 32`, preset to `64`). |
 | `AILA_Q4E_DECODE_EXACT256_MIN_LEN` | int | `256` | Minimum attended length to dispatch `attention_decode_exact_head256_partial_merge` for `head_dim=256`. |
-| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `12` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
+| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `16` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
 | `AILA_Q4E_MAX_SWAPS` | int | `4` | Maximum expert swaps executed per swap interval. |
 | `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS` | int | `60` | Minimum sequence position before online decode expert swaps begin. |
+| `AILA_Q4E_ADAPTIVE_SWAP_DECAY` | bool | `true` | Multiply `Qwen4ExpAdaptiveCache` routing usage counters by `0.85` after each swap interval so early prompt routing does not permanently lock out later hot experts. |
+| `AILA_Q4E_VERIFY_LINEAR_REUSE` | int | `3` | 2-row NF4 weight-reuse level during multi-row verification decode (`0` = off, `1` = `2560x16480`, `2` = +`6144x2560`, `3` = +`2560x13312`, `2560x7168`, `2560x1280`, `640x2560`). |
+| `AILA_Q4E_MTP_HIDDEN_REUSE` | bool | `true` | Enable 2-pair NF4 weight reuse for 4-row `2560x2560` MTP draft hidden projections. |
+| `AILA_Q4E_SERVER_MTP` | bool | `false` | Enable speculative 2-token MTP draft/verify runtime on `LoadedModel::LoadQwen4ExpNf4`. |
+| `AILA_Q4E_MTP_MAX_CONTEXT` | int | `2048` | Maximum sequence context length tracked by `Qwen4ExpMtpRuntime` before gracefully falling back to standard T1 decode. |
 | `AILA_Q4E_CPU_COMPLETION_SINGLE_PASS` | bool | `true` | Fuse CPU cold-expert `gate_up`, inline `h` quantization, and completion-ordered `down` tiles into a single `CpuTilePool::ParallelFor` pass per layer. |
 | `AILA_Q4E_DECODE_STRIDE_SNAPSHOT` | bool | `false` | Capture periodic `AILA_Q4E_PREFILL_STEP` recurrent snapshots during unforced single-token decode steps (off by default to avoid 64-token D2H stalls and preserve prompt checkpoints). |
 | `AILA_BNB4_GEMV_INPUT_PREFETCH_OFF` | bool | `true` | Skip redundant per-subgroup LSC input prefetches in BF16 NF4 decode GEMV kernels. |

@@ -55,9 +55,11 @@ are already excluded from the samples; this only shortens the run.
 pwsh -NoProfile -File tools/decode-bench.ps1 -MaxTokens @(256, 512)
 #>
 param(
+    [Alias('Binary')]
     [string]$Exe = 'build-refactor/Aila.exe',
     [string]$Model = 'D:/QwenModels/Qwen3.8-Flash-Next-BNB-NF4-v2',
     [string]$Prompt = 'perf/qwen4exp/prompts/essay.json',
+    [Alias('Tokens')]
     [object[]]$MaxTokens = @(256, 512),
     [int]$MaxSeq = 4096,
     [string]$OutDir = 'tmp/decode-bench',

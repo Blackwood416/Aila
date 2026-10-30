@@ -1210,7 +1210,7 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
     static const bool s_completion_single_pass =
         aila::env::read_int_raw("AILA_Q4E_CPU_COMPLETION_SINGLE_PASS", 1) != 0;
     const bool use_completion_single_pass =
-        inline_gate_quant && s_completion_single_pass && currentTilePool != nullptr && count > 1;
+        inline_gate_quant && s_completion_single_pass && currentTilePool != nullptr && count >= 1;
     if (inline_gate_quant) {
         for (int c = 0; c < count; ++c) {
             gate_countdown[c].rem.store(gate_tile_cols, std::memory_order_relaxed);

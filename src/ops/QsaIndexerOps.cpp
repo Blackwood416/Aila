@@ -24,9 +24,9 @@ struct QsaSelectorPolicy {
 int qsa_selector_mode(Context& ctx, int topk, int ratio, int blocks) {
     static const int mode = aila::env::read_int_raw("AILA_QSA_SELECTOR", -1);
     if (mode >= 0) return mode;
-    // A770/Level Zero, Qwen's 512-block budget, through 128K visible tokens.
+    // A770/Level Zero, Qwen's 512-block budget, through 262K visible tokens.
     // Cache device identification per Context, never in a process-global device flag.
-    if (topk != 512 || ratio != 4 || blocks > 32768) return 0;
+    if (topk != 512 || ratio != 4 || blocks > 65536) return 0;
     return ctx.workspace<QsaSelectorPolicy>().mode;
 }
 
@@ -1300,6 +1300,63 @@ void qsa_compute_block_scores_compressed(
     constexpr int kWgSize = 128;
     constexpr float inv_sqrt_d = 0.08838834764831845f;
 
+    // Block-native long-context fastpath. Past 514 complete blocks a per-block
+    // 128-lane work-group pays more launch and reduction overhead than the
+    // block's 512 multiply-adds justify, so one 128-thread work-group owns eight
+    // blocks: each 16-lane sub-group reduces one block from sixteen vec8 loads
+    // of its compressed key. Q is staged once per work-group in SLM.
+    static const bool s_fast_block_scores =
+        aila::env::read_flag("AILA_QSA_FAST_BLOCK_SCORES", true);
+    constexpr int kFastBlocksPerWg = 8;
+    constexpr int kFastSgSize = kWgSize / kFastBlocksPerWg;
+    if (num_complete_blocks > 514 && s_fast_block_scores) {
+        using kvec8 = sycl::vec<bf16, 8>;
+        const int num_groups = (num_complete_blocks + kFastBlocksPerWg - 1) / kFastBlocksPerWg;
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> q_slm(4 * kHeadDim, cgh);
+            cgh.parallel_for(
+                sycl::nd_range<1>(static_cast<size_t>(num_groups) * kWgSize, kWgSize),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kFastSgSize)]] {
+                    const int lid = item.get_local_id(0);
+                    for (int i = lid; i < 4 * kHeadDim; i += kWgSize)
+                        q_slm[i] = static_cast<float>(q_ptr[i]);
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    const int b = static_cast<int>(item.get_group(0)) * kFastBlocksPerWg +
+                        lid / kFastSgSize;
+                    if (b >= num_complete_blocks) return;
+                    const auto sg = item.get_sub_group();
+                    const int lane = static_cast<int>(sg.get_local_linear_id());
+                    const int d0 = lane * 8;
+                    const kvec8 k_vec = *reinterpret_cast<const kvec8*>(
+                        comp_k_ptr + static_cast<size_t>(b) * kHeadDim + d0);
+                    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const float kl = static_cast<float>(k_vec[j]);
+                        const int d = d0 + j;
+                        p0 += q_slm[0 * kHeadDim + d] * kl;
+                        p1 += q_slm[1 * kHeadDim + d] * kl;
+                        p2 += q_slm[2 * kHeadDim + d] * kl;
+                        p3 += q_slm[3 * kHeadDim + d] * kl;
+                    }
+                    const float dot0 = sycl::reduce_over_group(sg, p0, sycl::plus<float>());
+                    const float dot1 = sycl::reduce_over_group(sg, p1, sycl::plus<float>());
+                    const float dot2 = sycl::reduce_over_group(sg, p2, sycl::plus<float>());
+                    const float dot3 = sycl::reduce_over_group(sg, p3, sycl::plus<float>());
+
+                    if (lane == 0 && b < num_complete_blocks) {
+                        const float r0 = sycl::max(0.0f, dot0);
+                        const float r1 = sycl::max(0.0f, dot1);
+                        const float r2 = sycl::max(0.0f, dot2);
+                        const float r3 = sycl::max(0.0f, dot3);
+                        scores_ptr[b] = (r0 + r1 + r2 + r3) * inv_sqrt_d;
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(num_complete_blocks * kWgSize, kWgSize),
@@ -1596,7 +1653,6 @@ int qsa_select_topk_blocks(
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int, 1> local_cnt_one(sycl::range<1>(kWgSize), cgh);
-        sycl::local_accessor<int, 1> selected_blocks(sycl::range<1>(std::max(1, block_topk)), cgh);
         sycl::local_accessor<std::uint32_t, 1> cutoff_key(sycl::range<1>(1), cgh);
         sycl::local_accessor<int, 1> remaining_rank(sycl::range<1>(1), cgh);
 
@@ -1643,26 +1699,31 @@ int qsa_select_topk_blocks(
                     prefix_mask |= bit_mask;
                 }
 
-                if (lid == 0) {
-                    const std::uint32_t threshold = cutoff_key[0];
-                    int above_count = 0;
-                    for (int b = 0; b < num_complete_blocks; ++b) {
-                        if (qsa_score_order_key(scores_ptr[b]) > threshold) ++above_count;
-                    }
-                    int ties_needed = block_topk - above_count;
-                    int added = 0;
-                    for (int b = 0; b < num_complete_blocks; ++b) {
-                        const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
-                        if (key > threshold || (key == threshold && ties_needed > 0)) {
-                            selected_blocks[added++] = b;
-                            if (key == threshold) --ties_needed;
-                        }
-                    }
+                // Contiguous per-lane intervals make the compaction stable: every
+                // lane writes its own run at its prefix offset, so out_ptr stays
+                // ascending by block ID without a serial single-lane pass.
+                const std::uint32_t threshold = cutoff_key[0];
+                const int ties_available = remaining_rank[0];
+                const int per = (num_complete_blocks + kWgSize - 1) / kWgSize;
+                const int begin = lid * per;
+                const int end = sycl::min(begin + per, num_complete_blocks);
+                int greater = 0, equal = 0;
+                for (int b = begin; b < end; ++b) {
+                    const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                    greater += key > threshold;
+                    equal += key == threshold;
                 }
-                item.barrier(sycl::access::fence_space::local_space);
-
-                for (int idx = lid; idx < block_topk; idx += kWgSize) {
-                    out_ptr[idx] = selected_blocks[idx];
+                const int eq_before = sycl::exclusive_scan_over_group(
+                    item.get_group(), equal, sycl::plus<int>());
+                int ties = sycl::min(equal, sycl::max(0, ties_available - eq_before));
+                int offset = sycl::exclusive_scan_over_group(
+                    item.get_group(), greater + ties, sycl::plus<int>());
+                for (int b = begin; b < end; ++b) {
+                    const std::uint32_t key = qsa_score_order_key(scores_ptr[b]);
+                    if (key > threshold || (key == threshold && ties > 0)) {
+                        out_ptr[offset++] = b;
+                        if (key == threshold) --ties;
+                    }
                 }
 
                 if (lid < tail_len) {
