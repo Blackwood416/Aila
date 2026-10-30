@@ -888,7 +888,7 @@ target_include_directories(AilaQwen4ExpModuleTests PRIVATE
 )
 target_link_libraries(AilaQwen4ExpModuleTests PRIVATE AilaLib)
 add_test(NAME AilaQwen4ExpModuleTests COMMAND AilaQwen4ExpModuleTests)
-set_tests_properties(AilaQwen4ExpModuleTests PROPERTIES LABELS "gpu;models;qwen4_exp" TIMEOUT 120)
+set_tests_properties(AilaQwen4ExpModuleTests PROPERTIES LABELS "gpu;models;qwen4_exp" TIMEOUT 300)
 
 add_executable(AilaQwen4ExpGenerationTests tests/models/Qwen4ExpGenerationTests.cpp)
 target_compile_definitions(AilaQwen4ExpGenerationTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)

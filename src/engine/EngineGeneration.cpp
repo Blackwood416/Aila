@@ -103,6 +103,24 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
             slice_options.prefill_remaining = prompt_phase ? end - next : -1;
             slice_options.capture_snapshot = options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
                 (options.capture_snapshot || (snapshot_after_len > 0 && next == snapshot_after_len));
+            // Qwen4Exp gathers embedding rows from the host mmap, so a prompt
+            // slice never needs its ids in device memory: the ids stay in the
+            // caller's vector and the backend skips the device readback. A
+            // single-row slice still copies them because the opt-in
+            // whole-token graph path reads the device row directly.
+            const bool host_ids = model_spec_.family == ModelFamily::Qwen4Exp;
+            if (host_ids) {
+                slice_options.host_token_ids = token_ids.data() + pos;
+                if (prompt_phase && next < end) {
+                    // PLE lookahead: the next chunk's n-gram staging depends
+                    // only on the known tokens, so it is prepared while this
+                    // slice runs instead of after it.
+                    const int remaining = end - next;
+                    slice_options.next_prefill_tokens = token_ids.data() + next;
+                    slice_options.next_prefill_count = std::min(
+                        chunk_size > 0 ? chunk_size : remaining, remaining);
+                }
+            }
             try {
                 if (async_h2d) {
                     ctx_->memcpy_h2d_async(token_ids_device,
@@ -1094,6 +1112,10 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                 auto pop_forced_token = [&]() -> int {
                     return forced_tokens[forced_token_index++];
                 };
+                // The token being fed is always this host copy of
+                // next_token, so the decode step needs no device readback.
+                ForwardOptions decode_opts{SnapshotPolicy::None, true};
+                decode_opts.host_token_ids = &next_token;
 
                 while (generated_count < max_new_tokens) {
                     if (tokenizer_.is_eos(current_token)) {
@@ -1148,7 +1170,7 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                         break;
                     }
 
-                    Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1, forward_options);
+                    Tensor& logits_next = backend_->forward(*ctx_, current_token_device, 1, decode_opts);
                     if (has_forced_token()) {
                         next_token = pop_forced_token();
                     } else {

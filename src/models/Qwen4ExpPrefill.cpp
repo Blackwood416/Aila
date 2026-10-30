@@ -70,7 +70,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
     const int cached_len = start_pos + count;
     constexpr int full_rotary_dim = 64;
     static const bool s_small_rows_decode = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_DECODE", false);
-    const bool small_rows_decode = (s_small_rows_decode || verify_rows_alignment_) && count >= 2 && count <= 4;
+    const bool small_rows_decode =
+        (s_small_rows_decode || verify_rows_alignment_ || verify_decode_kernels_) &&
+        count >= 2 && count <= 4;
     auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& x, Tensor& y) {
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, x, y, count);
         else projection.forward(ctx, linear_scratch_, x, y, count);
@@ -384,7 +386,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             }
 
             project_prefill(layer.qkv_proj, input, buf_.full_qkv);
-            static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", false);
+            static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", true);
             if (verify_decode_prepare && allowQ8 && !interior && count >= 2 && count <= 4 && start_pos > 0 && !sparse_prefill) {
                 // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode.
                 // Reuse the packed projection and existing output banks; no USM scratch.
@@ -458,8 +460,23 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         session.mropePromptLength_, session.mropeTextPositionDelta_,
                         cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
 
-                    for (int tile_offset = 0; tile_offset < count; tile_offset += qsa_query_tile_) {
-                        const int tile_count = std::min(qsa_query_tile_, count - tile_offset);
+                    // Dynamic query tiling: the block-score buffer bounds how
+                    // many rows one tile may score at this window's block count.
+                    // Growing the tile toward that bound cuts the three
+                    // launches per tile; an explicit AILA_QSA_QUERY_TILE still
+                    // wins because it may deliberately shrink the tile.
+                    const int window_max_blocks = std::max(1, (start_pos + count) / compress_ratio);
+                    const int max_tile_rows = static_cast<int>(buf_.qsa_tile_active_blocks.shape(0));
+                    const int score_fit_rows = static_cast<int>(
+                        static_cast<size_t>(buf_.qsa_tile_block_scores.numel()) /
+                        static_cast<size_t>(window_max_blocks));
+                    static const int s_qsa_query_tile_env =
+                        aila::env::read_int_raw("AILA_QSA_QUERY_TILE", 0);
+                    const int query_tile = s_qsa_query_tile_env > 0
+                        ? std::min(qsa_query_tile_, max_tile_rows)
+                        : std::clamp(score_fit_rows, 16, std::min(max_tile_rows, 1024));
+                    for (int tile_offset = 0; tile_offset < count; tile_offset += query_tile) {
+                        const int tile_count = std::min(query_tile, count - tile_offset);
                         const int tile_start_pos = start_pos + tile_offset;
                         const int tile_max_blocks = std::max(1, (tile_start_pos + tile_count) / compress_ratio);
 
@@ -590,8 +607,8 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         cache.num_compressed_blocks = total_complete_blocks;
                     }
                 }
-                static const bool verify_decode_attention = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", false);
-                static const bool verify_attention_pair = aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR", false);
+                static const bool verify_decode_attention = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", true);
+                static const bool verify_attention_pair = aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR", true);
                 static const int decode_window = aila::env::read_int_raw("AILA_ATTN_DECODE_WINDOW", 0);
                 static const int decode_sink = aila::env::read_int_raw("AILA_ATTN_DECODE_SINK", 0);
                 if (verify_decode_attention && verify_attention_pair && allowQ8 && count == 2 &&

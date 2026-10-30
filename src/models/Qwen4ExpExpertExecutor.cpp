@@ -885,11 +885,11 @@ sycl::event Qwen4ExpExpertExecutor::JoinResidentCold(float* output, const sycl::
 }
 
 bool Qwen4ExpExpertExecutor::CanExecuteArenaColdRows(int rows) const {
-    static const bool enabled = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", false);
+    static const bool enabled = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", true);
     return enabled && initialized_ && cpu_worker_ && rows >= 2 && rows <= 4 &&
         rows <= max_cpu_tokens_ && hidden_size_ == ops::cpu::kHiddenDim &&
         intermediate_size_ == ops::cpu::kIntermediateDim &&
-        !cpu_result_host_read_ && !cpu_result_packet_host_ &&
+        !cpu_result_packet_host_ &&
         !cold_count_ && !arena_verify_pending_ && !arena_cold_rows_pending_;
 }
 
@@ -935,7 +935,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         if (offset != task_count)
             throw std::logic_error("Multi-row CPU task spans are not a strict partition");
         if (task_count > 1) {
-            static const bool s_merge = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE", false);
+            static const bool s_merge = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE", true);
             if (s_merge) {
                 std::array<int, ops::cpu::kMaxExpertBatchTasks> pair_group{}, group_ids{}, group_counts{};
                 int groups = 0;
@@ -1039,22 +1039,33 @@ sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int
     }
     const int begin = arena_cold_row_begin_[row], count = arena_cold_row_count_[row];
     sycl::event upload{};
-    sycl::queue* row_copy_q = copy_queue();
-    sycl::event row_fence{};
-    const sycl::event* row_fence_ptr = nullptr;
-    if (order_dep) row_fence_ptr = order_dep;
-    else if (row_copy_q) { row_fence = q4e::host_copy_fence(*ctx_, row_copy_q); row_fence_ptr = &row_fence; }
-    for (int c = begin; c < begin + count;) {
-        int end = c + 1;
-        while (end < begin + count && cold_ranks_[end] == cold_ranks_[end - 1] + 1) ++end;
-        const size_t bytes = size_t(end - c) * hidden_size_ * sizeof(float);
-        upload = q4e::submit_host_copy(*ctx_, row_copy_q,
-            rank_output + size_t(cold_ranks_[c]) * hidden_size_,
-            cpu_out_host_ + size_t(c) * hidden_size_, bytes, row_fence_ptr);
-        ++stats_.cpu_result_copies; stats_.cpu_result_bytes += bytes;
-        c = end;
+    if (cpu_result_host_read_ && count > 0) {
+        // Same host-resident handoff as JoinResidentCold, scoped to this row's
+        // slice of the shared CPU output image.
+        cpu_host_rows_.values = cpu_out_host_ + static_cast<size_t>(begin) * hidden_size_;
+        cpu_host_rows_.rows = count;
+        cpu_host_rows_.rank_to_row.fill(-1);
+        for (int c = 0; c < count; ++c)
+            cpu_host_rows_.rank_to_row[cold_ranks_[begin + c]] = c;
+        cpu_host_result_active_ = true;
+    } else if (count > 0) {
+        sycl::queue* row_copy_q = copy_queue();
+        sycl::event row_fence{};
+        const sycl::event* row_fence_ptr = nullptr;
+        if (order_dep) row_fence_ptr = order_dep;
+        else if (row_copy_q) { row_fence = q4e::host_copy_fence(*ctx_, row_copy_q); row_fence_ptr = &row_fence; }
+        for (int c = begin; c < begin + count;) {
+            int end = c + 1;
+            while (end < begin + count && cold_ranks_[end] == cold_ranks_[end - 1] + 1) ++end;
+            const size_t bytes = size_t(end - c) * hidden_size_ * sizeof(float);
+            upload = q4e::submit_host_copy(*ctx_, row_copy_q,
+                rank_output + size_t(cold_ranks_[c]) * hidden_size_,
+                cpu_out_host_ + size_t(c) * hidden_size_, bytes, row_fence_ptr);
+            ++stats_.cpu_result_copies; stats_.cpu_result_bytes += bytes;
+            c = end;
+        }
+        if (upload != sycl::event{}) prev_cpu_h2d_ev_ = upload;
     }
-    if (upload != sycl::event{}) prev_cpu_h2d_ev_ = upload;
     ++arena_cold_rows_next_row_;
     if (row == arena_cold_rows_ - 1) {
         stats_.cpu_tasks_completed += cold_count_; ++stats_.cpu_async_layers;

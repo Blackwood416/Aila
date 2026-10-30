@@ -698,6 +698,12 @@ private:
     // kernels so the window matches sequential B1 decode. Default false keeps
     // the legacy multi-row GEMM schedule byte-for-byte unchanged.
     bool verify_rows_alignment_ = false;
+    // AILA_Q4E_VERIFY_DECODE_KERNELS: same 2..4 row window, but only the
+    // projection kernels move to ForwardDecodeRows / the fused two-launch
+    // hyper-connection. The LM head keeps its single-launch multi-row kernel
+    // and the per-row verify shapes stay off, so it costs less than
+    // verify_rows_alignment_ while still matching B1 projection arithmetic.
+    bool verify_decode_kernels_ = false;
     std::optional<sycl::kernel_bundle<sycl::bundle_state::executable>> verification_attention_pair_bundle_;
     bool component_profile_active_for_test_ = false;
     std::array<double, 5> component_profile_ms_for_test_{};
@@ -754,6 +760,10 @@ private:
     HostTensorView embed_host_{};
     int* embed_host_ids_ = nullptr;      // pinned [runtime_seq_capacity_]
     uint8_t* embed_host_rows_ = nullptr; // pinned [runtime_seq_capacity_, hidden] bf16
+    // Async H2D that reads embed_host_ids_ / embed_host_rows_. Their pinned
+    // blocks may only be rewritten after it retires, so a host-id forward
+    // waits on this event instead of draining the queue with a d2h readback.
+    sycl::event embed_h2d_event_{};
     Tensor lm_head_weight_transposed_;
     Linear lm_head_;
     // Experimental head replacement. Original host mmap remains owned by the

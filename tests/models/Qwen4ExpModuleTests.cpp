@@ -1493,6 +1493,21 @@ void test_supports_interior_checkpoint_whitelist(Context& ctx) {
     std::cout << "[PASS] X2 interior checkpoint eligibility\n";
 }
 
+std::optional<ModelWeights>& shared_real_model_weights_slot() {
+    static std::optional<ModelWeights> s_weights;
+    return s_weights;
+}
+
+ModelWeights& get_shared_real_model_weights(Context& ctx, const std::string& model_dir) {
+    auto& s_weights = shared_real_model_weights_slot();
+    static std::string s_dir;
+    if (!s_weights || s_dir != model_dir) {
+        s_weights.emplace(LoadModelWeightsLazy(model_dir, &ctx));
+        s_dir = model_dir;
+    }
+    return *s_weights;
+}
+
 void test_real_model_ple_and_cache_if_present(Context& ctx, bool pleOnly = false) {
     const std::string model_dir = resolve_qwen4exp_model_dir();
     if (!fs::exists(model_dir) || !fs::exists(model_dir + "/model.safetensors.index.json")) {
@@ -1502,7 +1517,7 @@ void test_real_model_ple_and_cache_if_present(Context& ctx, bool pleOnly = false
     }
 
     std::cout << "[Test] Loading real model lazy index from " << model_dir << "...\n";
-    ModelWeights weights = LoadModelWeightsLazy(model_dir, &ctx);
+    ModelWeights& weights = get_shared_real_model_weights(ctx, model_dir);
 
     // 1. Verify PLE indexing on real model
     Qwen4ExpPle ple;
@@ -1865,7 +1880,7 @@ void test_real_model_qsa_indexer_weights_if_present(Context& ctx) {
     }
 
     std::cout << "[Test] Verifying QSA Indexer weights on real model from " << model_dir << "...\n";
-    ModelWeights weights = LoadModelWeightsLazy(model_dir, &ctx);
+    ModelWeights& weights = get_shared_real_model_weights(ctx, model_dir);
 
     int verified_layers = 0;
     for (int l = 0; l < 48; ++l) {
@@ -1907,7 +1922,7 @@ void test_real_model_qsa_indexer_fixture(Context& ctx) {
     }
 
     std::cout << "[Test] Running real-checkpoint layer 11 QSA indexer fixture test (F4 precision & margin audit)...\n";
-    ModelWeights weights = LoadModelWeightsLazy(model_dir, &ctx);
+    ModelWeights& weights = get_shared_real_model_weights(ctx, model_dir);
 
     const std::string prefix = "model.language_model.layers.11.";
     const std::string qk_name = prefix + "self_attn.indexer.index_qk_proj.weight";
@@ -3360,6 +3375,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--ple-only") {
             test_real_model_ple_and_cache_if_present(ctx, true);
+            shared_real_model_weights_slot().reset();
             std::cout << "AilaQwen4ExpModuleTests: PLE PASSED\n";
             return 0;
         }
@@ -3389,13 +3405,16 @@ int main(int argc, char** argv) {
         test_qsa_complement_selection_513(ctx);
         test_qsa_batched_multi_q_head_attention(ctx);
         test_qsa_pre_indexer_fusion_reentrant(ctx);
+        shared_real_model_weights_slot().reset();
         std::cout << "AilaQwen4ExpModuleTests: ALL PASSED\n";
         return 0;
     } catch (const std::exception& e) {
+        shared_real_model_weights_slot().reset();
         std::cout << "[ERROR CATCH] AilaQwen4ExpModuleTests FAILED: " << e.what() << std::endl;
         std::cerr << "AilaQwen4ExpModuleTests FAILED: " << e.what() << std::endl;
         return 1;
     } catch (...) {
+        shared_real_model_weights_slot().reset();
         std::cout << "[ERROR CATCH] AilaQwen4ExpModuleTests FAILED: unknown exception" << std::endl;
         std::cerr << "AilaQwen4ExpModuleTests FAILED: unknown exception" << std::endl;
         return 1;

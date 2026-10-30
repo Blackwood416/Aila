@@ -225,6 +225,13 @@ static thread_local int d1_stash_cpu_count = -1;
 static thread_local bool d1_stash_valid = false;
 static thread_local std::array<int, 16> d1_stash_ids{};
 static thread_local std::array<int, 16> d1_stash_ranks{};
+
+// R1 expert-XMX plan staging: one compact block per chunk. The staging buffer
+// is sized for this many chunks because a long prefill now splits hot experts
+// into <=256-row bands (AILA_Q4E_PREFILL_EXPERT_XMX_MAX_M), which can push a
+// single layer past the old 128-chunk bound. The per-chunk block (row bases
+// plus slot descriptors) is small next to the shared rows/ranks region.
+constexpr int kMaxXmxPlanChunks = 256;
 }  // namespace
 
 // ============================================================================
@@ -516,6 +523,9 @@ void Qwen4ExpBnb4Backend::free_pinned_host_buffers() {
     if (embed_host_rows_) context_->free_host(embed_host_rows_);
     embed_host_ids_ = nullptr;
     embed_host_rows_ = nullptr;
+    // The drain above retired the row upload; the event must not outlive the
+    // pinned blocks it was reading.
+    embed_h2d_event_ = sycl::event{};
     if (batch_slots_host_) context_->free_host(batch_slots_host_);
     if (batch_slots_dev_) context_->free_device(batch_slots_dev_);
     if (batch_weights_dev_) context_->free_device(batch_weights_dev_);
@@ -1284,8 +1294,13 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     }
     qsa_query_tile_ = aila::env::read_int("AILA_QSA_QUERY_TILE", default_tile);
     buf_.qsa_tile_block_scores = Tensor::allocate(ctx, {qsa_query_tile_, max_complete_blocks}, dnnl::memory::data_type::f32);
-    buf_.qsa_tile_active_blocks = Tensor::allocate(ctx, {qsa_query_tile_, block_topk + 4}, dnnl::memory::data_type::s32);
-    buf_.qsa_tile_valid_counts = Tensor::allocate(ctx, {qsa_query_tile_, 2}, dnnl::memory::data_type::s32);
+    // The per-tile selector buffers are sized for the largest query tile the
+    // prefill loop may derive from the score budget (<= 1024 rows), not just for
+    // the configured tile: at long context the score fit shrinks the tile, but
+    // the buffer row count must stay independent of that choice.
+    const int max_qsa_tile_rows = std::max(qsa_query_tile_, 1024);
+    buf_.qsa_tile_active_blocks = Tensor::allocate(ctx, {max_qsa_tile_rows, block_topk + 4}, dnnl::memory::data_type::s32);
+    buf_.qsa_tile_valid_counts = Tensor::allocate(ctx, {max_qsa_tile_rows, 2}, dnnl::memory::data_type::s32);
 
 
     // Linear Attention buffers
@@ -1418,7 +1433,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             const size_t slots_off = (ranks_off + rows_bytes + 63u) & ~size_t(63u);
             const size_t slots_bytes = size_t(16) * sizeof(ops::MoeExpertSlotDev);
             const size_t per_chunk_hdr = ((bases_bytes + slots_bytes + 127u) & ~size_t(63u));
-            xmx_plan_bytes_ = int(slots_off + slots_bytes + 128u * per_chunk_hdr);
+            xmx_plan_bytes_ = int(slots_off + slots_bytes + size_t(kMaxXmxPlanChunks) * per_chunk_hdr);
             xmx_tokens_off_ = int(bases_bytes);
             xmx_ranks_off_ = int(ranks_off);
             xmx_slots_off_ = int(slots_off);
@@ -1524,6 +1539,13 @@ void Qwen4ExpBnb4Backend::WarmupPrefillKernels(Context& ctx) {
                 dnnl::memory::data_type::bf16);
             projection->forward(ctx, linear_scratch_, warm_input, warm_output, kWarmSeq);
             ++dense_warmed;
+        }
+
+        if (prefill_expert_xmx_ && xmx_scratch_.impl != nullptr) {
+            // Pre-populate the (B, M) oneDNN primitives the prefill chunk
+            // scheduler targets so no JIT compilation happens mid-prefill.
+            ops::moe_expert_xmx_warmup_primitives(ctx, xmx_scratch_, hidden_size_,
+                cfg_.moe_intermediate_size);
         }
 
         // 2. Expert-XMX prefill chunk (AILA_Q4E_PREFILL_EXPERT_XMX).
@@ -1696,7 +1718,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         // device (and same slot bytes) that a sequential T1 decode of that
         // row would. Stage all rows once so every per-row job indexes the
         // same pinned host image.
-        static const bool s_verify_cpu_cold = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_COLD", false);
+        static const bool s_verify_cpu_cold = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_COLD", true);
         const bool verify_cpu_cold = s_verify_cpu_cold && verify_rows && count >= 2 && count <= 4 &&
             count <= expert_executor_.max_cpu_tokens() && expert_executor_.cpu_overlap_enabled();
         if (verify_cpu_cold) expert_executor_.StageResidentInput(x_base, count);
@@ -1709,7 +1731,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         // overflow are unchanged, and the loop below re-checks each row's
         // prefix and fails closed on any drift. Any unmet condition drops back
         // to the untouched per-row G1 path.
-        static const bool s_verify_cpu_batch = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", false);
+        static const bool s_verify_cpu_batch = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", true);
         bool verify_cpu_batch = s_verify_cpu_batch && verify_cpu_cold && !d1_stash_valid &&
             expert_executor_.CanExecuteArenaColdRows(count);
         std::array<std::array<int, kMaxTopK>, 4> batch_experts{}, batch_ranks{};
@@ -1749,6 +1771,11 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             }
         }
 
+        const bool batch_split_gpu_join = verify_cpu_batch && verify_down_.valid();
+        std::array<bool, 4> batch_device_live{};
+        std::array<sycl::event, 4> batch_device_last{};
+        std::array<int, 4> batch_row_cpu_count{};
+
         for (int t = 0; t < count; ++t) {
             const int* t_ids = router_host_ids_ + t * top_k;
             const float* t_weights = router_host_weights_ + t * top_k;
@@ -1756,6 +1783,9 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             bf16* y_t = y_base + static_cast<size_t>(t) * hidden_size_;
             const bf16* sh_out_t = sh_out_base ? sh_out_base + static_cast<size_t>(t) * hidden_size_ : nullptr;
             const bf16* sh_gate_t = sh_gate_base ? sh_gate_base + t : nullptr;
+            float* row_down = batch_split_gpu_join
+                ? (verify_down_.data_as<float>() + static_cast<size_t>(t) * top_k * hidden_size_)
+                : down;
 
             // 1. Separate hits and misses via adaptive cache
             int hit_count = 0;
@@ -1868,7 +1898,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
                 last = ops::moe_decode_down_to_rank_f32(
                     ctx, hot.data(), hit_ranks.data(), h_base,
-                    down, hit_count, top_k, intermediate, hidden_size_, 64,
+                    row_down, hit_count, top_k, intermediate, hidden_size_, 64,
                     nullptr, nullptr, &last, nested, nested_fixed256);
                 adaptive_cache_.RecordResidentConsumer(last);
             }
@@ -1889,10 +1919,17 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
                 last = ops::moe_decode_down_to_rank_f32(
                     ctx, cold.data(), miss_ranks.data()+cpu_count, cold_h,
-                    down, staging.count, top_k, intermediate, hidden_size_, 64,
+                    row_down, staging.count, top_k, intermediate, hidden_size_, 64,
                     nullptr, nullptr, &last, nested, nested_fixed256);
 
                 adaptive_cache_.RecordStagingConsumer(staging.ping_pong_index,last);
+            }
+
+            if (batch_split_gpu_join) {
+                batch_device_live[t] = hit_count > 0 || staging.count > 0;
+                batch_device_last[t] = last;
+                batch_row_cpu_count[t] = cpu_count;
+                continue;
             }
 
             // P1: release the queued kernels before the host blocks on the CPU
@@ -1961,6 +1998,58 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     y_t,1,top_k,hidden_size_,sh_out_t,sh_gate_t,&last,expert_executor_.ResidentCpuResultPacket());
             }
             expert_executor_.FinishResidentCpuRead(last);
+        }
+
+        if (batch_split_gpu_join) {
+            // Release all queued GPU expert kernels across the entire multi-row
+            // window before blocking on the single batched CPU job, so row 1..N
+            // GPU hot experts execute concurrently with the CPU worker instead
+            // of waiting in the host batch behind row 0's CPU join.
+            if (s_join_release) {
+                if (last == sycl::event{}) {
+                    last = ctx.queue().ext_oneapi_submit_barrier();
+                }
+                try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
+                catch (...) {}
+            }
+            for (int t = 0; t < count; ++t) {
+                float* row_down = verify_down_.data_as<float>() + static_cast<size_t>(t) * top_k * hidden_size_;
+                const float* t_weights = router_host_weights_ + t * top_k;
+                bf16* y_t = y_base + static_cast<size_t>(t) * hidden_size_;
+                const bf16* sh_out_t = sh_out_base ? sh_out_base + static_cast<size_t>(t) * hidden_size_ : nullptr;
+                const bf16* sh_gate_t = sh_gate_base ? sh_gate_base + t : nullptr;
+                const bool device_event_live = batch_device_live[t];
+                const sycl::event device_last = batch_device_last[t];
+                const sycl::event* copy_order =
+                    (aila::q4e::moe_copy_via_copyq() && device_event_live) ? &device_last : nullptr;
+                const auto cpu_ready = expert_executor_.JoinArenaColdRowsRow(row_down, t, copy_order);
+                if (batch_row_cpu_count[t]) last = cpu_ready;
+                cpu_work.active = (t + 1 < count);
+                const auto* cpu_rows = expert_executor_.ResidentCpuHostRows();
+                if (cpu_rows) {
+                    ops::MoeCpuHostDownRows rows_with_weights = *cpu_rows;
+                    rows_with_weights.has_host_weights = true;
+                    for (int k = 0; k < top_k; ++k)
+                        rows_with_weights.host_weights[static_cast<size_t>(k)] = t_weights[k];
+                    last = ops::moe_ordered_accumulate_cpu_host_rows(ctx, row_down, nullptr,
+                        y_t, 1, top_k, hidden_size_, rows_with_weights, sh_out_t, sh_gate_t,
+                        device_event_live ? &device_last : nullptr);
+                } else {
+                    float* row_weights_dev = verify_weights_.valid()
+                        ? (verify_weights_.data_as<float>() + static_cast<size_t>(t) * top_k)
+                        : resident_weights_.data_as<float>();
+                    if (aila::q4e::moe_copy_via_copyq() && copy_q_) {
+                        last = aila::q4e::submit_host_copy(ctx, copy_q_.get(), row_weights_dev,
+                            t_weights, top_k * sizeof(float), copy_order);
+                    } else {
+                        ctx.queue().memcpy(row_weights_dev, t_weights, top_k * sizeof(float));
+                    }
+                    last = ops::moe_ordered_accumulate_down_rows(ctx, row_down, row_weights_dev,
+                        y_t, 1, top_k, hidden_size_, sh_out_t, sh_gate_t, &last,
+                        expert_executor_.ResidentCpuResultPacket());
+                }
+                expert_executor_.FinishResidentCpuRead(last);
+            }
         }
 
         if (resident_probe_) resident_probe_(resident_probe_data_, *this, layer);
@@ -2257,6 +2346,18 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
     const int effective_min_band = (count < 4096) ? std::min(min_band_env, 64) : min_band_env;
     const int min_band = effective_min_band > 0 ? ((effective_min_band + 15) & ~15) : 0;
     const int max_band_rows = xmx_scratch_.max_chunk_rows;
+    // AILA_Q4E_PREFILL_EXPERT_XMX_MAX_M caps the band height of a large
+    // prefill. The measured loss of a 1560-row-hot expert band comes from the
+    // square padding around its real rows; splitting it into <= MAX_M bands
+    // keeps every GEMM near its real M and lets the scheduler pack more experts
+    // per chunk. Only the bucketed route can address several bands of one
+    // expert in the same chunk (it keeps each band's own token/rank slice), so
+    // the split stays off for the legacy scan path.
+    static const int s_split_band_max =
+        std::max(64, aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_MAX_M", 256));
+    const int split_band_rows = (count >= 1024 && xmx_route_bucketed_)
+        ? std::min(max_band_rows, s_split_band_max)
+        : max_band_rows;
 
     xmx_members_.clear();
     int total_rows = 0;
@@ -2265,8 +2366,8 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
         const int n = prefill_expert_uses_[e];
         if (n <= 0) continue;
         total_rows += n;
-        for (int off = 0; off < n; off += max_band_rows) {
-            xmx_members_.push_back({e, off, std::min(max_band_rows, n - off)});
+        for (int off = 0; off < n; off += split_band_rows) {
+            xmx_members_.push_back({e, off, std::min(split_band_rows, n - off)});
         }
     }
     if (xmx_members_.empty()) return ready;
@@ -2279,6 +2380,14 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
 
     sycl::event last = ready;
     sycl::event last_dequant = ready;
+    // Pre-warmed oneDNN primitives exist only for M in {64, 128, 192, 256}, so a
+    // large prefill rounds every band up to a 64-row multiple instead of
+    // JIT-compiling a new matmul per encountered M mid-prefill.
+    const bool canonical_band = count >= 1024;
+    auto canonical_rows = [canonical_band](int rows) {
+        const int rounded = (rows + 15) & ~15;
+        return (canonical_band && rounded <= 256) ? ((rounded + 63) & ~63) : rounded;
+    };
     size_t mi = 0;
     while (mi < xmx_members_.size()) {
         const size_t chunk_begin = mi;
@@ -2291,7 +2400,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
         } else {
             while (mi < xmx_members_.size() && b_count < 16) {
                 const int n = xmx_members_[mi].rows;
-                const int m_try = std::max((std::max(max_rows, n) + 15) & ~15, min_band);
+                const int m_try = std::max(canonical_rows(std::max(max_rows, n)), min_band);
                 if (b_count > 0 && size_t(b_count + 1) * size_t(m_try) > size_t(rows_budget)) break;
                 max_rows = std::max(max_rows, n);
                 total_chunk_rows += n;
@@ -2299,7 +2408,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExpertsXmx(Context& ctx, int layer, i
                 ++mi;
             }
         }
-        const int rows_per_band = std::max((max_rows + 15) & ~15, min_band);
+        const int rows_per_band = std::max(canonical_rows(max_rows), min_band);
         if (size_t(b_count) * size_t(rows_per_band) > size_t(max_band_rows)) {
             throw std::runtime_error("Qwen4Exp: XMX chunk exceeds scratch capacity");
         }
@@ -2397,10 +2506,25 @@ void Qwen4ExpBnb4Backend::EmbedTokens(
     Context& ctx, const int* tokenIdsDevice, int count,
     const int* tokenIdsHost) {
     if (!embed_host_.valid()) {
+        if (tokenIdsHost) {
+            // The resident lookup kernel still reads packed device ids, so a
+            // host-id caller gets its ids uploaded asynchronously instead of
+            // synchronously; waiting on the previous upload keeps this pinned
+            // block safe to rewrite without draining the compute queue.
+            if (embed_h2d_event_ != sycl::event{}) embed_h2d_event_.wait_and_throw();
+            std::copy_n(tokenIdsHost, count, embed_host_ids_);
+            embed_h2d_event_ = ctx.memcpy_h2d_async(
+                const_cast<int*>(tokenIdsDevice), embed_host_ids_,
+                static_cast<size_t>(count) * sizeof(int));
+        }
         ops::embedding_lookup(ctx, *embed_weight_, tokenIdsDevice, count, buf_.x, hidden_size_);
         return;
     }
     if (tokenIdsHost) {
+        // Host ids reach the gather directly. The previous forward's row upload
+        // may still be reading the pinned rows, and waiting on that copy is a
+        // fraction of the queue drain a blocking readback would cost.
+        if (embed_h2d_event_ != sycl::event{}) embed_h2d_event_.wait_and_throw();
         std::copy_n(tokenIdsHost, count, embed_host_ids_);
     } else {
         // The blocking readback also drains the previous h2d, so the pinned
@@ -2419,7 +2543,8 @@ void Qwen4ExpBnb4Backend::EmbedTokens(
         std::memcpy(embed_host_rows_ + static_cast<size_t>(t) * row_bytes,
                     embed_host_.ptr + static_cast<size_t>(id) * row_bytes, row_bytes);
     }
-    ctx.memcpy_h2d_async(buf_.x.data(), embed_host_rows_, static_cast<size_t>(count) * row_bytes);
+    embed_h2d_event_ = ctx.memcpy_h2d_async(buf_.x.data(), embed_host_rows_,
+                                            static_cast<size_t>(count) * row_bytes);
 }
 
 sycl::event Qwen4ExpBnb4Backend::ForwardLmHead(
@@ -2611,7 +2736,8 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
     static const bool s_hc_up_streams = aila::env::read_flag("AILA_Q4E_HC_DECODE_UP_STREAMS", false);
     const int hc_down_wg = decodeHcReferenceForTest_ ? 256 : s_hc_down_wg;
     const bool hc_up_streams = !decodeHcReferenceForTest_ && s_hc_up_streams;
-    if ((s_small_rows_hc || verify_rows_alignment_) && s_fused_hc && count >= 2 && count <= 4 &&
+    if ((s_small_rows_hc || verify_rows_alignment_ || verify_decode_kernels_) && s_fused_hc &&
+        count >= 2 && count <= 4 &&
         hc.mix_down_w && hc.mix_up_w && (!with_inject || hc.inject_w)) {
         ops::hc_decode_down_inject_rows(ctx, buf_.hc_N.data_as<bf16>(),
             hc.mix_down_w->data_as<bf16>(), with_inject ? hc.inject_w->data_as<bf16>() : nullptr,
@@ -2785,12 +2911,18 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     }
 
     // 1. Embedding lookup + optional vision embedding override
-    EmbedTokens(ctx, tokenIdsDevice, count);
+    EmbedTokens(ctx, tokenIdsDevice, count, options.host_token_ids);
 
     // P0: Early PLE prepare pipeline (pure prepare + async DMA to double-buffered staging)
     const int* ple_ids_ptr = embed_host_ids_;
     if (!embed_host_.valid()) {
-        ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
+        // The host ids were already copied into the pinned block by EmbedTokens;
+        // only a device-id caller has to read them back.
+        if (options.host_token_ids) {
+            std::copy_n(options.host_token_ids, count, embed_host_ids_);
+        } else {
+            ctx.memcpy_d2h(embed_host_ids_, tokenIdsDevice, static_cast<size_t>(count) * sizeof(int));
+        }
     }
     static const bool ple_lookahead = aila::env::read_flag("AILA_Q4E_PLE_ASYNC", true);
     const bool reuse_ple = ple_lookahead && options.prefill_remaining >= 0 &&
@@ -2896,24 +3028,36 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // model numerics and state semantics are accepted for each supported shape.
     static const bool s_small_rows_decode = aila::env::read_flag("AILA_Q4E_SMALL_ROWS_DECODE", false);
     static const bool s_verify_small_rows = aila::env::read_flag("AILA_Q4E_VERIFY_SMALL_ROWS", false);
+    static const bool s_verify_decode_kernels =
+        aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_KERNELS", true);
     const bool verify_rows_alignment = s_verify_small_rows && options.decode_verification &&
         count >= 2 && count <= 4;
-    const bool small_rows_decode = (s_small_rows_decode || verify_rows_alignment) && count >= 2 && count <= 4;
+    // AILA_Q4E_VERIFY_DECODE_KERNELS keeps verify_rows_alignment_ off on purpose:
+    // the window then runs the multi-row decode-row projections and the fused
+    // two-launch hyper-connection while the LM head keeps its single-launch
+    // multi-row kernel instead of one GEMV per row.
+    const bool verify_decode_kernels = options.decode_verification && s_verify_decode_kernels &&
+        count >= 2 && count <= 4 && !verify_rows_alignment;
+    const bool small_rows_decode =
+        (s_small_rows_decode || verify_rows_alignment || verify_decode_kernels) &&
+        count >= 2 && count <= 4;
     // Scope the verify-path alignment to this forward; the in-order submission
     // means the flag only affects kernels queued here.
     struct VerifyRowsAlignScope {
         Qwen4ExpBnb4Backend& self;
         bool prev;
-        VerifyRowsAlignScope(Qwen4ExpBnb4Backend& s, bool v)
+        VerifyRowsAlignScope(Qwen4ExpBnb4Backend& s, bool v, bool decode)
             : self(s), prev(s.verify_rows_alignment_) {
             self.verify_rows_alignment_ = v;
-            self.ple_.set_rows_decode(v);
+            self.verify_decode_kernels_ = decode;
+            self.ple_.set_rows_decode(v || decode);
         }
         ~VerifyRowsAlignScope() {
             self.verify_rows_alignment_ = prev;
+            self.verify_decode_kernels_ = false;
             self.ple_.set_rows_decode(prev);
         }
-    } verifyRowsAlignScope{*this, verify_rows_alignment};
+    } verifyRowsAlignScope{*this, verify_rows_alignment, verify_decode_kernels};
     auto project_prefill = [&](Bnb4BitLinear& projection, Tensor& input, Tensor& output) {
         if (small_rows_decode) projection.ForwardDecodeRows(ctx, linear_scratch_, input, output, count);
         else projection.forward(ctx, linear_scratch_, input, output, count);

@@ -6,12 +6,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "utils/EnvUtils.hpp"
+#include "profile/Profiling.hpp"
 
 namespace ops {
 namespace {
@@ -53,6 +57,7 @@ inline float slot_scale(const MoeNestedScaleDev& nested, const float* absmax, si
 struct XmxPrim {
     dnnl::matmul mm1;
     dnnl::matmul mm2;
+    size_t scratchpad_bytes = 0;
     dnnl::memory::desc s1, w1, d1, s2, w2, d2;
     std::unordered_map<int, dnnl::memory> args1[2];
     std::unordered_map<int, dnnl::memory> args2[2];
@@ -64,6 +69,38 @@ struct XmxCache {
 
 XmxCache& cache_of(MoeExpertXmxScratch& s) {
     return *static_cast<XmxCache*>(s.impl);
+}
+
+// Compiled primitives for one shape, shared by every scratch instance in the
+// process. Only the matmul objects live here: the USM argument bindings are per
+// scratch (they point at that scratch's banks) and stay in XmxPrim.
+using XmxShapeKey =
+    std::tuple<int, int, int, int, bool, bool, bool>; // H, I, B, M, c1_f32, w_f16, w_kn
+
+struct XmxSharedPrim {
+    dnnl::matmul mm1;
+    dnnl::matmul mm2;
+    size_t scratchpad_bytes = 0;
+};
+
+struct XmxSharedEntry {
+    // A compiled primitive belongs to one dnnl engine, i.e. one (device,
+    // SYCL context) pair; two contexts are never interchangeable.
+    sycl::context context;
+    sycl::device device;
+    std::map<XmxShapeKey, XmxSharedPrim> prims;
+};
+
+std::mutex& shared_cache_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<XmxSharedEntry>& shared_cache() {
+    // Deliberately leaked: oneDNN primitive handles must never be destroyed
+    // after the SYCL runtime during static teardown.
+    static auto* entries = new std::vector<XmxSharedEntry>();
+    return *entries;
 }
 
 dnnl::memory usm_memory(Context& ctx, const dnnl::memory::desc& md, void* ptr) {
@@ -394,15 +431,76 @@ sycl::event run_prefill_chunk_typed(Context& ctx, MoeExpertXmxScratch& scratch,
     return submit_scatter(ctx, scratch, chunk, down_acc, hidden, last);
 }
 
+// Reuses one compiled (B, M) pair for every scratch instance of the process.
+// Compilation is the only expensive part of ensure_xmx_prim (a JIT pass per
+// shape), and the shape set repeats across model loads and test scratches.
+// Returns by value so the caller never holds a reference into a map another
+// thread may evict.
+XmxSharedPrim shared_xmx_prim(Context& ctx, const XmxShapeKey& shape,
+                              const dnnl::memory::desc& s1,
+                              const dnnl::memory::desc& w1,
+                              const dnnl::memory::desc& d1,
+                              const dnnl::memory::desc& s2,
+                              const dnnl::memory::desc& w2,
+                              const dnnl::memory::desc& d2) {
+    const sycl::queue& queue = ctx.queue();
+    const sycl::context context = queue.get_context();
+    const sycl::device device = queue.get_device();
+    std::lock_guard<std::mutex> lock(shared_cache_mutex());
+    std::vector<XmxSharedEntry>& entries = shared_cache();
+    auto entry = std::find_if(entries.begin(), entries.end(),
+        [&context, &device](const XmxSharedEntry& candidate) {
+            return candidate.device == device && candidate.context == context;
+        });
+    if (entry == entries.end()) {
+        entries.push_back(XmxSharedEntry{context, device, {}});
+        entry = entries.end() - 1;
+    }
+    const auto found = entry->prims.find(shape);
+    if (found != entry->prims.end()) return found->second;
+    if (entry->prims.size() >= kMaxCachedShapes) {
+        // Dropping a shared entry only drops compiled descriptors; every user
+        // holds its own copy, so no queue drain is needed here.
+        entry->prims.erase(entry->prims.begin());
+    }
+    dnnl::matmul::primitive_desc pd1(ctx.engine(), s1, w1, d1);
+    dnnl::matmul::primitive_desc pd2(ctx.engine(), s2, w2, d2);
+    XmxSharedPrim prim;
+    prim.scratchpad_bytes =
+        std::max(pd1.scratchpad_desc().get_size(), pd2.scratchpad_desc().get_size());
+    prim.mm1 = dnnl::matmul(pd1);
+    prim.mm2 = dnnl::matmul(pd2);
+    return entry->prims.emplace(shape, std::move(prim)).first->second;
+}
+
 XmxPrim& ensure_xmx_prim(Context& ctx, MoeExpertXmxScratch& s, int num_experts, int rows_per_band,
                          int hidden, int intermediate) {
     XmxCache& cache = cache_of(s);
+    // Bucket tail expert counts in [1, 16] on the production 4096-row scratch
+    // to {1, 2, 4, 8, 12, 16} so every tail chunk reuses one of the pre-warmed
+    // oneDNN primitives instead of JIT-compiling a distinct matmul per B.
+    // Batch slices >= chunk.num_experts are never read by submit_scatter.
+    if (s.max_chunk_rows >= 4096 && hidden == 2560 && intermediate == 640 &&
+        rows_per_band > 0 && rows_per_band <= 256) {
+        int b_bucket = num_experts;
+        if (num_experts <= 1) b_bucket = 1;
+        else if (num_experts <= 2) b_bucket = 2;
+        else if (num_experts <= 4) b_bucket = 4;
+        else if (num_experts <= 8) b_bucket = 8;
+        else if (num_experts <= 12) b_bucket = 12;
+        else b_bucket = 16;
+        if (b_bucket * rows_per_band <= s.max_chunk_rows) {
+            num_experts = b_bucket;
+        }
+    }
     // The storage dtypes are part of the key: an f32 gate_up dst or an fp16
     // A/W descriptor must never be served to a scratch of the other mode.
     const bool c1_f32 = s.c1_f32;
     const bool w_f16 = s.w_f16;
+    const bool w_kn = s.w_kn;
     const uint64_t key = (uint64_t(c1_f32 ? 1u : 0u) << 63) |
                          (uint64_t(w_f16 ? 1u : 0u) << 62) |
+                         (uint64_t(w_kn ? 1u : 0u) << 61) |
                          (uint64_t(static_cast<uint32_t>(num_experts)) << 32) |
                          uint64_t(static_cast<uint32_t>(rows_per_band));
     const auto found = cache.prims.find(key);
@@ -426,23 +524,21 @@ XmxPrim& ensure_xmx_prim(Context& ctx, MoeExpertXmxScratch& s, int num_experts, 
     // The A/W element type is bf16 by default and fp16 under W_F16 (c1 is f32
     // then), so both matmuls are f16 x f16 -> f32 in that mode.
     const dt elem_dt = w_f16 ? dt::f16 : dt::bf16;
-    // AILA_Q4E_PREFILL_EXPERT_XMX_W_KN selects a canonical N-contiguous B
-    // operand (strides {K*N, N, 1}) to match the transposed store in
-    // submit_dequant.  Read once: the scratch latches the same flag at creation
-    // and a scratch is created once per model load.
-    static const bool s_w_kn =
-        aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_KN", 0) != 0;
     prim.s1 = dnnl::memory::desc({b, m, h}, elem_dt, {m * h, h, 1});
-    prim.w1 = s_w_kn ? dnnl::memory::desc({b, h, two_i}, elem_dt, {h * two_i, two_i, 1})
-                     : dnnl::memory::desc({b, h, two_i}, elem_dt, {two_i * h, 1, h});
+    prim.w1 = w_kn ? dnnl::memory::desc({b, h, two_i}, elem_dt, {h * two_i, two_i, 1})
+                   : dnnl::memory::desc({b, h, two_i}, elem_dt, {two_i * h, 1, h});
     prim.d1 = dnnl::memory::desc({b, m, two_i}, c1_f32 ? dt::f32 : dt::bf16,
                                  {m * two_i, two_i, 1});
     prim.s2 = dnnl::memory::desc({b, m, i}, elem_dt, {m * i, i, 1});
-    prim.w2 = s_w_kn ? dnnl::memory::desc({b, i, h}, elem_dt, {i * h, h, 1})
-                     : dnnl::memory::desc({b, i, h}, elem_dt, {h * i, 1, i});
+    prim.w2 = w_kn ? dnnl::memory::desc({b, i, h}, elem_dt, {i * h, h, 1})
+                   : dnnl::memory::desc({b, i, h}, elem_dt, {h * i, 1, i});
     prim.d2 = dnnl::memory::desc({b, m, h}, dt::f32, {m * h, h, 1});
-    prim.mm1 = dnnl::matmul(dnnl::matmul::primitive_desc(ctx.engine(), prim.s1, prim.w1, prim.d1));
-    prim.mm2 = dnnl::matmul(dnnl::matmul::primitive_desc(ctx.engine(), prim.s2, prim.w2, prim.d2));
+    const XmxSharedPrim shared = shared_xmx_prim(
+        ctx, XmxShapeKey{hidden, intermediate, num_experts, rows_per_band, c1_f32, w_f16, w_kn},
+        prim.s1, prim.w1, prim.d1, prim.s2, prim.w2, prim.d2);
+    prim.mm1 = shared.mm1;
+    prim.mm2 = shared.mm2;
+    prim.scratchpad_bytes = shared.scratchpad_bytes;
     for (int bank = 0; bank < 2; ++bank) {
         prim.args1[bank] = {
             {DNNL_ARG_SRC, usm_memory(ctx, prim.s1, s.a1)},
@@ -535,6 +631,13 @@ bool moe_expert_xmx_scratch_create(Context& ctx, MoeExpertXmxScratch& s, int max
         a2 = ctx.alloc_device(size_t(rows) * size_t(intermediate) * sizeof(bf16));
         c2 = ctx.alloc_device(size_t(rows) * size_t(hidden) * sizeof(float));
         d_plan = ctx.alloc_device((size_t(kPlanBaseSlots) + 2 * size_t(rows)) * sizeof(int));
+        ctx.queue().memset(wgu0, 0, gu_bytes);
+        ctx.queue().memset(wgu1, 0, gu_bytes);
+        ctx.queue().memset(wdn0, 0, dn_bytes);
+        ctx.queue().memset(wdn1, 0, dn_bytes);
+        ctx.queue().memset(a1, 0, size_t(rows) * size_t(hidden) * sizeof(bf16));
+        ctx.queue().memset(c1, 0, c1_bytes);
+        ctx.queue().memset(a2, 0, size_t(rows) * size_t(intermediate) * sizeof(bf16));
         cache = new XmxCache();
     } catch (...) {
         rollback();
@@ -634,6 +737,34 @@ sycl::event moe_expert_xmx_prefill_chunk(Context& ctx, MoeExpertXmxScratch& scra
     }
     return run_prefill_chunk_typed<bf16>(ctx, scratch, chunk, bank, x, down_acc, hidden,
                                          intermediate, blocksize, ready, prim, dequant_done);
+}
+
+void moe_expert_xmx_warmup_primitives(Context& ctx, MoeExpertXmxScratch& scratch, int hidden,
+                                      int intermediate) {
+    if (scratch.impl == nullptr) return;
+    if (hidden <= 0 || intermediate <= 0) {
+        throw std::invalid_argument(
+            "moe_expert_xmx_warmup_primitives: dimensions must be positive");
+    }
+    if (hidden != scratch.hidden || intermediate != scratch.intermediate) {
+        throw std::invalid_argument(
+            "moe_expert_xmx_warmup_primitives: shape differs from the scratch's geometry");
+    }
+    // A long prefill now uses <=256-row bands packed up to 16 experts per chunk
+    // (RunGroupedExpertsXmx canonicalizes M to a 64-row multiple), so this set
+    // covers every full chunk it can produce; the small B values cover short
+    // chunks that route to only a few experts.
+    size_t scratchpad_max = 0;
+    for (int rows_per_band : {64, 128, 192, 256}) {
+        for (int num_experts : {1, 2, 4, 8, 12, 16}) {
+            scratchpad_max = std::max(scratchpad_max,
+                ensure_xmx_prim(ctx, scratch, num_experts, rows_per_band, hidden, intermediate)
+                    .scratchpad_bytes);
+        }
+    }
+    AILA_LOG_INFO("[Q4E PrefillExpertXmxWarmup] prewarmed_prims=%zu B_buckets=6 M_bands=4 "
+                  "onednn_scratchpad_max_bytes=%zu hidden=%d intermediate=%d",
+                  cache_of(scratch).prims.size(), scratchpad_max, hidden, intermediate);
 }
 
 }  // namespace ops

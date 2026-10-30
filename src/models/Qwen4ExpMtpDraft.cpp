@@ -50,7 +50,8 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
         embedNorm_ = Allocate(1, 2560);
         embedFc_ = Allocate(1, 2560);
         hiddenNorm_ = Allocate(4, 2560);
-        hostEmbed_.resize(2560);
+        hostEmbed_ = static_cast<bf16*>(ctx_.alloc_host(
+            static_cast<size_t>(kMtpHostEmbedRing) * static_cast<size_t>(kMtpHidden) * sizeof(bf16)));
         embeddingTable_ = weights_.host_view("model.language_model.embed_tokens.weight");
         Require(embeddingTable_.valid() && embeddingTable_.dtype == DT_BF16, "MTP shared embedding missing");
 
@@ -62,6 +63,7 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
             ctx_.synchronize();
         } catch (...) {}
         ReleaseExpertCache();
+        FreeHostEmbed();
         throw;
     }
 }
@@ -72,6 +74,19 @@ Qwen4ExpMtpDraft::~Qwen4ExpMtpDraft() {
         ctx_.synchronize();
     } catch (...) {}
     ReleaseExpertCache();
+    FreeHostEmbed();
+}
+
+void Qwen4ExpMtpDraft::FreeHostEmbed() noexcept {
+    if (!hostEmbed_) return;
+    for (auto& ev : hostEmbedEvents_) {
+        try {
+            if (ev != sycl::event{}) ev.wait_and_throw();
+        } catch (...) {}
+        ev = sycl::event{};
+    }
+    try { ctx_.free_host(hostEmbed_); } catch (...) {}
+    hostEmbed_ = nullptr;
 }
 
 void Qwen4ExpMtpDraft::Require(bool ok, const std::string& message) {
@@ -354,9 +369,15 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     auto& b = target_.buf_;
     auto& scratch = target_.linear_scratch_;
     Require(token >= 0 && token < target_.cfg_.vocab_size, "MTP token out of range");
-    std::memcpy(hostEmbed_.data(), embeddingTable_.ptr + size_t(token) * 2560 * sizeof(bf16),
+    // The previous step's async row upload must have finished reading the
+    // staging block before it is overwritten. Waiting on that copy keeps the
+    // compute queue running, unlike the blocking ctx_.memcpy_h2d it replaces.
+    const size_t ringSlot = static_cast<size_t>((hostEmbedTick_++) % kMtpHostEmbedRing);
+    bf16* stagedRow = hostEmbed_ + ringSlot * static_cast<size_t>(kMtpHidden);
+    if (hostEmbedEvents_[ringSlot] != sycl::event{}) hostEmbedEvents_[ringSlot].wait_and_throw();
+    std::memcpy(stagedRow, embeddingTable_.ptr + size_t(token) * 2560 * sizeof(bf16),
                 2560 * sizeof(bf16));
-    ctx_.memcpy_h2d(embed_.data(), hostEmbed_.data(), 2560 * sizeof(bf16));
+    hostEmbedEvents_[ringSlot] = ctx_.queue().memcpy(embed_.data(), stagedRow, 2560 * sizeof(bf16));
     ops::grouped_rms_norm(ctx_, embed_.data_as<bf16>(), normEmbedding_->data_as<float>(), 1e-6f,
                           embedNorm_.data_as<bf16>(), 1, 1, 2560, true);
     fcEmbedding_.ForwardDecodeRows(ctx_, scratch, embedNorm_, embedFc_, 1);

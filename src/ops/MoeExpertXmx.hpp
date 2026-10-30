@@ -115,4 +115,12 @@ sycl::event moe_expert_xmx_prefill_chunk(
     const bf16* x, float* down_acc, int hidden, int intermediate, int blocksize,
     const sycl::event* ready, sycl::event* dequant_done = nullptr);
 
+// Compiles the oneDNN matmul primitives the prefill chunk scheduler targets
+// before the first real chunk: (B=16, M in {64,128,192,256}) for long prefills
+// and (B in {1,2,4,8}, M=64) for short ones. Primitives are process-cached by
+// shape, so this only pays the JIT cost once; without it the first long prefill
+// compiles each new band height mid-run. No device work is submitted.
+void moe_expert_xmx_warmup_primitives(
+    Context& ctx, MoeExpertXmxScratch& scratch, int hidden = 2560, int intermediate = 640);
+
 }  // namespace ops

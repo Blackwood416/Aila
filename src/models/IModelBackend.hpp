@@ -20,6 +20,10 @@ struct ForwardOptions {
     // future prompt chunk without advancing any session state.
     const int* next_prefill_tokens = nullptr;
     int next_prefill_count = 0;
+    // Borrowed through Forward only. Set when the caller already holds the
+    // input ids on the host, so a backend that gathers embedding rows from a
+    // host mmap never has to read them back from the device.
+    const int* host_token_ids = nullptr;
 };
 
 class IModelBackend {

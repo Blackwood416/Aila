@@ -40,6 +40,13 @@ private:
     int pleHead = 0, length = 0, noMiss = 0;
     uint64_t windows = 0, accepted = 0;
     std::array<ops::GreedyResult, 2> Select(int rows);
+    // Device pointers of the recurrent checkpoint layout: 36 DeltaNet layers
+    // (state then conv ring, layer-major) followed by the PLE conv ring.
+    struct RecurrentCheckpointPtrs;
+    void BindRecurrentCheckpoint(Qwen4ExpBnb4Backend::Session&, RecurrentCheckpointPtrs&);
+    // One kernel launch for the whole 118 MB recurrent checkpoint instead of
+    // 73 in-order queue copies. capture=true copies session -> checkpoint.
+    void SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs&, bool capture);
     void Capture(Qwen4ExpBnb4Backend::Session&);
     void Restore(Qwen4ExpBnb4Backend::Session&);
 };

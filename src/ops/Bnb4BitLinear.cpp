@@ -2571,11 +2571,14 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
 
     static const int verify_reuse = aila::env::read_int_raw("AILA_Q4E_VERIFY_LINEAR_REUSE", 3);
     static const bool draft_reuse = aila::env::read_flag("AILA_Q4E_MTP_HIDDEN_REUSE", true);
+    // PLE key/value projections (2560 -> 10240 and 2560 -> 2560) join the same
+    // two-accumulator reuse set so a 2-row verification window stays aligned
+    // with sequential B1 decode for every dense projection.
     const bool reuse_shape = (verify_reuse > 0 && in_features_ == 2560 && out_features_ == 16480) ||
         (verify_reuse >= 2 && in_features_ == 6144 && out_features_ == 2560) ||
-        (verify_reuse >= 3 && in_features_ == 2560 && out_features_ == 13312) ||
         (verify_reuse >= 3 && in_features_ == 2560 &&
-         (out_features_ == 7168 || out_features_ == 1280)) ||
+         (out_features_ == 13312 || out_features_ == 7168 || out_features_ == 1280 ||
+          out_features_ == 10240 || out_features_ == 2560)) ||
         (verify_reuse >= 3 && in_features_ == 640 && out_features_ == 2560);
     // Four MTP hidden streams form two independent pairs; still two accumulators.
     if ((rows == 2 && reuse_shape) ||

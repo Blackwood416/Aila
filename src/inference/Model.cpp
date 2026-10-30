@@ -388,6 +388,9 @@ private:
                         // token only update state; their LM head is never read.
                         options.need_logits = sampling != nullptr || captureLogits;
                         options.prefill_remaining = prefillRemaining;
+                        // The ids are still in this std::vector, so the host
+                        // embedding gather needs no device readback.
+                        options.host_token_ids = tokenIds.data();
                         if (prefillRemaining >= 0) {
                             options.next_prefill_tokens = nextTokens;
                             options.next_prefill_count = nextCount;

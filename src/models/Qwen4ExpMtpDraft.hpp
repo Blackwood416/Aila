@@ -94,8 +94,17 @@ private:
     Tensor embedNorm_;
     Tensor embedFc_;
     Tensor hiddenNorm_;
-    std::vector<bf16> hostEmbed_;
+    // USM host staging for one embedding row. A dedicated host block plus the
+    // async H2D event keeps the row upload off the compute queue's critical
+    // path: the blocking ctx_.memcpy_h2d would otherwise drain the queue on
+    // every draft step.
+    static constexpr int kMtpHostEmbedRing = 64;
+    sycl::ext::oneapi::bfloat16* hostEmbed_ = nullptr;
+    std::array<sycl::event, kMtpHostEmbedRing> hostEmbedEvents_{};
+    uint64_t hostEmbedTick_ = 0;
     HostTensorView embeddingTable_;
+
+    void FreeHostEmbed() noexcept;
 
     SlotLayout layout_{};
     Bnb4BitHostWeightRef gu_{};

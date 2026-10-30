@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (`qwen4_exp`) on Intel Arc A770 — Architecture & Handoff
 
-> **Status:** Post-Round-11 Architecture Reference.
+> **Status:** Post-Round-12 Architecture Reference.
 > `docs/plans/` intermediate logs and the legacy `Qwen4ExpExpertCache` / `Qwen4ExpLayerStage` / `Qwen4ExpLayerMajor` / `L0HostImport` modules have been retired.
 > Environment variable reference: [`docs/Environment_Variables.md`](Environment_Variables.md).
 
@@ -50,21 +50,21 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
 
 ---
 
-## 3. Prefill & Decode Architecture & Round 11 Scoreboard
+## 3. Prefill & Decode Architecture & Round 12 Scoreboard
 
 ### 3.1 Measured Prefill Scoreboard (`tools/prefill-bench.ps1 -Chunk 8192`, `max-seq 12288`)
 
-| Prompt Tokens | Round 6 | Round 9 | Round 10 | **Round 11 Wall** | **ms/token** | **Round 11 Tok/s** |
+| Prompt Tokens | Round 6 | Round 9 | Round 11 (`9169dc0`) | **Round 12 Wall** | **ms/token** | **Round 12 Tok/s** |
 |---:|---:|---:|---:|---:|---:|---:|
-| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,277.9 ms (242.5 tok/s) | 8,056.8 ms (249.1 tok/s) | **7,966.9 ms** | 3.970 | **251.9 tok/s** |
-| **4,895** | 11,701.2 ms (418.3 tok/s) | 9,847.4 ms (497.1 tok/s) | 9,843.5 ms (497.3 tok/s) | **9,751.9 ms** | 1.992 | **502.0 tok/s** |
-| **7,764** | 15,071.3 ms (515.1 tok/s) | 12,282.8 ms (632.1 tok/s) | 12,367.1 ms (627.8 tok/s) | **12,317.0 ms** | 1.586 | **630.4 tok/s** |
+| **2,007** | 10,177.8 ms (197.2 tok/s) | 8,277.9 ms (242.5 tok/s) | 7,966.9 ms (251.9 tok/s) | **7,421.5 ms** | 3.698 | **270.4 tok/s** |
+| **4,895** | 11,701.2 ms (418.3 tok/s) | 9,847.4 ms (497.1 tok/s) | 9,751.9 ms (502.0 tok/s) | **9,526.6 ms** | 1.946 | **513.8 tok/s** |
+| **7,764** | 15,071.3 ms (515.1 tok/s) | 12,282.8 ms (632.1 tok/s) | 12,317.0 ms (630.4 tok/s) | **12,008.2 ms** | 1.547 | **646.6 tok/s** |
 
-- **Linear fit**: `~6,670 ms` fixed cost + **`0.70 ms/token` marginal cost (`~1,430 tok/s` marginal throughput across 2K–8K)**.
+- **Linear fit**: **`~5,888 ms` fixed cost** (down **`-782 ms`** from Round 11's `~6,670 ms`) + **`0.81 ms/token` marginal cost (`~1,235 tok/s` marginal throughput across 2K–8K)**.
 - **Decode throughput (single-stream, no MTP)**:
   - **Long-Horizon Decode (`tools/decode-bench.ps1`, `essay.json` 40p + 256g / 512g)**:
-    - **256 Generated Tokens**: **`23.6–23.7 tok/s`** (`mean = 42.22–42.33 ms/tok`, **`p50 = 41.87–41.97 ms`**, `p90 = 44.60–44.76 ms`; intervals `1-64: 23.8–23.9 tok/s`, `65-256: 23.6 tok/s`).
-    - **512 Generated Tokens**: **`23.4–23.5 tok/s`** (`mean = 42.62–42.78 ms/tok`, **`p50 = 42.34–42.49 ms`**, `p90 = 45.15–45.29 ms`; intervals `1-64: 23.8–23.9 tok/s`, `65-256: 23.5 tok/s`, `257-512: 23.2–23.3 tok/s`).
+    - **256 Generated Tokens**: **`23.5–23.7 tok/s`** (`mean = 42.22–42.62 ms/tok`, **`p50 = 41.87–41.98 ms`**, `p90 = 44.60–44.93 ms`; prefill **`1,907.2 ms`**).
+    - **512 Generated Tokens**: **`23.4–23.5 tok/s`** (`mean = 42.62–42.73 ms/tok`, **`p50 = 42.32 ms`**, `p90 = 45.15–45.47 ms`; prefill **`1,913.0 ms`**, intervals `1-64: 23.7 tok/s`, `65-256: 23.4 tok/s`, `257-512: 23.3 tok/s`).
 
 ### 3.2 Key Prefill Optimizations
 1. **Dense NF4 Projections via Vectorized Dequant + oneDNN (`AILA_BNB4_ONEDNN_MIN_M = 128`)**: Routes all `seq_len >= 128` dense NF4 projections (including the 97 `N = 2560` calls: 36 `linear_o_proj`, 12 QSA `o_proj`, 48 `shared_down_proj`, 1 PLE `value_proj`) to word-vectorized `dequantize_weight` + oneDNN `ab` MatMul (16.0× faster than the custom wide joint-matrix kernel on `N = 2560`, saving ~2.95 s at 8K).
@@ -98,6 +98,11 @@ Because 48 layers × 512 experts × 2.5344 MB = **62.28 GB** of expert weights c
     - **Unified `ForwardLmHead` Entry Point, 2-Row Q8 Head Weight-Reuse Kernel & MTP Runtime Unblocking**: Unifies target and draft LM-head dispatch through `Qwen4ExpBnb4Backend::ForwardLmHead`, adds a single-launch 2-row weight-reuse fastpath to `ops::bf16_q8_head_forward` alongside default-on 2-row NF4 verification weight reuse (`AILA_Q4E_VERIFY_LINEAR_REUSE=3`, `AILA_Q4E_MTP_HIDDEN_REUSE=1`), and removes the legacy `!lmHeadQ8Enabled_` and `gdn_chunk_mode_ == 0` blocks from `Qwen4ExpMtpRuntime` while bounding MTP session allocations by `EffectiveCapacity(maxSequenceLength)`.
     - **Sparse QSA & Fused Operators in `Qwen4ExpMtpDraft`**: Upgrades the 1-layer MTP draft head to use `target_.RunHyperConnectionCombined`, `ops::bf16_moe_front_fused`, `target_.ForwardLmHead`, and sparse QSA block selection past 2,048 tokens using `mtp.layers.0.self_attn.indexer.*`.
     - **Adaptive Cache Warmup Isolation, Usage Decay & Worker Preset Inheritance**: Guards `adaptive_cache_.ObserveRouting` on `cold_epoch_enabled_` so synthetic load-time warmup tokens cannot pollute hotset frequencies, ages `usage_` by `0.85` after each swap interval (`AILA_Q4E_ADAPTIVE_SWAP_DECAY=1`, `AILA_Q4E_ADAPTIVE_SWAP_FREQ=16`), and propagates `AILA_Q4E_ACTIVE_PRESET=qwen38-a770` into `AilaWorker.exe` (`WorkerMain.cpp` + `tools/server/start-qwen38.ps1`).
+14. **Pre-Warmed Canonical Expert-XMX Band Bucketing, Per-Token PLE Page Prefetch, Zero-Readback Host Token IDs & Multi-Row Verification Fusion (Round 12)**:
+    - **Canonical Expert-XMX Band Splitting & `(B, M)` Primitive Pre-Warming (`AILA_Q4E_PREFILL_EXPERT_XMX_MAX_M=256`, `moe_expert_xmx_warmup_primitives`)**: Splits hot prefill experts (`count >= 1024`) into `<= 256`-row bands rounded to `{64, 128, 192, 256}`, buckets tail chunk expert counts to `{1, 2, 4, 8, 12, 16}` in `ensure_xmx_prim`, and pre-warms all 24 `(B, M)` `dnnl::matmul` primitives during `WarmupPrefillKernels`, eliminating mid-prefill oneDNN JIT compilation across 2K/5K/8K prefills (`2K: 7,966.9 -> 7,421.5 ms`, `5K: 9,751.9 -> 9,526.6 ms`, `8K: 12,317.0 -> 12,008.2 ms / 646.6 tok/s`).
+    - **Dynamic Budget-Derived QSA Query Tile (`AILA_QSA_QUERY_TILE` unset -> `16..1024`)**: Sizes `qsa_tile_active_blocks` and `qsa_tile_valid_counts` for up to 1,024 query rows and derives `effective_query_tile` per prefill window from `AILA_QSA_LOGITS_BUDGET_BYTES / blocks` (`16..1024`), reducing QSA prefill launches up to 16× before sparse context grows huge.
+    - **Per-Token PLE `PrefetchVirtualMemory` (`AILA_Q4E_PLE_PREFETCH_MIN=1`) & Zero-Readback `host_token_ids`**: Lowers the PLE Win32 `PrefetchVirtualMemory` floor from 64 tokens to 1 token (eliminating 16–32 demand page faults per decode step on the PLE worker, `ple_host: 6.55 -> 0.26 ms`, `ForwardWall: 64.17 -> 60.14 ms`) and passes `options.host_token_ids` + `next_prefill_tokens` directly from `EngineGeneration` so neither prompt slices nor decode steps block on a D2H token-ID readback.
+    - **Fused Multi-Row Verification Prepare (`AILA_Q4E_VERIFY_DECODE_PREPARE=1`), Pinned Host Readback in `JoinArenaColdRowsRow` & 64-Slot `Qwen4ExpMtpDraft` Host Embedding Ring**: Replaces the 6-launch `split_qgkv + head_rms_norm` sequence on 2..4-row verification windows with two fused `ops::decode_prepare_qgkv_packed_partial` launches, enables zero-upload pinned host readback (`moe_ordered_accumulate_cpu_host_rows`) on batched verification rows, and replaces the single-slot blocking host embedding upload in `Qwen4ExpMtpDraft::Step` with a 64-slot non-blocking ring (`hostEmbedEvents_[64]`).
 
 ---
 

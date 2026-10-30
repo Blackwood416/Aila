@@ -6,6 +6,39 @@
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
+namespace {
+
+// Recurrent checkpoint geometry, fixed by the Qwen4Exp layer shapes: every
+// DeltaNet layer owns a [48, 128, 128] f32 state and a [3, 10240] f32 conv
+// ring, and the PLE owns a [9, 10240] f32 conv ring. The checkpoint tensor is
+// sized from these numbers, so a geometry change fails the bind checks below
+// instead of silently truncating a rollback.
+constexpr int kMtpLinearLayers = 36;
+constexpr int kMtpStateFloats = 48 * 128 * 128;
+constexpr int kMtpConvFloats = 3 * 10240;
+constexpr int kMtpPleFloats = 9 * 10240;
+constexpr size_t kMtpLinearStateBytes = size_t(kMtpStateFloats) * sizeof(float);
+constexpr size_t kMtpLinearConvBytes = size_t(kMtpConvFloats) * sizeof(float);
+constexpr size_t kMtpPleCheckpointBytes = size_t(kMtpPleFloats) * sizeof(float);
+constexpr size_t kMtpRecurrentCheckpointBytes =
+    size_t(kMtpLinearLayers) * (kMtpLinearStateBytes + kMtpLinearConvBytes);
+// One work-item moves one 16-byte chunk, so the whole checkpoint is a single
+// kMtpRecurrentChunks-wide launch instead of 73 queue memcpys.
+constexpr int kMtpLayerChunks = (kMtpStateFloats + kMtpConvFloats) / 4;   // 204,288
+constexpr int kMtpStateChunks = kMtpStateFloats / 4;                      // 196,608
+constexpr int kMtpRecurrentChunks = static_cast<int>(
+    (kMtpRecurrentCheckpointBytes + kMtpPleCheckpointBytes) / (4 * sizeof(float)));
+static_assert(kMtpRecurrentCheckpointBytes + kMtpPleCheckpointBytes == 118038528,
+              "MTP recurrent checkpoint size must match the checkpoint tensor");
+
+}  // namespace
+
+struct Qwen4ExpMtpRuntime::RecurrentCheckpointPtrs {
+    float* linear_state[kMtpLinearLayers];
+    float* linear_conv[kMtpLinearLayers];
+    float* ple_conv;
+};
+
 Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
     ModelWeights& weights, int cap) : ctx(c), target(b), capacity(cap) {
     try {
@@ -84,6 +117,67 @@ std::array<ops::GreedyResult, 2> Qwen4ExpMtpRuntime::Select(int rows) {
             throw std::runtime_error("MTP nonfinite/invalid greedy logits");
     return result;
 }
+void Qwen4ExpMtpRuntime::BindRecurrentCheckpoint(Qwen4ExpBnb4Backend::Session& s,
+                                                RecurrentCheckpointPtrs& ptrs) {
+    if (s.layerCaches_.size() != convHeads.size())
+        throw std::runtime_error("MTP recurrent checkpoint layer count changed");
+    ptrs = RecurrentCheckpointPtrs{};
+    int linear = 0;
+    for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
+        auto& c = s.layerCaches_[l];
+        if (!c.linear_state.valid()) continue;
+        if (linear >= kMtpLinearLayers || !c.linear_conv_state.valid() ||
+            c.linear_state.size_bytes() != kMtpLinearStateBytes ||
+            c.linear_conv_state.size_bytes() != kMtpLinearConvBytes) {
+            throw std::runtime_error("MTP recurrent checkpoint geometry changed");
+        }
+        ptrs.linear_state[linear] = c.linear_state.data_as<float>();
+        ptrs.linear_conv[linear] = c.linear_conv_state.data_as<float>();
+        ++linear;
+    }
+    if (linear != kMtpLinearLayers ||
+        s.ple_state_.conv_state.size_bytes() != kMtpPleCheckpointBytes) {
+        throw std::runtime_error("MTP recurrent checkpoint geometry changed");
+    }
+    ptrs.ple_conv = s.ple_state_.conv_state.data_as<float>();
+}
+
+void Qwen4ExpMtpRuntime::SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs& ptrs,
+                                                   bool capture) {
+    using vec4 = sycl::vec<float, 4>;
+    float* ckpt = checkpoint.data_as<float>();
+    // In-order queue: the launch is ordered after the work that produced the
+    // session state and before the next forward reads it.
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(kMtpRecurrentChunks)),
+                              sycl::range<1>(256)),
+            [=](sycl::nd_item<1> item) {
+                const int idx = static_cast<int>(item.get_global_id(0));
+                if (idx >= kMtpRecurrentChunks) return;
+                float* layer_ptr = nullptr;
+                if (idx < kMtpLinearLayers * kMtpLayerChunks) {
+                    const int l = idx / kMtpLayerChunks;
+                    const int rem = idx - l * kMtpLayerChunks;
+                    layer_ptr = rem < kMtpStateChunks
+                        ? ptrs.linear_state[l] + static_cast<size_t>(rem) * 4
+                        : ptrs.linear_conv[l] + static_cast<size_t>(rem - kMtpStateChunks) * 4;
+                } else {
+                    layer_ptr = ptrs.ple_conv +
+                        static_cast<size_t>(idx - kMtpLinearLayers * kMtpLayerChunks) * 4;
+                }
+                float* ckpt_ptr = ckpt + static_cast<size_t>(idx) * 4;
+                if (capture) {
+                    *reinterpret_cast<vec4*>(ckpt_ptr) =
+                        *reinterpret_cast<const vec4*>(layer_ptr);
+                } else {
+                    *reinterpret_cast<vec4*>(layer_ptr) =
+                        *reinterpret_cast<const vec4*>(ckpt_ptr);
+                }
+            });
+    });
+}
+
 void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
     if (s.token_graph_poisoned()) {
         throw std::logic_error(
@@ -97,30 +191,25 @@ void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
                        sizeof(pleHead));
     }
     target.SynchronizeGdnDeviceHeadsToHost(ctx, s);
-    size_t offset = 0;
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
         auto& c = s.layerCaches_[l]; convHeads[l] = c.linear_conv_head; blocks[l] = c.num_compressed_blocks;
-        for (auto* t : {&c.linear_state, &c.linear_conv_state}) if (t->valid()) {
-            ctx.queue().memcpy(checkpoint.data_as<uint8_t>() + offset, t->data(), t->size_bytes());
-            offset += t->size_bytes();
-        }
     }
-    ctx.queue().memcpy(checkpoint.data_as<uint8_t>() + offset, s.ple_state_.conv_state.data(), s.ple_state_.conv_state.size_bytes());
+    RecurrentCheckpointPtrs ptrs{};
+    BindRecurrentCheckpoint(s, ptrs);
+    SubmitRecurrentCheckpoint(ptrs, true);
 }
 void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
     // Roll back a rejected verification window without treating it as a new
     // session generation. The dedicated epoch rejects prefetch tickets that
     // were prepared against the speculative target state.
     s.InvalidateMtpRestoreState();
-    size_t offset = 0;
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
         auto& c = s.layerCaches_[l]; c.linear_conv_head = convHeads[l]; c.num_compressed_blocks = blocks[l];
-        for (auto* t : {&c.linear_state, &c.linear_conv_state}) if (t->valid()) {
-            ctx.queue().memcpy(t->data(), checkpoint.data_as<uint8_t>() + offset, t->size_bytes()); offset += t->size_bytes();
-        }
         if (c.linear_state.valid()) c.device_state_dirty = true;
     }
-    ctx.queue().memcpy(s.ple_state_.conv_state.data(), checkpoint.data_as<uint8_t>() + offset, s.ple_state_.conv_state.size_bytes());
+    RecurrentCheckpointPtrs ptrs{};
+    BindRecurrentCheckpoint(s, ptrs);
+    SubmitRecurrentCheckpoint(ptrs, false);
     target.PublishGdnHostHeadsToDevice(ctx, s);
     s.ple_state_.prev_tokens = pleTokens; s.ple_state_.conv_head = pleHead;
     if (s.ple_state_.conv_head_dev.valid()) {
@@ -137,7 +226,6 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), pending, start - 1);
     const std::array<int, 2> proposal{pending, Select(1)[0].index};
     Capture(s);
-    ctx.memcpy_h2d(ids.data(), proposal.data(), sizeof(proposal));
     {
         struct CaptureInputs {
             Qwen4ExpBnb4Backend& b;
@@ -145,6 +233,10 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         } captureInputs{target};
         target.verification_linear_inputs_for_test_ = linearInputs.data_as<bf16>();
         ForwardOptions options{SnapshotPolicy::None, true}; options.decode_verification = true;
+        // The proposal lives on the host: the host embedding gather reads it
+        // directly, so no device copy (and no queue drain) separates the
+        // capture from the verification window.
+        options.host_token_ids = proposal.data();
         target.ForwardImpl(ctx, s, ids.data_as<int>(), 2, false, options);
     }
     ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(), 2 * 10240 * sizeof(bf16));
