@@ -7,6 +7,10 @@ void InferenceEngine::reset_context() {
         cached_ids_.clear();
         benchmark_seed_ready_ = false;
         if (backend_) backend_->reset();
+        if (mtp_state_) {
+            mtp_state_->length = 0;
+            mtp_state_->valid = true;
+        }
         AILA_LOG_INFO("[Context] Conversation reset");
     }
 

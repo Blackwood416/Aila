@@ -68,7 +68,7 @@ void hc_inject_add_and_grouped_rms_norm(
 bool try_hc_decode_inject_add_and_grouped_rms_norm(
     Context& ctx, bf16* H, const bf16* y, const float* inj,
     const float* norm_w, float eps, bf16* out_N, int group_dim,
-    bool plus_one = true);
+    bool plus_one = true, int rows = 1);
 
 // Single-row (decode) hyper-connection, stage A. One SG16 per output row:
 //   act[r] = silu(bf16(W_down[r] . N) / groups)          r < lowrank

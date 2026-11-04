@@ -58,6 +58,8 @@ struct DecodeWindowResult {
     int consumedInputs = 1;
     int cacheLength = 0;
     bool firstTokenCached = false;
+    std::array<int, 2> extraBonusTokenIds{{-1, -1}};
+    int extraBonusCount = 0;
 };
 using DecodeWindowSelector = std::function<bool(int)>;
 

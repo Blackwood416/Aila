@@ -51,6 +51,13 @@ void* AllocateLargePages(size_t rounded_bytes) {
     void* ptr = VirtualAlloc(nullptr, rounded_bytes, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE);
     if (!ptr) {
         const DWORD error = GetLastError();
+        if (error == ERROR_NO_SYSTEM_RESOURCES && rounded_bytes <= (512ULL << 20)) {
+            ptr = VirtualAlloc(nullptr, rounded_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (ptr) {
+                (void)VirtualLock(ptr, rounded_bytes);
+                return ptr;
+            }
+        }
         throw std::runtime_error("MEM_LARGE_PAGES allocation failed: bytes=" + std::to_string(rounded_bytes) +
                                  " win32_error=" + std::to_string(error));
     }

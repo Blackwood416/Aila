@@ -169,6 +169,8 @@ StepResult RequestState::Finish(RequestStatus status, std::string_view error,
     if (errorSize) snapshot.error.assign(error.data(), errorSize);
     pendingToken = -1;
     verifiedBonus.reset();
+    verifiedExtraBonusCount = 0;
+    verifiedExtraBonusIdx = 0;
     // B4-5 opt-in accounting probe: records the session boundary at terminal
     // time so the MTP window path can be compared with plain T1 decode.
     // Raw int read: keep this TU free of the CLI-driven KV-quant override
@@ -299,7 +301,13 @@ StepResult RequestState::StepLocked(size_t outputSlots) {
         } else if (snapshot.status == RequestStatus::Decode) {
             if (verifiedBonus) {
                 result.tokenId = *verifiedBonus;
-                verifiedBonus.reset();
+                if (verifiedExtraBonusIdx < verifiedExtraBonusCount) {
+                    verifiedBonus = verifiedExtraBonus[verifiedExtraBonusIdx++];
+                } else {
+                    verifiedBonus.reset();
+                    verifiedExtraBonusCount = 0;
+                    verifiedExtraBonusIdx = 0;
+                }
                 return PublishSample(std::move(result), false);
             }
             const auto& g = options.generation;
@@ -324,6 +332,9 @@ StepResult RequestState::StepLocked(size_t outputSlots) {
                     if (window->firstTokenCached && !IsTerminal(published.status)) {
                         pendingToken = -1;
                         verifiedBonus = window->bonusTokenId;
+                        verifiedExtraBonus = window->extraBonusTokenIds;
+                        verifiedExtraBonusCount = window->extraBonusCount;
+                        verifiedExtraBonusIdx = 0;
                     }
                     return published;
                 }

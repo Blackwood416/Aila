@@ -424,7 +424,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         if (verify_q8 || verify_a64)
             std::copy_n(current.tasks.begin(), current.count,
                         original_tasks.begin());
-        arena.execute([&] {
+        auto run_body = [&] {
             ops::cpu::CpuTilePoolScope poolScope(tilePool.get());
             if (!current.count) return;
             if (verify_a64 && !current.resident_prepared)
@@ -493,7 +493,12 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                 compute_expert(current.tasks[c].slot, current.x + current.tasks[c].token * current.hidden,
                     current.h + c * current.intermediate, current.out + c * current.hidden,
                     current.hidden, current.intermediate);
-        });
+        };
+        if (tilePool != nullptr && !(verify_q8 || verify_a64) && (batched || current.resident_prepared)) {
+            run_body();
+        } else {
+            arena.execute(run_body);
+        }
     }
     void execute_direct(Job current, Result& completed) {
         {
@@ -898,7 +903,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
     int task_count, const bf16* x_dev) {
     if (!CanExecuteArenaColdRows(rows))
         throw std::logic_error("Invalid multi-row native arena CPU batch");
-    if (!ids || !ranks || !row_task_begin || !row_task_count || !x_dev ||
+    if (!ids || !ranks || !row_task_begin || !row_task_count ||
         task_count < 1 || task_count > ops::cpu::kMaxExpertBatchTasks ||
         layer < 0 || layer >= arena.NumLayers())
         throw std::logic_error("Invalid multi-row native arena CPU batch");
@@ -914,8 +919,8 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
         job.output_reader = cpu_output_reader_event_;
         job.activation = resident_input_event_ != sycl::event{} ? resident_input_event_ :
-            q4e::submit_host_copy(*ctx_, copy_queue(), x_host_, x_dev,
-                size_t(hidden_size_) * size_t(rows) * sizeof(bf16));
+            (x_dev ? q4e::submit_host_copy(*ctx_, copy_queue(), x_host_, x_dev,
+                size_t(hidden_size_) * size_t(rows) * sizeof(bf16)) : sycl::event{});
         int offset = 0;
         for (int r = 0; r < rows; ++r) {
             const int begin = row_task_begin[r], count = row_task_count[r];
@@ -968,7 +973,8 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
                 merge_stat_pairs_ += static_cast<uint64_t>(task_count);
                 merge_stat_groups_ += static_cast<uint64_t>(groups);
                 ++merge_stat_builds_;
-                if (merge_stat_builds_ <= 4 || (merge_stat_builds_ % 48) == 0) {
+                static const bool s_merge_log = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE_LOG", false);
+                if (s_merge_log && (merge_stat_builds_ <= 4 || (merge_stat_builds_ % 48) == 0)) {
                     const double window_f = 1.0 - static_cast<double>(groups) / static_cast<double>(task_count);
                     const double cum_f = merge_stat_pairs_ > 0
                         ? 1.0 - static_cast<double>(merge_stat_groups_) / static_cast<double>(merge_stat_pairs_)
@@ -1076,6 +1082,86 @@ sycl::event Qwen4ExpExpertExecutor::JoinArenaColdRowsRow(float* rank_output, int
         arena_cold_rows_ = 0; arena_cold_rows_next_row_ = 0;
     }
     return upload;
+}
+
+void Qwen4ExpExpertExecutor::JoinDeferredArenaColdRows(const sycl::event& merge) {
+    if (!arena_cold_rows_pending_) return;
+    if (merge == sycl::event{})
+        throw std::logic_error("CPU host result requires an actual merge reader event");
+    const auto join = steady_ns();
+    const auto result = cpu_worker_->finish();
+    stats_.cpu_join_wait_ns += steady_ns() - join;
+    stats_.cpu_activation_wait_ns += result.activation_ns;
+    stats_.cpu_compute_ns += result.end_ns - result.begin_ns;
+    stats_.cpu_mmap_prefetch_ns += result.prefetch_ns;
+    stats_.cpu_mmap_touch_ns += result.touch_ns;
+    stats_.cpu_scale_cache_bytes = std::max(stats_.cpu_scale_cache_bytes, result.scale_cache_bytes);
+    stats_.cpu_scale_cache_hits += result.scale_cache_hits;
+    stats_.cpu_scale_cache_misses += result.scale_cache_misses;
+    stats_.cpu_scale_cache_prepare_ns += result.scale_cache_prepare_ns;
+    stats_.cpu_diagnostic_batches += result.diagnostic_batches;
+    stats_.cpu_diagnostic_failures += result.diagnostic_failures;
+    stats_.cpu_verify_batches += result.verify_batches;
+    stats_.cpu_a64_verify_batches += result.a64_verify_batches;
+    stats_.cpu_process_faults += result.process_faults;
+    stats_.cpu_process_user_ns += result.process_user_ns;
+    stats_.cpu_process_kernel_ns += result.process_kernel_ns;
+    stats_.cpu_gate_up_ns += result.phases.gate_up_ns;
+    stats_.cpu_quantize_ns += result.phases.quantize_ns;
+    stats_.cpu_down_ns += result.phases.down_ns;
+    stats_.cpu_gate_chunks += result.phases.gate_chunks;
+    stats_.cpu_down_chunks += result.phases.down_chunks;
+    stats_.cpu_tasks_completed += cold_count_;
+    ++stats_.cpu_async_layers;
+    stats_.cpu_max_batch_tasks = std::max(stats_.cpu_max_batch_tasks, uint64_t(cold_count_));
+    cold_source_slots_ = {};
+    cold_count_ = 0; cold_mapped_count_ = 0; cold_cached_count_ = 0;
+    arena_cold_rows_pending_ = false;
+    arena_cold_rows_joined_ = false;
+    arena_cold_rows_ = 0; arena_cold_rows_next_row_ = 0;
+    cpu_output_reader_event_ = merge;
+    cpu_host_result_active_ = false;
+}
+
+const ops::MoeCpuHostDownRows* Qwen4ExpExpertExecutor::ExecuteDraftCold(
+    const ops::MoeExpertSlotHost* sources, const int* ids, const int* ranks, int count) {
+    if (!initialized_ || !cpu_worker_ || !sources || !ids || !ranks ||
+        count < 1 || count > 16 || cold_count_ || arena_verify_pending_ ||
+        arena_cold_rows_pending_ || cpu_host_result_active_) {
+        throw std::logic_error("Invalid MTP draft CPU cold batch");
+    }
+    if (prev_cpu_h2d_ev_ != sycl::event{}) {
+        prev_cpu_h2d_ev_.wait_and_throw();
+        prev_cpu_h2d_ev_ = {};
+    }
+    CpuWorker::Job job;
+    job.count = count;
+    job.hidden = hidden_size_;
+    job.intermediate = intermediate_size_;
+    job.tokens = 1;
+    job.x = x_host_;
+    job.h = scratch_h_;
+    job.out = cpu_out_host_;
+    job.resident_prepared = true;
+    job.output_reader = cpu_output_reader_event_;
+    job.activation = resident_input_event_;
+    for (int c = 0; c < count; ++c) {
+        if (!sources[c].gate_up_packed || !sources[c].down_packed ||
+            ranks[c] < 0 || ranks[c] >= 16) {
+            throw std::logic_error("MTP draft CPU expert has invalid source or rank");
+        }
+        job.tasks[c] = {sources[c], 0};
+    }
+    cpu_worker_->submit(job);
+    const auto result = cpu_worker_->finish();
+    if (result.error) std::rethrow_exception(result.error);
+    cpu_host_rows_.values = cpu_out_host_;
+    cpu_host_rows_.rows = count;
+    cpu_host_rows_.rank_to_row.fill(-1);
+    for (int c = 0; c < count; ++c) {
+        cpu_host_rows_.rank_to_row[ranks[c]] = c;
+    }
+    return &cpu_host_rows_;
 }
 
 void Qwen4ExpExpertExecutor::FinishResidentCpuRead(const sycl::event& merge) {

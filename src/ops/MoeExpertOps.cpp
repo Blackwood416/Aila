@@ -6605,4 +6605,116 @@ sycl::event moe_ordered_accumulate_cpu_host_rows(
     });
 }
 
+sycl::event moe_ordered_accumulate_cpu_host_rows_batch(
+    Context& ctx, const float* down_acc, bf16* y,
+    int tokens, int top_k, int out_features, const MoeCpuHostDownRows* cpu_host_rows,
+    const bf16* shared_out, const bf16* shared_gate, const sycl::event* dep_event) {
+    if (tokens < 1 || tokens > 4 || top_k <= 0 || top_k > 16 || out_features <= 0 || !cpu_host_rows)
+        throw std::invalid_argument("CPU host rows batch requires 1..4 tokens and at most 16 ranks");
+    if (tokens == 1) {
+        return moe_ordered_accumulate_cpu_host_rows(
+            ctx, down_acc, nullptr, y, 1, top_k, out_features, cpu_host_rows[0],
+            shared_out, shared_gate, dep_event);
+    }
+    std::array<MoeCpuHostDownRows, 4> rows_pack{};
+    bool vec4_aligned = (out_features % 4 == 0) &&
+        (reinterpret_cast<uintptr_t>(down_acc) % 16 == 0) &&
+        (reinterpret_cast<uintptr_t>(y) % 8 == 0) &&
+        (shared_out == nullptr || reinterpret_cast<uintptr_t>(shared_out) % 8 == 0);
+    for (int t = 0; t < tokens; ++t) {
+        const auto& hr = cpu_host_rows[t];
+        if (!hr.values || hr.rows <= 0 || hr.rows > 16 || !hr.has_host_weights)
+            throw std::invalid_argument("CPU host rows batch entry invalid");
+        for (int k = 0; k < top_k; ++k)
+            if (hr.rank_to_row[k] < -1 || hr.rank_to_row[k] >= hr.rows)
+                throw std::invalid_argument("CPU host row mapping is out of range");
+        rows_pack[static_cast<size_t>(t)] = hr;
+        vec4_aligned = vec4_aligned && (reinterpret_cast<uintptr_t>(hr.values) % 16 == 0);
+    }
+    if (vec4_aligned) {
+        const size_t vecs_per_row = static_cast<size_t>(out_features) / 4;
+        constexpr size_t wg_col = 64;
+        const size_t padded_cols = ((vecs_per_row + wg_col - 1) / wg_col) * wg_col;
+        return ctx.queue().submit([&](sycl::handler& cgh) {
+            if (dep_event && *dep_event != sycl::event{}) cgh.depends_on(*dep_event);
+            cgh.parallel_for(
+                sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(tokens), padded_cols),
+                                  sycl::range<2>(1, wg_col)),
+                [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                    const size_t t = item.get_global_id(0);
+                    const size_t c4 = item.get_global_id(1);
+                    if (t >= static_cast<size_t>(tokens) || c4 >= vecs_per_row) return;
+                    const auto& host_rows = rows_pack[t];
+                    const float* row_down = down_acc + t * static_cast<size_t>(top_k) * out_features;
+                    bf16* y_t = y + t * static_cast<size_t>(out_features);
+                    const size_t row0 = c4 * 4;
+                    sycl::vec<float, 4> total_val(0.0f);
+                    for (int k = 0; k < top_k; ++k) {
+                        const float w_exp = host_rows.host_weights[k];
+                        const int cpu_row = host_rows.rank_to_row[k];
+                        const float* src = cpu_row >= 0
+                            ? host_rows.values + size_t(cpu_row) * out_features + row0
+                            : row_down + size_t(k) * out_features + row0;
+                        const sycl::vec<float, 4> v =
+                            *reinterpret_cast<const sycl::vec<float, 4>*>(src);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            total_val[j] += w_exp * v[j];
+                        }
+                    }
+                    sycl::vec<bf16, 4> out4;
+                    if (shared_out && shared_gate) {
+                        const float gate = static_cast<float>(shared_gate[t]);
+                        const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                        const sycl::vec<bf16, 4> sh4 =
+                            *reinterpret_cast<const sycl::vec<bf16, 4>*>(
+                                shared_out + t * static_cast<size_t>(out_features) + row0);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const bf16 routed = bf16(total_val[j]);
+                            out4[j] = bf16(static_cast<float>(routed) +
+                                           gate_act * static_cast<float>(sh4[j]));
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            out4[j] = bf16(total_val[j]);
+                        }
+                    }
+                    *reinterpret_cast<sycl::vec<bf16, 4>*>(y_t + row0) = out4;
+                });
+        });
+    }
+    constexpr size_t wg_size = 256;
+    const size_t num_wgs = (static_cast<size_t>(out_features) + wg_size - 1) / wg_size;
+    return ctx.queue().submit([&](sycl::handler& cgh) {
+        if (dep_event && *dep_event != sycl::event{}) cgh.depends_on(*dep_event);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(static_cast<size_t>(tokens), num_wgs * wg_size),
+                                           sycl::range<2>(1, wg_size)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(16)]] {
+                const size_t t = item.get_global_id(0);
+                const size_t row = item.get_global_id(1);
+                if (t >= static_cast<size_t>(tokens) || row >= static_cast<size_t>(out_features)) return;
+                const auto& host_rows = rows_pack[t];
+                const float* row_down = down_acc + t * static_cast<size_t>(top_k) * out_features;
+                bf16* y_t = y + t * static_cast<size_t>(out_features);
+                float total_val = 0.0f;
+                for (int k = 0; k < top_k; ++k) {
+                    const float w_exp = host_rows.host_weights[k];
+                    const int cpu_row = host_rows.rank_to_row[k];
+                    const float val = cpu_row >= 0 ? host_rows.values[size_t(cpu_row) * out_features + row]
+                                                   : row_down[size_t(k) * out_features + row];
+                    total_val += w_exp * val;
+                }
+                const bf16 routed = bf16(total_val);
+                if (shared_out && shared_gate) {
+                    const float gate = static_cast<float>(shared_gate[t]);
+                    const float gate_act = 1.0f / (1.0f + sycl::native::exp(-gate));
+                    y_t[row] = bf16(static_cast<float>(routed) +
+                                    gate_act * static_cast<float>(shared_out[t * static_cast<size_t>(out_features) + row]));
+                } else y_t[row] = routed;
+            });
+    });
+}
+
 } // namespace ops

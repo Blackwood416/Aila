@@ -169,13 +169,47 @@ foreach ($target in $MaxTokens) {
     $cpuJoinMs = 0.0
     $hits = 0.0
     $misses = 0.0
+    $lastVerifyLine = $null
+    $lastVerifyPos = -1
+    $lastVerifySubmitted = 0.0
     for ($i = $readyAt + 1; $i -lt $lines.Count; ++$i) {
         $line = $lines[$i]
-        if ($line -notmatch '\[Q4E AdaptiveWork\] pos=\d+ count=(\d+)') { continue }
-        $count = [int]$Matches[1]
+        if ($line -match '\[Q4E MtpWindow\] pos=(\d+) count=(\d+) emitted=(\d+) accepted=(\d+) window_ms=([0-9.]+)') {
+            $winPos = [int]$Matches[1]
+            $emitted = [Math]::Max(1, [int]$Matches[3])
+            $winMs = [double]$Matches[5]
+            if ($null -ne $lastVerifyLine -and $lastVerifyPos -eq $winPos) {
+                $prefillMs = [Math]::Max(0.0, $prefillMs - $lastVerifySubmitted)
+                $value = Get-ForwardField $lastVerifyLine 'router_wait_ms'
+                if ($null -ne $value) { $routerWaitMs += $value }
+                $value = Get-ForwardField $lastVerifyLine 'cpu_compute_ms'
+                if ($null -ne $value) { $cpuComputeMs += $value }
+                $value = Get-ForwardField $lastVerifyLine 'cpu_join_ms'
+                if ($null -ne $value) { $cpuJoinMs += $value }
+                $value = Get-ForwardField $lastVerifyLine 'hits'
+                if ($null -ne $value) { $hits += $value }
+                $value = Get-ForwardField $lastVerifyLine 'misses'
+                if ($null -ne $value) { $misses += $value }
+                $lastVerifyLine = $null
+            }
+            $perTokMs = $winMs / $emitted
+            for ($k = 0; $k -lt $emitted; ++$k) {
+                $decodeMs.Add($perTokMs)
+            }
+            continue
+        }
+        if ($line -notmatch '\[Q4E AdaptiveWork\] pos=(\d+) count=(\d+)') { continue }
+        $pos = [int]$Matches[1]
+        $count = [int]$Matches[2]
         $submitted = Get-ForwardField $line 'submitted_ms'
         if ($null -eq $submitted) { continue }
-        if ($count -ne 1) { $prefillMs += $submitted; continue }
+        if ($count -ne 1) {
+            $prefillMs += $submitted
+            $lastVerifyLine = $line
+            $lastVerifyPos = $pos
+            $lastVerifySubmitted = $submitted
+            continue
+        }
 
         $decodeMs.Add($submitted)
         $value = Get-ForwardField $line 'router_wait_ms'

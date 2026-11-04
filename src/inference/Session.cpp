@@ -174,9 +174,15 @@ std::optional<DecodeWindowResult> SessionState::ExecuteWindow(
         return result;
     }
     const auto& r = *result;
-    if (r.tokenId < 0 || r.tokenId >= vocabSize ||
+    bool extraOk = (r.extraBonusCount >= 0 && r.extraBonusCount <= 2) &&
+                   (r.extraBonusCount == 0 || r.bonusTokenId.has_value());
+    for (int i = 0; i < r.extraBonusCount && extraOk; ++i) {
+        if (r.extraBonusTokenIds[i] < 0 || r.extraBonusTokenIds[i] >= vocabSize) extraOk = false;
+    }
+    const int expectedConsumed = (r.firstTokenCached ? 2 : 1) + r.extraBonusCount;
+    if (!extraOk || r.tokenId < 0 || r.tokenId >= vocabSize ||
         (r.bonusTokenId && (*r.bonusTokenId < 0 || *r.bonusTokenId >= vocabSize)) ||
-        r.consumedInputs != (r.firstTokenCached ? 2 : 1) ||
+        r.consumedInputs != expectedConsumed ||
         r.firstTokenCached != r.bonusTokenId.has_value() ||
         r.cacheLength != after || after != before + r.consumedInputs)
         throw Error(ErrorCode::RuntimeFault, "Invalid decode window prefix commit");

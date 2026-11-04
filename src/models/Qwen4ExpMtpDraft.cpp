@@ -7,6 +7,10 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#include <memoryapi.h>
+#endif
 
 Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, ModelWeights& weights)
     : ctx_(ctx), target_(target), weights_(weights) {
@@ -50,6 +54,8 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
         embedNorm_ = Allocate(1, 2560);
         embedFc_ = Allocate(1, 2560);
         hiddenNorm_ = Allocate(4, 2560);
+        draftH_ = Allocate(kMtpExpertsPerStep, kMtpIntermediate);
+        draftDown_ = Allocate(kMtpExpertsPerStep, kMtpHidden, dnnl::memory::data_type::f32);
         hostEmbed_ = static_cast<bf16*>(ctx_.alloc_host(
             static_cast<size_t>(kMtpHostEmbedRing) * static_cast<size_t>(kMtpHidden) * sizeof(bf16)));
         embeddingTable_ = weights_.host_view("model.language_model.embed_tokens.weight");
@@ -203,9 +209,55 @@ void Qwen4ExpMtpDraft::InitExpertCache() {
     ctx_.memcpy_h2d(gu_nested_quant_map_dev_, gu_.nested_quant_map.ptr, 256 * sizeof(float));
     ctx_.memcpy_h2d(dn_nested_quant_map_dev_, dn_.nested_quant_map.ptr, 256 * sizeof(float));
 
+    const auto touch_span = [](const uint8_t* ptr, size_t bytes) {
+        if (!ptr || bytes == 0) return;
+#ifdef _WIN32
+        WIN32_MEMORY_RANGE_ENTRY entry{const_cast<uint8_t*>(ptr), bytes};
+        (void)PrefetchVirtualMemory(GetCurrentProcess(), 1, &entry, 0);
+#endif
+        volatile uint8_t sink = 0;
+        for (size_t off = 0; off < bytes; off += 4096) {
+            sink = static_cast<uint8_t>(sink ^ ptr[off]);
+        }
+        sink = static_cast<uint8_t>(sink ^ ptr[bytes - 1]);
+        (void)sink;
+    };
+    touch_span(gu_.packed_weight.ptr, gu_.packed_weight.bytes);
+    touch_span(gu_.absmax.ptr, gu_.absmax.bytes);
+    touch_span(dn_.packed_weight.ptr, dn_.packed_weight.bytes);
+    touch_span(dn_.absmax.ptr, dn_.absmax.bytes);
+
+    const float* gu_nested_absmax_host = reinterpret_cast<const float*>(gu_.nested_absmax.ptr);
+    const float* dn_nested_absmax_host = reinterpret_cast<const float*>(dn_.nested_absmax.ptr);
+    const float* gu_nested_qmap_host = reinterpret_cast<const float*>(gu_.nested_quant_map.ptr);
+    const float* dn_nested_qmap_host = reinterpret_cast<const float*>(dn_.nested_quant_map.ptr);
+    for (int e = 0; e < kMtpExperts; ++e) {
+        auto& hs = host_slots_[size_t(e)];
+        hs = ops::MoeExpertSlotHost{};
+        hs.gate_up_packed = gu_.packed_weight.ptr + size_t(e) * layout_.gu_packed_bytes;
+        hs.down_packed = dn_.packed_weight.ptr + size_t(e) * layout_.dn_packed_bytes;
+        hs.gate_up_nested.codes = gu_.absmax.ptr + size_t(e) * layout_.gu_absmax_bytes;
+        hs.down_nested.codes = dn_.absmax.ptr + size_t(e) * layout_.dn_absmax_bytes;
+        hs.gate_up_nested.nested_absmax = gu_nested_absmax_host + size_t(e) * gu_nested_per_expert_;
+        hs.down_nested.nested_absmax = dn_nested_absmax_host + size_t(e) * dn_nested_per_expert_;
+        hs.gate_up_nested.nested_quant_map = gu_nested_qmap_host;
+        hs.down_nested.nested_quant_map = dn_nested_qmap_host;
+        hs.gate_up_nested.offset = gu_nested_offset_;
+        hs.down_nested.offset = dn_nested_offset_;
+        hs.gate_up_nested.blocksize = kMtpNestedBlocksize;
+        hs.down_nested.blocksize = kMtpNestedBlocksize;
+    }
+
     for (auto& s : slot_pool_) s = SlotEntry{};
     for (int i = 0; i < kMtpExpertsPerStep; ++i) staging_copy_valid_[i] = false;
     tick_ = 0;
+    for (int s = 0; s < kMtpExpertSlots; ++s) {
+        StageExpert(slot_staging_host_, s);
+        ctx_.memcpy_h2d(slot_pool_dev_ + size_t(s) * layout_.slot_bytes,
+                        slot_staging_host_, layout_.slot_bytes);
+        slot_pool_[size_t(s)].expert = s;
+        slot_pool_[size_t(s)].last_used = ++tick_;
+    }
 }
 
 void Qwen4ExpMtpDraft::ReleaseExpertCache() noexcept {
@@ -362,7 +414,8 @@ std::unique_ptr<Qwen4ExpMtpDraft::State> Qwen4ExpMtpDraft::CreateState(int capac
 }
 
 void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hidden, int token,
-                            int position, bool kvOnly) {
+                            int position, bool kvOnly,
+                            void (*onBeforeCpuCold)(void*), void* onBeforeCpuColdCtx) {
     auto& cache = state.cache;
     const int capacity = static_cast<int>(cache.k.shape(1));
     Require(position >= 0 && position < capacity, "MTP position outside draft capacity");
@@ -373,13 +426,18 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     // staging block before it is overwritten. Waiting on that copy keeps the
     // compute queue running, unlike the blocking ctx_.memcpy_h2d it replaces.
     const size_t ringSlot = static_cast<size_t>((hostEmbedTick_++) % kMtpHostEmbedRing);
+    const size_t fenceSlot = ringSlot | 15u;
     bf16* stagedRow = hostEmbed_ + ringSlot * static_cast<size_t>(kMtpHidden);
-    if (hostEmbedEvents_[ringSlot] != sycl::event{}) hostEmbedEvents_[ringSlot].wait_and_throw();
+    if (hostEmbedEvents_[fenceSlot] != sycl::event{}) {
+        hostEmbedEvents_[fenceSlot].wait_and_throw();
+        hostEmbedEvents_[fenceSlot] = sycl::event{};
+    }
     std::memcpy(stagedRow, embeddingTable_.ptr + size_t(token) * 2560 * sizeof(bf16),
                 2560 * sizeof(bf16));
-    hostEmbedEvents_[ringSlot] = ctx_.queue().memcpy(embed_.data(), stagedRow, 2560 * sizeof(bf16));
-    ops::grouped_rms_norm(ctx_, embed_.data_as<bf16>(), normEmbedding_->data_as<float>(), 1e-6f,
+    ops::grouped_rms_norm(ctx_, stagedRow, normEmbedding_->data_as<float>(), 1e-6f,
                           embedNorm_.data_as<bf16>(), 1, 1, 2560, true);
+    if ((ringSlot & 15u) == 15u)
+        hostEmbedEvents_[ringSlot] = ctx_.queue().ext_oneapi_submit_barrier();
     fcEmbedding_.ForwardDecodeRows(ctx_, scratch, embedNorm_, embedFc_, 1);
     ops::grouped_rms_norm(ctx_, hidden, normHidden_->data_as<float>(), 1e-6f,
                           hiddenNorm_.data_as<bf16>(), 1, 1, 10240, true);
@@ -436,13 +494,17 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     layer_.o_proj.ForwardDecodeRows(ctx_, scratch, b.attn_out, b.y, 1);
     target_.RunHyperConnectionCombined(ctx_, layer_.mlp_hc, 1, true, b.y.data_as<bf16>(),
                                        b.hc_inject_f32.data_as<float>());
+    const bool use_cpu_cold = target_.expert_executor_.cpu_overlap_enabled() &&
+                              target_.expert_executor_.x_host_ptr() != nullptr;
     ops::bf16_moe_front_fused(ctx_, layer_.router_w->data_as<bf16>(),
                               layer_.shared_expert_gate_w->data_as<bf16>(), b.x.data_as<bf16>(),
                               b.router_scores.data_as<bf16>(), b.shared_gate_buf.data_as<bf16>(),
-                              nullptr, nullptr, 2560, 512);
+                              nullptr, nullptr, 2560, 512,
+                              use_cpu_cold ? target_.expert_executor_.x_host_ptr() : nullptr);
     auto route = ops::router_softmax_topk_device(ctx_, b.router_scores.data_as<bf16>(), nullptr,
                                                  target_.router_host_ids_, target_.router_host_weights_, 1, 512,
                                                  10, true);
+    try { (void)route.get_info<sycl::info::event::command_execution_status>(); } catch (...) {}
     if (!Bnb4BitLinear::try_forward_decode_gate_up_swiglu(ctx_, layer_.shared_gate_up_proj, b.x,
                                                           b.shared_inter_buf, 640)) {
         layer_.shared_gate_up_proj.ForwardDecodeRows(ctx_, scratch, b.x, b.shared_gate_up_buf, 1);
@@ -451,18 +513,97 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     }
     layer_.shared_down_proj.ForwardDecodeRows(ctx_, scratch, b.shared_inter_buf, b.shared_out_buf, 1);
     route.wait_and_throw();
-    slot_ready_ = AcquireExperts(target_.router_host_ids_, kMtpExpertsPerStep, slotIds_.data());
-    slot_ready_valid_ = (slot_ready_ != sycl::event{});
-    ops::moe_decode_gate_up_swiglu_grouped(ctx_, slots_.data(), nullptr, b.x.data_as<bf16>(),
-                                           b.moe_h.data_as<bf16>(), kMtpExpertsPerStep, 2560, 640, 64,
-                                           slot_ready_valid_ ? &slot_ready_ : nullptr);
-    auto done = ops::moe_decode_down_weighted_accumulate(
-        ctx_, slots_.data(), nullptr, target_.router_host_weights_, b.moe_h.data_as<bf16>(), nullptr,
-        b.y.data_as<bf16>(), kMtpExpertsPerStep, 640, 2560, 64, b.shared_out_buf.data_as<bf16>(),
-        b.shared_gate_buf.data_as<bf16>());
-    RecordSlotReaders(slotIds_.data(), kMtpExpertsPerStep, done);
-    ops::hc_inject_add(ctx_, b.hidden4.data_as<bf16>(), b.y.data_as<bf16>(),
-                       b.hc_inject_f32.data_as<float>(), 1, 2560, 4);
-    target_.RunHyperConnectionCombined(ctx_, mixer_, 1, false, nullptr, nullptr);
+    if (use_cpu_cold) {
+        target_.expert_executor_.MarkComputeQueueSyncedAfterRoute();
+        std::array<ops::MoeExpertSlotDev, kMtpExpertsPerStep> gpu_slots{};
+        std::array<int, kMtpExpertsPerStep> gpu_ranks{};
+        std::array<ops::MoeExpertSlotHost, kMtpExpertsPerStep> cpu_sources{};
+        std::array<int, kMtpExpertsPerStep> cpu_ids{}, cpu_ranks{};
+        int gpu_count = 0, cpu_count = 0;
+        for (int r = 0; r < kMtpExpertsPerStep; ++r) {
+            const int e = target_.router_host_ids_[r];
+            Require(e >= 0 && e < kMtpExperts, "MTP expert id out of range");
+            int hit_slot = -1;
+            for (int s = 0; s < kMtpExpertSlots; ++s) {
+                if (slot_pool_[size_t(s)].expert == e) {
+                    hit_slot = s;
+                    slot_pool_[size_t(s)].last_used = ++tick_;
+                    break;
+                }
+            }
+            if (hit_slot >= 0) {
+                BuildSlotDev(hit_slot, e, gpu_slots[size_t(gpu_count)]);
+                gpu_ranks[size_t(gpu_count)] = r;
+                ++gpu_count;
+            } else {
+                cpu_sources[size_t(cpu_count)] = host_slots_[size_t(e)];
+                cpu_ids[size_t(cpu_count)] = e;
+                cpu_ranks[size_t(cpu_count)] = r;
+                ++cpu_count;
+            }
+        }
+        sycl::event last_gpu{};
+        bool gpu_live = false;
+        if (gpu_count > 0) {
+            last_gpu = ops::moe_decode_gate_up_swiglu_grouped(
+                ctx_, gpu_slots.data(), nullptr, b.x.data_as<bf16>(),
+                draftH_.data_as<bf16>(), gpu_count, 2560, 640, 64,
+                nullptr, nullptr, true, true);
+            last_gpu = ops::moe_decode_down_to_rank_f32(
+                ctx_, gpu_slots.data(), gpu_ranks.data(), draftH_.data_as<bf16>(),
+                draftDown_.data_as<float>(), gpu_count, kMtpExpertsPerStep, 640, 2560, 64,
+                nullptr, nullptr, &last_gpu, true, true);
+            gpu_live = true;
+        }
+        if (cpu_count > 0) {
+            if (onBeforeCpuCold) {
+                onBeforeCpuCold(onBeforeCpuColdCtx);
+                onBeforeCpuCold = nullptr;
+            }
+            last_gpu = ctx_.queue().ext_oneapi_submit_barrier();
+            gpu_live = true;
+            try { (void)last_gpu.get_info<sycl::info::event::command_execution_status>(); } catch (...) {}
+            const auto* cpu_rows = target_.expert_executor_.ExecuteDraftCold(
+                cpu_sources.data(), cpu_ids.data(), cpu_ranks.data(), cpu_count);
+            ops::MoeCpuHostDownRows rows_with_weights = *cpu_rows;
+            rows_with_weights.has_host_weights = true;
+            for (int r = 0; r < kMtpExpertsPerStep; ++r) {
+                rows_with_weights.host_weights[size_t(r)] = target_.router_host_weights_[r];
+            }
+            auto done = ops::moe_ordered_accumulate_cpu_host_rows(
+                ctx_, draftDown_.data_as<float>(), nullptr, b.y.data_as<bf16>(),
+                1, kMtpExpertsPerStep, 2560, rows_with_weights,
+                b.shared_out_buf.data_as<bf16>(), b.shared_gate_buf.data_as<bf16>(),
+                gpu_live ? &last_gpu : nullptr);
+            target_.expert_executor_.RecordDraftMergeEvent(done);
+        } else {
+            ops::MoeCpuHostDownRows empty_rows{};
+            empty_rows.values = target_.expert_executor_.cpu_out_host_ptr();
+            empty_rows.rows = 1;
+            empty_rows.rank_to_row.fill(-1);
+            empty_rows.has_host_weights = true;
+            for (int r = 0; r < kMtpExpertsPerStep; ++r) {
+                empty_rows.host_weights[size_t(r)] = target_.router_host_weights_[r];
+            }
+            (void)ops::moe_ordered_accumulate_cpu_host_rows(
+                ctx_, draftDown_.data_as<float>(), nullptr, b.y.data_as<bf16>(),
+                1, kMtpExpertsPerStep, 2560, empty_rows,
+                b.shared_out_buf.data_as<bf16>(), b.shared_gate_buf.data_as<bf16>(),
+                gpu_live ? &last_gpu : nullptr);
+        }
+    } else {
+        slot_ready_ = AcquireExperts(target_.router_host_ids_, kMtpExpertsPerStep, slotIds_.data());
+        slot_ready_valid_ = (slot_ready_ != sycl::event{});
+        ops::moe_decode_gate_up_swiglu_grouped(ctx_, slots_.data(), nullptr, b.x.data_as<bf16>(),
+                                               b.moe_h.data_as<bf16>(), kMtpExpertsPerStep, 2560, 640, 64,
+                                               slot_ready_valid_ ? &slot_ready_ : nullptr);
+        auto done = ops::moe_decode_down_weighted_accumulate(
+            ctx_, slots_.data(), nullptr, target_.router_host_weights_, b.moe_h.data_as<bf16>(), nullptr,
+            b.y.data_as<bf16>(), kMtpExpertsPerStep, 640, 2560, 64, b.shared_out_buf.data_as<bf16>(),
+            b.shared_gate_buf.data_as<bf16>());
+        RecordSlotReaders(slotIds_.data(), kMtpExpertsPerStep, done);
+    }
+    target_.RunHyperConnectionCombined(ctx_, mixer_, 1, false,
+                                       b.y.data_as<bf16>(), b.hc_inject_f32.data_as<float>());
     target_.ForwardLmHead(ctx_, b.x, b.logits, 1);
 }

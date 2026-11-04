@@ -130,6 +130,31 @@ public:
         }
         return true;
     }
+    float* cpu_out_host_ptr() const noexcept { return cpu_out_host_; }
+    bool HasPendingArenaColdRows() const noexcept { return arena_cold_rows_pending_; }
+    bool CanDeferArenaColdRowsHostRead() const noexcept {
+        return cpu_result_host_read_ && arena_cold_rows_pending_ && cold_count_ > 0 && cpu_observer_ == nullptr;
+    }
+    bool PrepareDeferredHostReadRowsRow(int row, ops::MoeCpuHostDownRows& out_rows) const noexcept {
+        if (!cpu_result_host_read_ || !arena_cold_rows_pending_ || !cpu_out_host_ ||
+            row < 0 || row >= arena_cold_rows_ || cpu_observer_ != nullptr) return false;
+        const int begin = arena_cold_row_begin_[row];
+        const int count = arena_cold_row_count_[row];
+        out_rows.values = count > 0 ? (cpu_out_host_ + static_cast<size_t>(begin) * hidden_size_) : cpu_out_host_;
+        out_rows.rows = count > 0 ? count : 1;
+        out_rows.rank_to_row.fill(-1);
+        for (int c = 0; c < count; ++c) {
+            out_rows.rank_to_row[cold_ranks_[begin + c]] = c;
+        }
+        return true;
+    }
+    void JoinDeferredArenaColdRows(const sycl::event& merge);
+    const ops::MoeCpuHostDownRows* ExecuteDraftCold(
+        const ops::MoeExpertSlotHost* sources, const int* ids, const int* ranks, int count);
+    void RecordDraftMergeEvent(const sycl::event& merge) noexcept {
+        cpu_output_reader_event_ = merge;
+        cpu_host_result_active_ = false;
+    }
     void FinishResidentCpuRead(const sycl::event& merge);
     void AbortResidentCold() noexcept;
 

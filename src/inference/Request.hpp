@@ -128,6 +128,9 @@ private:
     // Verified but unpublished and uncached. The preceding output was already
     // committed by ExecuteWindow, so it must never be forwarded a second time.
     std::optional<int> verifiedBonus;
+    std::array<int, 2> verifiedExtraBonus{{-1, -1}};
+    int verifiedExtraBonusCount = 0;
+    int verifiedExtraBonusIdx = 0;
     bool usedDecodeWindow = false;
     bool ownsSession = false;
     bool insideThinking = false;

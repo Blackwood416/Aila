@@ -27,11 +27,19 @@ void InferenceEngine::align_backend_context_to_sequence(const std::vector<int>& 
             } else {
                 actual_len = backend_->get_current_context_len();
             }
+            if (mtp_state_ && actual_len != mtp_state_->length) {
+                mtp_state_->length = actual_len;
+                mtp_state_->valid = (actual_len == 0);
+            }
         }
 
         if (actual_len > accepted_len) {
             // Truncation left extra tokens behind; rebuild from scratch.
             backend_->reset();
+            if (mtp_state_) {
+                mtp_state_->length = 0;
+                mtp_state_->valid = true;
+            }
             actual_len = 0;
         }
         if (actual_len < prompt_len) {
@@ -100,7 +108,10 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
             ForwardOptions slice_options = options;
             slice_options.checkpoint_after = checkpoint_after;
             slice_options.need_logits = options.need_logits && next == end;
-            slice_options.prefill_remaining = prompt_phase ? end - next : -1;
+            slice_options.prefill_remaining =
+                (mtp_ && mtp_state_ && mtp_state_->valid && pos + slice_len <= mtp_->Capacity())
+                    ? -1
+                    : (prompt_phase ? end - next : -1);
             slice_options.capture_snapshot = options.snapshot_policy == SnapshotPolicy::ReusablePrefix &&
                 (options.capture_snapshot || (snapshot_after_len > 0 && next == snapshot_after_len));
             // Qwen4Exp gathers embedding rows from the host mmap, so a prompt
@@ -133,6 +144,10 @@ Tensor* InferenceEngine::forward_prompt_tokens(const std::vector<int>& token_ids
                 }
                 Tensor& output = backend_->forward(*ctx_, token_ids_device, slice_len, slice_options);
                 logits_ptr = slice_options.need_logits ? &output : nullptr;
+                if (mtp_ && mtp_state_) {
+                    std::vector<int> slice_vec(token_ids.begin() + pos, token_ids.begin() + next);
+                    mtp_->AfterForward(*mtp_state_, pos, slice_vec);
+                }
                 ctx_->synchronize();
             } catch (...) {
                 ctx_->synchronize();
@@ -873,10 +888,18 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
                 // recurrent state requires a full rebuild).  Reset and
                 // fall back to a full prefill of all prompt tokens.
                 backend_->reset();
+                if (mtp_state_) {
+                    mtp_state_->length = 0;
+                    mtp_state_->valid = true;
+                }
                 cached_ids_.clear();
                 reusable_prefix = 0;
             } else {
                 reusable_prefix = backend_->get_current_context_len();
+                if (mtp_state_ && reusable_prefix != mtp_state_->length) {
+                    mtp_state_->length = reusable_prefix;
+                    mtp_state_->valid = (reusable_prefix == 0);
+                }
                 if (requested_reusable_prefix > reusable_prefix) {
                     AILA_LOG_INFO("[GenerateMessages] Incremental prefill rollback: requested reuse=%d actual reuse=%d reprefill=%d",
                                   requested_reusable_prefix, reusable_prefix,
@@ -892,6 +915,10 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
         int new_tokens_to_prefill = total_prompt_len - prefill_start;
         if (new_tokens_to_prefill <= 0) {
             if (backend_) backend_->reset();
+            if (mtp_state_) {
+                mtp_state_->length = 0;
+                mtp_state_->valid = true;
+            }
             cached_ids_.clear();
             prefill_start = 0;
             new_tokens_to_prefill = total_prompt_len;
@@ -1017,7 +1044,99 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
         int generated_count = 0;
         bool hit_eos = false;
         bool hit_loop_guard = false;
-        if (use_chunked_fast_decode) {
+        auto* q4e_mtp_backend = (model_spec_.family == ModelFamily::Qwen4Exp && mtp_ && mtp_state_)
+            ? dynamic_cast<Qwen4ExpBnb4Backend*>(backend_.get())
+            : nullptr;
+        if (use_chunked_fast_decode && q4e_mtp_backend && !tuned_cfg.do_sample) {
+            bool stop_decode = false;
+            int* generated_tokens_device = static_cast<int*>(
+                ctx_->alloc_device(sizeof(int)));
+            int pending_token = mtp_->Select(1)[0].index;
+            auto emit_mtp_token = [&](int current_token) -> bool {
+                if (tokenizer_.is_eos(current_token)) {
+                    hit_eos = true;
+                    stop_decode = true;
+                    return false;
+                }
+                if (current_token == last_token) same_token_run++;
+                else {
+                    same_token_run = 1;
+                    last_token = current_token;
+                }
+                generated_token_ids.push_back(current_token);
+                int step_index = generated_count;
+                generated_count++;
+                if (same_token_run >= 48) {
+                    AILA_LOG_WARN("[GenerateMessages] Loop guard triggered (token=%d run=%d)",
+                                  current_token, same_token_run);
+                    hit_loop_guard = true;
+                    stop_decode = true;
+                    return false;
+                }
+                if (debug_token_ids && step_index < 64) {
+                    std::string piece = tokenizer_.decode(current_token);
+                    AILA_LOG_INFO("[DebugToken] step=%d id=%d text='%s'",
+                                  step_index, current_token, piece.c_str());
+                }
+                if (streaming) {
+                    std::string token_text = tokenizer_.decode(current_token);
+                    emit_stream_piece(token_text);
+                    if (generation_abort_requested_) {
+                        stop_decode = true;
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (max_new_tokens > 0) {
+                emit_mtp_token(pending_token);
+            }
+            auto& q4e_session = q4e_mtp_backend->DefaultSession(*ctx_);
+            while (generated_count < max_new_tokens && !stop_decode) {
+                const int avail_width = std::min<int>({
+                    mtp_->ConfiguredWidth(),
+                    max_new_tokens - generated_count,
+                    mtp_->Capacity() - q4e_session.CurrentLength()});
+                const bool window_ok = (avail_width >= 2) &&
+                    mtp_state_->valid &&
+                    (mtp_state_->length == q4e_session.CurrentLength()) &&
+                    (q4e_session.CurrentLength() >= 1);
+                if (window_ok) {
+                    int check_last = last_token;
+                    int check_run = same_token_run;
+                    auto win = mtp_->ForwardWindow(q4e_session, *mtp_state_, pending_token, [&](int first) {
+                        if (generation_abort_requested_ || tokenizer_.is_eos(first)) return false;
+                        check_run = (first == check_last) ? (check_run + 1) : 1;
+                        check_last = first;
+                        return check_run < 48;
+                    }, avail_width);
+                    if (!emit_mtp_token(win.tokenId)) break;
+                    pending_token = win.tokenId;
+                    if (win.firstTokenCached && win.bonusTokenId.has_value() &&
+                        generated_count < max_new_tokens && !stop_decode) {
+                        const int bonus = *win.bonusTokenId;
+                        if (!emit_mtp_token(bonus)) break;
+                        pending_token = bonus;
+                        for (int eb = 0; eb < win.extraBonusCount &&
+                             generated_count < max_new_tokens && !stop_decode; ++eb) {
+                            const int extra = win.extraBonusTokenIds[eb];
+                            if (!emit_mtp_token(extra)) break;
+                            pending_token = extra;
+                        }
+                    }
+                } else {
+                    ForwardOptions decode_opts = forward_options;
+                    decode_opts.host_token_ids = &pending_token;
+                    ctx_->memcpy_h2d_async(generated_tokens_device, &pending_token, sizeof(int));
+                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device, 1, decode_opts);
+                    mtp_->AfterForward(*mtp_state_, q4e_session.CurrentLength() - 1, {pending_token});
+                    ops::argmax(*ctx_, logits_next, config_.vocab_size, generated_tokens_device);
+                    ctx_->memcpy_d2h(&pending_token, generated_tokens_device, sizeof(int));
+                    if (!emit_mtp_token(pending_token)) break;
+                }
+            }
+            ctx_->free_device(generated_tokens_device);
+        } else if (use_chunked_fast_decode) {
             bool stop_decode = false;
             int available_tokens = 1;
             std::vector<int> host_tokens(static_cast<size_t>(max_new_tokens));
@@ -1037,7 +1156,11 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
 
                 while (available_tokens < chunk_end) {
                     int current_index = available_tokens - 1;
-                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device + current_index, 1, forward_options);
+                    ForwardOptions step_options = forward_options;
+                    if (current_index < chunk_begin) {
+                        step_options.host_token_ids = &host_tokens[static_cast<size_t>(current_index)];
+                    }
+                    Tensor& logits_next = backend_->forward(*ctx_, generated_tokens_device + current_index, 1, step_options);
                     if (tuned_cfg.do_sample) {
                         ops::sample_with_config_device(*ctx_, logits_next, config_.vocab_size,
                                                        tuned_cfg, ops::next_sampling_uniform(),
@@ -1213,6 +1336,10 @@ std::string InferenceEngine::generate_messages(const std::vector<Message>& messa
             cached_ids_.insert(cached_ids_.end(), generated_token_ids.begin(), generated_token_ids.end());
         } else {
             backend_->reset();
+            if (mtp_state_) {
+                mtp_state_->length = 0;
+                mtp_state_->valid = true;
+            }
             cached_ids_.clear();
         }
         return output_text;

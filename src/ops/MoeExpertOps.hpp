@@ -658,4 +658,10 @@ sycl::event moe_ordered_accumulate_cpu_host_rows(
     const bf16* shared_out = nullptr, const bf16* shared_gate = nullptr,
     const sycl::event* dep_event = nullptr);
 
+sycl::event moe_ordered_accumulate_cpu_host_rows_batch(
+    Context& ctx, const float* down_acc, bf16* y,
+    int tokens, int top_k, int out_features, const MoeCpuHostDownRows* cpu_host_rows,
+    const bf16* shared_out = nullptr, const bf16* shared_gate = nullptr,
+    const sycl::event* dep_event = nullptr);
+
 } // namespace ops

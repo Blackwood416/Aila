@@ -491,9 +491,6 @@ inline float a64_nested_scale_register(const MoeNestedScaleHost& nested, size_t 
     return _mm_cvtss_f32(_mm_add_ss(product, _mm_set_ss(nested.offset)));
 }
 
-// Same rounding contract as the struct-taking form, but the nested scale
-// pointers arrive as raw arguments so a caller's block loop hoists them once
-// instead of reloading them through the struct reference per block.
 inline float a64_nested_scale_register_ptrs(const uint8_t* codes, const float* nested_absmax,
     const float* nested_quant_map, float offset, size_t index) {
 #if defined(__clang__)
@@ -510,6 +507,33 @@ inline float a64_nested_scale_register_ptrs(const uint8_t* codes, const float* n
     product = _mm_set_ss(rounded);
 #endif
     return _mm_cvtss_f32(_mm_add_ss(product, _mm_set_ss(offset)));
+}
+
+inline __m128 a64_nested_scale4_ptrs(const uint8_t* codes, const float* nested_absmax,
+    const float* nested_quant_map, float offset,
+    size_t idx0, size_t idx1, size_t idx2, size_t idx3) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+    const __m128 q = _mm_set_ps(
+        nested_quant_map[codes[idx3]],
+        nested_quant_map[codes[idx2]],
+        nested_quant_map[codes[idx1]],
+        nested_quant_map[codes[idx0]]);
+    const __m128 a = _mm_set_ps(
+        nested_absmax[idx3 >> 8],
+        nested_absmax[idx2 >> 8],
+        nested_absmax[idx1 >> 8],
+        nested_absmax[idx0 >> 8]);
+    __m128 product = _mm_mul_ps(q, a);
+#if defined(__clang__)
+    __asm__("" : "+x"(product));
+#else
+    volatile float r0 = _mm_cvtss_f32(product);
+    (void)r0;
+#endif
+    return _mm_add_ps(product, _mm_set1_ps(offset));
 }
 
 inline A64ScaleMode a64_scale_mode(const float* absmax,
@@ -741,23 +765,29 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
         const auto activation1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + b * 64 + 32));
         const auto ax0 = _mm256_abs_epi8(activation0);
         const auto ax1 = _mm256_abs_epi8(activation1);
-        const auto in_scale_ss = _mm_set_ss(input_scales[b]);
-        const auto lut_scale_ss = _mm_set_ss(lut_scale);
-        auto step_row = [&](size_t row, __m256 acc) -> __m256 {
-            const size_t scale_index = row * (Columns / 64) + b;
-            float scale;
-            if constexpr (Mode == A64ScaleMode::FlatF32) {
-                scale = absmax[scale_index];
-            } else if constexpr ((Mode == A64ScaleMode::Nested256 || Mode == A64ScaleMode::Nested256ByteShuffle)) {
-                volatile float product = nested_quant_map[codes[scale_index]] *
-                                         nested_absmax[scale_index >> 8];
-                scale = product + nested_offset;
-            } else if constexpr (Mode == A64ScaleMode::Nested256Register) {
-                scale = a64_nested_scale_register_ptrs(codes, nested_absmax,
-                    nested_quant_map, nested_offset, scale_index);
-            } else {
-                scale = load_host_absmax(absmax, nested, scale_index, nf4_scale_shift);
-            }
+        const auto in_scale_ps = _mm_set1_ps(input_scales[b]);
+        const auto lut_scale_ps = _mm_set1_ps(lut_scale);
+        const size_t idx0 = row0 * (Columns / 64) + b;
+        const size_t idx1 = row1 * (Columns / 64) + b;
+        const size_t idx2 = row2 * (Columns / 64) + b;
+        const size_t idx3 = row3 * (Columns / 64) + b;
+        __m128 scale4;
+        if constexpr (Mode == A64ScaleMode::FlatF32) {
+            scale4 = _mm_set_ps(absmax[idx3], absmax[idx2], absmax[idx1], absmax[idx0]);
+        } else if constexpr (Mode == A64ScaleMode::Nested256 ||
+                             Mode == A64ScaleMode::Nested256ByteShuffle ||
+                             Mode == A64ScaleMode::Nested256Register) {
+            scale4 = a64_nested_scale4_ptrs(codes, nested_absmax, nested_quant_map, nested_offset,
+                                            idx0, idx1, idx2, idx3);
+        } else {
+            scale4 = _mm_set_ps(
+                load_host_absmax(absmax, nested, idx3, nf4_scale_shift),
+                load_host_absmax(absmax, nested, idx2, nf4_scale_shift),
+                load_host_absmax(absmax, nested, idx1, nf4_scale_shift),
+                load_host_absmax(absmax, nested, idx0, nf4_scale_shift));
+        }
+        const __m128 factor4 = _mm_mul_ps(_mm_mul_ps(scale4, in_scale_ps), lut_scale_ps);
+        auto step_row = [&](size_t row, __m256 factor_v, __m256 acc) -> __m256 {
             auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * stride + b * 32));
             bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
             const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
@@ -767,14 +797,12 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
             const auto pairs0 = _mm256_maddubs_epi16(ax0, _mm256_sign_epi8(weights0, activation0));
             const auto pairs1 = _mm256_maddubs_epi16(ax1, _mm256_sign_epi8(weights1, activation1));
             const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
-            const auto scale_input = _mm_mul_ss(_mm_set_ss(scale), in_scale_ss);
-            const float factor = _mm_cvtss_f32(_mm_mul_ss(scale_input, lut_scale_ss));
-            return _mm256_fmadd_ps(_mm256_set1_ps(factor), _mm256_cvtepi32_ps(dot), acc);
+            return _mm256_fmadd_ps(factor_v, _mm256_cvtepi32_ps(dot), acc);
         };
-        accumulator0 = step_row(row0, accumulator0);
-        accumulator1 = step_row(row1, accumulator1);
-        accumulator2 = step_row(row2, accumulator2);
-        accumulator3 = step_row(row3, accumulator3);
+        accumulator0 = step_row(row0, _mm256_broadcastss_ps(factor4), accumulator0);
+        accumulator1 = step_row(row1, _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(1, 1, 1, 1))), accumulator1);
+        accumulator2 = step_row(row2, _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(2, 2, 2, 2))), accumulator2);
+        accumulator3 = step_row(row3, _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(3, 3, 3, 3))), accumulator3);
     }
     output[0] = hsum256_ps(accumulator0);
     output[1] = hsum256_ps(accumulator1);
@@ -782,11 +810,146 @@ static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows4(
     output[3] = hsum256_ps(accumulator3);
 }
 
+template <int Columns, A64ScaleMode Mode>
+#if defined(_MSC_VER)
+static __forceinline void nf4_q8_dot_activation64_rows2_pair(const uint8_t* packed, const float* absmax,
+#else
+static inline __attribute__((always_inline)) void nf4_q8_dot_activation64_rows2_pair(const uint8_t* packed, const float* absmax,
+#endif
+    const MoeNestedScaleHost& nested, size_t row0, size_t row1,
+    const int8_t* input_a, const float* scales_a,
+    const int8_t* input_b, const float* scales_b,
+    __m128i lut, float lut_scale, bool nf4_scale_shift,
+    float* output_a, float* output_b) {
+    static_assert(Columns > 0 && Columns % 64 == 0, "NF4Q8 A64 requires complete 64-weight blocks");
+    const auto mask = _mm256_set1_epi8(15);
+    const auto ones = _mm256_set1_epi16(1);
+    const auto table = _mm256_broadcastsi128_si256(lut);
+    auto acc0_a = _mm256_setzero_ps();
+    auto acc1_a = _mm256_setzero_ps();
+    auto acc0_b = _mm256_setzero_ps();
+    auto acc1_b = _mm256_setzero_ps();
+    constexpr size_t stride = Columns / 2;
+    [[maybe_unused]] const uint8_t* const codes = nested.codes;
+    [[maybe_unused]] const float* const nested_absmax = nested.nested_absmax;
+    [[maybe_unused]] const float* const nested_quant_map = nested.nested_quant_map;
+    [[maybe_unused]] const float nested_offset = nested.offset;
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+    for (int b = 0; b < Columns / 64; ++b) {
+        if ((b & 1) == 0 && b + 4 < Columns / 64) {
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row0 * stride + b * 32 + 128), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(packed + row1 * stride + b * 32 + 128), _MM_HINT_T0);
+        }
+        const auto act0_a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_a + b * 64));
+        const auto act1_a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_a + b * 64 + 32));
+        const auto act0_b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_b + b * 64));
+        const auto act1_b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input_b + b * 64 + 32));
+        const size_t idx0 = row0 * (Columns / 64) + b;
+        const size_t idx1 = row1 * (Columns / 64) + b;
+        __m128 scale4;
+        if constexpr (Mode == A64ScaleMode::FlatF32) {
+            scale4 = _mm_set_ps(absmax[idx1], absmax[idx0], absmax[idx1], absmax[idx0]);
+        } else if constexpr (Mode == A64ScaleMode::Nested256 ||
+                             Mode == A64ScaleMode::Nested256ByteShuffle ||
+                             Mode == A64ScaleMode::Nested256Register) {
+            scale4 = a64_nested_scale4_ptrs(codes, nested_absmax, nested_quant_map, nested_offset,
+                                            idx0, idx1, idx0, idx1);
+        } else {
+            const float s0 = load_host_absmax(absmax, nested, idx0, nf4_scale_shift);
+            const float s1 = load_host_absmax(absmax, nested, idx1, nf4_scale_shift);
+            scale4 = _mm_set_ps(s1, s0, s1, s0);
+        }
+        const __m128 in_scales_ab = _mm_set_ps(scales_b[b], scales_b[b], scales_a[b], scales_a[b]);
+        const __m128 factor4 = _mm_mul_ps(_mm_mul_ps(scale4, in_scales_ab), _mm_set1_ps(lut_scale));
+        auto step_row = [&](size_t row, __m256 fa_v, __m256 fb_v, __m256& acc_a, __m256& acc_b) {
+            auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed + row * stride + b * 32));
+            bytes = _mm256_permute4x64_epi64(bytes, _MM_SHUFFLE(3, 1, 2, 0));
+            const auto high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+            const auto low = _mm256_and_si256(bytes, mask);
+            const auto weights0 = _mm256_shuffle_epi8(table, _mm256_unpacklo_epi8(high, low));
+            const auto weights1 = _mm256_shuffle_epi8(table, _mm256_unpackhi_epi8(high, low));
+            const auto aw0 = _mm256_abs_epi8(weights0);
+            const auto aw1 = _mm256_abs_epi8(weights1);
+            {
+                const auto pairs0 = _mm256_maddubs_epi16(aw0, _mm256_sign_epi8(act0_a, weights0));
+                const auto pairs1 = _mm256_maddubs_epi16(aw1, _mm256_sign_epi8(act1_a, weights1));
+                const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
+                acc_a = _mm256_fmadd_ps(fa_v, _mm256_cvtepi32_ps(dot), acc_a);
+            }
+            {
+                const auto pairs0 = _mm256_maddubs_epi16(aw0, _mm256_sign_epi8(act0_b, weights0));
+                const auto pairs1 = _mm256_maddubs_epi16(aw1, _mm256_sign_epi8(act1_b, weights1));
+                const auto dot = _mm256_add_epi32(_mm256_madd_epi16(pairs0, ones), _mm256_madd_epi16(pairs1, ones));
+                acc_b = _mm256_fmadd_ps(fb_v, _mm256_cvtepi32_ps(dot), acc_b);
+            }
+        };
+        step_row(row0,
+                 _mm256_broadcastss_ps(factor4),
+                 _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(2, 2, 2, 2))),
+                 acc0_a, acc0_b);
+        step_row(row1,
+                 _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(1, 1, 1, 1))),
+                 _mm256_broadcastss_ps(_mm_permute_ps(factor4, _MM_SHUFFLE(3, 3, 3, 3))),
+                 acc1_a, acc1_b);
+    }
+    output_a[0] = hsum256_ps(acc0_a);
+    output_a[1] = hsum256_ps(acc1_a);
+    output_b[0] = hsum256_ps(acc0_b);
+    output_b[1] = hsum256_ps(acc1_b);
+}
+
 inline void mark_a64_row2_enabled() {
     static std::atomic<bool> reported{false};
     if (!reported.load(std::memory_order_relaxed) &&
         !reported.exchange(true, std::memory_order_relaxed))
         std::fprintf(stderr, "[Q4E A64Row2Enabled] rows=2\n");
+}
+
+template <A64ScaleMode Mode>
+static void dispatch_a64_gate_tile_pair(const MoeExpertSlotHost& slot,
+    int begin, const int8_t* values_a, const float* scales_a,
+    const int8_t* values_b, const float* scales_b,
+    __m128i lut, float lut_scale, bool nf4_scale_shift, bf16* h_a, bf16* h_b, int tile_rows = 16) {
+#if defined(__clang__)
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+#endif
+    for (int row = begin; row < begin + tile_rows; ++row) {
+        float dots_a[2], dots_b[2];
+        nf4_q8_dot_activation64_rows2_pair<kHiddenDim, Mode>(slot.gate_up_packed,
+            slot.gate_up_absmax, slot.gate_up_nested,
+            row, row + kIntermediateDim,
+            values_a, scales_a, values_b, scales_b,
+            lut, lut_scale, nf4_scale_shift, dots_a, dots_b);
+        {
+            const float gate = dots_a[0], up = dots_a[1];
+            const float denominator = 1.0f + std::exp(-gate);
+            const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+            h_a[row] = bf16(silu * up);
+        }
+        {
+            const float gate = dots_b[0], up = dots_b[1];
+            const float denominator = 1.0f + std::exp(-gate);
+            const float silu = _mm_cvtss_f32(_mm_div_ss(_mm_set_ss(gate), _mm_set_ss(denominator)));
+            h_b[row] = bf16(silu * up);
+        }
+    }
+    mark_a64_row2_enabled();
+}
+
+template <A64ScaleMode Mode>
+static void dispatch_a64_down_tile_pair(const MoeExpertSlotHost& slot,
+    int begin, const int8_t* values_a, const float* scales_a,
+    const int8_t* values_b, const float* scales_b,
+    __m128i lut, float lut_scale, bool nf4_scale_shift, float* out_a, float* out_b, int tile_rows = 32) {
+    for (int row = begin; row < begin + tile_rows; row += 2) {
+        nf4_q8_dot_activation64_rows2_pair<kIntermediateDim, Mode>(slot.down_packed,
+            slot.down_absmax, slot.down_nested, row, row + 1,
+            values_a, scales_a, values_b, scales_b,
+            lut, lut_scale, nf4_scale_shift, out_a + row, out_b + row);
+    }
+    mark_a64_row2_enabled();
 }
 
 template <A64ScaleMode Mode>
@@ -805,7 +968,8 @@ static void dispatch_a64_gate_tile(const MoeExpertSlotHost& slot,
         float dots[4];
         nf4_q8_dot_activation64_rows4<kHiddenDim, Mode>(slot.gate_up_packed,
             slot.gate_up_absmax, slot.gate_up_nested,
-            row, row + kIntermediateDim, row + 1, row + 1 + kIntermediateDim,
+            row, row + kIntermediateDim,
+            row + 1, row + 1 + kIntermediateDim,
             values, scales, lut, lut_scale, nf4_scale_shift, dots);
 #if defined(__clang__)
 #pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
@@ -831,8 +995,9 @@ static void dispatch_a64_down_tile(const MoeExpertSlotHost& slot,
     }
     for (int row = begin; row < begin + 32; row += 4)
         nf4_q8_dot_activation64_rows4<kIntermediateDim, Mode>(slot.down_packed,
-            slot.down_absmax, slot.down_nested, row, row + 1, row + 2, row + 3, values, scales,
-            lut, lut_scale, nf4_scale_shift, out + row);
+            slot.down_absmax, slot.down_nested,
+            row, row + 1, row + 2, row + 3,
+            values, scales, lut, lut_scale, nf4_scale_shift, out + row);
     mark_a64_row2_enabled();
 }
 
@@ -1149,6 +1314,41 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                     h[c * kIntermediateDim + row] = bf16(silu * up);
                 }
     };
+    auto nf4_q8_gate_tile_pair_body = [&](int c0, int c1, int begin, int tile_rows = 16) {
+        if (!(activation64 && (a64_specialize || a64_row2) && a64_row2)) {
+            nf4_q8_gate_tile_body(c0, begin);
+            nf4_q8_gate_tile_body(c1, begin);
+            return;
+        }
+        const auto& slot = tasks[c0].slot;
+        const auto* values0 = input + tasks[c0].token * kHiddenDim;
+        const auto* scales0 = input_scales + tasks[c0].token * (kHiddenDim / 64);
+        auto* output0 = h + c0 * kIntermediateDim;
+        const auto* values1 = input + tasks[c1].token * kHiddenDim;
+        const auto* scales1 = input_scales + tasks[c1].token * (kHiddenDim / 64);
+        auto* output1 = h + c1 * kIntermediateDim;
+        const auto mode = a64_specialize
+            ? a64_scale_mode(slot.gate_up_absmax, slot.gate_up_nested, nf4_scale_shift)
+            : A64ScaleMode::Generic;
+        switch (mode) {
+        case A64ScaleMode::FlatF32:
+            dispatch_a64_gate_tile_pair<A64ScaleMode::FlatF32>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256:
+            dispatch_a64_gate_tile_pair<A64ScaleMode::Nested256>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256Register:
+            dispatch_a64_gate_tile_pair<A64ScaleMode::Nested256Register>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256ByteShuffle:
+            dispatch_a64_gate_tile_pair<A64ScaleMode::Nested256ByteShuffle>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        default:
+            dispatch_a64_gate_tile_pair<A64ScaleMode::Generic>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        }
+        mark_a64_specialize_enabled(mode);
+    };
     const int down_tile_cols = kHiddenDim / down_tile;
     auto nf4_q8_down_tile_body = [&](int c, int begin) {
                 const auto& slot = tasks[c].slot;
@@ -1200,76 +1400,147 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
                         row, intermediate + c * kIntermediateDim, intermediate_scales + c * (kIntermediateDim / 32),
                         kIntermediateDim, lut, lut_scale, nf4_scale_shift);
     };
+    auto nf4_q8_down_tile_pair_body = [&](int c0, int c1, int begin, int tile_rows = 32) {
+        if (!(activation64 && (a64_specialize || a64_row2) && a64_row2)) {
+            nf4_q8_down_tile_body(c0, begin);
+            nf4_q8_down_tile_body(c1, begin);
+            return;
+        }
+        const auto& slot = tasks[c0].slot;
+        const auto* values0 = intermediate + c0 * kIntermediateDim;
+        const auto* scales0 = intermediate_scales + c0 * (kIntermediateDim / 64);
+        auto* output0 = out + c0 * kHiddenDim;
+        const auto* values1 = intermediate + c1 * kIntermediateDim;
+        const auto* scales1 = intermediate_scales + c1 * (kIntermediateDim / 64);
+        auto* output1 = out + c1 * kHiddenDim;
+        const auto mode = a64_specialize
+            ? a64_scale_mode(slot.down_absmax, slot.down_nested, nf4_scale_shift)
+            : A64ScaleMode::Generic;
+        switch (mode) {
+        case A64ScaleMode::FlatF32:
+            dispatch_a64_down_tile_pair<A64ScaleMode::FlatF32>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256:
+            dispatch_a64_down_tile_pair<A64ScaleMode::Nested256>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256Register:
+            dispatch_a64_down_tile_pair<A64ScaleMode::Nested256Register>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        case A64ScaleMode::Nested256ByteShuffle:
+            dispatch_a64_down_tile_pair<A64ScaleMode::Nested256ByteShuffle>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        default:
+            dispatch_a64_down_tile_pair<A64ScaleMode::Generic>(slot, begin,
+                values0, scales0, values1, scales1, lut, lut_scale, nf4_scale_shift, output0, output1, tile_rows); break;
+        }
+        mark_a64_specialize_enabled(mode);
+    };
     struct alignas(64) GateTileCountdown {
         std::atomic<int> rem{0};
         std::atomic<int> ready_unit{-1};
     };
     GateTileCountdown gate_countdown[kMaxExpertBatchTasks];
     std::atomic<int> ready_write{0};
-    const bool inline_gate_quant = activation64 && group_count <= 0 && !timings;
+    const int unit_count = group_count > 0 ? group_count : count;
+    const bool inline_gate_quant = activation64 && !timings;
     static const bool s_completion_single_pass =
         aila::env::read_int_raw("AILA_Q4E_CPU_COMPLETION_SINGLE_PASS", 1) != 0;
     const bool use_completion_single_pass =
-        inline_gate_quant && s_completion_single_pass && currentTilePool != nullptr && count >= 1;
+        inline_gate_quant && s_completion_single_pass && currentTilePool != nullptr && unit_count >= 1;
     if (inline_gate_quant) {
-        for (int c = 0; c < count; ++c) {
-            gate_countdown[c].rem.store(gate_tile_cols, std::memory_order_relaxed);
-            gate_countdown[c].ready_unit.store(-1, std::memory_order_relaxed);
+        for (int u = 0; u < unit_count; ++u) {
+            gate_countdown[u].rem.store(gate_tile_cols, std::memory_order_relaxed);
+            gate_countdown[u].ready_unit.store(-1, std::memory_order_relaxed);
         }
     }
+    auto run_group_gate_tile = [&](int unit, int begin) {
+        if (group_count <= 0) {
+            nf4_q8_gate_tile_body(unit, begin);
+            return;
+        }
+        const int member_begin = groups[unit].member_begin;
+        const int member_count = groups[unit].member_count;
+        int mi = 0;
+        for (; mi + 1 < member_count; mi += 2) {
+            nf4_q8_gate_tile_pair_body(members[member_begin + mi], members[member_begin + mi + 1], begin);
+        }
+        for (; mi < member_count; ++mi) {
+            nf4_q8_gate_tile_body(members[member_begin + mi], begin);
+        }
+    };
+    auto quantize_group_unit = [&](int unit) {
+        if (group_count <= 0) {
+            quantize_bf16_q8_activation64(
+                h + unit * kIntermediateDim, kIntermediateDim,
+                intermediate + unit * kIntermediateDim,
+                intermediate_scales + unit * (kIntermediateDim / 64));
+            return;
+        }
+        const int member_begin = groups[unit].member_begin;
+        const int member_count = groups[unit].member_count;
+        for (int mi = 0; mi < member_count; ++mi) {
+            const int c = members[member_begin + mi];
+            quantize_bf16_q8_activation64(
+                h + c * kIntermediateDim, kIntermediateDim,
+                intermediate + c * kIntermediateDim,
+                intermediate_scales + c * (kIntermediateDim / 64));
+        }
+    };
+    auto run_group_down_tile = [&](int unit, int begin) {
+        if (group_count <= 0) {
+            nf4_q8_down_tile_body(unit, begin);
+            return;
+        }
+        const int member_begin = groups[unit].member_begin;
+        const int member_count = groups[unit].member_count;
+        int mi = 0;
+        for (; mi + 1 < member_count; mi += 2) {
+            nf4_q8_down_tile_pair_body(members[member_begin + mi], members[member_begin + mi + 1], begin);
+        }
+        for (; mi < member_count; ++mi) {
+            nf4_q8_down_tile_body(members[member_begin + mi], begin);
+        }
+    };
     if (use_completion_single_pass) {
-        const int total_gate_tiles = count * gate_tile_cols;
-        const int total_tiles = total_gate_tiles + count * down_tile_cols;
+        const int total_gate_tiles = unit_count * gate_tile_cols;
+        const int total_tiles = total_gate_tiles + unit_count * down_tile_cols;
         nf4_q8_parallel_tiles(total_tiles,
             [&](const tbb::blocked_range<int>& range) {
                 for (int tile = range.begin(); tile < range.end(); ++tile) {
                     if (tile < total_gate_tiles) {
                         const int unit = tile / gate_tile_cols;
                         const int begin = (tile % gate_tile_cols) * gate_tile;
-                        nf4_q8_gate_tile_body(unit, begin);
+                        run_group_gate_tile(unit, begin);
                         if (gate_countdown[unit].rem.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            quantize_bf16_q8_activation64(
-                                h + unit * kIntermediateDim, kIntermediateDim,
-                                intermediate + unit * kIntermediateDim,
-                                intermediate_scales + unit * (kIntermediateDim / 64));
-                            const int slot = ready_write.fetch_add(1, std::memory_order_relaxed);
-                            gate_countdown[slot].ready_unit.store(unit, std::memory_order_release);
+                            quantize_group_unit(unit);
+                            const int dst = ready_write.fetch_add(1, std::memory_order_relaxed);
+                            gate_countdown[dst].ready_unit.store(unit, std::memory_order_release);
                         }
                     } else {
                         const int down_tile_idx = tile - total_gate_tiles;
-                        const int slot = down_tile_idx / down_tile_cols;
+                        const int dst = down_tile_idx / down_tile_cols;
                         const int begin = (down_tile_idx % down_tile_cols) * down_tile;
-                        int unit = gate_countdown[slot].ready_unit.load(std::memory_order_acquire);
+                        int unit = gate_countdown[dst].ready_unit.load(std::memory_order_acquire);
                         while (unit < 0) {
                             _mm_pause();
-                            unit = gate_countdown[slot].ready_unit.load(std::memory_order_acquire);
+                            unit = gate_countdown[dst].ready_unit.load(std::memory_order_acquire);
                         }
-                        nf4_q8_down_tile_body(unit, begin);
+                        run_group_down_tile(unit, begin);
                     }
                 }
             });
         return;
     }
-    const int gate_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * gate_tile_cols,
+    const int gate_chunks = nf4_q8_parallel_tiles(unit_count * gate_tile_cols,
         [&](const tbb::blocked_range<int>& range) {
             for (int tile = range.begin(); tile < range.end(); ++tile) {
                 const int unit = tile / gate_tile_cols;
                 const int begin = tile % gate_tile_cols * gate_tile;
-                if (group_count <= 0) {
-                    nf4_q8_gate_tile_body(unit, begin);
-                    if (inline_gate_quant &&
-                        gate_countdown[unit].rem.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                        quantize_bf16_q8_activation64(
-                            h + unit * kIntermediateDim, kIntermediateDim,
-                            intermediate + unit * kIntermediateDim,
-                            intermediate_scales + unit * (kIntermediateDim / 64));
-                    }
-                    continue;
+                run_group_gate_tile(unit, begin);
+                if (inline_gate_quant &&
+                    gate_countdown[unit].rem.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    quantize_group_unit(unit);
                 }
-                const int member_begin = groups[unit].member_begin;
-                const int member_count = groups[unit].member_count;
-                for (int mi = 0; mi < member_count; ++mi)
-                    nf4_q8_gate_tile_body(members[member_begin + mi], begin);
             }
         });
     if (timings) {
@@ -1293,16 +1564,12 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
         timings->quantize_ns += now - phase_begin;
         phase_begin = now;
     }
-    const int down_chunks = nf4_q8_parallel_tiles((group_count > 0 ? group_count : count) * down_tile_cols,
+    const int down_chunks = nf4_q8_parallel_tiles(unit_count * down_tile_cols,
         [&](const tbb::blocked_range<int>& range) {
             for (int tile = range.begin(); tile < range.end(); ++tile) {
                 const int unit = tile / down_tile_cols;
                 const int begin = tile % down_tile_cols * down_tile;
-                if (group_count <= 0) { nf4_q8_down_tile_body(unit, begin); continue; }
-                const int member_begin = groups[unit].member_begin;
-                const int member_count = groups[unit].member_count;
-                for (int mi = 0; mi < member_count; ++mi)
-                    nf4_q8_down_tile_body(members[member_begin + mi], begin);
+                run_group_down_tile(unit, begin);
             }
         });
     if (timings) {

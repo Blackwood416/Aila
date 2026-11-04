@@ -537,7 +537,10 @@ void run_linear_delta_prefill_gpu_batched_impl(
     DeltaNetState& state,
     const bf16* fused_ptr,
     bf16* out_ptr,
-    int seq_len) {
+    int seq_len,
+    bool defer_grouped_history = false,
+    const float* state_in_override = nullptr) {
+    if (seq_len <= 0) return;
 
     const int qkv_dim = geom.qkv_dim;
     const int z_dim = geom.z_dim;
@@ -555,6 +558,7 @@ void run_linear_delta_prefill_gpu_batched_impl(
     const int all_dim = geom.all_dim;
 
     float* state_ptr = state.state;
+    const float* state_in_ptr = state_in_override ? state_in_override : state.state;
     float* conv_state_ptr = state.conv_state;
     const bf16* conv_w_ptr = weights.conv_weight;
     const float* norm_w_ptr = weights.norm_weight;
@@ -605,6 +609,24 @@ void run_linear_delta_prefill_gpu_batched_impl(
                     int a_offset = qkv_dim + z_dim;
                     int b_offset = qkv_dim + z_dim + num_heads;
                     float* S = state_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
+                    const float* S_in = state_in_ptr + static_cast<size_t>(hv) * head_dim * head_dim;
+                    float s_col[head_dim];
+                    if constexpr (!Prefetch) {
+                        if (lid < head_dim) {
+                            const int dv = lid;
+                            for (int j = 0; j < head_dim; j += 8) {
+                                const size_t b = static_cast<size_t>(j) * head_dim + dv;
+                                s_col[j + 0] = S_in[b + 0 * head_dim];
+                                s_col[j + 1] = S_in[b + 1 * head_dim];
+                                s_col[j + 2] = S_in[b + 2 * head_dim];
+                                s_col[j + 3] = S_in[b + 3 * head_dim];
+                                s_col[j + 4] = S_in[b + 4 * head_dim];
+                                s_col[j + 5] = S_in[b + 5 * head_dim];
+                                s_col[j + 6] = S_in[b + 6 * head_dim];
+                                s_col[j + 7] = S_in[b + 7 * head_dim];
+                            }
+                        }
+                    }
 
                     int local_conv_head = conv_head;
 
@@ -704,7 +726,7 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                 // order match the scalar loop verbatim so the
                                 // result is bit-identical.
                                 constexpr int kBlk = linear_delta_prefill_mlp_block;
-                                float* S_col = S + dv;
+                                const float* S_col = (t == 0 ? S_in : S) + dv;
                                 float blk[kBlk];
                                 #pragma unroll
                                 for (int i = 0; i < kBlk; ++i) {
@@ -737,14 +759,10 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                 }
                             } else {
                             for (int j = 0; j < head_dim; j += 4) {
-                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                                float sv0 = S[off0] * decay;
-                                float sv1 = S[off1] * decay;
-                                float sv2 = S[off2] * decay;
-                                float sv3 = S[off3] * decay;
+                                float sv0 = s_col[j + 0] * decay;
+                                float sv1 = s_col[j + 1] * decay;
+                                float sv2 = s_col[j + 2] * decay;
+                                float sv3 = s_col[j + 3] * decay;
                                 acc += sv0 * k_local[j + 0] +
                                        sv1 * k_local[j + 1] +
                                        sv2 * k_local[j + 2] +
@@ -761,7 +779,7 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                 // is updated, and the update/output expressions
                                 // keep the original order.
                                 constexpr int kBlk = linear_delta_prefill_mlp_block;
-                                float* S_col = S + dv;
+                                const float* S_col = (t == 0 ? S_in : S) + dv;
                                 float blk[kBlk];
                                 #pragma unroll
                                 for (int i = 0; i < kBlk; ++i) {
@@ -801,19 +819,27 @@ void run_linear_delta_prefill_gpu_batched_impl(
                                     }
                                 }
                             } else {
+                            const bool write_state = (t + 1 == seq_len);
                             for (int j = 0; j < head_dim; j += 4) {
-                                const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
-                                const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
-                                const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
-                                const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
-                                float sv0 = S[off0] * decay + k_local[j + 0] * dval;
-                                float sv1 = S[off1] * decay + k_local[j + 1] * dval;
-                                float sv2 = S[off2] * decay + k_local[j + 2] * dval;
-                                float sv3 = S[off3] * decay + k_local[j + 3] * dval;
-                                S[off0] = sv0;
-                                S[off1] = sv1;
-                                S[off2] = sv2;
-                                S[off3] = sv3;
+                                float sv0 = s_col[j + 0] * decay + k_local[j + 0] * dval;
+                                float sv1 = s_col[j + 1] * decay + k_local[j + 1] * dval;
+                                float sv2 = s_col[j + 2] * decay + k_local[j + 2] * dval;
+                                float sv3 = s_col[j + 3] * decay + k_local[j + 3] * dval;
+                                if (write_state) {
+                                    const size_t off0 = static_cast<size_t>(j + 0) * head_dim + dv;
+                                    const size_t off1 = static_cast<size_t>(j + 1) * head_dim + dv;
+                                    const size_t off2 = static_cast<size_t>(j + 2) * head_dim + dv;
+                                    const size_t off3 = static_cast<size_t>(j + 3) * head_dim + dv;
+                                    S[off0] = sv0;
+                                    S[off1] = sv1;
+                                    S[off2] = sv2;
+                                    S[off3] = sv3;
+                                } else {
+                                    s_col[j + 0] = sv0;
+                                    s_col[j + 1] = sv1;
+                                    s_col[j + 2] = sv2;
+                                    s_col[j + 3] = sv3;
+                                }
                                 out += sv0 * q_local[j + 0] +
                                        sv1 * q_local[j + 1] +
                                        sv2 * q_local[j + 2] +
@@ -840,7 +866,7 @@ void run_linear_delta_prefill_gpu_batched_impl(
                 });
         });
 
-        if (grouped_heads) {
+        if (grouped_heads && !defer_grouped_history) {
             commit_linear_conv_history(ctx, fused_ptr, all_dim, conv_state_ptr,
                                        qkv_dim, conv_rows, conv_head, seq_len);
         }
@@ -850,6 +876,10 @@ void run_linear_delta_prefill_gpu_batched_impl(
     }
 
     // Fallback: per-token iteration for non-standard shapes
+    if (state_in_override && state_in_override != state.state) {
+        ctx.queue().memcpy(state.state, state_in_override,
+                           static_cast<size_t>(num_heads) * head_k_dim * head_v_dim * sizeof(float));
+    }
     for (int t = 0; t < seq_len; ++t) {
         const bf16* row_ptr = fused_ptr + static_cast<size_t>(t) * all_dim;
         const bf16* qkv_view = row_ptr;
@@ -869,8 +899,13 @@ void run_linear_delta_prefill_gpu_batched(
     DeltaNetState& state,
     const bf16* fused_ptr,
     bf16* out_ptr,
-    int seq_len, bool decode_order, bool force_prefetch) {
+    int seq_len, bool decode_order, bool force_prefetch, bool defer_grouped_history,
+    const float* state_in_override) {
     if (decode_order && seq_len >= 1 && seq_len <= 4) {
+        if (state_in_override && state_in_override != state.state) {
+            ctx.queue().memcpy(state.state, state_in_override,
+                               static_cast<size_t>(geom.v_heads) * geom.head_k_dim * geom.head_v_dim * sizeof(float));
+        }
         // Reuse the actual decode kernel: matching the source-level sum grouping
         // alone did not produce bitwise recurrent trajectories on DG2.
         for (int r = 0; r < seq_len; ++r) {
@@ -890,18 +925,18 @@ void run_linear_delta_prefill_gpu_batched(
     if (geom.gate_act == GateActivation::Sigmoid) {
         if (use_prefetch) {
             run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid, true>(
-                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len, defer_grouped_history, state_in_override);
         } else {
             run_linear_delta_prefill_gpu_batched_impl<GateActivation::Sigmoid, false>(
-                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len, defer_grouped_history, state_in_override);
         }
     } else {
         if (use_prefetch) {
             run_linear_delta_prefill_gpu_batched_impl<GateActivation::Silu, true>(
-                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len, defer_grouped_history, state_in_override);
         } else {
             run_linear_delta_prefill_gpu_batched_impl<GateActivation::Silu, false>(
-                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len);
+                ctx, geom, weights, state, fused_ptr, out_ptr, seq_len, defer_grouped_history, state_in_override);
         }
     }
 }

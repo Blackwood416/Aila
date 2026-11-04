@@ -7,6 +7,7 @@
 #include "../src/models/Qwen35HybridBnb4Backend.hpp"
 #include "../src/models/DiffusionGemmaBnb4Backend.hpp"
 #include "../src/models/Qwen4ExpBnb4Backend.hpp"
+#include "../src/models/Qwen4ExpMtpRuntime.hpp"
 #include "../src/generation/DiffusionGemmaGenerator.hpp"
 #include "../src/models/Qwen35HybridTextBackend.hpp"
 #include "../src/models/Qwen3ASRBackend.hpp"
@@ -428,6 +429,8 @@ private:
     std::unique_ptr<Context> ctx_;
     std::unique_ptr<ModelWeights> weights_;
     std::unique_ptr<IModelBackend> backend_;
+    std::unique_ptr<Qwen4ExpMtpRuntime> mtp_;
+    std::unique_ptr<Qwen4ExpMtpRuntime::State> mtp_state_;
     Tensor token_input_staging_;
     friend struct Qwen4ExpGenerationTestAccess;
     std::unique_ptr<aila::vision::Yolo26Detector> detector_;

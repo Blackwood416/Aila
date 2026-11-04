@@ -25,28 +25,33 @@ public:
     // caller's admission check must reject windows at Capacity()-1 or above,
     // so longer sessions silently take the plain T1 path.
     int Capacity() const noexcept { return capacity; }
+    int ConfiguredWidth() const noexcept { return configuredWidth; }
+    void ResetStats() noexcept { windows = 0; accepted = 0; }
+    std::array<ops::GreedyResult, 4> Select(int rows);
     std::unique_ptr<State> CreateState();
     void AfterForward(State&, int start, const std::vector<int>& tokens);
     aila::inference::DecodeWindowResult ForwardWindow(Qwen4ExpBnb4Backend::Session&,
-        State&, int pending, const aila::inference::DecodeWindowSelector&);
+        State&, int pending, const aila::inference::DecodeWindowSelector&, int maxWidth = 0);
 private:
     Context& ctx;
     Qwen4ExpBnb4Backend& target;
     int capacity;
+    int configuredWidth = 2;
     std::unique_ptr<Qwen4ExpMtpDraft> draft;
     Tensor hiddenRows, checkpoint, linearInputs, plePrefix, ids, greedyPartials, greedyResult;
+    ops::GreedyResult* greedyResultHost = nullptr;
     std::array<int, 48> convHeads{}, blocks{};
     std::array<int, 2> pleTokens{};
     int pleHead = 0, length = 0, noMiss = 0;
     uint64_t windows = 0, accepted = 0;
-    std::array<ops::GreedyResult, 2> Select(int rows);
     // Device pointers of the recurrent checkpoint layout: 36 DeltaNet layers
     // (state then conv ring, layer-major) followed by the PLE conv ring.
     struct RecurrentCheckpointPtrs;
     void BindRecurrentCheckpoint(Qwen4ExpBnb4Backend::Session&, RecurrentCheckpointPtrs&);
     // One kernel launch for the whole 118 MB recurrent checkpoint instead of
     // 73 in-order queue copies. capture=true copies session -> checkpoint.
-    void SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs&, bool capture);
+    void SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs&, bool capture, int keepPleRows = 1,
+                                   bool skipLinearState = false);
     void Capture(Qwen4ExpBnb4Backend::Session&);
-    void Restore(Qwen4ExpBnb4Backend::Session&);
+    void Restore(Qwen4ExpBnb4Backend::Session&, int keepPleRows = 1, bool skipLinearState = false);
 };

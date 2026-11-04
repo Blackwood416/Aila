@@ -26,6 +26,9 @@ constexpr size_t kMtpRecurrentCheckpointBytes =
 // kMtpRecurrentChunks-wide launch instead of 73 queue memcpys.
 constexpr int kMtpLayerChunks = (kMtpStateFloats + kMtpConvFloats) / 4;   // 204,288
 constexpr int kMtpStateChunks = kMtpStateFloats / 4;                      // 196,608
+constexpr int kMtpConvChunks = kMtpConvFloats / 4;                        // 7,680
+constexpr int kMtpConvRecurrentChunks =
+    (kMtpLinearLayers * kMtpConvFloats + kMtpPleFloats) / 4;              // 299,520
 constexpr int kMtpRecurrentChunks = static_cast<int>(
     (kMtpRecurrentCheckpointBytes + kMtpPleCheckpointBytes) / (4 * sizeof(float)));
 static_assert(kMtpRecurrentCheckpointBytes + kMtpPleCheckpointBytes == 118038528,
@@ -36,7 +39,9 @@ static_assert(kMtpRecurrentCheckpointBytes + kMtpPleCheckpointBytes == 118038528
 struct Qwen4ExpMtpRuntime::RecurrentCheckpointPtrs {
     float* linear_state[kMtpLinearLayers];
     float* linear_conv[kMtpLinearLayers];
+    int conv_heads[kMtpLinearLayers];
     float* ple_conv;
+    int ple_head;
 };
 
 Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
@@ -44,24 +49,31 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
     try {
         if (cap < 2 || cap > target.max_seq_len())
             throw std::invalid_argument("MTP requires a draft window within the sequence budget");
-        target.ensure_runtime_buffers(ctx, cap);
+        configuredWidth = std::clamp(aila::env::read_int_raw("AILA_Q4E_MTP_WIDTH", 2), 2, 4);
+        target.ensure_runtime_buffers(ctx, std::min(cap, 64));
         draft = std::make_unique<Qwen4ExpMtpDraft>(ctx, target, weights);
         hiddenRows = Tensor::allocate(ctx, {cap, 10240});
         checkpoint = Tensor::allocate(ctx, {117669888 + 368640}, dnnl::memory::data_type::u8);
         linearInputs = Tensor::allocate(ctx, {48, 4, 16480});
         plePrefix = Tensor::allocate(ctx, {1, 10240}, dnnl::memory::data_type::f32);
-        ids = Tensor::allocate(ctx, {2}, dnnl::memory::data_type::s32);
-        greedyPartials = Tensor::allocate(ctx, {2 * ops::GreedyGroups * int64_t(sizeof(ops::GreedyResult))}, dnnl::memory::data_type::u8);
-        greedyResult = Tensor::allocate(ctx, {2 * int64_t(sizeof(ops::GreedyResult))}, dnnl::memory::data_type::u8);
-        if (target.buf_.logits.shape(0) < 2)
-            target.buf_.logits = Tensor::allocate(ctx, {2, target.vocab_size()});
+        ids = Tensor::allocate(ctx, {4}, dnnl::memory::data_type::s32);
+        greedyPartials = Tensor::allocate(ctx, {4 * ops::GreedyGroups * int64_t(sizeof(ops::GreedyResult))}, dnnl::memory::data_type::u8);
+        greedyResult = Tensor::allocate(ctx, {4 * int64_t(sizeof(ops::GreedyResult))}, dnnl::memory::data_type::u8);
+        greedyResultHost = static_cast<ops::GreedyResult*>(ctx.alloc_host(4 * sizeof(ops::GreedyResult)));
+        if (target.buf_.logits.shape(0) < 4)
+            target.buf_.logits = Tensor::allocate(ctx, {4, target.vocab_size()});
         target.PrepareDecodeVerification(ctx);
         ctx.synchronize();
-        AILA_LOG_INFO("[Q4E Server MTP] enabled=1 experimental=1 bitwise_t1_guarantee=0 width=2 capacity=%d draft_slots=64", cap);
-    } catch (...) { try { ctx.synchronize(); } catch (...) {} throw; }
+        AILA_LOG_INFO("[Q4E Server MTP] enabled=1 experimental=1 bitwise_t1_guarantee=0 width=%d capacity=%d draft_slots=64", configuredWidth, cap);
+    } catch (...) {
+        try { ctx.synchronize(); } catch (...) {}
+        if (greedyResultHost) { ctx.free_device(greedyResultHost); greedyResultHost = nullptr; }
+        throw;
+    }
 }
 Qwen4ExpMtpRuntime::~Qwen4ExpMtpRuntime() {
     try { ctx.synchronize(); } catch (...) {}
+    if (greedyResultHost) { ctx.free_device(greedyResultHost); greedyResultHost = nullptr; }
     AILA_LOG_INFO("[Q4E Server MTP] windows=%llu accepted=%llu",
         static_cast<unsigned long long>(windows), static_cast<unsigned long long>(accepted));
 }
@@ -107,11 +119,17 @@ void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector
     ctx.queue().memcpy(state.lastHidden.data(), hiddenRows.data_as<bf16>() + (count - 1) * 10240, 10240 * sizeof(bf16));
     state.length = start + int(count);
 }
-std::array<ops::GreedyResult, 2> Qwen4ExpMtpRuntime::Select(int rows) {
-    ops::greedy_bf16(ctx, target.buf_.logits.data_as<bf16>(), target.vocab_size(),
-        greedyPartials.data_as<ops::GreedyResult>(), greedyResult.data_as<ops::GreedyResult>(), rows);
-    std::array<ops::GreedyResult, 2> result{};
-    ctx.memcpy_d2h(result.data(), greedyResult.data(), rows * sizeof(result[0]));
+std::array<ops::GreedyResult, 4> Qwen4ExpMtpRuntime::Select(int rows) {
+    ops::GreedyResult* dst = greedyResultHost ? greedyResultHost : greedyResult.data_as<ops::GreedyResult>();
+    sycl::event ev = ops::greedy_bf16(ctx, target.buf_.logits.data_as<bf16>(), target.vocab_size(),
+        greedyPartials.data_as<ops::GreedyResult>(), dst, rows);
+    std::array<ops::GreedyResult, 4> result{};
+    if (greedyResultHost) {
+        ev.wait_and_throw();
+        for (int r = 0; r < rows; ++r) result[r] = greedyResultHost[r];
+    } else {
+        ctx.memcpy_d2h(result.data(), greedyResult.data(), rows * sizeof(result[0]));
+    }
     for (int r = 0; r < rows; ++r)
         if (result[r].nonfinite || result[r].index < 0 || result[r].index >= target.vocab_size())
             throw std::runtime_error("MTP nonfinite/invalid greedy logits");
@@ -133,6 +151,7 @@ void Qwen4ExpMtpRuntime::BindRecurrentCheckpoint(Qwen4ExpBnb4Backend::Session& s
         }
         ptrs.linear_state[linear] = c.linear_state.data_as<float>();
         ptrs.linear_conv[linear] = c.linear_conv_state.data_as<float>();
+        ptrs.conv_heads[linear] = convHeads[l] % 3;
         ++linear;
     }
     if (linear != kMtpLinearLayers ||
@@ -140,12 +159,42 @@ void Qwen4ExpMtpRuntime::BindRecurrentCheckpoint(Qwen4ExpBnb4Backend::Session& s
         throw std::runtime_error("MTP recurrent checkpoint geometry changed");
     }
     ptrs.ple_conv = s.ple_state_.conv_state.data_as<float>();
+    ptrs.ple_head = pleHead % 9;
 }
 
 void Qwen4ExpMtpRuntime::SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs& ptrs,
-                                                   bool capture) {
+                                                   bool capture, int keepPleRows,
+                                                   bool skipLinearState) {
     using vec4 = sycl::vec<float, 4>;
     float* ckpt = checkpoint.data_as<float>();
+    if (!capture && skipLinearState) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(kMtpConvRecurrentChunks)),
+                                  sycl::range<1>(256)),
+                [=](sycl::nd_item<1> item) {
+                    const int idx = static_cast<int>(item.get_global_id(0));
+                    if (idx >= kMtpConvRecurrentChunks) return;
+                    float* layer_ptr = nullptr;
+                    const float* ckpt_ptr = nullptr;
+                    if (idx < kMtpLinearLayers * kMtpConvChunks) {
+                        const int l = idx / kMtpConvChunks;
+                        const int rem = idx - l * kMtpConvChunks;
+                        layer_ptr = ptrs.linear_conv[l] + static_cast<size_t>(rem) * 4;
+                        ckpt_ptr = ckpt + static_cast<size_t>(l * kMtpLayerChunks + kMtpStateChunks + rem) * 4;
+                    } else {
+                        const int ple_rem = idx - kMtpLinearLayers * kMtpConvChunks;
+                        const int ple_row = (ple_rem * 4) / 10240;
+                        const int rel_row = (ple_row - ptrs.ple_head + 9) % 9;
+                        if (rel_row < keepPleRows) return;
+                        layer_ptr = ptrs.ple_conv + static_cast<size_t>(ple_rem) * 4;
+                        ckpt_ptr = ckpt + static_cast<size_t>(kMtpLinearLayers * kMtpLayerChunks + ple_rem) * 4;
+                    }
+                    *reinterpret_cast<vec4*>(layer_ptr) = *reinterpret_cast<const vec4*>(ckpt_ptr);
+                });
+        });
+        return;
+    }
     // In-order queue: the launch is ordered after the work that produced the
     // session state and before the next forward reads it.
     ctx.queue().submit([&](sycl::handler& cgh) {
@@ -163,8 +212,13 @@ void Qwen4ExpMtpRuntime::SubmitRecurrentCheckpoint(const RecurrentCheckpointPtrs
                         ? ptrs.linear_state[l] + static_cast<size_t>(rem) * 4
                         : ptrs.linear_conv[l] + static_cast<size_t>(rem - kMtpStateChunks) * 4;
                 } else {
-                    layer_ptr = ptrs.ple_conv +
-                        static_cast<size_t>(idx - kMtpLinearLayers * kMtpLayerChunks) * 4;
+                    const int ple_rem = idx - kMtpLinearLayers * kMtpLayerChunks;
+                    if (!capture) {
+                        const int ple_row = (ple_rem * 4) / 10240;
+                        const int rel_row = (ple_row - ptrs.ple_head + 9) % 9;
+                        if (rel_row < keepPleRows) return;
+                    }
+                    layer_ptr = ptrs.ple_conv + static_cast<size_t>(ple_rem) * 4;
                 }
                 float* ckpt_ptr = ckpt + static_cast<size_t>(idx) * 4;
                 if (capture) {
@@ -198,7 +252,7 @@ void Qwen4ExpMtpRuntime::Capture(Qwen4ExpBnb4Backend::Session& s) {
     BindRecurrentCheckpoint(s, ptrs);
     SubmitRecurrentCheckpoint(ptrs, true);
 }
-void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
+void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s, int keepPleRows, bool skipLinearState) {
     // Roll back a rejected verification window without treating it as a new
     // session generation. The dedicated epoch rejects prefetch tickets that
     // were prepared against the speculative target state.
@@ -209,7 +263,7 @@ void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
     }
     RecurrentCheckpointPtrs ptrs{};
     BindRecurrentCheckpoint(s, ptrs);
-    SubmitRecurrentCheckpoint(ptrs, false);
+    SubmitRecurrentCheckpoint(ptrs, false, keepPleRows, skipLinearState);
     target.PublishGdnHostHeadsToDevice(ctx, s);
     s.ple_state_.prev_tokens = pleTokens; s.ple_state_.conv_head = pleHead;
     if (s.ple_state_.conv_head_dev.valid()) {
@@ -220,12 +274,39 @@ void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s) {
 }
 aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     Qwen4ExpBnb4Backend::Session& s, State& state, int pending,
-    const aila::inference::DecodeWindowSelector& acceptFirst) {
+    const aila::inference::DecodeWindowSelector& acceptFirst, int maxWidth) {
+    static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
+    static const int s_server_width = std::clamp(aila::env::read_int_raw("AILA_Q4E_SERVER_MTP_WIDTH", 2), 2, 4);
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = s_work_summary ? Clock::now() : Clock::time_point{};
     const int start = s.CurrentLength();
+    const int reqWidth = maxWidth > 0 ? maxWidth : s_server_width;
+    const int width = std::clamp(reqWidth, 2, std::min(4, capacity - start));
     const auto allocations = ctx.device_allocation_count();
-    draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), pending, start - 1);
-    const std::array<int, 2> proposal{pending, Select(1)[0].index};
-    Capture(s);
+    struct CaptureHook {
+        Qwen4ExpMtpRuntime* self;
+        Qwen4ExpBnb4Backend::Session* session;
+        bool captured = false;
+        static void Run(void* p) {
+            auto* h = static_cast<CaptureHook*>(p);
+            if (!h->captured) {
+                h->self->Capture(*h->session);
+                h->captured = true;
+            }
+        }
+    } captureHook{this, &s, false};
+    std::array<int, 4> proposal{};
+    proposal[0] = pending;
+    draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), proposal[0], start - 1, false,
+                &CaptureHook::Run, &captureHook);
+    proposal[1] = Select(1)[0].index;
+    const int savedDraftBlocksAfterStep1 = state.draft->cache.num_compressed_blocks;
+    for (int d = 2; d < width; ++d) {
+        draft->Step(*state.draft, target.buf_.hidden4.data_as<bf16>(), proposal[d - 1], start + d - 2, false);
+        proposal[d] = Select(1)[0].index;
+    }
+    if (!captureHook.captured) Capture(s);
+    const auto t_draft = s_work_summary ? Clock::now() : Clock::time_point{};
     {
         struct CaptureInputs {
             Qwen4ExpBnb4Backend& b;
@@ -237,45 +318,128 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         // directly, so no device copy (and no queue drain) separates the
         // capture from the verification window.
         options.host_token_ids = proposal.data();
-        target.ForwardImpl(ctx, s, ids.data_as<int>(), 2, false, options);
+        target.ForwardImpl(ctx, s, ids.data_as<int>(), width, false, options);
     }
-    ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(), 2 * 10240 * sizeof(bf16));
-    const auto selected = Select(2);
-    const bool takeDraft = proposal[1] == selected[0].index && acceptFirst(selected[0].index);
-    if (!takeDraft) {
-        // Keep only the pending input: replay causal GDN inputs and the first
-        // PLE ring write from verification, hiding all appended KV tails.
-        ctx.queue().memcpy(plePrefix.data(), s.ple_state_.conv_state.data_as<float>() + size_t(pleHead) * 10240, 10240 * sizeof(float));
-        Restore(s);
+    const auto t_verify = s_work_summary ? Clock::now() : Clock::time_point{};
+    std::array<ops::GreedyResult, 4> selected{};
+    bool kvOnlyPreSubmitted = false;
+    if (width == 2 && greedyResultHost != nullptr) {
+        ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(),
+                           size_t(2) * 10240 * sizeof(bf16));
+        sycl::event verifyGreedyEv = ops::greedy_bf16(
+            ctx, target.buf_.logits.data_as<bf16>(), target.vocab_size(),
+            greedyPartials.data_as<ops::GreedyResult>(), greedyResultHost, 2);
+        try {
+            (void)verifyGreedyEv.get_info<sycl::info::event::command_execution_status>();
+        } catch (...) {}
+        draft->Step(*state.draft, hiddenRows.data_as<bf16>(), proposal[1], start, true);
+        kvOnlyPreSubmitted = true;
+        try {
+            (void)ctx.queue().ext_oneapi_submit_barrier()
+                .get_info<sycl::info::event::command_execution_status>();
+        } catch (...) {}
+        verifyGreedyEv.wait_and_throw();
+        for (int r = 0; r < 2; ++r) {
+            selected[r] = greedyResultHost[r];
+            if (selected[r].nonfinite || selected[r].index < 0 || selected[r].index >= target.vocab_size())
+                throw std::runtime_error("MTP nonfinite/invalid greedy logits");
+        }
+    } else {
+        selected = Select(width);
+    }
+    int emitted = 1;
+    for (int d = 1; d < width; ++d) {
+        if (proposal[d] == selected[d - 1].index && acceptFirst(selected[d - 1].index)) {
+            emitted = d + 1;
+        } else {
+            break;
+        }
+    }
+    if (kvOnlyPreSubmitted) {
+        ctx.queue().memcpy(state.lastHidden.data(),
+                           hiddenRows.data_as<bf16>() + size_t(emitted - 1) * 10240,
+                           10240 * sizeof(bf16));
+        if (emitted < width) {
+            state.draft->cache.num_compressed_blocks = savedDraftBlocksAfterStep1;
+        }
+    } else {
+        ctx.queue().memcpy(state.lastHidden.data(),
+                           target.buf_.hidden4.data_as<bf16>() + size_t(emitted - 1) * 10240,
+                           10240 * sizeof(bf16));
+        if (emitted > 2) {
+            ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(),
+                               size_t(emitted - 1) * 10240 * sizeof(bf16));
+        }
+        state.draft->cache.num_compressed_blocks = savedDraftBlocksAfterStep1;
+    }
+    if (emitted < width) {
+        static const bool verifyOrder = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
+        Restore(s, emitted, !verifyOrder);
+        const float* ckpt_base = checkpoint.data_as<float>();
+        int linear_idx = 0;
         for (size_t l = 0; l < target.layers_.size(); ++l) {
             auto& layer = target.layers_[l]; auto& c = s.layerCaches_[l];
-            if (!layer.is_linear) { c.num_compressed_blocks = (start + 1) / 4; continue; }
+            if (!layer.is_linear) continue;
+            const float* ckpt_state = !verifyOrder
+                ? (ckpt_base + static_cast<size_t>(linear_idx) * kMtpLayerChunks * 4)
+                : nullptr;
+            ++linear_idx;
             ops::DeltaNetWeights weights{layer.linear_conv1d_weight->data_as<bf16>(), layer.linear_norm_weight->data_as<float>(),
                 layer.linear_A_log->data_as<float>(), layer.linear_dt_bias->data_as<bf16>()};
             ops::DeltaNetState stateView{c.linear_state.data_as<float>(), c.linear_conv_state.data_as<float>(), c.linear_conv_head, true};
-            static const bool verifyOrder = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
             ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, weights, stateView,
-                linearInputs.data_as<bf16>() + l * 4 * 16480, target.buf_.attn_out.data_as<bf16>(), 1, verifyOrder);
+                linearInputs.data_as<bf16>() + l * 4 * 16480, target.buf_.attn_out.data_as<bf16>(),
+                emitted, verifyOrder, false, false, ckpt_state);
             c.linear_conv_head = stateView.conv_head; c.device_state_dirty = stateView.device_state_dirty;
             if (c.linear_conv_head_dev != nullptr) {
                 c.linear_conv_head_device_authority = false;
                 c.linear_conv_head_device_synced = false;
             }
         }
-        ctx.queue().memcpy(s.ple_state_.conv_state.data_as<float>() + size_t(pleHead) * 10240, plePrefix.data(), 10240 * sizeof(float));
-        s.ple_state_.conv_head = (pleHead + 1) % 9;
+        s.ple_state_.conv_head = (pleHead + emitted) % 9;
+        if (s.ple_state_.conv_head_dev.valid()) {
+            ctx.memcpy_h2d(s.ple_state_.conv_head_dev.data(), &s.ple_state_.conv_head,
+                           sizeof(s.ple_state_.conv_head));
+        }
         std::array<int64_t, 64> ngrams{}; std::array<int, 2> prev{};
-        target.ple_.compute_ngram_ids_pure(s.ple_state_, proposal.data(), 1, ngrams.data(), prev);
-        s.ple_state_.prev_tokens = prev; s.currentLength_ = start + 1; s.consecutive_no_miss_layers_ = 0;
-    } else {
-        draft->Step(*state.draft, hiddenRows.data_as<bf16>(), proposal[1], start, true);
+        target.ple_.compute_ngram_ids_pure(s.ple_state_, proposal.data(), emitted, ngrams.data(), prev);
+        s.ple_state_.prev_tokens = prev; s.currentLength_ = start + emitted; s.consecutive_no_miss_layers_ = 0;
+    }
+    if (!kvOnlyPreSubmitted) {
+        const bf16* kvOnlyHiddenBase = (emitted == 2)
+            ? target.buf_.hidden4.data_as<bf16>()
+            : hiddenRows.data_as<bf16>();
+        for (int j = 0; j + 1 < emitted; ++j) {
+            draft->Step(*state.draft, kvOnlyHiddenBase + size_t(j) * 10240,
+                        proposal[j + 1], start + j, true);
+        }
     }
     state.length = s.currentLength_;
-    ctx.queue().memcpy(state.lastHidden.data(), hiddenRows.data_as<bf16>() + (takeDraft ? 10240 : 0), 10240 * sizeof(bf16));
-    ++windows; accepted += takeDraft;
-    ctx.synchronize();
+    ++windows; accepted += (emitted > 1 ? 1 : 0);
+    try {
+        (void)ctx.queue().ext_oneapi_submit_barrier()
+            .get_info<sycl::info::event::command_execution_status>();
+    } catch (...) {}
+    if (s_work_summary) {
+        const auto t_end = Clock::now();
+        auto ms = [](Clock::time_point a, Clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        AILA_LOG_INFO("[Q4E MtpWindow] pos=%d count=%d emitted=%d accepted=%d window_ms=%.3f draft_ms=%.3f verify_ms=%.3f tail_ms=%.3f",
+            start, width, emitted, emitted - 1,
+            ms(t0, t_end), ms(t0, t_draft), ms(t_draft, t_verify), ms(t_verify, t_end));
+    }
     if (ctx.device_allocation_count() != allocations)
         throw std::runtime_error("MTP window unexpectedly allocated device memory");
-    return {selected[0].index, takeDraft ? std::optional<int>(selected[1].index) : std::nullopt,
-        takeDraft ? 2 : 1, s.currentLength_, takeDraft};
+    aila::inference::DecodeWindowResult res{};
+    res.tokenId = selected[0].index;
+    if (emitted >= 2) res.bonusTokenId = selected[1].index;
+    res.consumedInputs = emitted;
+    res.cacheLength = s.currentLength_;
+    res.firstTokenCached = (emitted >= 2);
+    res.extraBonusCount = std::max(0, emitted - 2);
+    for (int i = 0; i < res.extraBonusCount; ++i) {
+        res.extraBonusTokenIds[i] = selected[2 + i].index;
+    }
+    return res;
 }

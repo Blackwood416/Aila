@@ -169,10 +169,23 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             auto component_start = component_begin();
             project_prefill(layer.linear_all_proj, input, buf_.linear_all);
             component_end(0,component_start);
-            if (verification_linear_inputs_for_test_ && allowQ8 && count <= 4 && !interior)
-                ctx.queue().memcpy(verification_linear_inputs_for_test_ + size_t(L) * 4 * linear_all_dim_,
-                    buf_.linear_all.data(), size_t(count) * linear_all_dim_ * sizeof(bf16));
-            const auto run_range = [&](int offset, int length) {
+            static const bool s_gdn_history_fused = aila::env::read_flag("AILA_Q4E_GDN_HISTORY_FUSED", true);
+            static const bool verify_gdn_order = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
+            const bool defer_verify_history =
+                s_gdn_history_fused && small_rows_decode && allowQ8 && !interior &&
+                !verify_gdn_order && !gpuNf4Q8ReferenceForTest_ && !decodeHcReferenceForTest_ &&
+                ops::supports_default_grouped_linear_delta_fastpath(layer.geom.q_heads, layer.geom.v_heads,
+                    layer.geom.head_k_dim, layer.geom.head_v_dim, layer.geom.kernel, layer.geom.conv_rows);
+            const int initial_conv_head = layer.geom.conv_rows > 0 ? d_state.conv_head % layer.geom.conv_rows : 0;
+            const int save_linear_rows = std::max(1, count - 1);
+            bf16* save_linear_row0 = (verification_linear_inputs_for_test_ && allowQ8 && count <= 4 && !interior)
+                ? (verification_linear_inputs_for_test_ + size_t(L) * 4 * linear_all_dim_) : nullptr;
+            if (save_linear_row0 && (!defer_verify_history || count < 2 || count > 4)) {
+                ctx.queue().memcpy(save_linear_row0, buf_.linear_all.data(),
+                    size_t(count) * linear_all_dim_ * sizeof(bf16));
+                save_linear_row0 = nullptr;
+            }
+            const auto run_range = [&](int offset, int length, bool defer_hist) {
                 const bf16* input = buf_.linear_all.data_as<bf16>() + static_cast<size_t>(offset) * linear_all_dim_;
                 bf16* output = buf_.attn_out.data_as<bf16>() + static_cast<size_t>(offset) * linear_kv_dim_;
                 if (gdn_chunk_mode_ > 0 && grouped_xmx_supported_ && (count > 64 || !cold_epoch_enabled_) &&
@@ -180,14 +193,14 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         gdn_chunk_scratch_, input, output, length, gdn_chunk_mode_ == 2)) {
                     ++gdn_chunk_calls_;
                 } else {
-                    static const bool verify_gdn_order = aila::env::read_flag("AILA_Q4E_VERIFY_GDN_ORDER", false);
                     ops::run_linear_delta_prefill_gpu_batched(ctx, layer.geom, d_weights, d_state,
-                        input, output, length, verify_gdn_order && allowQ8 && count <= 4 && !interior);
+                        input, output, length, verify_gdn_order && allowQ8 && count <= 4 && !interior,
+                        false, defer_hist);
                 }
             };
             component_start = component_begin();
             if (interior) {
-                run_range(0, checkpoint_after);
+                run_range(0, checkpoint_after, false);
                 auto& snapshot = interior->layers[L];
                 snapshot.linear_conv_head = d_state.conv_head;
                 // In-order D2H completes before the suffix may overwrite the recurrent state.
@@ -195,13 +208,29 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                      cache.linear_state.size_bytes());
                 ctx.memcpy_d2h_async(snapshot.linear_conv_state_host.data(), cache.linear_conv_state.data(),
                                      cache.linear_conv_state.size_bytes());
-                if (checkpoint_after < count) run_range(checkpoint_after, count - checkpoint_after);
+                if (checkpoint_after < count) run_range(checkpoint_after, count - checkpoint_after, false);
             } else {
-                run_range(0, count);
+                run_range(0, count, defer_verify_history);
             }
             component_end(1,component_start);
             component_start = component_begin();
-            project_prefill(layer.linear_o_proj, buf_.attn_out, output);
+            if (defer_verify_history && layer.linear_o_proj.TryForwardDecodeCommitHistory(
+                    ctx, buf_.attn_out, output, buf_.linear_all.data_as<bf16>(), d_state.conv_state,
+                    layer.geom.qkv_dim, initial_conv_head, count, linear_all_dim_,
+                    layer.geom.conv_rows, save_linear_row0,
+                    save_linear_row0 ? save_linear_rows * linear_all_dim_ : 0)) {
+                // Fused multi-row history commit + optional verification prefix save.
+            } else {
+                if (defer_verify_history) {
+                    if (save_linear_row0) {
+                        ctx.queue().memcpy(save_linear_row0, buf_.linear_all.data(),
+                            size_t(save_linear_rows) * linear_all_dim_ * sizeof(bf16));
+                    }
+                    ops::commit_linear_conv_history(ctx, buf_.linear_all.data_as<bf16>(), linear_all_dim_,
+                        d_state.conv_state, layer.geom.qkv_dim, layer.geom.conv_rows, initial_conv_head, count);
+                }
+                project_prefill(layer.linear_o_proj, buf_.attn_out, output);
+            }
             component_end(2,component_start);
         }
         if (use_device_conv_head) {
@@ -388,28 +417,28 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             project_prefill(layer.qkv_proj, input, buf_.full_qkv);
             static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", true);
             if (verify_decode_prepare && allowQ8 && !interior && count >= 2 && count <= 4 && start_pos > 0 && !sparse_prefill) {
-                // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode.
-                // Reuse the packed projection and existing output banks; no USM scratch.
-                for (int r = 0; r < count; ++r) {
-                    bf16* packed = buf_.full_qkv.data_as<bf16>() + size_t(r) * (full_q_proj_dim_ + 2 * full_kv_dim_);
-                    const int q_dim = full_q_heads_ * full_head_dim_;
-                    auto qg = Tensor::view(ctx, packed, {1, full_q_proj_dim_});
-                    auto k = Tensor::view(ctx, packed + full_q_proj_dim_, {1, full_kv_dim_});
-                    auto v = Tensor::view(ctx, packed + full_q_proj_dim_ + full_kv_dim_, {1, full_kv_dim_});
-                    auto q = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(r) * q_dim, {1, q_dim});
-                    auto z = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(r) * q_dim, {1, q_dim});
-                    ops::decode_prepare_qgkv_packed_partial(
-                        ctx, qg, k, v, q, z, *layer.q_norm_weight, *layer.k_norm_weight,
-                        cache.k, cache.v, start_pos + r, full_q_heads_, full_kv_heads_, full_head_dim_,
-                        cfg_.rms_norm_eps, full_rotary_dim, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
-                        (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
-                        (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
-                        (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
-                        session.mropePromptLength_, session.mropeTextPositionDelta_,
-                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
-                        cache.k_scale.valid() ? &cache.k_scale : nullptr,
-                        cache.v_scale.valid() ? &cache.v_scale : nullptr);
-                }
+                // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode,
+                // launched in one multi-row grid.
+                bf16* packed = buf_.full_qkv.data_as<bf16>();
+                const int qkv_stride = full_q_proj_dim_ + 2 * full_kv_dim_;
+                const int q_dim = full_q_heads_ * full_head_dim_;
+                auto qg = Tensor::view(ctx, packed, {count, full_q_proj_dim_});
+                auto k = Tensor::view(ctx, packed + full_q_proj_dim_, {count, full_kv_dim_});
+                auto v = Tensor::view(ctx, packed + full_q_proj_dim_ + full_kv_dim_, {count, full_kv_dim_});
+                auto q = Tensor::view(ctx, buf_.q.data_as<bf16>(), {count, q_dim});
+                auto z = Tensor::view(ctx, buf_.z.data_as<bf16>(), {count, q_dim});
+                ops::decode_prepare_qgkv_packed_partial(
+                    ctx, qg, k, v, q, z, *layer.q_norm_weight, *layer.k_norm_weight,
+                    cache.k, cache.v, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
+                    cfg_.rms_norm_eps, full_rotary_dim, cfg_.rope.rope_theta, cfg_.rope.mrope_interleaved,
+                    (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
+                    (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
+                    (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
+                    session.mropePromptLength_, session.mropeTextPositionDelta_,
+                    cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                    cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                    cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                    count, qkv_stride);
             } else {
                 ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
                                 full_q_heads_, full_kv_heads_, full_head_dim_);
@@ -611,19 +640,37 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 static const bool verify_attention_pair = aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR", true);
                 static const int decode_window = aila::env::read_int_raw("AILA_ATTN_DECODE_WINDOW", 0);
                 static const int decode_sink = aila::env::read_int_raw("AILA_ATTN_DECODE_SINK", 0);
-                if (verify_decode_attention && verify_attention_pair && allowQ8 && count == 2 &&
-                    start_pos+1 >= 1024 && !interior && decode_window <= 0 && decode_sink <= 0 &&
+                if (verify_decode_attention && verify_attention_pair && allowQ8 && count >= 2 && count <= 4 &&
+                    start_pos + 1 >= 1 && !interior && decode_window <= 0 && decode_sink <= 0 &&
                     cache.k.dtype()==dnnl::memory::data_type::bf16 &&
-                    buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272 &&
+                    (start_pos + count - 1 < 1024 || buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272) &&
                     !verify_rows_alignment_) {
                     static const bool logged=[] {
                         AILA_LOG_INFO("[Q4E VerifyAttentionPair] active=1 rows=2 bf16_kv_reuse=1 phase_scratch_reuse=1");
                         return true;
                     }();
                     (void)logged;
-                    ops::q4e_attention_decode_pair(ctx,buf_.q,cache.k,cache.v,buf_.attn_out,
-                        buf_.incr_scores,start_pos+1,buf_.z,
-                        verification_attention_pair_bundle_ ? &*verification_attention_pair_bundle_ : nullptr);
+                    const int q_dim = full_q_heads_ * full_head_dim_;
+                    int row = 0;
+                    for (; row + 1 < count; row += 2) {
+                        auto q_pair = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(row) * q_dim, {2, full_q_heads_, full_head_dim_});
+                        auto z_pair = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(row) * q_dim, {2, full_q_heads_, full_head_dim_});
+                        auto out_pair = Tensor::view(ctx, buf_.attn_out.data_as<bf16>() + size_t(row) * q_dim, {2, q_dim});
+                        ops::q4e_attention_decode_pair(ctx, q_pair, cache.k, cache.v, out_pair,
+                            buf_.incr_scores, start_pos + row + 1, z_pair,
+                            verification_attention_pair_bundle_ ? &*verification_attention_pair_bundle_ : nullptr);
+                    }
+                    if (row < count) {
+                        auto q_row = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        auto z_row = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        auto out_row = Tensor::view(ctx, buf_.attn_out.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
+                        ops::attention_decode(ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
+                            full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + row + 1,
+                            &buf_.decode_attn_partials, &z_row,
+                            nullptr, 0, nullptr, 0,
+                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                            cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                    }
                 } else if (verify_decode_attention && allowQ8 && count <= 4 && !interior &&
                     decode_window <= 0 && decode_sink <= 0) {
                     // Verification queries share KV storage but each sees only its

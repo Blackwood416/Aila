@@ -1346,34 +1346,18 @@ void packed_nf4_gemv_gate_up_swiglu_wgrow(
     });
 }
 
-void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
-                                    const uint8_t* gate_packed,
-                                    const float* gate_absmax,
-                                    const uint8_t* up_packed,
-                                    const float* up_absmax,
-                                    const float* quant_map_ptr,
-                                    const bf16* input_ptr,
-                                    bf16* output_ptr,
-                                    int in_features,
-                                    int intermediate_size,
-                                    int blocksize) {
-    // AILA_Q4E_SHARED_GU_WGROW=1 opts into one work-group per output row.
-    // Measured neutral (route_wait 25.14 -> 25.03, i.e. inside the noise) and
-    // it changes the reduction order, so it is off by default: the shared
-    // expert gate/up runs between the doorbell and the packet wait, i.e. inside
-    // the window where the host is computing cold experts, so it is already
-    // off the critical path.
-    static const bool gu_wgrow = [] {
-        const char* raw = std::getenv("AILA_Q4E_SHARED_GU_WGROW");
-        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
-    }();
-    if (gu_wgrow) {
-        packed_nf4_gemv_gate_up_swiglu_wgrow(
-            ctx, gate_packed, gate_absmax, up_packed, up_absmax,
-            quant_map_ptr, input_ptr, output_ptr, in_features,
-            intermediate_size, blocksize);
-        return;
-    }
+template<bool ReuseTwo = false>
+void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
+                                         const uint8_t* gate_packed,
+                                         const float* gate_absmax,
+                                         const uint8_t* up_packed,
+                                         const float* up_absmax,
+                                         const float* quant_map_ptr,
+                                         const bf16* input_ptr,
+                                         bf16* output_ptr,
+                                         int in_features,
+                                         int intermediate_size,
+                                         int blocksize) {
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
     const size_t wg_size = 256;
@@ -1398,6 +1382,8 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
 
             float gate_acc = 0.0f;
             float up_acc = 0.0f;
+            float gate_acc_second = 0.0f;
+            float up_acc_second = 0.0f;
             if (row < intermediate_size) {
                 const int row_byte_base = row * packed_bytes_per_row;
                 const int row_block_base = row * blocks_per_row;
@@ -1429,22 +1415,49 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                     const uint8_t ub1 = static_cast<uint8_t>(u4 >> 8);
                     const uint8_t ub2 = static_cast<uint8_t>(u4 >> 16);
                     const uint8_t ub3 = static_cast<uint8_t>(u4 >> 24);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[gb0 >> 4] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[gb0 & 0xF] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[gb1 >> 4] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[gb1 & 0xF] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[gb2 >> 4] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[gb2 & 0xF] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[gb3 >> 4] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[gb3 & 0xF] * ga, gate_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[0]), qmap[ub0 >> 4] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[1]), qmap[ub0 & 0xF] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[2]), qmap[ub1 >> 4] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[3]), qmap[ub1 & 0xF] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[4]), qmap[ub2 >> 4] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[5]), qmap[ub2 & 0xF] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[6]), qmap[ub3 >> 4] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[7]), qmap[ub3 & 0xF] * ua, up_acc);
+                    const float gw0 = qmap[gb0 >> 4] * ga, gw1 = qmap[gb0 & 0xF] * ga;
+                    const float gw2 = qmap[gb1 >> 4] * ga, gw3 = qmap[gb1 & 0xF] * ga;
+                    const float gw4 = qmap[gb2 >> 4] * ga, gw5 = qmap[gb2 & 0xF] * ga;
+                    const float gw6 = qmap[gb3 >> 4] * ga, gw7 = qmap[gb3 & 0xF] * ga;
+                    const float uw0 = qmap[ub0 >> 4] * ua, uw1 = qmap[ub0 & 0xF] * ua;
+                    const float uw2 = qmap[ub1 >> 4] * ua, uw3 = qmap[ub1 & 0xF] * ua;
+                    const float uw4 = qmap[ub2 >> 4] * ua, uw5 = qmap[ub2 & 0xF] * ua;
+                    const float uw6 = qmap[ub3 >> 4] * ua, uw7 = qmap[ub3 & 0xF] * ua;
+                    gate_acc = sycl::fma(static_cast<float>(in_v[0]), gw0, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[1]), gw1, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[2]), gw2, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[3]), gw3, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[4]), gw4, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[5]), gw5, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[6]), gw6, gate_acc);
+                    gate_acc = sycl::fma(static_cast<float>(in_v[7]), gw7, gate_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[0]), uw0, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[1]), uw1, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[2]), uw2, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[3]), uw3, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[4]), uw4, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[5]), uw5, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[6]), uw6, up_acc);
+                    up_acc = sycl::fma(static_cast<float>(in_v[7]), uw7, up_acc);
+                    if constexpr (ReuseTwo) {
+                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(input_ptr + in_features + ib);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc_second);
+                    }
                 }
                 for (; byte_offset < packed_bytes_per_row;
                      byte_offset += static_cast<int>(sub_group_size)) {
@@ -1463,17 +1476,78 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
                         qmap[ub >> 4] * ua, up_acc);
                     up_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
                         qmap[ub & 0xF] * ua, up_acc);
+                    if constexpr (ReuseTwo) {
+                        gate_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
+                            qmap[gb >> 4] * ga, gate_acc_second);
+                        gate_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
+                            qmap[gb & 0xF] * ga, gate_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
+                            qmap[ub >> 4] * ua, up_acc_second);
+                        up_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
+                            qmap[ub & 0xF] * ua, up_acc_second);
+                    }
                 }
             }
 
             float gate_sum = sycl::reduce_over_group(item.get_sub_group(), gate_acc, sycl::plus<>());
             float up_sum = sycl::reduce_over_group(item.get_sub_group(), up_acc, sycl::plus<>());
+            float gate_sum2 = 0.0f, up_sum2 = 0.0f;
+            if constexpr (ReuseTwo) {
+                gate_sum2 = sycl::reduce_over_group(item.get_sub_group(), gate_acc_second, sycl::plus<>());
+                up_sum2 = sycl::reduce_over_group(item.get_sub_group(), up_acc_second, sycl::plus<>());
+            }
             if (sg_lane == 0 && row < intermediate_size) {
                 const float silu_gate = gate_sum / (1.0f + sycl::native::exp(-gate_sum));
                 output_ptr[row] = bf16(silu_gate * up_sum);
+                if constexpr (ReuseTwo) {
+                    const float silu_gate2 = gate_sum2 / (1.0f + sycl::native::exp(-gate_sum2));
+                    output_ptr[intermediate_size + row] = bf16(silu_gate2 * up_sum2);
+                }
             }
         });
     });
+}
+
+void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
+                                    const uint8_t* gate_packed,
+                                    const float* gate_absmax,
+                                    const uint8_t* up_packed,
+                                    const float* up_absmax,
+                                    const float* quant_map_ptr,
+                                    const bf16* input_ptr,
+                                    bf16* output_ptr,
+                                    int in_features,
+                                    int intermediate_size,
+                                    int blocksize,
+                                    int rows = 1) {
+    static const bool gu_wgrow = [] {
+        const char* raw = std::getenv("AILA_Q4E_SHARED_GU_WGROW");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    if (gu_wgrow) {
+        for (int r = 0; r < rows; ++r) {
+            packed_nf4_gemv_gate_up_swiglu_wgrow(
+                ctx, gate_packed, gate_absmax, up_packed, up_absmax,
+                quant_map_ptr, input_ptr + static_cast<size_t>(r) * in_features,
+                output_ptr + static_cast<size_t>(r) * intermediate_size,
+                in_features, intermediate_size, blocksize);
+        }
+        return;
+    }
+    if (rows == 2) {
+        packed_nf4_gemv_gate_up_swiglu_impl<true>(
+            ctx, gate_packed, gate_absmax, up_packed, up_absmax,
+            quant_map_ptr, input_ptr, output_ptr, in_features,
+            intermediate_size, blocksize);
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        packed_nf4_gemv_gate_up_swiglu_impl<false>(
+            ctx, gate_packed, gate_absmax, up_packed, up_absmax,
+            quant_map_ptr, input_ptr + static_cast<size_t>(r) * in_features,
+            output_ptr + static_cast<size_t>(r) * intermediate_size,
+            in_features, intermediate_size, blocksize);
+    }
 }
 
 void set_error(std::string* error_message, const std::string& message) {
@@ -1767,7 +1841,7 @@ void packed_nf4_gemv_bf16(Context& ctx,
 // Each sequence owns its own padded output-row grid. Keeping one SG16 per
 // output and the original vec8/FMA reduction order makes B2..4 decode match
 // B1, without dequantizing a whole weight matrix for a prefill GEMM.
-template<bool ReuseTwo = false>
+template<bool ReuseTwo = false, bool CommitHistory = false>
 void packed_nf4_decode_rows_bf16(Context& ctx,
                                 const Bnb4BitWeightRef& weight,
                                 Tensor& absmax_f32,
@@ -1775,7 +1849,15 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                                 Tensor& output,
                                 int in_features,
                                 int out_features,
-                                int rows) {
+                                int rows,
+                                const bf16* history_input = nullptr,
+                                float* history = nullptr,
+                                int history_channels = 0,
+                                int history_initial_head = 0,
+                                int history_input_stride = 0,
+                                int history_rows = 3,
+                                bf16* save_first_row_out = nullptr,
+                                int save_first_row_cols = 0) {
     const uint8_t* packed_ptr = static_cast<const uint8_t*>(weight.packed_weight->data());
     const float* quant_map_ptr = static_cast<const float*>(weight.quant_map->data());
     const float* absmax_ptr = static_cast<const float*>(absmax_f32.data());
@@ -1792,12 +1874,43 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
     const size_t groups_per_sequence =
         (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
     const size_t num_groups = static_cast<size_t>(ReuseTwo ? rows / 2 : rows) * groups_per_sequence;
+    const int rows_to_copy = CommitHistory ? std::min(rows, history_rows) : 0;
+    const int first_token = CommitHistory ? (rows - rows_to_copy) : 0;
+    const size_t total_history_elems = CommitHistory
+        ? static_cast<size_t>(rows_to_copy) * static_cast<size_t>(history_channels) : 0;
+    const size_t history_groups = CommitHistory
+        ? (total_history_elems + wg_size - 1) / wg_size : 0;
+    const size_t save_elems = (CommitHistory && save_first_row_out != nullptr && save_first_row_cols > 0)
+        ? static_cast<size_t>(save_first_row_cols) : 0;
+    const size_t save_groups = (save_elems + wg_size - 1) / wg_size;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> quant_map_cache(sycl::range<1>(16), cgh);
-        cgh.parallel_for(sycl::nd_range<1>(num_groups * wg_size, wg_size),
+        cgh.parallel_for(sycl::nd_range<1>((num_groups + history_groups + save_groups) * wg_size, wg_size),
                          [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
             const int lid = static_cast<int>(item.get_local_id(0));
+            if constexpr (CommitHistory) {
+                const size_t grp = item.get_group(0);
+                if (grp >= num_groups) {
+                    if (grp < num_groups + history_groups) {
+                        const uint32_t idx = static_cast<uint32_t>((grp - num_groups) * wg_size + lid);
+                        if (idx < static_cast<uint32_t>(total_history_elems)) {
+                            const uint32_t u_channels = static_cast<uint32_t>(history_channels);
+                            const uint32_t channel = idx % u_channels;
+                            const int token = first_token + static_cast<int>(idx / u_channels);
+                            const int h_row = (history_initial_head + token % history_rows) % history_rows;
+                            history[static_cast<size_t>(h_row) * history_channels + channel] =
+                                static_cast<float>(history_input[static_cast<size_t>(token) * history_input_stride + channel]);
+                        }
+                    } else if (save_first_row_out != nullptr) {
+                        const size_t col = (grp - num_groups - history_groups) * wg_size + lid;
+                        if (col < save_elems) {
+                            save_first_row_out[col] = history_input[col];
+                        }
+                    }
+                    return;
+                }
+            }
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
             const size_t sequence = (item.get_group(0) / groups_per_sequence) * (ReuseTwo ? 2 : 1);
@@ -1837,8 +1950,6 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
                     const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
                     if constexpr (ReuseTwo) {
-                        // One output channel per subgroup, two input tokens.
-                        // Reuse dequantization; each token retains vec8 FMA order.
                         const float w0 = float(bf16(quant_map_cache[b0 >> 4] * am));
                         const float w1 = float(bf16(quant_map_cache[b0 & 15] * am));
                         const float w2 = float(bf16(quant_map_cache[b1 >> 4] * am));
@@ -1847,20 +1958,18 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                         const float w5 = float(bf16(quant_map_cache[b2 & 15] * am));
                         const float w6 = float(bf16(quant_map_cache[b3 >> 4] * am));
                         const float w7 = float(bf16(quant_map_cache[b3 & 15] * am));
-#pragma unroll
-                        for (int t = 0; t < 2; ++t) {
-                            const vec8 v = *reinterpret_cast<const vec8*>(input_ptr + size_t(t) * in_features + ib);
-                            float a = t == 0 ? partial : partial_second;
-                            a = sycl::fma(float(v[0]),w0,a); a = sycl::fma(float(v[1]),w1,a);
-                            a = sycl::fma(float(v[2]),w2,a); a = sycl::fma(float(v[3]),w3,a);
-                            a = sycl::fma(float(v[4]),w4,a); a = sycl::fma(float(v[5]),w5,a);
-                            a = sycl::fma(float(v[6]),w6,a); a = sycl::fma(float(v[7]),w7,a);
-                            if (t == 0) partial = a; else partial_second = a;
-                        }
+                        const vec8 v0 = *reinterpret_cast<const vec8*>(input_ptr + ib);
+                        const vec8 v1 = *reinterpret_cast<const vec8*>(input_ptr + in_features + ib);
+                        partial = sycl::fma(float(v0[0]),w0,partial); partial = sycl::fma(float(v0[1]),w1,partial);
+                        partial = sycl::fma(float(v0[2]),w2,partial); partial = sycl::fma(float(v0[3]),w3,partial);
+                        partial = sycl::fma(float(v0[4]),w4,partial); partial = sycl::fma(float(v0[5]),w5,partial);
+                        partial = sycl::fma(float(v0[6]),w6,partial); partial = sycl::fma(float(v0[7]),w7,partial);
+                        partial_second = sycl::fma(float(v1[0]),w0,partial_second); partial_second = sycl::fma(float(v1[1]),w1,partial_second);
+                        partial_second = sycl::fma(float(v1[2]),w2,partial_second); partial_second = sycl::fma(float(v1[3]),w3,partial_second);
+                        partial_second = sycl::fma(float(v1[4]),w4,partial_second); partial_second = sycl::fma(float(v1[5]),w5,partial_second);
+                        partial_second = sycl::fma(float(v1[6]),w6,partial_second); partial_second = sycl::fma(float(v1[7]),w7,partial_second);
                     } else {
                     const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
-                    // Inline dequant into FMA: eliminates 8 float temporaries,
-                    // giving the compiler freedom to schedule and reuse registers.
                     partial = sycl::fma(static_cast<float>(in_v[0]),
                         static_cast<float>(bf16(quant_map_cache[b0 >> 4] * am)), partial);
                     partial = sycl::fma(static_cast<float>(in_v[1]),
@@ -1885,28 +1994,33 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const float am = absmax_ptr[row_block_base +
                         (byte_offset / packed_bytes_per_block)];
                     const int ii = byte_offset * 2;
-                    if constexpr (ReuseTwo) {
-                        partial_second = sycl::fma(float(input_ptr[in_features + ii]),
-                            float(bf16(quant_map_cache[(pb >> 4) & 15] * am)), partial_second);
-                        partial_second = sycl::fma(float(input_ptr[in_features + ii + 1]),
-                            float(bf16(quant_map_cache[pb & 15] * am)), partial_second);
-                    }
                     partial = sycl::fma(static_cast<float>(input_ptr[ii]),
                         static_cast<float>(bf16(
                             quant_map_cache[(pb >> 4) & 0xF] * am)), partial);
                     partial = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
                         static_cast<float>(bf16(
                             quant_map_cache[pb & 0xF] * am)), partial);
+                    if constexpr (ReuseTwo) {
+                        partial_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
+                            static_cast<float>(bf16(
+                                quant_map_cache[(pb >> 4) & 0xF] * am)), partial_second);
+                        partial_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
+                            static_cast<float>(bf16(
+                                quant_map_cache[pb & 0xF] * am)), partial_second);
+                    }
                 }
             }
 
-            float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            const float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
+            float sum_second = 0.0f;
+            if constexpr (ReuseTwo) {
+                sum_second = sycl::reduce_over_group(item.get_sub_group(), partial_second, sycl::plus<>());
+            }
             if (sg_lane == 0 && row < out_features) {
                 out_ptr[row] = bf16(sum);
-            }
-            if constexpr (ReuseTwo) {
-                const float second = sycl::reduce_over_group(item.get_sub_group(), partial_second, sycl::plus<>());
-                if (sg_lane == 0 && row < out_features) out_ptr[out_features + row] = bf16(second);
+                if constexpr (ReuseTwo) {
+                    out_ptr[out_features + row] = bf16(sum_second);
+                }
             }
         });
     });
@@ -2382,10 +2496,12 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
                                                       Bnb4BitLinear& fused_gate_up,
                                                       Tensor& input,
                                                       Tensor& output,
-                                                      int ff_dim) {
+                                                      int ff_dim,
+                                                      int rows) {
     // Both gate and up adapters live on this fused projection. The fused
     // kernel only reads the base weights; let the ordinary projection apply
     // every adapter before the existing SwiGLU fallback instead.
+    if (rows < 1 || rows > 4) return false;
     if (fused_gate_up.has_lora()) return false;
     if (input.dtype() != dnnl::memory::data_type::bf16 ||
         output.dtype() != dnnl::memory::data_type::bf16) return false;
@@ -2400,6 +2516,8 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
     const int in_features = fused_gate_up.in_features_;
     const int blocksize = w.quant_state.blocksize;
     if (blocksize <= 0 || (blocksize % 2) != 0 || (in_features % blocksize) != 0) return false;
+    if (input.numel() < static_cast<int64_t>(rows) * in_features ||
+        output.numel() < static_cast<int64_t>(rows) * ff_dim) return false;
 
     const int packed_bytes_per_row = in_features / 2;
     const int blocks_per_row = in_features / blocksize;
@@ -2418,7 +2536,7 @@ bool Bnb4BitLinear::try_forward_decode_gate_up_swiglu(Context& ctx,
     packed_nf4_gemv_gate_up_swiglu(ctx, gate_packed, gate_absmax,
                                    up_packed, up_absmax,
                                    quant_map_ptr, input_ptr, output_ptr,
-                                   in_features, ff_dim, blocksize);
+                                   in_features, ff_dim, blocksize, rows);
     return true;
 }
 
@@ -2585,7 +2703,7 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
         (draft_reuse && rows == 4 && in_features_ == 2560 && out_features_ == 2560))
         packed_nf4_decode_rows_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
     else
-        packed_nf4_decode_rows_bf16(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+        packed_nf4_decode_rows_bf16<false>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
     if (!lora_attachments_.empty()) {
         // The in-order queue safely reuses the retained single-row adapter
         // intermediate, including attachments with different ranks/overlaps.
@@ -2607,14 +2725,37 @@ bool Bnb4BitLinear::supports_decode_graph() const {
 }
 
 bool Bnb4BitLinear::TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, Tensor& output,
-    const bf16* historyInput, float* history, int channels, int ringRow) {
+    const bf16* historyInput, float* history, int channels, int ringRow,
+    int rows, int inputStride, int historyRows, bf16* saveFirstRowOut, int saveFirstRowCols) {
     if (!can_use_packed_decode_fastpath(weight_, cache_dequantized_weight_, 1) ||
         has_lora() || in_features_ < 512 || !historyInput || !history || channels <= 0 || ringRow < 0 ||
+        rows < 1 || rows > 4 || historyRows <= 0 ||
         !input.valid() || !output.valid() || input.context() != &ctx || output.context() != &ctx ||
         input.dtype() != dnnl::memory::data_type::bf16 || output.dtype() != dnnl::memory::data_type::bf16 ||
-        input.numel() < in_features_ || output.numel() < out_features_) return false;
-    packed_nf4_gemv_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_,
-        nullptr, historyInput, history, channels, ringRow);
+        input.numel() < static_cast<int64_t>(rows) * in_features_ ||
+        output.numel() < static_cast<int64_t>(rows) * out_features_) return false;
+    if (rows == 1 && saveFirstRowOut == nullptr) {
+        packed_nf4_gemv_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_,
+            nullptr, historyInput, history, channels, ringRow);
+        return true;
+    }
+    const int eff_stride = inputStride > 0 ? inputStride : channels;
+    static const int verify_reuse = aila::env::read_int_raw("AILA_Q4E_VERIFY_LINEAR_REUSE", 3);
+    const bool reuse_shape = (verify_reuse > 0 && in_features_ == 2560 && out_features_ == 16480) ||
+        (verify_reuse >= 2 && in_features_ == 6144 && out_features_ == 2560) ||
+        (verify_reuse >= 3 && in_features_ == 2560 &&
+         (out_features_ == 13312 || out_features_ == 7168 || out_features_ == 1280 ||
+          out_features_ == 10240 || out_features_ == 2560)) ||
+        (verify_reuse >= 3 && in_features_ == 640 && out_features_ == 2560);
+    if (rows == 2 && reuse_shape) {
+        packed_nf4_decode_rows_bf16<true, true>(ctx, weight_, absmax_f32_, input, output,
+            in_features_, out_features_, rows, historyInput, history, channels, ringRow,
+            eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
+    } else {
+        packed_nf4_decode_rows_bf16<false, true>(ctx, weight_, absmax_f32_, input, output,
+            in_features_, out_features_, rows, historyInput, history, channels, ringRow,
+            eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
+    }
     return true;
 }
 
@@ -2998,10 +3139,7 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
     if (rows == 2 && xq.numel() >= int64_t(2) * hidden &&
         xs.numel() >= int64_t(2) * (hidden / 64)) {
         quantize_bf16_head_blocks(ctx, input.data_as<bf16>(),
-                                 input_codes, input_scales, size_t(blocks_per_row));
-        quantize_bf16_head_blocks(ctx, input.data_as<bf16>() + size_t(hidden),
-                                 input_codes + hidden, input_scales + blocks_per_row,
-                                 size_t(blocks_per_row));
+                                 input_codes, input_scales, size_t(2 * blocks_per_row));
         bf16* destination0 = output.data_as<bf16>();
         bf16* destination1 = destination0 + size_t(vocab);
         return ctx.queue().submit([&](sycl::handler& cgh) {
@@ -3015,6 +3153,9 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
                     float acc0 = 0.0f, acc1 = 0.0f;
                     #pragma unroll 4
                     for (int k = lane * 8; k < hidden; k += sg_size * 8) {
+                        if (k + sg_size * 8 < hidden) {
+                            sycl::ext::oneapi::experimental::prefetch(w + k + sg_size * 8);
+                        }
                         const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
                         const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
                         const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + k);
@@ -3038,6 +3179,53 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
                 });
         });
     }
+    if (rows >= 3 && rows <= 4 && xq.numel() >= int64_t(rows) * hidden &&
+        xs.numel() >= int64_t(rows) * (hidden / 64)) {
+        quantize_bf16_head_blocks(ctx, input.data_as<bf16>(),
+                                 input_codes, input_scales, size_t(rows * blocks_per_row));
+        bf16* destination0 = output.data_as<bf16>();
+        auto submit_multi = [&](auto rows_tag) -> sycl::event {
+            constexpr int R = decltype(rows_tag)::value;
+            return ctx.queue().submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<1>(size_t(vocab / rows_per_group) * wg, wg),
+                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
+                        const int lane = static_cast<int>(item.get_local_linear_id() % sg_size);
+                        const int row = static_cast<int>(item.get_group(0)) * rows_per_group
+                            + static_cast<int>(item.get_local_linear_id() / sg_size);
+                        const int8_t* w = weights + size_t(row) * hidden;
+                        const float* ws = weight_scales + size_t(row) * blocks_per_row;
+                        float acc[R] = {};
+                        #pragma unroll 4
+                        for (int k = lane * 8; k < hidden; k += sg_size * 8) {
+                            if (k + sg_size * 8 < hidden) {
+                                sycl::ext::oneapi::experimental::prefetch(w + k + sg_size * 8);
+                            }
+                            const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
+                            const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
+                            const int blk = k >> 6;
+                            const float scale = ws[blk];
+                            #pragma unroll
+                            for (int r = 0; r < R; ++r) {
+                                const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + r * hidden + k);
+                                const int32_t x1 = *reinterpret_cast<const int32_t*>(input_codes + r * hidden + k + 4);
+                                const int32_t dot = bf16_head_signed_dot4(w0, x0) + bf16_head_signed_dot4(w1, x1);
+                                acc[r] = sycl::fma(static_cast<float>(dot),
+                                                   scale * input_scales[r * blocks_per_row + blk], acc[r]);
+                            }
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            const float sum = sycl::reduce_over_group(item.get_sub_group(), acc[r], sycl::plus<float>());
+                            if (lane == 0) {
+                                destination0[size_t(r) * vocab + row] = bf16(sum);
+                            }
+                        }
+                    });
+            });
+        };
+        if (rows == 3) return submit_multi(std::integral_constant<int, 3>{});
+        return submit_multi(std::integral_constant<int, 4>{});
+    }
     for (int token = 0; token < rows; ++token) {
         quantize_bf16_head_blocks(ctx, input.data_as<bf16>() + size_t(token) * hidden,
                                  input_codes, input_scales, size_t(blocks_per_row));
@@ -3053,6 +3241,9 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
                     float acc = 0.0f;
                     #pragma unroll 4
                     for (int k = lane * 8; k < hidden; k += sg_size * 8) {
+                        if (k + sg_size * 8 < hidden) {
+                            sycl::ext::oneapi::experimental::prefetch(w + k + sg_size * 8);
+                        }
                         const int32_t w0 = *reinterpret_cast<const int32_t*>(w + k);
                         const int32_t w1 = *reinterpret_cast<const int32_t*>(w + k + 4);
                         const int32_t x0 = *reinterpret_cast<const int32_t*>(input_codes + k);
@@ -3072,9 +3263,10 @@ sycl::event bf16_q8_head_forward(Context& ctx, Tensor& q8, Tensor& scales,
 void bf16_moe_front_fused(Context& ctx, const bf16* router_weight,
     const bf16* shared_gate_weight, const bf16* input, bf16* router_scores,
     bf16* shared_gate, int8_t* optional_xq, float* optional_xs, int hidden, int experts,
-    bf16* optional_x_host) {
-    if (hidden != 2560 || experts != 512 || !router_weight || !shared_gate_weight ||
-        !input || !router_scores || !shared_gate || bool(optional_xq) != bool(optional_xs)) {
+    bf16* optional_x_host, int rows) {
+    if (hidden != 2560 || experts != 512 || rows < 1 || rows > 4 ||
+        !router_weight || !shared_gate_weight || !input || !router_scores || !shared_gate ||
+        bool(optional_xq) != bool(optional_xs) || (rows > 1 && optional_xq != nullptr)) {
         throw std::invalid_argument("bf16_moe_front_fused: unsupported decode shape or buffers");
     }
     using vec8 = sycl::vec<bf16, 8>;
@@ -3088,62 +3280,136 @@ void bf16_moe_front_fused(Context& ctx, const bf16* router_weight,
     static const bool s_fast_rte = aila::env::read_flag("AILA_Q4E_GPU_Q8_FAST_RTE", false);
     const bool fast_rte = s_fast_rte;
 
+    if (rows == 1) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(static_cast<size_t>(projection_groups + quantization_groups) * WG, WG),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                    const int group = static_cast<int>(item.get_group(0));
+                    if (group >= projection_groups) {
+                        const int block = group - projection_groups;
+                        const int lid = static_cast<int>(item.get_local_id(0));
+                        const size_t index = static_cast<size_t>(block) * 64 + lid;
+                        uint16_t bits = lid < 64 ? reinterpret_cast<const uint16_t*>(input)[index] : 0;
+                        if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
+                        const float value = static_cast<float>(sycl::bit_cast<bf16>(bits));
+                        const float magnitude = sycl::fabs(value);
+                        const float maximum = sycl::reduce_over_group(item.get_group(), magnitude, sycl::maximum<float>());
+                        const float scale = maximum / 127.0f;
+                        if (lid == 0) optional_xs[block] = scale;
+                        if (lid < 64) optional_xq[index] = quantize_moe_front_q8_value(value, maximum, fast_rte);
+                        return;
+                    }
+
+                    auto sg = item.get_sub_group();
+                    int sg_id = sg.get_group_linear_id();
+                    int lane = sg.get_local_linear_id();
+                    int row = group * rows_per_group + sg_id;
+                    float acc = 0.0f;
+                    if (row <= experts) {
+                        const bf16* w_row = row < experts ? router_weight + row * K : shared_gate_weight;
+                        for (int k8 = lane; k8 < K8; k8 += SG) {
+                            int k = k8 * 8;
+                            const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
+                            const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
+#pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc += static_cast<float>(w_vec[v]) *
+                                       static_cast<float>(x_vec[v]);
+                            }
+                        }
+                        int tail_start = K8 * 8;
+                        for (int k = tail_start + lane; k < K; k += SG) {
+                            acc += static_cast<float>(w_row[k]) *
+                                   static_cast<float>(input[k]);
+                        }
+                    }
+                    float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                    if (lane == 0 && row < experts) router_scores[row] = bf16(total);
+                    if (lane == 0 && row == experts) shared_gate[0] = bf16(total);
+                    if (optional_x_host && group == projection_groups - 1) {
+                        const int lid = static_cast<int>(item.get_local_id(0));
+                        for (int k8 = lid; k8 < K8; k8 += WG) {
+                            *reinterpret_cast<vec8*>(optional_x_host + k8 * 8) =
+                                *reinterpret_cast<const vec8*>(input + k8 * 8);
+                        }
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>(static_cast<size_t>(projection_groups + quantization_groups) * WG, WG),
+            sycl::nd_range<1>(static_cast<size_t>(projection_groups) * WG, WG),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
                 const int group = static_cast<int>(item.get_group(0));
-                if (group >= projection_groups) {
-                    // One WG owns one original 64-value block. The extra lanes
-                    // supply zero to max; sanitization ensures nonnegative,
-                    // finite magnitudes, so the maximum remains bit-identical.
-                    const int block = group - projection_groups;
-                    const int lid = static_cast<int>(item.get_local_id(0));
-                    const size_t index = static_cast<size_t>(block) * 64 + lid;
-                    uint16_t bits = lid < 64 ? reinterpret_cast<const uint16_t*>(input)[index] : 0;
-                    if ((bits & 0x7f80u) == 0x7f80u) bits = 0;
-                    const float value = static_cast<float>(sycl::bit_cast<bf16>(bits));
-                    const float magnitude = sycl::fabs(value);
-                    const float maximum = sycl::reduce_over_group(item.get_group(), magnitude, sycl::maximum<float>());
-                    const float scale = maximum / 127.0f;
-                    if (lid == 0) optional_xs[block] = scale;
-                    if (lid < 64) optional_xq[index] = quantize_moe_front_q8_value(value, maximum, fast_rte);
-                    return;
-                }
-
-                // Preserve bf16_gemv_bf16's SG16/vec8 accumulation, scalar
-                // tail, subgroup reduction, and final BF16 storage boundary.
                 auto sg = item.get_sub_group();
                 int sg_id = sg.get_group_linear_id();
                 int lane = sg.get_local_linear_id();
                 int row = group * rows_per_group + sg_id;
-                float acc = 0.0f;
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
                 if (row <= experts) {
                     const bf16* w_row = row < experts ? router_weight + row * K : shared_gate_weight;
                     for (int k8 = lane; k8 < K8; k8 += SG) {
                         int k = k8 * 8;
                         const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
-                        const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
+                        const vec8 x0 = *reinterpret_cast<const vec8*>(input + k);
+                        const vec8 x1 = *reinterpret_cast<const vec8*>(input + K + k);
 #pragma unroll
                         for (int v = 0; v < 8; v++) {
-                            acc += static_cast<float>(w_vec[v]) *
-                                   static_cast<float>(x_vec[v]);
+                            const float wf = static_cast<float>(w_vec[v]);
+                            acc0 += wf * static_cast<float>(x0[v]);
+                            acc1 += wf * static_cast<float>(x1[v]);
+                        }
+                        if (rows >= 3) {
+                            const vec8 x2 = *reinterpret_cast<const vec8*>(input + 2 * K + k);
+#pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc2 += static_cast<float>(w_vec[v]) * static_cast<float>(x2[v]);
+                            }
+                        }
+                        if (rows >= 4) {
+                            const vec8 x3 = *reinterpret_cast<const vec8*>(input + 3 * K + k);
+#pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc3 += static_cast<float>(w_vec[v]) * static_cast<float>(x3[v]);
+                            }
                         }
                     }
                     int tail_start = K8 * 8;
                     for (int k = tail_start + lane; k < K; k += SG) {
-                        acc += static_cast<float>(w_row[k]) *
-                               static_cast<float>(input[k]);
+                        const float wf = static_cast<float>(w_row[k]);
+                        acc0 += wf * static_cast<float>(input[k]);
+                        acc1 += wf * static_cast<float>(input[K + k]);
+                        if (rows >= 3) acc2 += wf * static_cast<float>(input[2 * K + k]);
+                        if (rows >= 4) acc3 += wf * static_cast<float>(input[3 * K + k]);
                     }
                 }
-                float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
-                if (lane == 0 && row < experts) router_scores[row] = bf16(total);
-                if (lane == 0 && row == experts) shared_gate[0] = bf16(total);
-                if (optional_x_host && group == projection_groups - 1) {
+                float total0 = sycl::reduce_over_group(sg, acc0, sycl::plus<>());
+                float total1 = sycl::reduce_over_group(sg, acc1, sycl::plus<>());
+                float total2 = rows >= 3 ? sycl::reduce_over_group(sg, acc2, sycl::plus<>()) : 0.0f;
+                float total3 = rows >= 4 ? sycl::reduce_over_group(sg, acc3, sycl::plus<>()) : 0.0f;
+                if (lane == 0 && row < experts) {
+                    router_scores[row] = bf16(total0);
+                    router_scores[experts + row] = bf16(total1);
+                    if (rows >= 3) router_scores[2 * experts + row] = bf16(total2);
+                    if (rows >= 4) router_scores[3 * experts + row] = bf16(total3);
+                }
+                if (lane == 0 && row == experts) {
+                    shared_gate[0] = bf16(total0);
+                    shared_gate[1] = bf16(total1);
+                    if (rows >= 3) shared_gate[2] = bf16(total2);
+                    if (rows >= 4) shared_gate[3] = bf16(total3);
+                }
+                if (optional_x_host && group >= projection_groups - rows) {
+                    const int r = group - (projection_groups - rows);
                     const int lid = static_cast<int>(item.get_local_id(0));
+                    const bf16* src = input + static_cast<size_t>(r) * K;
+                    bf16* dst = optional_x_host + static_cast<size_t>(r) * K;
                     for (int k8 = lid; k8 < K8; k8 += WG) {
-                        *reinterpret_cast<vec8*>(optional_x_host + k8 * 8) =
-                            *reinterpret_cast<const vec8*>(input + k8 * 8);
+                        *reinterpret_cast<vec8*>(dst + k8 * 8) =
+                            *reinterpret_cast<const vec8*>(src + k8 * 8);
                     }
                 }
             });
@@ -3154,7 +3420,9 @@ void bf16_gemv_bf16(Context& ctx,
                     Tensor& weight,
                     const bf16* input,
                     bf16* output,
-                    int M, int K) {
+                    int M, int K,
+                    int rows) {
+    if (rows <= 0) return;
     const bf16* weight_ptr = weight.data_as<bf16>();
     using vec8 = sycl::vec<bf16, 8>;
 
@@ -3165,6 +3433,51 @@ void bf16_gemv_bf16(Context& ctx,
     int rows_per_group = WG / SG;
     int num_groups = (M + rows_per_group - 1) / rows_per_group;
 
+    if (rows == 1) {
+        ctx.queue().submit([&](sycl::handler& cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<1>(static_cast<size_t>(num_groups) * WG, WG),
+                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
+                    auto sg = item.get_sub_group();
+                    int sg_id = sg.get_group_linear_id();
+                    int lane = sg.get_local_linear_id();
+                    int row = static_cast<int>(item.get_group(0)) * rows_per_group + sg_id;
+
+                    float acc = 0.0f;
+
+                    if (row < M) {
+                        const bf16* w_row = weight_ptr + row * K;
+
+                        // Vec8 main loop
+                        for (int k8 = lane; k8 < K8; k8 += SG) {
+                            int k = k8 * 8;
+                            const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
+                            const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
+
+                            #pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc += static_cast<float>(w_vec[v]) *
+                                       static_cast<float>(x_vec[v]);
+                            }
+                        }
+
+                        // Scalar tail
+                        int tail_start = K8 * 8;
+                        for (int k = tail_start + lane; k < K; k += SG) {
+                            acc += static_cast<float>(w_row[k]) *
+                                   static_cast<float>(input[k]);
+                        }
+                    }
+
+                    float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                    if (lane == 0 && row < M) {
+                        output[row] = bf16(total);
+                    }
+                });
+        });
+        return;
+    }
+
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(static_cast<size_t>(num_groups) * WG, WG),
@@ -3174,35 +3487,58 @@ void bf16_gemv_bf16(Context& ctx,
                 int lane = sg.get_local_linear_id();
                 int row = static_cast<int>(item.get_group(0)) * rows_per_group + sg_id;
 
-                float acc = 0.0f;
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
 
                 if (row < M) {
                     const bf16* w_row = weight_ptr + row * K;
 
-                    // Vec8 main loop
                     for (int k8 = lane; k8 < K8; k8 += SG) {
                         int k = k8 * 8;
                         const vec8 w_vec = *reinterpret_cast<const vec8*>(w_row + k);
-                        const vec8 x_vec = *reinterpret_cast<const vec8*>(input + k);
+                        const vec8 x0 = *reinterpret_cast<const vec8*>(input + k);
+                        const vec8 x1 = *reinterpret_cast<const vec8*>(input + K + k);
 
                         #pragma unroll
                         for (int v = 0; v < 8; v++) {
-                            acc += static_cast<float>(w_vec[v]) *
-                                   static_cast<float>(x_vec[v]);
+                            const float wf = static_cast<float>(w_vec[v]);
+                            acc0 += wf * static_cast<float>(x0[v]);
+                            acc1 += wf * static_cast<float>(x1[v]);
+                        }
+                        if (rows >= 3) {
+                            const vec8 x2 = *reinterpret_cast<const vec8*>(input + 2 * K + k);
+                            #pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc2 += static_cast<float>(w_vec[v]) * static_cast<float>(x2[v]);
+                            }
+                        }
+                        if (rows >= 4) {
+                            const vec8 x3 = *reinterpret_cast<const vec8*>(input + 3 * K + k);
+                            #pragma unroll
+                            for (int v = 0; v < 8; v++) {
+                                acc3 += static_cast<float>(w_vec[v]) * static_cast<float>(x3[v]);
+                            }
                         }
                     }
 
-                    // Scalar tail
                     int tail_start = K8 * 8;
                     for (int k = tail_start + lane; k < K; k += SG) {
-                        acc += static_cast<float>(w_row[k]) *
-                               static_cast<float>(input[k]);
+                        const float wf = static_cast<float>(w_row[k]);
+                        acc0 += wf * static_cast<float>(input[k]);
+                        acc1 += wf * static_cast<float>(input[K + k]);
+                        if (rows >= 3) acc2 += wf * static_cast<float>(input[2 * K + k]);
+                        if (rows >= 4) acc3 += wf * static_cast<float>(input[3 * K + k]);
                     }
                 }
 
-                float total = sycl::reduce_over_group(sg, acc, sycl::plus<>());
+                float total0 = sycl::reduce_over_group(sg, acc0, sycl::plus<>());
+                float total1 = sycl::reduce_over_group(sg, acc1, sycl::plus<>());
+                float total2 = rows >= 3 ? sycl::reduce_over_group(sg, acc2, sycl::plus<>()) : 0.0f;
+                float total3 = rows >= 4 ? sycl::reduce_over_group(sg, acc3, sycl::plus<>()) : 0.0f;
                 if (lane == 0 && row < M) {
-                    output[row] = bf16(total);
+                    output[row] = bf16(total0);
+                    output[M + row] = bf16(total1);
+                    if (rows >= 3) output[2 * M + row] = bf16(total2);
+                    if (rows >= 4) output[3 * M + row] = bf16(total3);
                 }
             });
     });

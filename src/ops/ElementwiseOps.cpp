@@ -1287,12 +1287,14 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              int mrope_section_h,
                                              int mrope_section_w,
                                              float* k_scale_ptr = nullptr,
-                                             float* v_scale_ptr = nullptr) {
-    bf16* packed_ptr = static_cast<bf16*>(q_gate_packed.data());
-    bf16* q_ptr = static_cast<bf16*>(q_out.data());
-    bf16* gate_ptr = static_cast<bf16*>(gate_out.data());
-    bf16* k_ptr = static_cast<bf16*>(k.data());
-    bf16* v_ptr = static_cast<bf16*>(v.data());
+                                             float* v_scale_ptr = nullptr,
+                                             int rows = 1,
+                                             int qkv_row_stride = 0) {
+    bf16* packed_base_ptr = static_cast<bf16*>(q_gate_packed.data());
+    bf16* q_base_ptr = static_cast<bf16*>(q_out.data());
+    bf16* gate_base_ptr = static_cast<bf16*>(gate_out.data());
+    bf16* k_base_ptr = static_cast<bf16*>(k.data());
+    bf16* v_base_ptr = static_cast<bf16*>(v.data());
     bf16* qn_ptr = static_cast<bf16*>(q_norm_weight.data());
     bf16* kn_ptr = static_cast<bf16*>(k_norm_weight.data());
     void* k_cache_ptr = k_cache.data();
@@ -1305,7 +1307,11 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
     }
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int packed_per_head = head_dim * 2;
+    int q_row_dim = num_heads_q * head_dim;
     int k_dim = num_kv_heads * head_dim;
+    int effective_qkv_stride = qkv_row_stride > 0
+        ? qkv_row_stride : (num_heads_q * packed_per_head + 2 * k_dim);
+    int effective_rows = std::max(1, rows);
     int rot = std::max(2, std::min(head_dim, rotary_dim));
     if (rot & 1) --rot;
     int half_dim = rot / 2;
@@ -1314,13 +1320,15 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> local_sum(sycl::range<1>(wg_size), cgh);
 
-        cgh.parallel_for(sycl::nd_range<1>(num_heads_q * wg_size, wg_size),
+        cgh.parallel_for(sycl::nd_range<1>(static_cast<size_t>(effective_rows) * num_heads_q * wg_size, wg_size),
             [=](sycl::nd_item<1> item) {
-                int head = item.get_group(0);
+                int group = static_cast<int>(item.get_group(0));
+                int row = group / num_heads_q;
+                int head = group % num_heads_q;
                 int lid = item.get_local_id(0);
                 if (control && graph_control_aborted(control)) return;
                 const int active_pos =
-                    control ? control[graph_control::start_pos] : start_pos;
+                    (control ? control[graph_control::start_pos] : start_pos) + row;
                 if (active_pos < 0 || active_pos >= max_seq_len) {
                     if (control) graph_control_mark_abort(control);
                     return;
@@ -1333,6 +1341,11 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                             compressed_blocks, layer))
                         return;
                 }
+                bf16* packed_ptr = packed_base_ptr + static_cast<size_t>(row) * effective_qkv_stride;
+                bf16* k_ptr = k_base_ptr + static_cast<size_t>(row) * effective_qkv_stride;
+                bf16* v_ptr = v_base_ptr + static_cast<size_t>(row) * effective_qkv_stride;
+                bf16* q_ptr = q_base_ptr + static_cast<size_t>(row) * q_row_dim;
+                bf16* gate_ptr = gate_base_ptr + static_cast<size_t>(row) * q_row_dim;
                 int packed_base = head * packed_per_head;
                 int q_base = head * head_dim;
 
@@ -1521,11 +1534,13 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
                                         int mrope_section_h,
                                         int mrope_section_w,
                                         Tensor* k_scale,
-                                        Tensor* v_scale) {
+                                        Tensor* v_scale,
+                                        int rows,
+                                        int qkv_row_stride) {
     float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
     float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
     auto dispatch = [&](auto tag) {
-        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr);
+        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr, rows, qkv_row_stride);
     };
     if (k_cache.dtype() == dnnl::memory::data_type::s8) {
         dispatch(std::integral_constant<int, kKvFmtInt8>{});

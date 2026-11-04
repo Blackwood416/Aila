@@ -34,7 +34,8 @@ public:
     std::unique_ptr<State> CreateState(int capacity);
 
     void Step(State& state, const sycl::ext::oneapi::bfloat16* hidden, int token,
-              int position, bool kvOnly = false);
+              int position, bool kvOnly = false,
+              void (*onBeforeCpuCold)(void*) = nullptr, void* onBeforeCpuColdCtx = nullptr);
 
 private:
     static constexpr int kMtpExperts = 512;
@@ -94,6 +95,8 @@ private:
     Tensor embedNorm_;
     Tensor embedFc_;
     Tensor hiddenNorm_;
+    Tensor draftH_;
+    Tensor draftDown_;
     // USM host staging for one embedding row. A dedicated host block plus the
     // async H2D event keeps the row upload off the compute queue's critical
     // path: the blocking ctx_.memcpy_h2d would otherwise drain the queue on
@@ -120,6 +123,7 @@ private:
     float gu_nested_offset_ = 0.0f;
     float dn_nested_offset_ = 0.0f;
     std::array<SlotEntry, kMtpExpertSlots> slot_pool_{};
+    std::array<ops::MoeExpertSlotHost, kMtpExperts> host_slots_{};
     std::array<sycl::event, kMtpExpertsPerStep> staging_copy_{};
     std::array<bool, kMtpExpertsPerStep> staging_copy_valid_{};
     std::unique_ptr<sycl::queue> copy_q_;

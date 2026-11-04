@@ -3,6 +3,8 @@
 bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
               const std::string& lora_dir) {
         clear_error();
+        mtp_state_.reset();
+        mtp_.reset();
         model_dir_ = model_dir;
         lora_dir_ = lora_dir;
 
@@ -438,6 +440,16 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
         // 5. Warmup to amortize first-run JIT/primitive costs
         auto* q4e_warmup_backend=dynamic_cast<Qwen4ExpBnb4Backend*>(backend_.get());
         if(q4e_warmup_backend)q4e_warmup_backend->SetColdEpochEnabled(false);
+        const bool enable_engine_mtp = q4e_warmup_backend != nullptr &&
+            (aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false) ||
+             aila::env::read_flag("AILA_Q4E_SERVER_MTP", false));
+        if (enable_engine_mtp) {
+            const int mtp_cap = Qwen4ExpMtpRuntime::EffectiveCapacity(backend_->max_seq_len());
+            if (mtp_cap >= 2 && mtp_cap <= backend_->max_seq_len()) {
+                mtp_ = std::make_unique<Qwen4ExpMtpRuntime>(*ctx_, *q4e_warmup_backend, *weights_, mtp_cap);
+                mtp_state_ = mtp_->CreateState();
+            }
+        }
         bool is_exact_q35_0p8b_spec =
             (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
             is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);
@@ -626,6 +638,23 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                 Tensor& warmup_decode_logits = backend_->forward(*ctx_, warmup_token_ids, 1);
                 ops::argmax(*ctx_, warmup_decode_logits, config_.vocab_size, warmup_argmax);
                 ctx_->synchronize();
+
+                if (q4e_warmup_backend && mtp_ && mtp_state_) {
+                    backend_->reset();
+                    mtp_state_->length = 0;
+                    mtp_state_->valid = true;
+                    ForwardOptions warm_opts;
+                    warm_opts.host_token_ids = warmup_arr;
+                    (void)backend_->forward(*ctx_, warmup_token_ids, 2, warm_opts);
+                    std::vector<int> warm_vec(warmup_arr, warmup_arr + 2);
+                    mtp_->AfterForward(*mtp_state_, 0, warm_vec);
+                    auto& warm_sess = q4e_warmup_backend->DefaultSession(*ctx_);
+                    (void)mtp_->ForwardWindow(warm_sess, *mtp_state_, warmup_token_id,
+                                              [](int) { return false; });
+                    (void)mtp_->ForwardWindow(warm_sess, *mtp_state_, warmup_token_id,
+                                              [](int) { return true; });
+                    mtp_->ResetStats();
+                }
                 t_warmup_end = std::chrono::high_resolution_clock::now();
 
                 ctx_->free_device(warmup_argmax);
@@ -633,6 +662,10 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                 ctx_->free_device(warmup_token_ids);
                 warmup_token_ids = nullptr;
                 backend_->reset();
+                if (mtp_state_) {
+                    mtp_state_->length = 0;
+                    mtp_state_->valid = true;
+                }
 
                 AILA_LOG_INFO("[Warmup Manifest] reached: %d-token prefill (gemm, score buf), prefill kernel warmup, 1-token decode (gemv, decode attn, moe), state reset", warmup_prefill_len);
             } catch (const std::exception& e) {
@@ -664,6 +697,10 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
             }
         } else {
             backend_->reset();
+            if (mtp_state_) {
+                mtp_state_->length = 0;
+                mtp_state_->valid = true;
+            }
             if (model_spec_.family == ModelFamily::Qwen35Hybrid) {
                 if (init_warmup_mode == 0) {
                     AILA_LOG_INFO("[Warmup] Skipping init warmup (AILA_INIT_WARMUP=0, hidden=%d layers=%d attn_heads=%d kv_heads=%d)",

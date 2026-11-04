@@ -36,7 +36,8 @@ void bf16_moe_front_fused(
     sycl::ext::oneapi::bfloat16* router_scores,
     sycl::ext::oneapi::bfloat16* shared_gate,
     int8_t* optional_xq, float* optional_xs, int hidden, int experts,
-    sycl::ext::oneapi::bfloat16* optional_x_host = nullptr);
+    sycl::ext::oneapi::bfloat16* optional_x_host = nullptr,
+    int rows = 1);
 }
 
 struct LoraAttachment {
@@ -122,12 +123,15 @@ public:
     // submitting work if unsupported; caller then commits history separately.
     bool TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, Tensor& output,
         const sycl::ext::oneapi::bfloat16* historyInput, float* history,
-        int channels, int ringRow);
+        int channels, int ringRow, int rows = 1, int inputStride = 0,
+        int historyRows = 3, sycl::ext::oneapi::bfloat16* saveFirstRowOut = nullptr,
+        int saveFirstRowCols = 0);
     static bool try_forward_decode_gate_up_swiglu(Context& ctx,
                                                   Bnb4BitLinear& fused_gate_up,
                                                   Tensor& input,
                                                   Tensor& output,
-                                                  int ff_dim);
+                                                  int ff_dim,
+                                                  int rows = 1);
 
     int in_features() const { return in_features_; }
     int out_features() const { return out_features_; }

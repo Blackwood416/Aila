@@ -1721,7 +1721,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         static const bool s_verify_cpu_cold = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_COLD", true);
         const bool verify_cpu_cold = s_verify_cpu_cold && verify_rows && count >= 2 && count <= 4 &&
             count <= expert_executor_.max_cpu_tokens() && expert_executor_.cpu_overlap_enabled();
-        if (verify_cpu_cold) expert_executor_.StageResidentInput(x_base, count);
+        if (verify_cpu_cold && !verify_x_already_staged_) expert_executor_.StageResidentInput(x_base, count);
 
         // G1b (opt-in, AILA_Q4E_VERIFY_CPU_BATCH): same cold prefixes as G1,
         // but the whole window runs as ONE CPU job so the coordinator pays one
@@ -1766,12 +1766,19 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                         flat_ranks[offset] = batch_ranks[t][c];
                     }
                 expert_executor_.StartArenaColdRows(host_arena_, layer, count, flat_experts.data(),
-                    flat_ranks.data(), batch_begin.data(), batch_count.data(), batch_total, x_base);
+                    flat_ranks.data(), batch_begin.data(), batch_count.data(), batch_total,
+                    verify_x_already_staged_ ? nullptr : x_base);
                 cpu_work.active = true;
             }
         }
 
         const bool batch_split_gpu_join = verify_cpu_batch && verify_down_.valid();
+        const bool batch_pack_gpu_hot = batch_split_gpu_join;
+        std::array<ops::MoeExpertSlotDev, 16> combined_hot{};
+        std::array<int, 16> combined_tokens{}, combined_ranks{};
+        int combined_hot_count = 0;
+        bool batch_any_staging = false;
+        bool batch_any_device_live = false;
         std::array<bool, 4> batch_device_live{};
         std::array<sycl::event, 4> batch_device_last{};
         std::array<int, 4> batch_row_cpu_count{};
@@ -1869,8 +1876,8 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                             cold_split_num_, expert_executor_.max_cpu_credits());
                     }
                 }
-                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),cpu_target,x_base,
-                    t, count);
+                cpu_count = expert_executor_.StartArenaCold(host_arena_,layer,miss_experts.data(),miss_ranks.data(),cpu_target,
+                    verify_x_already_staged_ ? nullptr : x_base, t, count);
             }
             cpu_work.active=verify_cpu_batch || cpu_count>0;
             const int gpu_cold_count=miss_count-cpu_count;
@@ -1885,7 +1892,33 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
             // 4. Build GPU descriptors and launch XMX fused kernels
             // 4a. Execute hot hits (immediate GPU execution)
-            if (hit_count > 0) {
+            if (hit_count > 0 && batch_pack_gpu_hot && combined_hot_count + hit_count <= 16 &&
+                staging.count == 0 && !batch_any_staging) {
+                for (int i = 0; i < hit_count; ++i) {
+                    combined_hot[static_cast<size_t>(combined_hot_count)] =
+                        adaptive_cache_.GetResidentSlotDev(hit_slots[i], &nested_meta);
+                    combined_tokens[static_cast<size_t>(combined_hot_count)] = t;
+                    combined_ranks[static_cast<size_t>(combined_hot_count)] = hit_ranks[i];
+                    ++combined_hot_count;
+                }
+            } else if (hit_count > 0) {
+                if (combined_hot_count > 0) {
+                    last = ops::moe_decode_gate_up_swiglu_grouped(
+                        ctx, combined_hot.data(), nullptr,
+                        x_base, h_base, combined_hot_count,
+                        hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(),
+                        combined_tokens.data(), nested, nested_fixed256);
+                    last = ops::moe_decode_down_to_rank_f32(
+                        ctx, combined_hot.data(), combined_ranks.data(), h_base,
+                        verify_down_.data_as<float>(), combined_hot_count, top_k, intermediate, hidden_size_, 64,
+                        combined_tokens.data(), nullptr, &last, nested, nested_fixed256);
+                    adaptive_cache_.RecordResidentConsumer(last);
+                    for (int prev_t = 0; prev_t < t; ++prev_t) {
+                        batch_device_live[prev_t] = true;
+                        batch_device_last[prev_t] = last;
+                    }
+                    combined_hot_count = 0;
+                }
                 std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
                 for (int i = 0; i < hit_count; ++i) {
                     hot[i] = adaptive_cache_.GetResidentSlotDev(hit_slots[i], &nested_meta);
@@ -1905,6 +1938,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 
             // 4b. Execute cold staging (waiting on PCIe DMA completion)
             if (staging.count > 0) {
+                batch_any_staging = true;
                 std::array<ops::MoeExpertSlotDev, kMaxTopK> cold{};
                 for (int i = 0; i < staging.count; ++i) {
                     cold[i] = adaptive_cache_.GetStagingSlotDev(staging.ping_pong_index, staging.staging_slots[i], &nested_meta);
@@ -1929,6 +1963,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 batch_device_live[t] = hit_count > 0 || staging.count > 0;
                 batch_device_last[t] = last;
                 batch_row_cpu_count[t] = cpu_count;
+                batch_any_device_live = batch_any_device_live || batch_device_live[t];
                 continue;
             }
 
@@ -2001,6 +2036,21 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         }
 
         if (batch_split_gpu_join) {
+            if (combined_hot_count > 0) {
+                last = ops::moe_decode_gate_up_swiglu_grouped(
+                    ctx, combined_hot.data(), nullptr,
+                    x_base, h_base, combined_hot_count,
+                    hidden_size_, intermediate, 64, adaptive_cache_.ResidentReady(),
+                    combined_tokens.data(), nested, nested_fixed256);
+                last = ops::moe_decode_down_to_rank_f32(
+                    ctx, combined_hot.data(), combined_ranks.data(), h_base,
+                    verify_down_.data_as<float>(), combined_hot_count, top_k, intermediate, hidden_size_, 64,
+                    combined_tokens.data(), nullptr, &last, nested, nested_fixed256);
+                adaptive_cache_.RecordResidentConsumer(last);
+                for (int t = 0; t < count; ++t) {
+                    if (batch_device_live[t]) batch_device_last[t] = last;
+                }
+            }
             // Release all queued GPU expert kernels across the entire multi-row
             // window before blocking on the single batched CPU job, so row 1..N
             // GPU hot experts execute concurrently with the CPU worker instead
@@ -2011,6 +2061,34 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 }
                 try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
                 catch (...) {}
+            }
+            static const bool s_defer_cpu_join_batch = [] {
+                const int l0_batch = std::max(
+                    aila::env::read_int_raw("UR_L0_BATCH_SIZE", 0),
+                    aila::env::read_int_raw("SYCL_PI_LEVEL_ZERO_BATCH_SIZE", 0));
+                return l0_batch >= 32 &&
+                    aila::env::read_flag("AILA_Q4E_DECODE_DEFER_CPU_JOIN", true);
+            }();
+            if (s_defer_cpu_join_batch && s_join_release && !batch_any_staging &&
+                !resident_probe_ && expert_executor_.CanDeferArenaColdRowsHostRead()) {
+                const sycl::event gpu_hot_done = last;
+                const bool gpu_hot_live = batch_any_device_live;
+                std::array<ops::MoeCpuHostDownRows, 4> deferred_rows_batch{};
+                for (int t = 0; t < count; ++t) {
+                    const float* t_weights = router_host_weights_ + t * top_k;
+                    (void)expert_executor_.PrepareDeferredHostReadRowsRow(t, deferred_rows_batch[static_cast<size_t>(t)]);
+                    deferred_rows_batch[static_cast<size_t>(t)].has_host_weights = true;
+                    for (int k = 0; k < top_k; ++k)
+                        deferred_rows_batch[static_cast<size_t>(t)].host_weights[static_cast<size_t>(k)] = t_weights[k];
+                }
+                last = ops::moe_ordered_accumulate_cpu_host_rows_batch(
+                    ctx, verify_down_.data_as<float>(), y_base, count, top_k, hidden_size_,
+                    deferred_rows_batch.data(), sh_out_base, sh_gate_base,
+                    gpu_hot_live ? &gpu_hot_done : nullptr);
+                deferred_cpu_join_pending_ = true;
+                deferred_cpu_merge_event_ = last;
+                cpu_work.active = false;
+                return last;
             }
             for (int t = 0; t < count; ++t) {
                 float* row_down = verify_down_.data_as<float>() + static_cast<size_t>(t) * top_k * hidden_size_;
@@ -2579,9 +2657,10 @@ void Qwen4ExpBnb4Backend::DenseLinear(
     Context& ctx, Linear& linear, Tensor* raw_weight,
     Tensor& input, Tensor& output, int count, int out_features, int in_features) {
     static const bool s_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
-    if (count == 1 && s_native_gemv && raw_weight) {
+    if ((count == 1 || ((verify_decode_kernels_ || verify_rows_alignment_) && count >= 2 && count <= 4)) &&
+        s_native_gemv && raw_weight && !component_profile_active_for_test_) {
         ops::bf16_gemv_bf16(ctx, *raw_weight, input.data_as<bf16>(), output.data_as<bf16>(),
-                            out_features, in_features);
+                            out_features, in_features, count);
         return;
     }
     const int component = component_profile_active_for_test_ && count == 2 && in_features == hidden_size_
@@ -2609,7 +2688,7 @@ void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::Defer() {
 
 void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::Materialize() {
     if (!pending) return;
-    ops::hc_inject_add(ctx, hidden, y, inject, 1, hiddenSize, 4);
+    ops::hc_inject_add(ctx, hidden, y, inject, rows, hiddenSize, 4);
     pending = false;
     ++materialized;
 }
@@ -2618,11 +2697,11 @@ void Qwen4ExpBnb4Backend::DecodePendingMlpResidual::ConsumeNorm(
     const float* normWeight, float eps, bf16* normalized) {
     if (!pending) throw std::logic_error("No pending MLP residual to normalize");
     if (!ops::try_hc_decode_inject_add_and_grouped_rms_norm(ctx, hidden, y, inject,
-        normWeight, eps, normalized, hiddenSize, true)) {
+        normWeight, eps, normalized, hiddenSize, true, rows)) {
         // Clear residual ownership after its submit, before the norm submit can
         // throw. The non-vec path keeps both original kernels unchanged.
         Materialize();
-        ops::grouped_rms_norm(ctx, hidden, normWeight, eps, normalized, 1, 4, hiddenSize, true);
+        ops::grouped_rms_norm(ctx, hidden, normWeight, eps, normalized, rows, 4, hiddenSize, true);
         return;
     }
     // Clear immediately after norm submission, before subsequent HC submissions
@@ -2703,13 +2782,13 @@ std::optional<sycl::event> Qwen4ExpBnb4Backend::RunHyperConnectionCombined(
         // one submission, and it keeps the updated row in private storage
         // instead of re-reading H for the output pass. A rejected shape falls
         // back to the reference op below, unchanged.
-        const bool vec_done = count == 1 &&
+        const bool vec_done = (count >= 1 && count <= 4) &&
             ops::try_hc_decode_inject_add_and_grouped_rms_norm(
                 ctx, static_cast<bf16*>(buf_.hidden4.data()),
                 pending_y, pending_inj,
                 static_cast<const float*>(hc.hc_norm_weight->data()),
                 cfg_.rms_norm_eps, static_cast<bf16*>(buf_.hc_N.data()),
-                hidden_size_, true);
+                hidden_size_, true, count);
         if (!vec_done) {
             ops::hc_inject_add_and_grouped_rms_norm(
                 ctx, static_cast<bf16*>(buf_.hidden4.data()),
@@ -3105,7 +3184,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     double stage_ms[kStageCount] = {};
     auto stage_t = prof_clock::now();
     const bool is_prefill = !options.decode_verification && (options.prefill_remaining >= 0 || count > 1);
-    if (count == 1 && !is_prefill && expert_executor_.cpu_overlap_enabled() &&
+    if (!is_prefill && expert_executor_.cpu_overlap_enabled() &&
         ops::cpu::TilePoolPinningEnabled() && ops::cpu::PhysicalCoreCount() >= 6) {
         static thread_local bool s_host_pinned = false;
         if (!s_host_pinned) {
@@ -3117,9 +3196,11 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     cold_split_this_forward_ = cold_split_num_ > 0 && direct_arena_stage_ &&
         count == 1 && !is_prefill && copy_q_ != nullptr;
     static const bool s_decode_pending_mlp = aila::env::read_flag("AILA_Q4E_DECODE_PENDING_MLP_RESIDUAL", true);
-    const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp && count == 1 && !is_prefill && !interior;
+    const bool decode_pending_mlp = !decodeHcReferenceForTest_ && s_decode_pending_mlp &&
+        (count == 1 || (options.decode_verification && count >= 2 && count <= 4)) &&
+        !is_prefill && !interior;
     DecodePendingMlpResidual pending_mlp(ctx, buf_.hidden4.data_as<bf16>(),
-        buf_.y.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(), hidden_size_);
+        buf_.y.data_as<bf16>(), buf_.hc_inject_f32.data_as<float>(), hidden_size_, count);
     static const bool s_moe_front_fused = aila::env::read_flag("AILA_Q4E_MOE_FRONT_FUSED", true);
     static const bool s_front_native_gemv = aila::env::read_flag("AILA_Q4E_DENSE_GEMV", true);
     // D1 layer-boundary decode pipeline defaults.
@@ -3203,12 +3284,17 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     auto complete_deferred_cpu_join = [&]() {
         if (!deferred_cpu_join_pending_) return;
         const auto t_join0 = (s_stages || s_work_summary) ? prof_clock::now() : prof_clock::time_point{};
-        (void)expert_executor_.JoinResidentCold(resident_down_.data_as<float>(), nullptr);
-        expert_executor_.FinishResidentCpuRead(deferred_cpu_merge_event_);
+        if (expert_executor_.HasPendingArenaColdRows()) {
+            expert_executor_.JoinDeferredArenaColdRows(deferred_cpu_merge_event_);
+        } else {
+            (void)expert_executor_.JoinResidentCold(resident_down_.data_as<float>(), nullptr);
+            expert_executor_.FinishResidentCpuRead(deferred_cpu_merge_event_);
+        }
         deferred_cpu_join_pending_ = false;
         deferred_cpu_merge_event_ = sycl::event{};
         if (s_stages || s_work_summary) {
             const auto now = prof_clock::now();
+            stage_ms[kStageRouter] += prof_ms(stage_t, t_join0);
             stage_ms[kStageExperts] += prof_ms(t_join0, now);
             stage_t = now;
         }
@@ -3233,7 +3319,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     for (int L = 0; L < cfg_.num_hidden_layers; ++L) {
         auto& layer = layers_[L];
         auto& cache = session.layerCaches_[L];
-        if (L == 1 || !s_dump_dir.empty() || s_stages || dev_trace ||
+        if (!s_dump_dir.empty() || s_stages || dev_trace ||
             (!layer.is_linear && (start_pos + count) > 2051 &&
              (!s_qsa_block_native || count > 1))) {
             complete_deferred_cpu_join();
@@ -3268,12 +3354,13 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         // 2.1. Attn Hyper-Connection
         if (verification_hidden_in_for_test_ &&
             count <= verification_stage_rows_for_test_) {
+            pending_mlp.Materialize();
             ctx.queue().memcpy(
                 verification_hidden_in_for_test_ + size_t(L) * verification_stage_rows_for_test_ * 10240,
                 buf_.hidden4.data(), size_t(count) * 10240 * sizeof(bf16));
         }
         if (pending_mlp.pending)
-            RunHyperConnectionCombined(ctx, layer.attn_hc, 1, true, nullptr, nullptr, &pending_mlp);
+            RunHyperConnectionCombined(ctx, layer.attn_hc, count, true, nullptr, nullptr, &pending_mlp);
         else
             RunHyperConnection(ctx, layer.attn_hc, count, true);
         if (verification_attn_in_for_test_ && count <= verification_stage_rows_for_test_) {
@@ -3318,15 +3405,19 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         dev_mark(kDevHc);
 
         const bool moe_front_fused = s_moe_front_fused && s_front_native_gemv && moeFrontFusedGpu_ &&
-            !decodeHcReferenceForTest_ && !gpuNf4Q8ReferenceForTest_ && count == 1 && !is_prefill &&
+            !decodeHcReferenceForTest_ && !gpuNf4Q8ReferenceForTest_ &&
+            (count == 1 || (options.decode_verification && count >= 2 && count <= 4)) && !is_prefill &&
             hidden_size_ == 2560 && cfg_.num_experts == 512 && layer.router_w && layer.shared_expert_gate_w &&
             layer.router_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.shared_expert_gate_w->dtype() == dnnl::memory::data_type::bf16 &&
             layer.router_w->numel() == int64_t(512) * hidden_size_ && layer.shared_expert_gate_w->numel() == hidden_size_;
         const bool fused_x_stagein = moe_front_fused && expert_executor_.cpu_overlap_enabled() &&
-            expert_executor_.x_host_ptr() != nullptr;
-        const bool stagein_hoisted = !fused_x_stagein && s_stagein_hoist && count == 1 &&
+            expert_executor_.x_host_ptr() != nullptr && count <= expert_executor_.max_cpu_tokens();
+        const bool stagein_hoisted = !fused_x_stagein && s_stagein_hoist &&
+            (count == 1 || (options.decode_verification && count >= 2 && count <= 4)) &&
+            count <= expert_executor_.max_cpu_tokens() &&
             expert_executor_.cpu_overlap_enabled();
+        verify_x_already_staged_ = fused_x_stagein || stagein_hoisted;
         const bool stagein_after_route = !fused_x_stagein && s_stagein_after_route && !s_stagein_hoist &&
             count == 1 && !is_prefill &&
             expert_executor_.cpu_overlap_enabled() && copy_q_ &&
@@ -3351,7 +3442,8 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             ops::bf16_moe_front_fused(ctx, layer.router_w->data_as<bf16>(), layer.shared_expert_gate_w->data_as<bf16>(),
                 buf_.x.data_as<bf16>(), buf_.router_scores.data_as<bf16>(), buf_.shared_gate_buf.data_as<bf16>(),
                 nullptr, nullptr, hidden_size_, cfg_.num_experts,
-                fused_x_stagein ? expert_executor_.x_host_ptr() : nullptr);
+                fused_x_stagein ? expert_executor_.x_host_ptr() : nullptr,
+                count);
             if (!moeFrontFusedLogged_) {
                 AILA_LOG_INFO("[Q4E MoE Front Fused] actual_enabled=1 hidden=%d experts=%d shared_gate=1 q8_input=0 launches_saved_per_layer=1",
                     hidden_size_, cfg_.num_experts);
@@ -3386,16 +3478,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 std::chrono::duration<double, std::micro>(t_after_topk - t_route_split).count());
         }
         hsplit_add(host_topk_submit_ms, t_topk);
-        complete_deferred_cpu_join();
         dev_mark(kDevRouter);
-        if (s_join_release && count == 1 && !is_prefill) {
-            // Querying the status is non-blocking and takes the route launch out
-            // of the in-flight set before the shared expert enqueues behind it.
-            try {
-                (void)actual_route_event
-                    .get_info<sycl::info::event::command_execution_status>();
-            } catch (...) {}
-        }
         auto bind_actual_route = [&] {
             if (s_route_replay_count && count == 1 && L >= 0 && L < 64 &&
                 adaptive_cache_.IsAllocated()) {
@@ -3470,21 +3553,24 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             }
             d1_stash_valid = true;
         };
-        if (route_early_cold) after_route();
+        if (route_early_cold) {
+            complete_deferred_cpu_join();
+            after_route();
+        }
 
         const auto t_shared = hsplit_begin();
         if (!moe_front_fused)
             dense_rows(layer.shared_expert_gate, layer.shared_expert_gate_w, buf_.x, buf_.shared_gate_buf,
                        1, hidden_size_);
-        if (count == 1) {
+        if (count == 1 || ((verify_decode_kernels_ || verify_rows_alignment_) && count >= 2 && count <= 4)) {
             bool fused_ok = Bnb4BitLinear::try_forward_decode_gate_up_swiglu(
-                ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size);
+                ctx, layer.shared_gate_up_proj, buf_.x, buf_.shared_inter_buf, cfg_.shared_expert_intermediate_size, count);
             if (!fused_ok) {
-                layer.shared_gate_up_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, 1);
+                layer.shared_gate_up_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.x, buf_.shared_gate_up_buf, count);
                 ops::moe_silu_gate_up_mul_flat(ctx, static_cast<const bf16*>(buf_.shared_gate_up_buf.data()),
-                                               static_cast<bf16*>(buf_.shared_inter_buf.data()), 1, cfg_.shared_expert_intermediate_size);
+                                               static_cast<bf16*>(buf_.shared_inter_buf.data()), count, cfg_.shared_expert_intermediate_size);
             }
-            layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, 1);
+            layer.shared_down_proj.ForwardDecodeRows(ctx, linear_scratch_, buf_.shared_inter_buf, buf_.shared_out_buf, count);
         } else if (verify_rows_alignment_) {
             for (int r = 0; r < count; ++r) {
                 auto x_row = Tensor::view(ctx, buf_.x.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
@@ -3511,7 +3597,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         hsplit_add(host_shared_submit_ms, t_shared);
         dev_mark(kDevShared);
 
-        if (!route_early_cold) after_route();
+        if (!route_early_cold) {
+            complete_deferred_cpu_join();
+            after_route();
+        }
         stage(kStageRouter);
         if (adaptive_cache_.IsAllocated()) {
             const uint64_t misses_before_moe = static_cast<uint64_t>(adaptive_cache_.Stats().cache_misses);
@@ -3600,7 +3689,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (options.need_logits) {
         // 3. Final Hyper-Connection Mixer
         if (pending_mlp.pending)
-            RunHyperConnectionCombined(ctx, mixer_, 1, false, nullptr, nullptr, &pending_mlp);
+            RunHyperConnectionCombined(ctx, mixer_, count, false, nullptr, nullptr, &pending_mlp);
         else
             RunHyperConnection(ctx, mixer_, count, false);
 

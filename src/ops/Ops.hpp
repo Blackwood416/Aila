@@ -339,7 +339,9 @@ namespace ops {
                                             int mrope_section_h = 0,
                                             int mrope_section_w = 0,
                                             Tensor* k_scale = nullptr,
-                                            Tensor* v_scale = nullptr);
+                                            Tensor* v_scale = nullptr,
+                                            int rows = 1,
+                                            int qkv_row_stride = 0);
 
     // Graph-safe decode preparation. control[start_pos] supplies RoPE and the
     // K/V cache row; control[abort] fail-closes. No host position is required.
@@ -761,13 +763,14 @@ namespace ops {
                                        int seq_len, int d_model,
                                        float max_timescale = 10000.0f);
 
-    // Native bf16 GEMV: output[M] = weight[M,K] × input[K]
-    // Cooperative SG=16 kernel, ~2-3× faster than oneDNN for single-token decode.
+    // Native bf16 GEMV: output[rows, M] = input[rows, K] × weight[M, K]^T
+    // Cooperative SG=16 kernel, ~2-3× faster than oneDNN for 1..4 token decode.
     void bf16_gemv_bf16(Context& ctx,
                         Tensor& weight,   // [M, K] bf16 (row-major)
-                        const bf16* input, // [K] bf16
-                        bf16* output,      // [M] bf16
-                        int M, int K);
+                        const bf16* input, // [rows, K] bf16
+                        bf16* output,      // [rows, M] bf16
+                        int M, int K,
+                        int rows = 1);
 
 
     // 2D Prefetch helper for A770

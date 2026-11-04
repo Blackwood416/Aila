@@ -510,6 +510,7 @@ private:
     std::array<uint64_t, 4> attentionNf4Q8ProjectionCounts_{};
     bool moeFrontFusedGpu_ = false;
     bool moeFrontFusedLogged_ = false;
+    bool verify_x_already_staged_ = false;
     // One forward owns this ticket. y/inject remain in their existing buffers
     // until the next HC norm consumes them on the in-order compute queue.
     struct DecodePendingMlpResidual {
@@ -518,13 +519,14 @@ private:
         const sycl::ext::oneapi::bfloat16* y;
         const float* inject;
         int hiddenSize;
+        int rows = 1;
         bool pending = false;
         uint64_t deferred = 0;
         uint64_t consumedNorm = 0;
         uint64_t materialized = 0;
         DecodePendingMlpResidual(Context& context, sycl::ext::oneapi::bfloat16* hiddenPtr,
-            const sycl::ext::oneapi::bfloat16* yPtr, const float* injectPtr, int dim)
-            : ctx(context), hidden(hiddenPtr), y(yPtr), inject(injectPtr), hiddenSize(dim) {}
+            const sycl::ext::oneapi::bfloat16* yPtr, const float* injectPtr, int dim, int rowCount = 1)
+            : ctx(context), hidden(hiddenPtr), y(yPtr), inject(injectPtr), hiddenSize(dim), rows(rowCount) {}
         DecodePendingMlpResidual(const DecodePendingMlpResidual&) = delete;
         DecodePendingMlpResidual& operator=(const DecodePendingMlpResidual&) = delete;
         ~DecodePendingMlpResidual() noexcept;
@@ -623,6 +625,7 @@ private:
     friend struct Qwen4ExpMtpProbe;
     friend class Qwen4ExpMtpDraft;
     friend class Qwen4ExpMtpRuntime;
+    friend class InferenceEngine;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
     void TrimDecodeRuntimeBuffers(Context& ctx);
     void free_pinned_host_buffers();
