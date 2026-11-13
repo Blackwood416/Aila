@@ -311,7 +311,12 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_ADAPTIVE_SWAP_DECAY` | bool | `true` | Multiply `Qwen4ExpAdaptiveCache` routing usage counters by `0.50` at end-of-prefill and `0.85` (`0.92` if `AILA_Q4E_ADAPTIVE_SWAP_FREQ <= 8`) after each swap interval. |
 | `AILA_Q4E_VERIFY_LINEAR_REUSE` | int | `3` | 2-row NF4 weight-reuse level during multi-row verification decode (`0` = off, `1` = `2560x16480`, `2` = +`6144x2560`, `3` = +`2560x13312`, `2560x7168`, `2560x1280`, `2560x10240`, `2560x2560`, `640x2560`). |
 | `AILA_Q4E_MTP_HIDDEN_REUSE` | bool | `true` | Enable 2-pair NF4 weight reuse for 4-row `2560x2560` MTP draft hidden projections. |
-| `AILA_Q4E_SERVER_MTP` | bool | `false` | Enable speculative 2-token MTP draft/verify runtime on `LoadedModel::LoadQwen4ExpNf4`. |
+| `AILA_Q4E_SERVER_MTP` | bool | `false` | Enable speculative MTP draft/verify runtime on `LoadedModel::LoadQwen4ExpNf4`. |
+| `AILA_Q4E_MTP_WIDTH` | int | `2` | Maximum MTP speculative window width (`2..4`). |
+| `AILA_Q4E_MTP_MARGIN_TH1` | float | `-1` (off) | Draft step-1 top-2 logit margin threshold (`> 0` to enable). If `margin1 < threshold`, the window stops drafting at `width = 2` instead of advancing to `d = 2`. |
+| `AILA_Q4E_MTP_MARGIN_TH2` | float | `-1` (off) | Draft step-2 top-2 logit margin threshold (`> 0` to enable). If `margin2 < threshold`, a `width = 4` window stops drafting at `width = 3`. |
+| `AILA_Q4E_MTP_VERIFY_MARGIN_TH2` | float | `-1` (off) | Post-draft verify-width gate for `width = 3` (`> 0` to enable). If `margin2 < threshold`, drops the 3rd column before `ForwardImpl` and verifies `width = 2`. |
+| `AILA_Q4E_MTP_VERIFY_MARGIN_TH3` | float | `-1` (off) | Post-draft verify-width gate for `width = 4` (`> 0` to enable). If `margin3 < threshold`, drops the 4th column before `ForwardImpl` and verifies `width = 3`. |
 | `AILA_Q4E_MTP_MAX_CONTEXT` | int | `2048` | Maximum sequence context length tracked by `Qwen4ExpMtpRuntime` before gracefully falling back to standard T1 decode. |
 | `AILA_Q4E_CPU_COMPLETION_SINGLE_PASS` | bool | `true` | Fuse CPU cold-expert `gate_up`, inline `h` quantization, and completion-ordered `down` tiles into a single `CpuTilePool::ParallelFor` pass per layer. |
 | `AILA_Q4E_DECODE_STRIDE_SNAPSHOT` | bool | `false` | Capture periodic `AILA_Q4E_PREFILL_STEP` recurrent snapshots during unforced single-token decode steps (off by default to avoid 64-token D2H stalls and preserve prompt checkpoints). |

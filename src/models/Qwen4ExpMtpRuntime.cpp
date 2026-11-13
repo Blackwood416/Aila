@@ -3,6 +3,8 @@
 #include "utils/EnvUtils.hpp"
 #include "profile/Profiling.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 
@@ -277,11 +279,24 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     const aila::inference::DecodeWindowSelector& acceptFirst, int maxWidth) {
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
     static const int s_server_width = std::clamp(aila::env::read_int_raw("AILA_Q4E_SERVER_MTP_WIDTH", 2), 2, 4);
+    // Top-2 logit margin gates. A drafted token whose margin is below its
+    // threshold rarely survives verification, so the window stops one column
+    // earlier instead of paying for another draft step plus verify column.
+    // Unset, empty or negative means disabled.
+    const auto read_margin_threshold = [](const char* name) {
+        const std::string raw = aila::env::read_string(name, "");
+        return raw.empty() ? -1.0f : std::strtof(raw.c_str(), nullptr);
+    };
+    static const float s_margin_th1 = read_margin_threshold("AILA_Q4E_MTP_MARGIN_TH1");
+    static const float s_margin_th2 = read_margin_threshold("AILA_Q4E_MTP_MARGIN_TH2");
+    static const float s_verify_margin_th2 = read_margin_threshold("AILA_Q4E_MTP_VERIFY_MARGIN_TH2");
+    static const float s_verify_margin_th3 = read_margin_threshold("AILA_Q4E_MTP_VERIFY_MARGIN_TH3");
+    const bool apply_margin_gates = target.cold_epoch_enabled_;
     using Clock = std::chrono::steady_clock;
     const auto t0 = s_work_summary ? Clock::now() : Clock::time_point{};
     const int start = s.CurrentLength();
     const int reqWidth = maxWidth > 0 ? maxWidth : s_server_width;
-    const int width = std::clamp(reqWidth, 2, std::min(4, capacity - start));
+    int width = std::clamp(reqWidth, 2, std::min(4, capacity - start));
     const auto allocations = ctx.device_allocation_count();
     struct CaptureHook {
         Qwen4ExpMtpRuntime* self;
@@ -299,12 +314,26 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     proposal[0] = pending;
     draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), proposal[0], start - 1, false,
                 &CaptureHook::Run, &captureHook);
-    proposal[1] = Select(1)[0].index;
+    const ops::GreedyResult sel1 = Select(1)[0];
+    proposal[1] = sel1.index;
+    const float margin1 = ops::greedy_margin(sel1);
     const int savedDraftBlocksAfterStep1 = state.draft->cache.num_compressed_blocks;
+    if (apply_margin_gates && width >= 3 && s_margin_th1 > 0.0f && margin1 < s_margin_th1) width = 2;
+    float margin2 = -1.0f;
+    float margin3 = -1.0f;
     for (int d = 2; d < width; ++d) {
         draft->Step(*state.draft, target.buf_.hidden4.data_as<bf16>(), proposal[d - 1], start + d - 2, false);
-        proposal[d] = Select(1)[0].index;
+        const ops::GreedyResult selD = Select(1)[0];
+        proposal[d] = selD.index;
+        const float mD = ops::greedy_margin(selD);
+        if (d == 2) {
+            margin2 = mD;
+            if (apply_margin_gates && width >= 4 && s_margin_th2 > 0.0f && margin2 < s_margin_th2) width = 3;
+        }
+        if (d == 3) margin3 = mD;
     }
+    if (apply_margin_gates && width == 3 && s_verify_margin_th2 > 0.0f && margin2 >= 0.0f && margin2 < s_verify_margin_th2) width = 2;
+    if (apply_margin_gates && width == 4 && s_verify_margin_th3 > 0.0f && margin3 >= 0.0f && margin3 < s_verify_margin_th3) width = 3;
     if (!captureHook.captured) Capture(s);
     const auto t_draft = s_work_summary ? Clock::now() : Clock::time_point{};
     struct DeferSwapGuard {
@@ -334,15 +363,19 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     const auto t_verify = s_work_summary ? Clock::now() : Clock::time_point{};
     std::array<ops::GreedyResult, 4> selected{};
     bool kvOnlyPreSubmitted = false;
-    if (width == 2 && greedyResultHost != nullptr) {
+    if (width >= 2 && width <= 4 && greedyResultHost != nullptr) {
         ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(),
-                           size_t(2) * 10240 * sizeof(bf16));
+                           size_t(width) * 10240 * sizeof(bf16));
         sycl::event verifyGreedyEv = ops::greedy_bf16(
             ctx, target.buf_.logits.data_as<bf16>(), target.vocab_size(),
-            greedyPartials.data_as<ops::GreedyResult>(), greedyResultHost, 2);
+            greedyPartials.data_as<ops::GreedyResult>(), greedyResultHost, width);
         try {
             (void)verifyGreedyEv.get_info<sycl::info::event::command_execution_status>();
         } catch (...) {}
+        // The speculative draft steps above advanced the draft block counter to
+        // the last proposed position, so the pre-submitted kv-only step for
+        // j = 0 must start again from the step-1 checkpoint.
+        state.draft->cache.num_compressed_blocks = savedDraftBlocksAfterStep1;
         draft->Step(*state.draft, hiddenRows.data_as<bf16>(), proposal[1], start, true);
         kvOnlyPreSubmitted = true;
         try {
@@ -351,7 +384,7 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         } catch (...) {}
         target.RunPendingAdaptiveSwap(ctx);
         verifyGreedyEv.wait_and_throw();
-        for (int r = 0; r < 2; ++r) {
+        for (int r = 0; r < width; ++r) {
             selected[r] = greedyResultHost[r];
             if (selected[r].nonfinite || selected[r].index < 0 || selected[r].index >= target.vocab_size())
                 throw std::runtime_error("MTP nonfinite/invalid greedy logits");
@@ -372,7 +405,9 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         ctx.queue().memcpy(state.lastHidden.data(),
                            hiddenRows.data_as<bf16>() + size_t(emitted - 1) * 10240,
                            10240 * sizeof(bf16));
-        if (emitted < width) {
+        if (emitted == 1) {
+            // Nothing was accepted, so the pre-submitted block is overwritten by
+            // the next window: roll the draft counter back with the window.
             state.draft->cache.num_compressed_blocks = savedDraftBlocksAfterStep1;
         }
     } else {
@@ -418,7 +453,14 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         target.ple_.compute_ngram_ids_pure(s.ple_state_, proposal.data(), emitted, ngrams.data(), prev);
         s.ple_state_.prev_tokens = prev; s.currentLength_ = start + emitted; s.consecutive_no_miss_layers_ = 0;
     }
-    if (!kvOnlyPreSubmitted) {
+    if (kvOnlyPreSubmitted) {
+        // j = 0 was submitted before the verify barrier from the same staged
+        // rows, so only the rest of the accepted prefix is replayed here.
+        for (int j = 1; j + 1 < emitted; ++j) {
+            draft->Step(*state.draft, hiddenRows.data_as<bf16>() + size_t(j) * 10240,
+                        proposal[j + 1], start + j, true);
+        }
+    } else {
         const bf16* kvOnlyHiddenBase = (emitted == 2)
             ? target.buf_.hidden4.data_as<bf16>()
             : hiddenRows.data_as<bf16>();
@@ -438,9 +480,10 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         auto ms = [](Clock::time_point a, Clock::time_point b) {
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
-        AILA_LOG_INFO("[Q4E MtpWindow] pos=%d count=%d emitted=%d accepted=%d window_ms=%.3f draft_ms=%.3f verify_ms=%.3f tail_ms=%.3f",
+        AILA_LOG_INFO("[Q4E MtpWindow] pos=%d count=%d emitted=%d accepted=%d window_ms=%.3f draft_ms=%.3f verify_ms=%.3f tail_ms=%.3f m1=%.2f m2=%.2f m3=%.2f",
             start, width, emitted, emitted - 1,
-            ms(t0, t_end), ms(t0, t_draft), ms(t_draft, t_verify), ms(t_verify, t_end));
+            ms(t0, t_end), ms(t0, t_draft), ms(t_draft, t_verify), ms(t_verify, t_end),
+            margin1, margin2, margin3);
     }
     if (ctx.device_allocation_count() != allocations)
         throw std::runtime_error("MTP window unexpectedly allocated device memory");

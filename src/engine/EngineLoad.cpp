@@ -650,9 +650,13 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                     mtp_->AfterForward(*mtp_state_, 0, warm_vec);
                     auto& warm_sess = q4e_warmup_backend->DefaultSession(*ctx_);
                     (void)mtp_->ForwardWindow(warm_sess, *mtp_state_, warmup_token_id,
-                                              [](int) { return false; });
-                    (void)mtp_->ForwardWindow(warm_sess, *mtp_state_, warmup_token_id,
-                                              [](int) { return true; });
+                                              [](int) { return false; }, 2);
+                    for (int w = 2; w <= mtp_->ConfiguredWidth(); ++w) {
+                        if (warm_sess.CurrentLength() + w <= mtp_->Capacity()) {
+                            (void)mtp_->ForwardWindow(warm_sess, *mtp_state_, warmup_token_id,
+                                                      [](int) { return true; }, w);
+                        }
+                    }
                     mtp_->ResetStats();
                 }
                 t_warmup_end = std::chrono::high_resolution_clock::now();

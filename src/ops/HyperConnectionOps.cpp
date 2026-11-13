@@ -738,6 +738,103 @@ void hc_decode_down_inject_dispatch(
     }
 }
 
+// 3..4 verification streams over one gate matrix. Every work-group still owns
+// one output dim (num_wgs * wg work-items, not num_wgs * rows * wg), the four
+// gate rows are read once for all streams, and each stream keeps its own
+// accumulator, reduction and sigmoid, so the result stays bit-identical to the
+// single-stream path.
+template<int R>
+sycl::event hc_decode_up_mix_k320_rows_impl(
+    Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
+    bf16* x, int group_dim, int groups) {
+    constexpr int wg = 256;
+    constexpr int sg_size = 16;
+    constexpr int dims_per_wg = wg / sg_size;
+    constexpr int kLowrank = 320;
+    using vec8 = sycl::vec<bf16, 8>;
+    const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
+    const float inv_groups = 1.0f / static_cast<float>(groups);
+    const auto hc_t0 = hc_submit_begin();
+    sycl::event ev = ctx.queue().submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                auto sg = item.get_sub_group();
+                const int lane = static_cast<int>(sg.get_local_linear_id());
+                const size_t group = item.get_group(0);
+                const int d = static_cast<int>(group) * dims_per_wg +
+                              static_cast<int>(sg.get_group_linear_id());
+                if (d >= group_dim) return;
+                // lowrank 320 with sg16 fixes the vec8 chunks of every stream
+                // to lane, lane + 16 and (lane < 8) lane + 32, so all streams'
+                // activations stay in registers across the four gate rows.
+                vec8 a0[R], a1[R];
+                vec8 a2[R]{};
+                float mixed[R] = {};
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const bf16* a_row = act + static_cast<size_t>(r) * kLowrank;
+                    a0[r] = *reinterpret_cast<const vec8*>(a_row + lane * 8);
+                    a1[r] = *reinterpret_cast<const vec8*>(a_row + (lane + 16) * 8);
+                    if (lane < 8)
+                        a2[r] = *reinterpret_cast<const vec8*>(a_row + (lane + 32) * 8);
+                }
+#pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    const size_t row = static_cast<size_t>(g) * group_dim + d;
+                    const bf16* w_row = w_up + row * kLowrank;
+                    float acc[R] = {};
+                    const vec8 w0 = *reinterpret_cast<const vec8*>(w_row + lane * 8);
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const float wf = static_cast<float>(w0[v]);
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            acc[r] = sycl::fma(wf, static_cast<float>(a0[r][v]), acc[r]);
+                        }
+                    }
+                    const vec8 w1 = *reinterpret_cast<const vec8*>(w_row + (lane + 16) * 8);
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const float wf = static_cast<float>(w1[v]);
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            acc[r] = sycl::fma(wf, static_cast<float>(a1[r][v]), acc[r]);
+                        }
+                    }
+                    if (lane < 8) {
+                        const vec8 w2 = *reinterpret_cast<const vec8*>(w_row + (lane + 32) * 8);
+#pragma unroll
+                        for (int v = 0; v < 8; ++v) {
+                            const float wf = static_cast<float>(w2[v]);
+#pragma unroll
+                            for (int r = 0; r < R; ++r) {
+                                acc[r] = sycl::fma(wf, static_cast<float>(a2[r][v]), acc[r]);
+                            }
+                        }
+                    }
+                    float dot[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        dot[r] = sycl::reduce_over_group(sg, acc[r], sycl::plus<>());
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const float u = static_cast<float>(bf16(dot[r]));
+                        const float m = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u))));
+                        mixed[r] += m * static_cast<float>(N[static_cast<size_t>(r) * groups * group_dim + row]);
+                    }
+                }
+                if (lane == 0) {
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        x[static_cast<size_t>(r) * group_dim + d] = bf16(mixed[r] * inv_groups);
+                }
+            });
+    });
+    hc_submit_end(kHcSubmitUp, hc_t0);
+    return ev;
+}
+
 template<bool Batched>
 sycl::event hc_decode_up_mix_impl(
     Context& ctx, const bf16* act, const bf16* w_up, const bf16* N,
@@ -751,80 +848,16 @@ sycl::event hc_decode_up_mix_impl(
     const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
-    const auto hc_t0 = hc_submit_begin();
-    if (Batched && rows == 2 && lowrank == 320 && groups == 4 && (group_dim % 8 == 0) &&
+    if (Batched && rows >= 3 && rows <= 4 && lowrank == 320 && groups == 4 &&
+        (group_dim % 8 == 0) &&
         (reinterpret_cast<uintptr_t>(act) % 16 == 0) &&
         (reinterpret_cast<uintptr_t>(w_up) % 16 == 0)) {
-        sycl::event ev = ctx.queue().submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(num_wgs * wg), sycl::range<1>(wg)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
-                    auto sg = item.get_sub_group();
-                    const int lane = static_cast<int>(sg.get_local_linear_id());
-                    const size_t group = item.get_group(0);
-                    const int d = static_cast<int>(group) * dims_per_wg +
-                                  static_cast<int>(sg.get_group_linear_id());
-                    if (d >= group_dim) return;
-                    const bf16* a_row0 = act;
-                    const bf16* a_row1 = act + lowrank;
-                    const bf16* n_row0 = N;
-                    const bf16* n_row1 = N + groups * group_dim;
-                    const vec8 a0_0 = *reinterpret_cast<const vec8*>(a_row0 + lane * 8);
-                    const vec8 a1_0 = *reinterpret_cast<const vec8*>(a_row0 + (lane + 16) * 8);
-                    const vec8 a0_1 = *reinterpret_cast<const vec8*>(a_row1 + lane * 8);
-                    const vec8 a1_1 = *reinterpret_cast<const vec8*>(a_row1 + (lane + 16) * 8);
-                    vec8 a2_0{}, a2_1{};
-                    if (lane < 8) {
-                        a2_0 = *reinterpret_cast<const vec8*>(a_row0 + (lane + 32) * 8);
-                        a2_1 = *reinterpret_cast<const vec8*>(a_row1 + (lane + 32) * 8);
-                    }
-                    float mixed0 = 0.0f, mixed1 = 0.0f;
-#pragma unroll
-                    for (int g = 0; g < 4; ++g) {
-                        const size_t row = static_cast<size_t>(g) * group_dim + d;
-                        const bf16* w_row = w_up + row * lowrank;
-                        float acc0 = 0.0f, acc1 = 0.0f;
-                        const vec8 w0 = *reinterpret_cast<const vec8*>(w_row + lane * 8);
-#pragma unroll
-                        for (int v = 0; v < 8; ++v) {
-                            const float wf = static_cast<float>(w0[v]);
-                            acc0 = sycl::fma(wf, static_cast<float>(a0_0[v]), acc0);
-                            acc1 = sycl::fma(wf, static_cast<float>(a0_1[v]), acc1);
-                        }
-                        const vec8 w1 = *reinterpret_cast<const vec8*>(w_row + (lane + 16) * 8);
-#pragma unroll
-                        for (int v = 0; v < 8; ++v) {
-                            const float wf = static_cast<float>(w1[v]);
-                            acc0 = sycl::fma(wf, static_cast<float>(a1_0[v]), acc0);
-                            acc1 = sycl::fma(wf, static_cast<float>(a1_1[v]), acc1);
-                        }
-                        if (lane < 8) {
-                            const vec8 w2 = *reinterpret_cast<const vec8*>(w_row + (lane + 32) * 8);
-#pragma unroll
-                            for (int v = 0; v < 8; ++v) {
-                                const float wf = static_cast<float>(w2[v]);
-                                acc0 = sycl::fma(wf, static_cast<float>(a2_0[v]), acc0);
-                                acc1 = sycl::fma(wf, static_cast<float>(a2_1[v]), acc1);
-                            }
-                        }
-                        const float dot0 = sycl::reduce_over_group(sg, acc0, sycl::plus<>());
-                        const float dot1 = sycl::reduce_over_group(sg, acc1, sycl::plus<>());
-                        const float u0 = static_cast<float>(bf16(dot0));
-                        const float m0 = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u0))));
-                        mixed0 += m0 * static_cast<float>(n_row0[row]);
-                        const float u1 = static_cast<float>(bf16(dot1));
-                        const float m1 = static_cast<float>(bf16(1.0f / (1.0f + sycl::native::exp(-u1))));
-                        mixed1 += m1 * static_cast<float>(n_row1[row]);
-                    }
-                    if (lane == 0) {
-                        x[d] = bf16(mixed0 * inv_groups);
-                        x[group_dim + d] = bf16(mixed1 * inv_groups);
-                    }
-                });
-        });
-        hc_submit_end(kHcSubmitUp, hc_t0);
-        return ev;
+        switch (rows) {
+        case 3: return hc_decode_up_mix_k320_rows_impl<3>(ctx, act, w_up, N, x, group_dim, groups);
+        default: return hc_decode_up_mix_k320_rows_impl<4>(ctx, act, w_up, N, x, group_dim, groups);
+        }
     }
+    const auto hc_t0 = hc_submit_begin();
     sycl::event ev = ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
             sycl::nd_range<1>(sycl::range<1>(num_wgs * (Batched ? rows : 1) * wg), sycl::range<1>(wg)),
@@ -1020,6 +1053,92 @@ sycl::event hc_decode_up_mix_streams_impl(
 
 } // namespace
 
+// 2..4 verification streams over one 10240-wide 16-bit weight row. One
+// work-group still owns one output row (total_rows * wg work-items, not
+// total_rows * rows * wg), the weight row is read once for all streams, and
+// every stream keeps the B1 FMA order and the B1 two-level SG16 -> work-group
+// reduction, so the result stays bit-identical to the single-stream path.
+template<int R>
+void hc_decode_down_inject_k10240_rows_impl(
+    Context& ctx, const bf16* N, const bf16* w_down, const bf16* w_inject,
+    bf16* act, float* inj, int lowrank, int groups) {
+    constexpr int wg = 256;
+    constexpr int sg_size = 16;
+    constexpr int kSubGroups = wg / sg_size;
+    constexpr int kDim = 10240;
+    using vec8 = sycl::vec<bf16, 8>;
+    const int total_rows = lowrank + (w_inject ? groups : 0);
+    const float inv_groups = 1.0f / static_cast<float>(groups);
+    ctx.queue().submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(R * kSubGroups), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(total_rows) * wg),
+                sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
+                const int row = static_cast<int>(item.get_group(0));
+                const int lid = static_cast<int>(item.get_local_id(0));
+                const bool is_inject = row >= lowrank;
+                const bf16* w_row = is_inject
+                    ? w_inject + static_cast<size_t>(row - lowrank) * kDim
+                    : w_down + static_cast<size_t>(row) * kDim;
+                float acc[R] = {};
+                // k8 = 1280 is exactly five full lanes-per-thread slots, so the
+                // weight row is loaded once per stream set with static bounds.
+#pragma unroll
+                for (int slot = 0; slot < 5; ++slot) {
+                    const int i = lid + slot * wg;
+                    const vec8 w = *reinterpret_cast<const vec8*>(w_row + i * 8);
+                    vec8 xr[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        xr[r] = *reinterpret_cast<const vec8*>(
+                            N + static_cast<size_t>(r) * kDim + i * 8);
+                    }
+#pragma unroll
+                    for (int v = 0; v < 8; ++v) {
+                        const float wf = static_cast<float>(w[v]);
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            acc[r] = sycl::fma(wf, static_cast<float>(xr[r][v]), acc[r]);
+                        }
+                    }
+                }
+                auto sg = item.get_sub_group();
+                const int sg_id = lid / sg_size;
+                const int lane = lid % sg_size;
+                float sg_sum[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r)
+                    sg_sum[r] = sycl::reduce_over_group(sg, acc[r], sycl::plus<>());
+                if (lane == 0) {
+#pragma unroll
+                    for (int r = 0; r < R; ++r) red[r * kSubGroups + sg_id] = sg_sum[r];
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (sg_id == 0) {
+                    float partial[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+                        partial[r] = lane < kSubGroups ? red[r * kSubGroups + lane] : 0.0f;
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const float total = sycl::reduce_over_group(sg, partial[r], sycl::plus<>());
+                        const float v = static_cast<float>(bf16(total)) * inv_groups;
+                        const float s = 1.0f / (1.0f + sycl::native::exp(-v));
+                        if (lane == 0) {
+                            if (is_inject) {
+                                inj[r * groups + row - lowrank] = 2.0f * s;
+                            } else {
+                                act[r * lowrank + row] = bf16(v * s);
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
 // One work-group per output row instead of one sub-group per row.
 //
 // The production mapping puts 16 rows in each 256-thread work-group, so the
@@ -1047,71 +1166,18 @@ void hc_decode_down_inject_wgrow_impl(
     const float inv_groups = 1.0f / static_cast<float>(groups);
     using vec8 = sycl::vec<bf16, 8>;
 
-    if (Batched && rows == 2 && k_dim == 10240 && wg == 256 &&
+    if (Batched && rows >= 2 && rows <= 4 && k_dim == 10240 && wg == 256 &&
         (reinterpret_cast<uintptr_t>(w_down) % 16 == 0) &&
         (w_inject == nullptr || reinterpret_cast<uintptr_t>(w_inject) % 16 == 0) &&
         (reinterpret_cast<uintptr_t>(N) % 16 == 0)) {
-        ctx.queue().submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> red(sycl::range<1>(2 * kSubGroups), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<1>(
-                    sycl::range<1>(static_cast<size_t>(total_rows) * wg),
-                    sycl::range<1>(wg)),
-                [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(sg_size)]] {
-                    const int row = static_cast<int>(item.get_group(0));
-                    const int lid = static_cast<int>(item.get_local_id(0));
-                    const bf16* n_row0 = N;
-                    const bf16* n_row1 = N + k_dim;
-                    const bool is_inject = row >= lowrank;
-                    const bf16* w_row = is_inject
-                        ? w_inject + static_cast<size_t>(row - lowrank) * k_dim
-                        : w_down + static_cast<size_t>(row) * k_dim;
-                    float acc0 = 0.0f, acc1 = 0.0f;
-#pragma unroll
-                    for (int slot = 0; slot < 5; ++slot) {
-                        const int i = lid + slot * 256;
-                        const vec8 w = *reinterpret_cast<const vec8*>(w_row + i * 8);
-                        const vec8 x0 = *reinterpret_cast<const vec8*>(n_row0 + i * 8);
-                        const vec8 x1 = *reinterpret_cast<const vec8*>(n_row1 + i * 8);
-#pragma unroll
-                        for (int v = 0; v < 8; ++v) {
-                            const float wf = static_cast<float>(w[v]);
-                            acc0 = sycl::fma(wf, static_cast<float>(x0[v]), acc0);
-                            acc1 = sycl::fma(wf, static_cast<float>(x1[v]), acc1);
-                        }
-                    }
-                    auto sg = item.get_sub_group();
-                    const int sg_id = lid / sg_size;
-                    const int lane = lid % sg_size;
-                    const float sg_sum0 = sycl::reduce_over_group(sg, acc0, sycl::plus<>());
-                    const float sg_sum1 = sycl::reduce_over_group(sg, acc1, sycl::plus<>());
-                    if (lane == 0) {
-                        red[sg_id] = sg_sum0;
-                        red[kSubGroups + sg_id] = sg_sum1;
-                    }
-                    item.barrier(sycl::access::fence_space::local_space);
-                    if (sg_id == 0) {
-                        const float partial0 = lane < kSubGroups ? red[lane] : 0.0f;
-                        const float partial1 = lane < kSubGroups ? red[kSubGroups + lane] : 0.0f;
-                        const float total0 = sycl::reduce_over_group(sg, partial0, sycl::plus<>());
-                        const float total1 = sycl::reduce_over_group(sg, partial1, sycl::plus<>());
-                        if (lane == 0) {
-                            const float v0 = static_cast<float>(bf16(total0)) * inv_groups;
-                            const float s0 = 1.0f / (1.0f + sycl::native::exp(-v0));
-                            const float v1 = static_cast<float>(bf16(total1)) * inv_groups;
-                            const float s1 = 1.0f / (1.0f + sycl::native::exp(-v1));
-                            if (is_inject) {
-                                inj[row - lowrank] = 2.0f * s0;
-                                inj[groups + row - lowrank] = 2.0f * s1;
-                            } else {
-                                act[row] = bf16(v0 * s0);
-                                act[lowrank + row] = bf16(v1 * s1);
-                            }
-                        }
-                    }
-                });
-        });
-        return;
+        switch (rows) {
+        case 2: hc_decode_down_inject_k10240_rows_impl<2>(
+                    ctx, N, w_down, w_inject, act, inj, lowrank, groups); return;
+        case 3: hc_decode_down_inject_k10240_rows_impl<3>(
+                    ctx, N, w_down, w_inject, act, inj, lowrank, groups); return;
+        default: hc_decode_down_inject_k10240_rows_impl<4>(
+                    ctx, N, w_down, w_inject, act, inj, lowrank, groups); return;
+        }
     }
     ctx.queue().submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(kSubGroups), cgh);

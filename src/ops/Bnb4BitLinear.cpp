@@ -1346,7 +1346,7 @@ void packed_nf4_gemv_gate_up_swiglu_wgrow(
     });
 }
 
-template<bool ReuseTwo = false>
+template<int ReuseRows = 1>
 void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
                                          const uint8_t* gate_packed,
                                          const float* gate_absmax,
@@ -1380,10 +1380,8 @@ void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
             if (lid < 16) qmap[lid] = quant_map_ptr[lid];
             item.barrier(sycl::access::fence_space::local_space);
 
-            float gate_acc = 0.0f;
-            float up_acc = 0.0f;
-            float gate_acc_second = 0.0f;
-            float up_acc_second = 0.0f;
+            float gate_acc[ReuseRows] = {};
+            float up_acc[ReuseRows] = {};
             if (row < intermediate_size) {
                 const int row_byte_base = row * packed_bytes_per_row;
                 const int row_block_base = row * blocks_per_row;
@@ -1406,7 +1404,6 @@ void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
                     const float ga = gate_absmax[row_block_base + blk_off];
                     const float ua = up_absmax[row_block_base + blk_off];
                     const int ib = byte_offset * 2;
-                    const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
                     const uint8_t gb0 = static_cast<uint8_t>(g4);
                     const uint8_t gb1 = static_cast<uint8_t>(g4 >> 8);
                     const uint8_t gb2 = static_cast<uint8_t>(g4 >> 16);
@@ -1423,40 +1420,25 @@ void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
                     const float uw2 = qmap[ub1 >> 4] * ua, uw3 = qmap[ub1 & 0xF] * ua;
                     const float uw4 = qmap[ub2 >> 4] * ua, uw5 = qmap[ub2 & 0xF] * ua;
                     const float uw6 = qmap[ub3 >> 4] * ua, uw7 = qmap[ub3 & 0xF] * ua;
-                    gate_acc = sycl::fma(static_cast<float>(in_v[0]), gw0, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[1]), gw1, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[2]), gw2, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[3]), gw3, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[4]), gw4, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[5]), gw5, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[6]), gw6, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(in_v[7]), gw7, gate_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[0]), uw0, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[1]), uw1, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[2]), uw2, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[3]), uw3, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[4]), uw4, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[5]), uw5, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[6]), uw6, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(in_v[7]), uw7, up_acc);
-                    if constexpr (ReuseTwo) {
-                        const vec8 in_v2 = *reinterpret_cast<const vec8*>(input_ptr + in_features + ib);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[0]), gw0, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[1]), gw1, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[2]), gw2, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[3]), gw3, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[4]), gw4, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[5]), gw5, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[6]), gw6, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(in_v2[7]), gw7, gate_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[0]), uw0, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[1]), uw1, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[2]), uw2, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[3]), uw3, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[4]), uw4, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[5]), uw5, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[6]), uw6, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(in_v2[7]), uw7, up_acc_second);
+                    #pragma unroll
+                    for (int r = 0; r < ReuseRows; ++r) {
+                        const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + static_cast<size_t>(r) * in_features + ib);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[0]), gw0, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[1]), gw1, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[2]), gw2, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[3]), gw3, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[4]), gw4, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[5]), gw5, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[6]), gw6, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(in_v[7]), gw7, gate_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[0]), uw0, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[1]), uw1, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[2]), uw2, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[3]), uw3, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[4]), uw4, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[5]), uw5, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[6]), uw6, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(in_v[7]), uw7, up_acc[r]);
                     }
                 }
                 for (; byte_offset < packed_bytes_per_row;
@@ -1468,40 +1450,32 @@ void packed_nf4_gemv_gate_up_swiglu_impl(Context& ctx,
                     const float ua = up_absmax[row_block_base +
                         (byte_offset / (blocksize / 2))];
                     const int ii = byte_offset * 2;
-                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
-                        qmap[gb >> 4] * ga, gate_acc);
-                    gate_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
-                        qmap[gb & 0xF] * ga, gate_acc);
-                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii]),
-                        qmap[ub >> 4] * ua, up_acc);
-                    up_acc = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
-                        qmap[ub & 0xF] * ua, up_acc);
-                    if constexpr (ReuseTwo) {
-                        gate_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
-                            qmap[gb >> 4] * ga, gate_acc_second);
-                        gate_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
-                            qmap[gb & 0xF] * ga, gate_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
-                            qmap[ub >> 4] * ua, up_acc_second);
-                        up_acc_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
-                            qmap[ub & 0xF] * ua, up_acc_second);
+                    #pragma unroll
+                    for (int r = 0; r < ReuseRows; ++r) {
+                        gate_acc[r] = sycl::fma(static_cast<float>(input_ptr[static_cast<size_t>(r) * in_features + ii]),
+                            qmap[gb >> 4] * ga, gate_acc[r]);
+                        gate_acc[r] = sycl::fma(static_cast<float>(input_ptr[static_cast<size_t>(r) * in_features + ii + 1]),
+                            qmap[gb & 0xF] * ga, gate_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(input_ptr[static_cast<size_t>(r) * in_features + ii]),
+                            qmap[ub >> 4] * ua, up_acc[r]);
+                        up_acc[r] = sycl::fma(static_cast<float>(input_ptr[static_cast<size_t>(r) * in_features + ii + 1]),
+                            qmap[ub & 0xF] * ua, up_acc[r]);
                     }
                 }
             }
 
-            float gate_sum = sycl::reduce_over_group(item.get_sub_group(), gate_acc, sycl::plus<>());
-            float up_sum = sycl::reduce_over_group(item.get_sub_group(), up_acc, sycl::plus<>());
-            float gate_sum2 = 0.0f, up_sum2 = 0.0f;
-            if constexpr (ReuseTwo) {
-                gate_sum2 = sycl::reduce_over_group(item.get_sub_group(), gate_acc_second, sycl::plus<>());
-                up_sum2 = sycl::reduce_over_group(item.get_sub_group(), up_acc_second, sycl::plus<>());
+            float gate_sum[ReuseRows];
+            float up_sum[ReuseRows];
+            #pragma unroll
+            for (int r = 0; r < ReuseRows; ++r) {
+                gate_sum[r] = sycl::reduce_over_group(item.get_sub_group(), gate_acc[r], sycl::plus<>());
+                up_sum[r] = sycl::reduce_over_group(item.get_sub_group(), up_acc[r], sycl::plus<>());
             }
             if (sg_lane == 0 && row < intermediate_size) {
-                const float silu_gate = gate_sum / (1.0f + sycl::native::exp(-gate_sum));
-                output_ptr[row] = bf16(silu_gate * up_sum);
-                if constexpr (ReuseTwo) {
-                    const float silu_gate2 = gate_sum2 / (1.0f + sycl::native::exp(-gate_sum2));
-                    output_ptr[intermediate_size + row] = bf16(silu_gate2 * up_sum2);
+                #pragma unroll
+                for (int r = 0; r < ReuseRows; ++r) {
+                    const float silu_gate = gate_sum[r] / (1.0f + sycl::native::exp(-gate_sum[r]));
+                    output_ptr[static_cast<size_t>(r) * intermediate_size + row] = bf16(silu_gate * up_sum[r]);
                 }
             }
         });
@@ -1535,14 +1509,14 @@ void packed_nf4_gemv_gate_up_swiglu(Context& ctx,
         return;
     }
     if (rows == 2) {
-        packed_nf4_gemv_gate_up_swiglu_impl<true>(
+        packed_nf4_gemv_gate_up_swiglu_impl<2>(
             ctx, gate_packed, gate_absmax, up_packed, up_absmax,
             quant_map_ptr, input_ptr, output_ptr, in_features,
             intermediate_size, blocksize);
         return;
     }
     for (int r = 0; r < rows; ++r) {
-        packed_nf4_gemv_gate_up_swiglu_impl<false>(
+        packed_nf4_gemv_gate_up_swiglu_impl<1>(
             ctx, gate_packed, gate_absmax, up_packed, up_absmax,
             quant_map_ptr, input_ptr + static_cast<size_t>(r) * in_features,
             output_ptr + static_cast<size_t>(r) * intermediate_size,
@@ -1841,7 +1815,12 @@ void packed_nf4_gemv_bf16(Context& ctx,
 // Each sequence owns its own padded output-row grid. Keeping one SG16 per
 // output and the original vec8/FMA reduction order makes B2..4 decode match
 // B1, without dequantizing a whole weight matrix for a prefill GEMM.
-template<bool ReuseTwo = false, bool CommitHistory = false>
+//
+// ReuseRows > 1 dequantizes one packed weight word once and reuses it for
+// ReuseRows sequences, so a verification window pays the weight read once per
+// row block instead of once per row. Every sequence still keeps its own FMA
+// chain in the B1 order, so the results are bit-identical to B1.
+template<int ReuseRows = 1, bool CommitHistory = false>
 void packed_nf4_decode_rows_bf16(Context& ctx,
                                 const Bnb4BitWeightRef& weight,
                                 Tensor& absmax_f32,
@@ -1873,7 +1852,9 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
     const size_t rows_per_group = wg_size / sub_group_size;
     const size_t groups_per_sequence =
         (static_cast<size_t>(out_features) + rows_per_group - 1) / rows_per_group;
-    const size_t num_groups = static_cast<size_t>(ReuseTwo ? rows / 2 : rows) * groups_per_sequence;
+    // ReuseRows > 1 is only dispatched for rows == ReuseRows (or rows == 4
+    // with ReuseRows == 2), so a row block spans a whole number of groups.
+    const size_t num_groups = static_cast<size_t>(rows / ReuseRows) * groups_per_sequence;
     const int rows_to_copy = CommitHistory ? std::min(rows, history_rows) : 0;
     const int first_token = CommitHistory ? (rows - rows_to_copy) : 0;
     const size_t total_history_elems = CommitHistory
@@ -1913,7 +1894,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
             }
             const int sg_id = lid / sub_group_size;
             const int sg_lane = lid % sub_group_size;
-            const size_t sequence = (item.get_group(0) / groups_per_sequence) * (ReuseTwo ? 2 : 1);
+            const size_t sequence = (item.get_group(0) / groups_per_sequence) * ReuseRows;
             const int group_row_base = static_cast<int>(item.get_group(0) % groups_per_sequence) *
                                        static_cast<int>(rows_per_group);
             const int row = group_row_base + sg_id;
@@ -1925,8 +1906,7 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
             }
             item.barrier(sycl::access::fence_space::local_space);
 
-            float partial = 0.0f;
-            float partial_second = 0.0f;
+            float partial[ReuseRows] = {};
             if (row < out_features) {
                 using vec8 = sycl::vec<bf16, 8>;
                 const int row_byte_base = row * packed_bytes_per_row;
@@ -1949,7 +1929,9 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const uint8_t b1 = static_cast<uint8_t>(p4 >> 8);
                     const uint8_t b2 = static_cast<uint8_t>(p4 >> 16);
                     const uint8_t b3 = static_cast<uint8_t>(p4 >> 24);
-                    if constexpr (ReuseTwo) {
+                    if constexpr (ReuseRows > 1) {
+                        // One dequantization feeds every sequence of the block;
+                        // each sequence keeps the B1 vec8 FMA order.
                         const float w0 = float(bf16(quant_map_cache[b0 >> 4] * am));
                         const float w1 = float(bf16(quant_map_cache[b0 & 15] * am));
                         const float w2 = float(bf16(quant_map_cache[b1 >> 4] * am));
@@ -1958,34 +1940,37 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                         const float w5 = float(bf16(quant_map_cache[b2 & 15] * am));
                         const float w6 = float(bf16(quant_map_cache[b3 >> 4] * am));
                         const float w7 = float(bf16(quant_map_cache[b3 & 15] * am));
-                        const vec8 v0 = *reinterpret_cast<const vec8*>(input_ptr + ib);
-                        const vec8 v1 = *reinterpret_cast<const vec8*>(input_ptr + in_features + ib);
-                        partial = sycl::fma(float(v0[0]),w0,partial); partial = sycl::fma(float(v0[1]),w1,partial);
-                        partial = sycl::fma(float(v0[2]),w2,partial); partial = sycl::fma(float(v0[3]),w3,partial);
-                        partial = sycl::fma(float(v0[4]),w4,partial); partial = sycl::fma(float(v0[5]),w5,partial);
-                        partial = sycl::fma(float(v0[6]),w6,partial); partial = sycl::fma(float(v0[7]),w7,partial);
-                        partial_second = sycl::fma(float(v1[0]),w0,partial_second); partial_second = sycl::fma(float(v1[1]),w1,partial_second);
-                        partial_second = sycl::fma(float(v1[2]),w2,partial_second); partial_second = sycl::fma(float(v1[3]),w3,partial_second);
-                        partial_second = sycl::fma(float(v1[4]),w4,partial_second); partial_second = sycl::fma(float(v1[5]),w5,partial_second);
-                        partial_second = sycl::fma(float(v1[6]),w6,partial_second); partial_second = sycl::fma(float(v1[7]),w7,partial_second);
+#pragma unroll
+                        for (int r = 0; r < ReuseRows; ++r) {
+                            const vec8 in_v = *reinterpret_cast<const vec8*>(
+                                input_ptr + static_cast<size_t>(r) * in_features + ib);
+                            partial[r] = sycl::fma(float(in_v[0]), w0, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[1]), w1, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[2]), w2, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[3]), w3, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[4]), w4, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[5]), w5, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[6]), w6, partial[r]);
+                            partial[r] = sycl::fma(float(in_v[7]), w7, partial[r]);
+                        }
                     } else {
                     const vec8 in_v = *reinterpret_cast<const vec8*>(input_ptr + ib);
-                    partial = sycl::fma(static_cast<float>(in_v[0]),
-                        static_cast<float>(bf16(quant_map_cache[b0 >> 4] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[1]),
-                        static_cast<float>(bf16(quant_map_cache[b0 & 0xF] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[2]),
-                        static_cast<float>(bf16(quant_map_cache[b1 >> 4] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[3]),
-                        static_cast<float>(bf16(quant_map_cache[b1 & 0xF] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[4]),
-                        static_cast<float>(bf16(quant_map_cache[b2 >> 4] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[5]),
-                        static_cast<float>(bf16(quant_map_cache[b2 & 0xF] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[6]),
-                        static_cast<float>(bf16(quant_map_cache[b3 >> 4] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(in_v[7]),
-                        static_cast<float>(bf16(quant_map_cache[b3 & 0xF] * am)), partial);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[0]),
+                        static_cast<float>(bf16(quant_map_cache[b0 >> 4] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[1]),
+                        static_cast<float>(bf16(quant_map_cache[b0 & 0xF] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[2]),
+                        static_cast<float>(bf16(quant_map_cache[b1 >> 4] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[3]),
+                        static_cast<float>(bf16(quant_map_cache[b1 & 0xF] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[4]),
+                        static_cast<float>(bf16(quant_map_cache[b2 >> 4] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[5]),
+                        static_cast<float>(bf16(quant_map_cache[b2 & 0xF] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[6]),
+                        static_cast<float>(bf16(quant_map_cache[b3 >> 4] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(in_v[7]),
+                        static_cast<float>(bf16(quant_map_cache[b3 & 0xF] * am)), partial[0]);
                     }
                 }
                 for (; byte_offset < packed_bytes_per_row;
@@ -1994,32 +1979,36 @@ void packed_nf4_decode_rows_bf16(Context& ctx,
                     const float am = absmax_ptr[row_block_base +
                         (byte_offset / packed_bytes_per_block)];
                     const int ii = byte_offset * 2;
-                    partial = sycl::fma(static_cast<float>(input_ptr[ii]),
+                    if constexpr (ReuseRows > 1) {
+                        const float w0 = float(bf16(quant_map_cache[(pb >> 4) & 0xF] * am));
+                        const float w1 = float(bf16(quant_map_cache[pb & 0xF] * am));
+#pragma unroll
+                        for (int r = 0; r < ReuseRows; ++r) {
+                            const bf16* row_input =
+                                input_ptr + static_cast<size_t>(r) * in_features;
+                            partial[r] = sycl::fma(float(row_input[ii]), w0, partial[r]);
+                            partial[r] = sycl::fma(float(row_input[ii + 1]), w1, partial[r]);
+                        }
+                    } else {
+                    partial[0] = sycl::fma(static_cast<float>(input_ptr[ii]),
                         static_cast<float>(bf16(
-                            quant_map_cache[(pb >> 4) & 0xF] * am)), partial);
-                    partial = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
+                            quant_map_cache[(pb >> 4) & 0xF] * am)), partial[0]);
+                    partial[0] = sycl::fma(static_cast<float>(input_ptr[ii + 1]),
                         static_cast<float>(bf16(
-                            quant_map_cache[pb & 0xF] * am)), partial);
-                    if constexpr (ReuseTwo) {
-                        partial_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii]),
-                            static_cast<float>(bf16(
-                                quant_map_cache[(pb >> 4) & 0xF] * am)), partial_second);
-                        partial_second = sycl::fma(static_cast<float>(input_ptr[in_features + ii + 1]),
-                            static_cast<float>(bf16(
-                                quant_map_cache[pb & 0xF] * am)), partial_second);
+                            quant_map_cache[pb & 0xF] * am)), partial[0]);
                     }
                 }
             }
 
-            const float sum = sycl::reduce_over_group(item.get_sub_group(), partial, sycl::plus<>());
-            float sum_second = 0.0f;
-            if constexpr (ReuseTwo) {
-                sum_second = sycl::reduce_over_group(item.get_sub_group(), partial_second, sycl::plus<>());
+            float sums[ReuseRows];
+#pragma unroll
+            for (int r = 0; r < ReuseRows; ++r) {
+                sums[r] = sycl::reduce_over_group(item.get_sub_group(), partial[r], sycl::plus<>());
             }
             if (sg_lane == 0 && row < out_features) {
-                out_ptr[row] = bf16(sum);
-                if constexpr (ReuseTwo) {
-                    out_ptr[out_features + row] = bf16(sum_second);
+#pragma unroll
+                for (int r = 0; r < ReuseRows; ++r) {
+                    out_ptr[static_cast<size_t>(r) * out_features + row] = bf16(sums[r]);
                 }
             }
         });
@@ -2698,12 +2687,16 @@ void Bnb4BitLinear::ForwardDecodeRows(Context& ctx,
          (out_features_ == 13312 || out_features_ == 7168 || out_features_ == 1280 ||
           out_features_ == 10240 || out_features_ == 2560)) ||
         (verify_reuse >= 3 && in_features_ == 640 && out_features_ == 2560);
-    // Four MTP hidden streams form two independent pairs; still two accumulators.
-    if ((rows == 2 && reuse_shape) ||
-        (draft_reuse && rows == 4 && in_features_ == 2560 && out_features_ == 2560))
-        packed_nf4_decode_rows_bf16<true>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+    // Four MTP hidden streams share one dequantized weight word per row block.
+    if (rows == 2 && reuse_shape)
+        packed_nf4_decode_rows_bf16<2>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+    else if (rows == 3 && reuse_shape)
+        packed_nf4_decode_rows_bf16<3>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+    else if (rows == 4 && (reuse_shape ||
+                           (draft_reuse && in_features_ == 2560 && out_features_ == 2560)))
+        packed_nf4_decode_rows_bf16<4>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
     else
-        packed_nf4_decode_rows_bf16<false>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
+        packed_nf4_decode_rows_bf16<1>(ctx, weight_, absmax_f32_, input, output, in_features_, out_features_, rows);
     if (!lora_attachments_.empty()) {
         // The in-order queue safely reuses the retained single-row adapter
         // intermediate, including attachments with different ranks/overlaps.
@@ -2748,11 +2741,19 @@ bool Bnb4BitLinear::TryForwardDecodeCommitHistory(Context& ctx, Tensor& input, T
           out_features_ == 10240 || out_features_ == 2560)) ||
         (verify_reuse >= 3 && in_features_ == 640 && out_features_ == 2560);
     if (rows == 2 && reuse_shape) {
-        packed_nf4_decode_rows_bf16<true, true>(ctx, weight_, absmax_f32_, input, output,
+        packed_nf4_decode_rows_bf16<2, true>(ctx, weight_, absmax_f32_, input, output,
+            in_features_, out_features_, rows, historyInput, history, channels, ringRow,
+            eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
+    } else if (rows == 3 && reuse_shape) {
+        packed_nf4_decode_rows_bf16<3, true>(ctx, weight_, absmax_f32_, input, output,
+            in_features_, out_features_, rows, historyInput, history, channels, ringRow,
+            eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
+    } else if (rows == 4 && reuse_shape) {
+        packed_nf4_decode_rows_bf16<4, true>(ctx, weight_, absmax_f32_, input, output,
             in_features_, out_features_, rows, historyInput, history, channels, ringRow,
             eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
     } else {
-        packed_nf4_decode_rows_bf16<false, true>(ctx, weight_, absmax_f32_, input, output,
+        packed_nf4_decode_rows_bf16<1, true>(ctx, weight_, absmax_f32_, input, output,
             in_features_, out_features_, rows, historyInput, history, channels, ringRow,
             eff_stride, historyRows, saveFirstRowOut, saveFirstRowCols);
     }
