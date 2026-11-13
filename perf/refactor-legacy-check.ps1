@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$CandidateBuild,
     [Parameter(Mandatory = $true)][string]$ModelDir,
     [string]$OutputDir = 'tmp\refactor\legacy-parity',
-    [string]$OneApiStack = 'oneapi-2026.1'
+    [string]$OneApiStack = 'oneapi-2026.2'
 )
 
 $ErrorActionPreference = 'Stop'

@@ -103,24 +103,63 @@ public:
         }
     }
 
-    // Explicitly resident CPU storage. This pointer is not USM and must not be
-    // dereferenced by a kernel. Account the rounded physical allocation.
+    // Explicitly resident CPU storage. When supported by the active SYCL
+    // backend (e.g. oneAPI 2026.2 + Level Zero v2) and enabled, registers the
+    // native 2 MB large-page allocation with Level Zero for zero-copy DMA/access
+    // without replacing the underlying Windows large-page allocator.
     void* alloc_large_host(size_t bytes) {
         async_errors_->Rethrow();
         CheckTrace();
         bytes = aila::memory::LargePageAllocationSize(bytes);
         host_budget_.Check(bytes, "Large-page host");
         void* ptr = aila::memory::AllocateLargePages(bytes);
+        bool registered = false;
+#if __has_include(<sycl/ext/oneapi/experimental/register_host_memory.hpp>)
+        if (should_register_large_host_memory() &&
+            q_.get_device().has(sycl::aspect::ext_oneapi_register_host_memory)) {
+            try {
+                sycl::ext::oneapi::experimental::register_host_memory(
+                    ptr, bytes, q_.get_context());
+                registered = true;
+            } catch (...) {
+                registered = false;
+            }
+        }
+#endif
         try {
             alloc_bytes_.emplace(
-                ptr, Allocation{bytes, AllocationKind::LargePageHost});
+                ptr, Allocation{bytes, AllocationKind::LargePageHost,
+                                nullptr, registered});
             host_budget_.Acquire(bytes, "Large-page host");
             return ptr;
         } catch (...) {
             alloc_bytes_.erase(ptr);
+#if __has_include(<sycl/ext/oneapi/experimental/register_host_memory.hpp>)
+            if (registered) {
+                try {
+                    sycl::ext::oneapi::experimental::unregister_host_memory(
+                        ptr, q_.get_context());
+                } catch (...) {}
+            }
+#endif
             aila::memory::FreeLargePages(ptr);
             throw;
         }
+    }
+
+    bool is_large_host_registered(const void* ptr) const {
+        if (!ptr) return false;
+        const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+        for (const auto& entry : alloc_bytes_) {
+            if (entry.second.kind == AllocationKind::LargePageHost &&
+                entry.second.host_registered) {
+                const auto start = reinterpret_cast<std::uintptr_t>(entry.first);
+                if (addr >= start && addr < start + entry.second.bytes) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void free_device(void* ptr) {
@@ -129,6 +168,7 @@ public:
         aila::diagnostics::ExecutionFields fields;
         AllocationKind kind = AllocationKind::Device;
         void* native_context = nullptr;
+        bool host_registered = false;
         if (it != alloc_bytes_.end()) {
             fields.bytes = it->second.bytes;
             fields.memory = it->second.IsHost()
@@ -136,6 +176,7 @@ public:
                                 : aila::diagnostics::TraceMemory::Device;
             kind = it->second.kind;
             native_context = it->second.native_context;
+            host_registered = it->second.host_registered;
         }
         TraceScope stage(trace_, TraceStage::UsmFree, fields);
         if (it != alloc_bytes_.end()) {
@@ -145,6 +186,14 @@ public:
         }
         switch (kind) {
         case AllocationKind::LargePageHost:
+#if __has_include(<sycl/ext/oneapi/experimental/register_host_memory.hpp>)
+            if (host_registered) {
+                try {
+                    sycl::ext::oneapi::experimental::unregister_host_memory(
+                        ptr, q_.get_context());
+                } catch (...) {}
+            }
+#endif
             aila::memory::FreeLargePages(ptr);
             break;
         case AllocationKind::UncachedHost:
@@ -298,9 +347,30 @@ private:
         size_t bytes;
         AllocationKind kind;
         void* native_context = nullptr;
+        bool host_registered = false;
 
         bool IsHost() const noexcept { return kind != AllocationKind::Device; }
     };
+
+    static bool should_register_large_host_memory() noexcept {
+        static const bool enabled = []() {
+#ifdef _WIN32
+            char* v = nullptr;
+            size_t len = 0;
+            if (_dupenv_s(&v, &len, "AILA_REGISTER_LARGE_HOST_MEMORY") != 0 || !v) {
+                return true;
+            }
+            const bool ok = !(*v == '0' && v[1] == '\0');
+            free(v);
+            return ok;
+#else
+            const char* v = std::getenv("AILA_REGISTER_LARGE_HOST_MEMORY");
+            if (!v || !*v) return true;
+            return !(v[0] == '0' && v[1] == '\0');
+#endif
+        }();
+        return enabled;
+    }
     std::unordered_map<void*, Allocation> alloc_bytes_;
     aila::memory::AllocationBudget device_budget_, host_budget_;
     std::unordered_map<std::type_index, std::shared_ptr<void>> workspaces_;

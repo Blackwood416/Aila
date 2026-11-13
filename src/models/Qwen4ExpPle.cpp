@@ -607,7 +607,7 @@ void Qwen4ExpPle::execute_prepare_slot(int slot, int num_tokens, const std::arra
 
 void Qwen4ExpPle::worker_loop() {
     if (ops::cpu::TilePoolPinningEnabled() && ops::cpu::PhysicalCoreCount() >= 6) {
-        ops::cpu::PinCurrentThreadToCore(1);
+        ops::cpu::PinCurrentThreadToNonWorkerCores();
     }
     while (true) {
         WorkerTask task;

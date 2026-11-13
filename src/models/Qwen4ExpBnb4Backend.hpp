@@ -743,6 +743,10 @@ private:
     bool cold_split_this_forward_ = false;
     bool deferred_cpu_join_pending_ = false;
     sycl::event deferred_cpu_merge_event_{};
+    bool defer_adaptive_swap_to_caller_ = false;
+    bool pending_adaptive_swap_ = false;
+    int pending_adaptive_max_swaps_ = 0;
+    void RunPendingAdaptiveSwap(Context& ctx);
     int cold_mode_ = 0; // 0 dynamic, 1 frozen + GPU cold, 2 frozen + bounded CPU cold
     bool resident_prefill_ = false;
     bool cold_epoch_enabled_ = true; // disabled explicitly during synthetic engine warmup

@@ -37,6 +37,7 @@ function Invoke-IncrementalBuild {
         throw "Cannot locate vcvars64.bat in Visual Studio installation."
     }
     $oneApiLibCandidates = @(
+        "C:\Program Files (x86)\Intel\oneAPI\compiler\2026.2\lib",
         "C:\Program Files (x86)\Intel\oneAPI\compiler\2026.1\lib",
         "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\lib"
     )

@@ -89,7 +89,7 @@ $env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'
 $env:UR_L0_BATCH_SIZE = '64'
 $env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
-$env:SYCL_CACHE_PERSISTENT = '1'
+$env:SYCL_CACHE_PERSISTENT = '0'
 
 # Both flags are read once per process, so they are set before the first run
 # rather than per iteration.

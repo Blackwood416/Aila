@@ -911,6 +911,8 @@ bool Qwen4ExpBnb4Backend::load(
                          aila::env::kv_quant_format_is_int8();
     const size_t kv_element_bytes = int8_kv ? 1 : sizeof(bf16);
     const int expert_cache_mb = aila::env::read_int("AILA_Q4E_EXPERT_CACHE_MB", 0);
+    const bool mtp_enabled = aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false) ||
+                             aila::env::read_flag("AILA_Q4E_SERVER_MTP", false);
     if (expert_cache_mb > 0) {
         expert_cache_bytes = static_cast<size_t>(expert_cache_mb) << 20;
     } else {
@@ -929,7 +931,9 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 1400))) << 20;
-        const size_t reserve = max_reserve + total_session_state;
+        // The draft head reserves a fixed 705 MB of resident expert slots.
+        const size_t mtp_reserve = mtp_enabled ? (static_cast<size_t>(705) << 20) : 0;
+        const size_t reserve = max_reserve + total_session_state + mtp_reserve;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
         expert_cache_bytes = vram > used + min_bytes ? vram - used : min_bytes;
@@ -973,7 +977,8 @@ bool Qwen4ExpBnb4Backend::load(
     // 3,456 = 72 slots/layer * 48 layers, so the auto VRAM budget (not the
     // guard) decides residency; the slot count still clamps to
     // expert_cache_bytes/slot_bytes minus the staging banks below.
-    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", lmHeadQ8Enabled_ ? 3456 : 3360);
+    const int default_max_gpu_slots = mtp_enabled ? 3072 : (lmHeadQ8Enabled_ ? 3456 : 3360);
+    const int max_gpu_slots = aila::env::read_int("AILA_Q4E_MAX_GPU_SLOTS", default_max_gpu_slots);
     // Reserve the staging banks by their configured depth (2 buffers).
     const int staging_reserve_slots = 2 * cache_cfg.staging_slots_per_buffer;
     cache_cfg.num_gpu_slots=std::min(max_gpu_slots,int(expert_cache_bytes/slot_bytes)-staging_reserve_slots);
@@ -1686,7 +1691,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     if (slot >= 0) { hit_slots[hit_count] = slot; hit_ranks[hit_count] = k; ++hit_count; }
                 }
                 if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
-                if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
+                if (export_enabled_ && cold_epoch_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
                 if (!hit_count) continue;
                 std::array<ops::MoeExpertSlotDev, kMaxTopK> hot{};
                 for (int i = 0; i < hit_count; ++i)
@@ -1817,8 +1822,10 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             }
 
             // 2. Observe routing for frequency tracking & stats
-            if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer, t_ids, top_k);
-            if (export_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
+            if (cold_epoch_enabled_) {
+                adaptive_cache_.ObserveRouting(layer, t_ids, top_k, 1.0f);
+            }
+            if (export_enabled_ && cold_epoch_enabled_) export_policy_.Observe(layer, t_ids, 1, top_k, false);
 
             // Native CPU sources remain owned until Join below. CPU work can
             // overlap the already submitted shared expert and resident kernels.
@@ -2139,8 +2146,11 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
 sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count) {
     const int top_k=cfg_.num_experts_per_tok;
     // Synthetic load-time warmup must not steer the adaptive hotset.
-    if (cold_epoch_enabled_) adaptive_cache_.ObserveRouting(layer,router_host_ids_,count*top_k);
-    if (export_enabled_) export_policy_.Observe(layer, router_host_ids_, count, top_k, true);
+    if (cold_epoch_enabled_) {
+        const float prefill_weight = std::min(1.0f, 32.0f / static_cast<float>(std::max(1, count)));
+        adaptive_cache_.ObserveRouting(layer, router_host_ids_, count * top_k, prefill_weight);
+    }
+    if (export_enabled_ && cold_epoch_enabled_) export_policy_.Observe(layer, router_host_ids_, count, top_k, true);
     std::fill(prefill_expert_uses_.begin(),prefill_expert_uses_.end(),0);
     prefill_unique_.clear();
     for (int i=0;i<count*top_k;++i) {
@@ -2623,6 +2633,29 @@ void Qwen4ExpBnb4Backend::EmbedTokens(
     }
     embed_h2d_event_ = ctx.memcpy_h2d_async(buf_.x.data(), embed_host_rows_,
                                             static_cast<size_t>(count) * row_bytes);
+}
+
+void Qwen4ExpBnb4Backend::RunPendingAdaptiveSwap(Context& ctx) {
+    if (!pending_adaptive_swap_) return;
+    pending_adaptive_swap_ = false;
+    const int max_swaps = pending_adaptive_max_swaps_;
+    pending_adaptive_max_swaps_ = 0;
+    static const int s_max_per_layer = std::max(1, aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS_PER_LAYER", 2));
+    auto swap_plans = adaptive_cache_.PlanSwaps(s_max_per_layer, max_swaps);
+    if (!swap_plans.empty()) {
+        sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
+        if (copy_q_) {
+            adaptive_cache_.BeginSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
+        } else {
+            adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
+        }
+    }
+    static const bool s_adaptive_swap_decay =
+        aila::env::read_flag("AILA_Q4E_ADAPTIVE_SWAP_DECAY", true);
+    static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 8);
+    if (s_adaptive_swap_decay) {
+        adaptive_cache_.Decay(s_adaptive_swap_freq <= 8 ? 0.92f : 0.85f);
+    }
 }
 
 sycl::event Qwen4ExpBnb4Backend::ForwardLmHead(
@@ -3188,9 +3221,10 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         ops::cpu::TilePoolPinningEnabled() && ops::cpu::PhysicalCoreCount() >= 6) {
         static thread_local bool s_host_pinned = false;
         if (!s_host_pinned) {
-            ops::cpu::PinCurrentThreadToCore(0);
+            ops::cpu::PinCurrentThreadToNonWorkerCores();
             s_host_pinned = true;
-            AILA_LOG_INFO("[Q4E HostThreadPin] pinned_core=0 physical_cores=%d", ops::cpu::PhysicalCoreCount());
+            AILA_LOG_INFO("[Q4E HostThreadPin] pinned_non_worker_cores=1 worker_threads=%d physical_cores=%d",
+                          ops::cpu::ConfiguredTilePoolThreads(), ops::cpu::PhysicalCoreCount());
         }
     }
     cold_split_this_forward_ = cold_split_num_ > 0 && direct_arena_stage_ &&
@@ -3505,6 +3539,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         };
         auto wait_actual_route = [&] {
             const auto begin = prof_clock::now();
+            if (L == 0 && adaptive_cache_.HasPendingSwaps()) {
+                adaptive_cache_.CompletePendingSwaps();
+            }
             actual_route_event.wait_and_throw();
             if (fused_x_stagein) {
                 expert_executor_.MarkComputeQueueSyncedAfterRoute();
@@ -3662,27 +3699,59 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
 
     bool run_adaptive_swap_now = false;
     int adaptive_max_swaps = 4;
-    if (adaptive_cache_.IsAllocated() && count == 1 && !options.decode_verification && !interior) {
-        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 16);
+    const bool end_of_prefill = is_prefill && options.need_logits && count > 4;
+    if (adaptive_cache_.IsAllocated() && cold_epoch_enabled_) {
+        static const int s_adaptive_swap_freq = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_FREQ", 8);
         static const int s_max_swaps = aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS", 4);
-        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 60);
+        static const int s_swap_min_pos = aila::env::read_int_raw("AILA_Q4E_ADAPTIVE_SWAP_MIN_POS", 48);
         adaptive_max_swaps = s_max_swaps;
-        if (s_adaptive_swap_freq > 0 && cached_len >= s_swap_min_pos &&
-            (cached_len % s_adaptive_swap_freq == 0)) {
+        if (end_of_prefill) {
             run_adaptive_swap_now = true;
+            adaptive_max_swaps = std::min(16, std::max(s_max_swaps, 16));
+        } else if (!interior && (count == 1 || options.decode_verification) &&
+                   s_adaptive_swap_freq > 0 && cached_len >= s_swap_min_pos) {
+            if (count == 1) {
+                if (cached_len % s_adaptive_swap_freq == 0) {
+                    run_adaptive_swap_now = true;
+                }
+            } else {
+                static int s_last_swap_bucket = -1;
+                const int prev_bucket = start_pos / s_adaptive_swap_freq;
+                const int curr_bucket = cached_len / s_adaptive_swap_freq;
+                if (curr_bucket < s_last_swap_bucket) {
+                    s_last_swap_bucket = -1;
+                }
+                if (curr_bucket > prev_bucket && curr_bucket != s_last_swap_bucket) {
+                    s_last_swap_bucket = curr_bucket;
+                    run_adaptive_swap_now = true;
+                }
+            }
         }
     }
-    if (run_adaptive_swap_now || !options.need_logits || !s_dump_dir.empty()) {
+    if ((run_adaptive_swap_now && !defer_adaptive_swap_to_caller_) || !options.need_logits || !s_dump_dir.empty()) {
         complete_deferred_cpu_join();
-        if (run_adaptive_swap_now) {
-            auto swap_plans = adaptive_cache_.PlanSwaps(1, adaptive_max_swaps);
+    }
+    if (run_adaptive_swap_now) {
+        if (defer_adaptive_swap_to_caller_) {
+            pending_adaptive_swap_ = true;
+            pending_adaptive_max_swaps_ = adaptive_max_swaps;
+        } else {
+            static const int s_max_per_layer = std::max(1, aila::env::read_int_raw("AILA_Q4E_MAX_SWAPS_PER_LAYER", 2));
+            auto swap_plans = adaptive_cache_.PlanSwaps(s_max_per_layer, adaptive_max_swaps);
             if (!swap_plans.empty()) {
                 sycl::queue& dma_q = copy_q_ ? *copy_q_ : ctx.queue();
-                adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
+                if (copy_q_) {
+                    adaptive_cache_.BeginSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
+                    if (!s_dump_dir.empty()) adaptive_cache_.CompletePendingSwaps();
+                } else {
+                    adaptive_cache_.ExecuteSwapsAsync(host_arena_, dma_q, swap_plans, direct_arena_stage_);
+                }
             }
             static const bool s_adaptive_swap_decay =
                 aila::env::read_flag("AILA_Q4E_ADAPTIVE_SWAP_DECAY", true);
-            if (s_adaptive_swap_decay) adaptive_cache_.Decay(0.85f);
+            if (s_adaptive_swap_decay) {
+                adaptive_cache_.Decay(end_of_prefill ? 0.50f : 0.85f);
+            }
         }
     }
 

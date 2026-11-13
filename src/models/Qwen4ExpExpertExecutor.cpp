@@ -683,9 +683,7 @@ void Qwen4ExpExpertExecutor::init(
     straggler_penalty_active_ = false;
     cpu_retry_countdown_ = 0;
     if (aila::env::read_flag("AILA_Q4E_CPU_OVERLAP", true) || aila::env::read_int("AILA_Q4E_COLD_MODE",0)>0) {
-        const int threads = std::clamp(
-            aila::env::read_int("AILA_Q4E_CPU_THREADS", std::clamp(ops::cpu::PhysicalCoreCount() - 2, 1, 16)),
-            1, 18);
+        const int threads = ops::cpu::ConfiguredTilePoolThreads();
         cpu_worker_ = std::make_unique<CpuWorker>(threads);
     }
     initialized_ = true;

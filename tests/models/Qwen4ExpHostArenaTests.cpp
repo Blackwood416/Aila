@@ -23,7 +23,10 @@ int main() {
         require(arena.TotalAllocatedBytes()==aila::memory::LargePageAllocationSize(8*arena.SlotBytes()),"rounded native accounting");
         require(ctx.current_pinned_host_bytes()==initial_host+arena.TotalAllocatedBytes()+arena.SlotBytes(),"Context accounting");
         auto* source=arena.GetExpertPointer(1,3);
-        require(sycl::get_pointer_type(source,ctx.queue().get_context())==sycl::usm::alloc::unknown,"arena must not be Host USM");
+        const auto expected_usm_kind = ctx.is_large_host_registered(source)
+            ? sycl::usm::alloc::host
+            : sycl::usm::alloc::unknown;
+        require(sycl::get_pointer_type(source,ctx.queue().get_context())==expected_usm_kind,"arena USM registration state mismatch");
 #ifdef _WIN32
         PSAPI_WORKING_SET_EX_INFORMATION info{}; info.VirtualAddress=source;
         require(QueryWorkingSetEx(GetCurrentProcess(),&info,sizeof(info)) && info.VirtualAttributes.Valid &&

@@ -92,6 +92,46 @@ inline int TilePoolWorkerCore(int worker_index, int first_core) {
     return begin + (worker_index % (total - begin));
 }
 
+inline int DefaultTilePoolThreads() {
+    const int total = PhysicalCoreCount();
+    return std::clamp(total - 3, 1, 15);
+}
+
+// Single source for the worker count: the pool, the executor job width, and the
+// coordinator's non-worker pinning must all agree on how many cores the pool
+// owns, otherwise the host thread can be pinned onto a pool worker's core.
+inline int ConfiguredTilePoolThreads() {
+    static const int threads = std::clamp(
+        aila::env::read_int("AILA_Q4E_CPU_THREADS", DefaultTilePoolThreads()),
+        1, 18);
+    return threads;
+}
+
+inline void PinCurrentThreadToNonWorkerCores(int reserved_begin = 2, int reserved_count = -1) {
+#if defined(_WIN32)
+    const auto& ids = PhysicalCoreIds();
+    const int total = int(ids.size());
+    if (total < 6) return;
+    const int workers = reserved_count > 0 ? reserved_count : ConfiguredTilePoolThreads();
+    const int end = std::clamp(reserved_begin + workers, reserved_begin, total);
+    GROUP_AFFINITY target{};
+    target.Group = WORD(unsigned(ids[0]) / 64u);
+    for (int i = 0; i < total; ++i) {
+        if (i >= reserved_begin && i < end) continue;
+        const int logical_cpu = ids[size_t(i)];
+        if (WORD(unsigned(logical_cpu) / 64u) == target.Group) {
+            target.Mask |= (KAFFINITY(1) << (unsigned(logical_cpu) & 63u));
+        }
+    }
+    if (target.Mask != 0 && SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr)) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+#else
+    (void)reserved_begin;
+    (void)reserved_count;
+#endif
+}
+
 inline bool TilePoolPinningEnabled() {
     static const bool enabled = aila::env::read_flag("AILA_Q4E_CPU_POOL_PIN", true);
     return enabled;

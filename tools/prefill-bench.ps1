@@ -47,7 +47,7 @@ $env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
 $env:UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
 $env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'
-$env:SYCL_CACHE_PERSISTENT = '1'
+$env:SYCL_CACHE_PERSISTENT = '0'
 $env:AILA_Q35_PREFILL_CHUNK = [string]$Chunk
 
 $sentence = 'The quick brown fox jumps over the lazy dog and then writes a long report about inference engines. '

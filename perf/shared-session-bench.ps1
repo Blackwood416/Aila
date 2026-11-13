@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelDir,
     [string]$BuildDir = 'build-refactor',
     [string]$OutputDir = 'tmp/refactor/q3-scheduler-bench',
-    [string]$OneApiStack = 'oneapi-2026.1',
+    [string]$OneApiStack = 'oneapi-2026.2',
     [hashtable]$EnvOverrides = @{},
     [ValidateRange(1, 3600)][int]$TimeoutSeconds = 600
 )

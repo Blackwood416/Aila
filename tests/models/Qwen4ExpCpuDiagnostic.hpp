@@ -16,6 +16,9 @@ inline constexpr float kQmap[16] = {-1.0f, -0.6961928009986877f, -0.525073051452
     -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
     0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
     0.4407079219818115f, 0.5626170039176941f, 0.7229568362236023f, 1.0f};
+#if defined(__clang__) && (defined(__x86_64__) || defined(_M_X64)) && !defined(__SYCL_DEVICE_ONLY__)
+__attribute__((target("fma")))
+#endif
 inline float host_fma(float a, float b, float c) {
     return _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
 }

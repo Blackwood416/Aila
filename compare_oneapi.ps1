@@ -1,9 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$BaselineBuildDir = 'build-oneapi-2025.3',
-    [string]$CandidateBuildDir = 'build-oneapi-2026.1',
+    [string]$CandidateBuildDir = 'build-oneapi-2026.2',
     [string]$BaselineStack = 'oneapi-2025.3',
-    [string]$CandidateStack = 'oneapi-2026.1',
+    [string]$CandidateStack = 'oneapi-2026.2',
     [string[]]$AccuracyCases = @(
         'q35_08_dense_text',
         'q35_vision_ocr',

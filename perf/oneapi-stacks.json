@@ -22,6 +22,17 @@
       "expectedDnnlVersion": "3.11.2",
       "expectedSyclDll": "sycl9.dll",
       "allowLegacyCompiler": false
+    },
+    "oneapi-2026.2": {
+      "role": "candidate",
+      "compilerRoot": "C:/Program Files (x86)/Intel/oneAPI/compiler/2026.2",
+      "dnnlRoot": "C:/Program Files (x86)/Intel/oneAPI/dnnl/2026.1",
+      "tbbRoot": "C:/Program Files (x86)/Intel/oneAPI/tbb/2023.2",
+      "umfRoot": "C:/Program Files (x86)/Intel/oneAPI/umf/1.2",
+      "expectedCompilerVersion": "2026.2.0",
+      "expectedDnnlVersion": "3.13.2",
+      "expectedSyclDll": "sycl9.dll",
+      "allowLegacyCompiler": false
     }
   }
 }

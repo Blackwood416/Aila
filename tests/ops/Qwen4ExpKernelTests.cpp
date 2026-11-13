@@ -3917,7 +3917,13 @@ void test_moe_prefill_wgshare_mapping_edges(Context& ctx) {
     ctx.memcpy_h2d(slots_dev, slots.data(), acts * sizeof(ops::MoeExpertSlotDev));
 
     const int gu_values = acts * gu_intermediate;
+    const int dn_in_values = acts * down_in_features;
     const int dn_values = acts * down_out_features;
+
+    std::vector<bf16> dn_in_host(dn_in_values);
+    for (auto& v : dn_in_host) v = bf16(in_dist(rng));
+    Tensor dn_in_dev = Tensor::allocate(ctx, {acts, down_in_features}, dnnl::memory::data_type::bf16);
+    ctx.memcpy_h2d(dn_in_dev.data(), dn_in_host.data(), dn_in_host.size() * sizeof(bf16));
 
     auto run_gu = [&](bool wgshare, int share, Tensor& h_out, const sycl::event* dep) {
         if (!wgshare) {
@@ -3951,7 +3957,7 @@ void test_moe_prefill_wgshare_mapping_edges(Context& ctx) {
     ctx.memcpy_h2d(ref_gu_dev.data(), ref_gu.data(), ref_gu.size() * sizeof(bf16));
     ctx.memcpy_h2d(ref_dn_dev.data(), ref_dn.data(), ref_dn.size() * sizeof(float));
     sycl::event ref_gu_ev = run_gu(false, 0, ref_gu_dev, nullptr);
-    sycl::event ref_dn_ev = run_dn(false, 0, ref_gu_dev, ref_dn_dev, &ref_gu_ev);
+    sycl::event ref_dn_ev = run_dn(false, 0, dn_in_dev, ref_dn_dev, &ref_gu_ev);
     ref_dn_ev.wait();
     ctx.memcpy_d2h(ref_gu.data(), ref_gu_dev.data(), ref_gu.size() * sizeof(bf16));
     ctx.memcpy_d2h(ref_dn.data(), ref_dn_dev.data(), ref_dn.size() * sizeof(float));
@@ -3965,7 +3971,7 @@ void test_moe_prefill_wgshare_mapping_edges(Context& ctx) {
         ctx.memcpy_h2d(ws_gu_dev.data(), ws_gu.data(), ws_gu.size() * sizeof(bf16));
         ctx.memcpy_h2d(ws_dn_dev.data(), ws_dn.data(), ws_dn.size() * sizeof(float));
         sycl::event ws_gu_ev = run_gu(true, share, ws_gu_dev, nullptr);
-        sycl::event ws_dn_ev = run_dn(true, share, ws_gu_dev, ws_dn_dev, &ws_gu_ev);
+        sycl::event ws_dn_ev = run_dn(true, share, dn_in_dev, ws_dn_dev, &ws_gu_ev);
         ws_dn_ev.wait();
         ctx.memcpy_d2h(ws_gu.data(), ws_gu_dev.data(), ws_gu.size() * sizeof(bf16));
         ctx.memcpy_d2h(ws_dn.data(), ws_dn_dev.data(), ws_dn.size() * sizeof(float));

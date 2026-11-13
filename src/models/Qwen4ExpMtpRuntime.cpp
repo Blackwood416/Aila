@@ -307,6 +307,17 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     }
     if (!captureHook.captured) Capture(s);
     const auto t_draft = s_work_summary ? Clock::now() : Clock::time_point{};
+    struct DeferSwapGuard {
+        Qwen4ExpBnb4Backend& backend;
+        Context& ctx;
+        DeferSwapGuard(Qwen4ExpBnb4Backend& b, Context& c) : backend(b), ctx(c) {
+            backend.defer_adaptive_swap_to_caller_ = true;
+        }
+        ~DeferSwapGuard() {
+            backend.defer_adaptive_swap_to_caller_ = false;
+            try { backend.RunPendingAdaptiveSwap(ctx); } catch (...) {}
+        }
+    } deferSwapGuard(target, ctx);
     {
         struct CaptureInputs {
             Qwen4ExpBnb4Backend& b;
@@ -338,6 +349,7 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
             (void)ctx.queue().ext_oneapi_submit_barrier()
                 .get_info<sycl::info::event::command_execution_status>();
         } catch (...) {}
+        target.RunPendingAdaptiveSwap(ctx);
         verifyGreedyEv.wait_and_throw();
         for (int r = 0; r < 2; ++r) {
             selected[r] = greedyResultHost[r];
@@ -345,6 +357,7 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
                 throw std::runtime_error("MTP nonfinite/invalid greedy logits");
         }
     } else {
+        target.RunPendingAdaptiveSwap(ctx);
         selected = Select(width);
     }
     int emitted = 1;

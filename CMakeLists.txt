@@ -22,6 +22,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project (Aila C CXX)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaRuntimeDllSelection.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AilaSyclPch.cmake")
+
+option(AILA_ENABLE_SYCL_PCH
+    "Enable bundled SYCL precompiled headers for IntelLLVM Ninja builds" ON)
+if(AILA_ENABLE_SYCL_PCH AND WIN32 AND MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    set(CMAKE_DEPFILE_FLAGS_CXX "-QMMD -QMT <OBJECT> -QMF <DEP_FILE>")
+endif()
 
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
@@ -378,6 +385,32 @@ target_include_directories(AilaLib PUBLIC
     ${PROJECT_SOURCE_DIR}/src
 )
 
+aila_configure_sycl_pch()
+set(AILA_LIB_SYCL_PCH_SOURCES ${LIB_SOURCES})
+list(REMOVE_ITEM AILA_LIB_SYCL_PCH_SOURCES
+    ${CHAT_SOURCES}
+    ${JINJA_SOURCES}
+    src/engine/AsrText.cpp
+    src/ops/Qwen4ExpCpuExpertOps.cpp
+    src/memory/LargePages.cpp
+    src/core/ExecutionTrace.cpp
+    src/inference/Session.cpp
+    src/inference/Request.cpp
+    src/inference/Scheduler.cpp
+    src/models/Qwen4ExpExpertReader.cpp
+    src/utils/Tokenizer.cpp
+    src/utils/ModelConfig.cpp
+    src/utils/ModelSpec.cpp
+    src/utils/MemoryMappedFile.cpp
+    src/utils/ForceAlignerPostProcess.cpp
+    src/utils/Base64.cpp
+    src/utils/JsonParser.cpp
+    src/vision/DetectionRenderer.cpp
+    src/audio/AudioPreprocessor.cpp
+    src/profile/Profiling.cpp
+)
+aila_enable_sycl_pch(AilaLib SOURCES ${AILA_LIB_SYCL_PCH_SOURCES})
+
 # ============================================================
 # Shared Library: AilaShared
 # ============================================================
@@ -425,6 +458,7 @@ set_target_properties(AilaShared PROPERTIES OUTPUT_NAME "AilaShared")
 add_executable(Aila src/main.cpp ${CLI_SOURCES})
 target_compile_definitions(Aila PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AILA_STATIC_LIB)
 target_link_libraries(Aila PRIVATE AilaLib)
+aila_enable_sycl_pch(Aila SOURCES src/main.cpp ${CLI_SOURCES})
 
 # ============================================================
 # Executable: AilaChatTests
@@ -898,9 +932,7 @@ target_include_directories(AilaQwen4ExpGenerationTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaQwen4ExpGenerationTests PRIVATE AilaLib)
-if(MSVC)
-    target_compile_options(AilaQwen4ExpGenerationTests PRIVATE /arch:AVX2)
-else()
+if(NOT MSVC)
     target_compile_options(AilaQwen4ExpGenerationTests PRIVATE -mavx2 -mfma)
 endif()
 add_test(NAME AilaQwen4ExpGenerationTests COMMAND AilaQwen4ExpGenerationTests)
@@ -914,9 +946,7 @@ target_include_directories(AilaQwen4ExpToleranceTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaQwen4ExpToleranceTests PRIVATE AilaLib)
-if(MSVC)
-    target_compile_options(AilaQwen4ExpToleranceTests PRIVATE /arch:AVX2)
-else()
+if(NOT MSVC)
     target_compile_options(AilaQwen4ExpToleranceTests PRIVATE -mavx2 -mfma)
 endif()
 add_test(NAME AilaQwen4ExpToleranceTests COMMAND AilaQwen4ExpToleranceTests)
@@ -1027,11 +1057,46 @@ target_include_directories(AilaQwen4ExpArenaVerifyTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/simdjson
 )
 target_link_libraries(AilaQwen4ExpArenaVerifyTests PRIVATE AilaLib)
-if(MSVC)
-    target_compile_options(AilaQwen4ExpArenaVerifyTests PRIVATE /arch:AVX2)
-else()
+if(NOT MSVC)
     target_compile_options(AilaQwen4ExpArenaVerifyTests PRIVATE -mavx2 -mfma)
 endif()
+
+foreach(aila_sycl_test_target IN ITEMS
+    AilaBnb4BitLinearKernelTests
+    AilaQsaAttentionProbe
+    AilaH2DBandwidthProbe
+    AilaKernelSubmitProbe
+    AilaConvOpsKernelTests
+    AilaYolo26InferRefAdapter
+    AilaDiffusionGemmaNf4InferRefAdapter
+    AilaQwen4ExpInferRefAdapter
+    AilaQwen4ExpKernelTests
+    AilaGdnChunkTests
+    AilaQwen4ExpMoeBench
+    AilaQwen4ExpGdnBench
+    AilaQwen4ExpDecodeMoeBench
+    AilaQwen4ExpPrefillSupplyBench
+    AilaQwen4ExpPrefillBlockBench
+    AilaQwen4ExpDecodeMiscBench
+    AilaQwen4ExpCpuMoePrefillBench
+    AilaQwen4ExpHostReadBench
+    AilaQwen4ExpArenaDmaBench
+    AilaQwen4ExpModuleTests
+    AilaQwen4ExpGenerationTests
+    AilaQwen4ExpToleranceTests
+    AilaQwen4ExpGpuQ8Tests
+    AilaMoeExpertXmxTests
+    AilaQwen4ExpHostArenaTests
+    AilaQwen4ExpAdaptiveCacheTests
+    AilaQwen4ExpArenaVerifyTests
+)
+    if(TARGET AilaLevelZero)
+        target_link_libraries(${aila_sycl_test_target} PRIVATE AilaLevelZero)
+    endif()
+    get_target_property(aila_target_srcs ${aila_sycl_test_target} SOURCES)
+    list(GET aila_target_srcs 0 aila_main_test_src)
+    aila_enable_sycl_pch(${aila_sycl_test_target} SOURCES ${aila_main_test_src})
+endforeach()
 add_test(NAME AilaQwen4ExpArenaVerifyTests COMMAND AilaQwen4ExpArenaVerifyTests)
 set_tests_properties(AilaQwen4ExpArenaVerifyTests PROPERTIES LABELS "gpu;models;qwen4_exp;verify" TIMEOUT 300)
 
@@ -1672,7 +1737,7 @@ file(WRITE "${stamp_path}" "ready\n")
         get_filename_component(AILA_SELECTED_RUNTIME_NAME "${AILA_SELECTED_RUNTIME_DLL}" NAME)
         string(TOLOWER "${AILA_SELECTED_RUNTIME_NAME}" AILA_SELECTED_RUNTIME_KEY)
         if(NOT AILA_SELECTED_RUNTIME_KEY MATCHES
-                "^(ur_loader|ur_win_proxy_loader|ur_adapter_opencl|ur_adapter_level_zero|ur_adapter_level_zero_v2|umf|xptifw|sycl-jit|opencl|intelocl64|common_clang64|libmmd.*|libhwloc-.*|tbb12|tbbbind|tbbbind_2_0|tbbbind_2_5|tbbmalloc|tbbmalloc_proxy|tcm|concrt140|msvcp140.*|vccorlib140|vcruntime140.*)\\.dll$")
+                "^(ur_loader|ur_loader_shared|ur_win_proxy_loader|ur_adapter_opencl|ur_adapter_level_zero|ur_adapter_level_zero_v2|umf|xptifw|sycl-jit|opencl|intelocl64|common_clang64|libmmd.*|libhwloc-.*|tbb12|tbbbind|tbbbind_2_0|tbbbind_2_5|tbbmalloc|tbbmalloc_proxy|tcm|concrt140|msvcp140.*|vccorlib140|vcruntime140.*)\\.dll$")
             continue()
         endif()
 

@@ -2,7 +2,7 @@ param(
     [string]$BuildDir = 'build',
     [ValidateSet('Release', 'RelWithDebInfo', 'Debug', 'MinSizeRel')]
     [string]$Config = 'Release',
-    [string]$OneApiStack = 'oneapi-2026.1',
+    [string]$OneApiStack = 'oneapi-2026.2',
     [string]$OneApiStacksFile = 'perf\oneapi-stacks.json',
     [switch]$Clean,
     [int]$Jobs = 36

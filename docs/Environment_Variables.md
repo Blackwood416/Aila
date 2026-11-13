@@ -277,7 +277,7 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 |----------|------|---------|-------------|
 | `AILA_Q4E_EXPERT_CACHE_MB` | int | `0` (auto) | GPU expert slot pool budget. Auto = device memory minus static weights, session KV/recurrent state for `max_seq_len`, and `AILA_Q4E_VRAM_RESERVE_MB` (floored at 1024 MB). |
 | `AILA_Q4E_VRAM_RESERVE_MB` | int | `1400` | Headroom kept free by the auto cache size for runtime buffers, oneDNN scratchpad, and display (~1.2–1.4 GB free VRAM at peak 8K prefill). |
-| `AILA_Q4E_MAX_GPU_SLOTS` | int | `3456` (preset / Q8 head) or `3360` | Maximum number of resident expert slots allocated in GPU VRAM (72 experts/layer × 48 layers = 3,456 slots ≈ 8.35 GB when `AILA_Q4E_LM_HEAD_Q8=1`; 3,360 otherwise). |
+| `AILA_Q4E_MAX_GPU_SLOTS` | int | `3456` (non-MTP) / `3072` (MTP) | Maximum number of resident expert slots allocated in GPU VRAM (`72 × 48 = 3,456` slots when MTP is disabled and `AILA_Q4E_LM_HEAD_Q8=1`, or `64 × 48 = 3,072` slots under `qwen38-a770` when `AILA_Q4E_MTP_DRAFT=1` / `AILA_Q4E_SERVER_MTP=1` to reserve `705 MiB` for the draft model + 8K prefill scratch headroom). |
 | `AILA_Q4E_LM_HEAD_Q8` | bool | `true` (preset) | Quantize the `[248320, 2560]` LM head to block-64 INT8 at load, saving 568.4 MiB of static VRAM and halving decode LM-head memory traffic. |
 | `AILA_Q4E_STAGING_SLOTS` | int | `16` | Number of expert slots per GPU staging bank (2 banks by default). |
 | `AILA_Q4E_HOT_RAM_MB` | int | `32768` (preset) | Host RAM budget for `Qwen4ExpHostArena` large-page complement. |
@@ -300,13 +300,15 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_CPU_POOL_SPIN_US` | int | `20000` | Spin duration in microseconds before `CpuTilePool` workers sleep on `workCv_`. |
 | `AILA_Q4E_CPU_RESULT_HOST_READ` | bool | `true` | Read CPU cold-expert down outputs directly from pinned host USM inside `moe_ordered_accumulate_cpu_host_rows` with by-value route weights. |
 | `AILA_Q4E_MOE_COPY_VIA_COPYQ` | bool | `true` | Route CPU-complement host copies through the dedicated in-order copy queue. |
+| `AILA_Q4E_CPU_THREADS` | int | `clamp(cores - 3, 1, 15)` | Number of `CpuTilePool` worker threads (`15` on an 18-core host, leaving 3 cores for the main submit thread, PLE worker, and OS). `PinCurrentThreadToNonWorkerCores()` automatically tracks this count. |
 | `AILA_Q4E_CPU_POOL_CLAIM` | int | `1` | Number of tiles claimed per atomic fetch in `CpuTilePool::Consume`. |
 | `AILA_Q4E_DECODE_DEFER_CPU_JOIN` | bool | `true` | Defer `JoinResidentCold` / `FinishResidentCpuRead` from layer `L` to layer `L+1` after `router_softmax_topk_device(L+1)` submission (requires `UR_L0_BATCH_SIZE >= 32`, preset to `64`). |
 | `AILA_Q4E_DECODE_EXACT256_MIN_LEN` | int | `256` | Minimum attended length to dispatch `attention_decode_exact_head256_partial_merge` for `head_dim=256`. |
-| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `16` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
+| `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `8` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
 | `AILA_Q4E_MAX_SWAPS` | int | `4` | Maximum expert swaps executed per swap interval. |
-| `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS` | int | `60` | Minimum sequence position before online decode expert swaps begin. |
-| `AILA_Q4E_ADAPTIVE_SWAP_DECAY` | bool | `true` | Multiply `Qwen4ExpAdaptiveCache` routing usage counters by `0.85` after each swap interval so early prompt routing does not permanently lock out later hot experts. |
+| `AILA_Q4E_MAX_SWAPS_PER_LAYER` | int | `2` | Maximum expert swaps allowed in a single layer per swap interval. |
+| `AILA_Q4E_ADAPTIVE_SWAP_MIN_POS` | int | `48` | Minimum sequence position before online decode expert swaps begin. |
+| `AILA_Q4E_ADAPTIVE_SWAP_DECAY` | bool | `true` | Multiply `Qwen4ExpAdaptiveCache` routing usage counters by `0.50` at end-of-prefill and `0.85` (`0.92` if `AILA_Q4E_ADAPTIVE_SWAP_FREQ <= 8`) after each swap interval. |
 | `AILA_Q4E_VERIFY_LINEAR_REUSE` | int | `3` | 2-row NF4 weight-reuse level during multi-row verification decode (`0` = off, `1` = `2560x16480`, `2` = +`6144x2560`, `3` = +`2560x13312`, `2560x7168`, `2560x1280`, `2560x10240`, `2560x2560`, `640x2560`). |
 | `AILA_Q4E_MTP_HIDDEN_REUSE` | bool | `true` | Enable 2-pair NF4 weight reuse for 4-row `2560x2560` MTP draft hidden projections. |
 | `AILA_Q4E_SERVER_MTP` | bool | `false` | Enable speculative 2-token MTP draft/verify runtime on `LoadedModel::LoadQwen4ExpNf4`. |

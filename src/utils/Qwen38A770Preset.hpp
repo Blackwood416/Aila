@@ -9,14 +9,18 @@ namespace aila {
 // Explicit environment overrides remain visible; expert arithmetic stays GPU-only.
 inline void ApplyQwen38A770Preset() {
     struct Setting { const char* name; const char* value; };
-    constexpr Setting settings[] = {
+    // MTP keeps a draft model plus its recurrent checkpoint resident, so the
+    // resident GPU expert budget drops to leave that headroom available.
+    const bool mtp_enabled = env::read_flag("AILA_Q4E_MTP_DRAFT", false) ||
+                             env::read_flag("AILA_Q4E_SERVER_MTP", false);
+    const Setting settings[] = {
         {"AILA_Q4E_PREFILL_XMX", "1"},
         {"AILA_Q4E_DIRECT_PREFILL_IO", "1"},
         {"AILA_Q4E_DEMAND_MICROBATCH", "32"},
         {"AILA_Q4E_PHASE_SCRATCH", "1"},
         {"AILA_Q4E_VRAM_RESERVE_MB", "1400"},
         {"AILA_Q4E_LM_HEAD_Q8", "1"},
-        {"AILA_Q4E_MAX_GPU_SLOTS", "3456"},
+        {"AILA_Q4E_MAX_GPU_SLOTS", mtp_enabled ? "3072" : "3456"},
         {"AILA_Q4E_HOT_RAM_MB", "32768"},
         {"AILA_Q4E_EXPERT_READER", "readfile"},
         // Round 2: 512 forces a 3K-token prompt through six chunks, and expert

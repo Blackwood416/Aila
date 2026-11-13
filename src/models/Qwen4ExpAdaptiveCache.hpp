@@ -295,6 +295,14 @@ public:
         const std::vector<AdaptiveSwapPlan>& plans,
         bool direct_arena = false);
 
+    void BeginSwapsAsync(
+        Qwen4ExpHostArena& arena,
+        sycl::queue& copy_q,
+        const std::vector<AdaptiveSwapPlan>& plans,
+        bool direct_arena = true);
+    void CompletePendingSwaps();
+    bool HasPendingSwaps() const noexcept { return swap_in_flight_ || resident_pending_; }
+
     // =========================================================================
     // Cold Expert Dual-Buffering Staging (Ping-Pong)
     // =========================================================================
@@ -360,6 +368,12 @@ private:
     bool staging_read_[AdaptiveCacheConfig::kMaxStagingBanks]{};
     sycl::event resident_ready_{}, resident_reader_{};
     bool resident_pending_=false, resident_read_=false;
+    bool swap_in_flight_=false;
+    int swap_d2h_count_=0;
+    sycl::event swap_d2h_ev_{};
+    std::array<uint8_t*, AdaptiveCacheConfig::kMaxStagingSlots> swap_d2h_dsts_{};
+    Qwen4ExpHostArena* swap_pending_arena_ = nullptr;
+    std::vector<AdaptiveSwapPlan> swap_pending_plans_;
 
     // Fast mapping tables
     std::vector<int32_t> slot_table_;           // Host table [num_layers * num_experts_per_layer]
