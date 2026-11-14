@@ -251,6 +251,7 @@ public:
         chat.maxBodyBytes = this->options.maxBodyBytes;
         chat.maxNewTokens = this->options.maxNewTokens;
         chat.maxOutputBytes = this->options.maxOutputBytes;
+        chat.defaultTemperature = this->options.defaultTemperature;
         chat.family = this->options.backend == "qwen3_nf4" ? ModelFamily::Qwen3Dense
             : this->options.backend == "qwen4exp_nf4" ? ModelFamily::Qwen4Exp : ModelFamily::Qwen35Hybrid;
     }

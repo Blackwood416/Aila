@@ -416,7 +416,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
 
             project_prefill(layer.qkv_proj, input, buf_.full_qkv);
             static const bool verify_decode_prepare = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_PREPARE", true);
-            if (verify_decode_prepare && allowQ8 && !interior && count >= 2 && count <= 4 && start_pos > 0 && !sparse_prefill) {
+            if (verify_decode_prepare && allowQ8 && !interior && count >= 2 && count <= 4 && start_pos > 0) {
                 // The same per-row RMSNorm/RoPE arithmetic and KV writes as decode,
                 // launched in one multi-row grid.
                 bf16* packed = buf_.full_qkv.data_as<bf16>();
@@ -538,11 +538,40 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             tile_count, tile_max_blocks, tile_start_pos, block_topk, compress_ratio,
                             &valid_counts_tile);
 
-                        ops::attention_prefill_qsa_batched(
-                            ctx, q_full_tile, cache.k, cache.v, buf_.qsa_tile_active_blocks, attn_out_tile,
-                            tile_count, tile_start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
-                            block_topk, compress_ratio, &z_tile, &valid_counts_tile,
-                            &cache.k_scale, &cache.v_scale);
+                        static const bool verify_decode_attention =
+                            aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", true);
+                        static const bool s_qsa_block_native =
+                            aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
+                        if (verify_decode_attention && allowQ8 && !interior && count >= 2 && count <= 4 &&
+                            s_qsa_block_native && !verify_rows_alignment_) {
+                            const size_t block_stride = static_cast<size_t>(block_topk + 4);
+                            for (int row = 0; row < tile_count; ++row) {
+                                const int row_len = tile_start_pos + row + 1;
+                                const int row_blocks = row_len / compress_ratio;
+                                const int row_active_blocks = std::min(row_blocks, block_topk);
+                                const int* row_blocks_ptr = buf_.qsa_tile_active_blocks.data_as<int>() +
+                                    static_cast<size_t>(row) * block_stride;
+                                auto q_row = Tensor::view(
+                                    ctx, q_full_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                auto z_row = Tensor::view(
+                                    ctx, z_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                auto out_row = Tensor::view(
+                                    ctx, attn_out_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                ops::attention_decode(
+                                    ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
+                                    full_q_heads_, full_kv_heads_, full_head_dim_, row_len,
+                                    &buf_.decode_attn_partials, &z_row,
+                                    nullptr, 0, row_blocks_ptr, row_active_blocks,
+                                    cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                    cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                            }
+                        } else {
+                            ops::attention_prefill_qsa_batched(
+                                ctx, q_full_tile, cache.k, cache.v, buf_.qsa_tile_active_blocks, attn_out_tile,
+                                tile_count, tile_start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
+                                block_topk, compress_ratio, &z_tile, &valid_counts_tile,
+                                &cache.k_scale, &cache.v_scale);
+                        }
                     }
                 } else {
                     // Fallback: cache raw K and compress blocks before row-by-row execution

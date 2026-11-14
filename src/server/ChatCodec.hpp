@@ -36,6 +36,7 @@ struct ChatSettings {
     // default; the server CLI may raise it up to 4 MiB.
     size_t maxBodyBytes = 1024 * 1024;
     size_t maxOutputBytes = 262144;
+    double defaultTemperature = 0.6;
     ModelFamily family = ModelFamily::Qwen3Dense;
 };
 

@@ -539,6 +539,7 @@ PreparedChat PrepareChat(std::string_view body, const Tokenizer& tokenizer, cons
     for (const char* field : {"max_tokens", "max_completion_tokens"}) {
         if (root.isMember(field)) generation.maxNewTokens = static_cast<uint32_t>(Unsigned(root[field], field, settings.maxNewTokens, false));
     }
+    generation.temperature = settings.defaultTemperature;
     if (root.isMember("temperature")) generation.temperature = Number(root["temperature"], "temperature");
     if (generation.temperature < 0 || (generation.temperature > 0 && static_cast<float>(generation.temperature) <= 0)) {
         Invalid("temperature", "Temperature must be nonnegative and representable as a float");

@@ -316,10 +316,12 @@ StepResult RequestState::StepLocked(size_t outputSlots) {
                 !options.thinkingBudget && !options.forceHostSampling && !options.legacyPrefillLogits &&
                 size_t(g.max_new_tokens) - snapshot.generatedIds.size() >= 2;
             if (eligible) {
+                const int availWidth = static_cast<int>(
+                    std::min<size_t>(4, size_t(g.max_new_tokens) - snapshot.generatedIds.size()));
                 auto window = session->ExecuteWindow(pendingToken, [&](int first) {
                     return !cancelRequested.load(std::memory_order_acquire) &&
                         std::find(options.stopTokenIds.begin(), options.stopTokenIds.end(), first) == options.stopTokenIds.end();
-                });
+                }, availWidth);
                 if (window) {
                     usedDecodeWindow = true;
                     pendingToken = -1;

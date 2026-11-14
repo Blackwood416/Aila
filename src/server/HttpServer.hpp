@@ -27,6 +27,7 @@ struct ServerOptions {
     uint32_t prefillChunkSize = 512;
     bool reuseSessions = false;
     uint32_t maxNewTokens = 1024;
+    double defaultTemperature = 0.6;
     size_t maxBodyBytes = 65536;
     size_t maxOutputBytes = 262144;
     size_t streamBufferBytes = 65536;

@@ -893,9 +893,13 @@ bool Qwen4ExpBnb4Backend::load(
         erase_bnb(prefix + "mlp.shared_expert.up_proj.weight");
     }
 
-    // PLE (Layer 1)
-    AILA_LOG_INFO("[Qwen4Exp] Initializing PLE (Layer 1)...");
-    if (!ple_.init(ctx, weights, 1, max_seq_len_, cfg_.rms_norm_eps, error_message)) {
+    // PLE (Layer 1): staging slots hold one forward slice (up to prefill chunk),
+    // not the full retained context, avoiding >2.5 GB VRAM/pinned bloat at 262K.
+    const int ple_chunk_cap = std::min(
+        max_seq_len_,
+        std::max(8192, aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 8192)));
+    AILA_LOG_INFO("[Qwen4Exp] Initializing PLE (Layer 1, staging_cap=%d)...", ple_chunk_cap);
+    if (!ple_.init(ctx, weights, 1, ple_chunk_cap, cfg_.rms_norm_eps, error_message)) {
         return false;
     }
 
@@ -931,9 +935,55 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 1400))) << 20;
-        // The draft head reserves a fixed 705 MB of resident expert slots.
-        const size_t mtp_reserve = mtp_enabled ? (static_cast<size_t>(705) << 20) : 0;
-        const size_t reserve = max_reserve + total_session_state + mtp_reserve;
+        const int prefill_chunk_cap = std::min(
+            max_seq_len_,
+            std::max(64, aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 8192)));
+        // Account for the full MTP footprint (705 MiB draft weights/slots/checkpoint +
+        // chunk-capped hiddenRows + MTP KV/session tensors) and prefill runtime buffers
+        // allocated lazily on the first prefill chunk so AILA_Q4E_VRAM_RESERVE_MB
+        // represents actual free WDDM headroom rather than getting eaten by workspace.
+        size_t mtp_reserve = 0;
+        if (mtp_enabled) {
+            const int mtp_cap = std::clamp(
+                aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048),
+                2,
+                std::max(2, max_seq_len_));
+            const int mtp_hidden_rows_cap = std::min(mtp_cap, std::max(8192, prefill_chunk_cap));
+            const size_t mtp_hidden_rows_bytes =
+                static_cast<size_t>(mtp_hidden_rows_cap) * 10240u * sizeof(bf16);
+            const size_t mtp_session_bytes =
+                static_cast<size_t>(mtp_cap) * 2304u +
+                static_cast<size_t>(std::max(1, mtp_cap / 4)) * 256u +
+                10240u * sizeof(bf16);
+            mtp_reserve = (static_cast<size_t>(705) << 20) + mtp_hidden_rows_bytes + mtp_session_bytes;
+        }
+        // Estimate peak workspace allocated by ensure_runtime_buffers(prefill_chunk_cap)
+        // plus WarmupPrefillKernels (linear_scratch_.weight_bf16 + xmx_scratch_).
+        const int ws_attn_cap = prefill_attention_tile_ ? std::min(prefill_chunk_cap, prefill_attention_tile_) : prefill_chunk_cap;
+        constexpr int ws_dense_limit = 2052;
+        const int ws_dense_cap = std::min(ws_attn_cap, ws_dense_limit);
+        const int ws_dense_kv_cap = std::min(max_seq_len_, ws_dense_limit);
+        const int ws_idx_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
+        const int ws_idx_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
+        const size_t ws_qsa_base = std::max({
+            size_t(ws_attn_cap) * size_t(full_fused_qkv_dim_) * sizeof(bf16),
+            size_t(full_q_heads_) * size_t(ws_dense_cap) * size_t(ws_dense_cap) * sizeof(float),
+            size_t(full_q_heads_) * size_t(ws_dense_cap) * size_t(ws_dense_kv_cap) * sizeof(float)});
+        const size_t ws_qsa_tail =
+            size_t(ws_attn_cap) * (size_t(full_q_dim_) * 2u + size_t(full_kv_dim_) * 2u +
+                                   size_t(ws_idx_out_dim) + size_t(ws_idx_q_dim)) * sizeof(bf16);
+        const size_t ws_phase_peak = std::max({
+            ws_qsa_base + ws_qsa_tail,
+            size_t(prefill_chunk_cap) * (20480u + 320u) * sizeof(bf16),
+            size_t(prefill_chunk_cap) * size_t(cfg_.num_experts_per_tok) * size_t(hidden_size_) * sizeof(float)});
+        const size_t ws_persistent_bufs =
+            size_t(prefill_chunk_cap) * (10240u + 2u * size_t(hidden_size_)) * sizeof(bf16) +
+            size_t(ws_attn_cap) * size_t(full_q_dim_) * sizeof(bf16) +
+            size_t(full_q_heads_) * size_t(max_seq_len_) * sizeof(float) +
+            size_t(full_q_heads_) * size_t((max_seq_len_ + 127) / 128) * size_t(full_head_dim_ == 256 ? 272 : 144) * sizeof(float) +
+            (static_cast<size_t>(520) << 20); // linear_scratch_.weight_bf16 + xmx_scratch_ + remaining buf_ + L0/oneDNN runtime headroom
+        const size_t workspace_reserve = ws_phase_peak + ws_persistent_bufs;
+        const size_t reserve = max_reserve + total_session_state + mtp_reserve + workspace_reserve;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
         expert_cache_bytes = vram > used + min_bytes ? vram - used : min_bytes;
@@ -941,7 +991,8 @@ bool Qwen4ExpBnb4Backend::load(
         AILA_LOG_INFO(
             "[Qwen4Exp] Memory Admission Accounting: Total VRAM=%.0f MB, Static Weights=%.1f MB, "
             "Session State=%.1f MB (KV=%.1f MB element_bytes=%zu kv_scales=%.1f MB, IndexerK=%.1f MB, "
-            "IndexerCompressedK=%.1f MB, Recurrent=%.1f MB), Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
+            "IndexerCompressedK=%.1f MB, Recurrent=%.1f MB), MTP=%.1f MB, Workspace=%.1f MB, "
+            "Reserve Headroom=%.0f MB, Expert Cache=%.0f MB",
             vram / (1024.0 * 1024.0),
             ctx.current_allocated_bytes() / (1024.0 * 1024.0),
             total_session_state / (1024.0 * 1024.0),
@@ -951,6 +1002,8 @@ bool Qwen4ExpBnb4Backend::load(
             indexer_k_bytes / (1024.0 * 1024.0),
             indexer_compressed_k_bytes / (1024.0 * 1024.0),
             recurrent_bytes / (1024.0 * 1024.0),
+            mtp_reserve / (1024.0 * 1024.0),
+            workspace_reserve / (1024.0 * 1024.0),
             max_reserve / (1024.0 * 1024.0),
             expert_cache_bytes / (1024.0 * 1024.0));
     }
@@ -3355,7 +3408,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         auto& cache = session.layerCaches_[L];
         if (!s_dump_dir.empty() || s_stages || dev_trace ||
             (!layer.is_linear && (start_pos + count) > 2051 &&
-             (!s_qsa_block_native || count > 1))) {
+             (!s_qsa_block_native || count > 4 || verify_rows_alignment_))) {
             complete_deferred_cpu_join();
         }
         // Round 2: layer boundary = queue idle from the previous layer's last

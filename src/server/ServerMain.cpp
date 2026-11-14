@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -40,11 +41,12 @@ void Usage() {
                  "  --port N                    Local 127.0.0.1 port (8080)\n"
                  "  --model-id NAME             HTTP model name (qwen3 / qwen3.5)\n"
                  "  --context N                 Session capacity, 32..262144 (4096)\n"
-                 "  --prefill-chunk-size N       Prefill work per scheduler step, 1..4096 (512)\n"
+                 "  --prefill-chunk-size N       Prefill work per scheduler step, 1..8192 (512)\n"
                  "  --reuse-sessions N           Reuse exact completed token prefixes, 0/1 (0)\n"
                  "  --sessions N                Concurrent requests, 1..4 (4)\n"
                  "  --decode-batch-size N       Compatible decode rows, 1..4 and <= sessions (1)\n"
                  "  --max-new-tokens N          Per-request generation limit, 1..32768 (1024)\n"
+                 "  --default-temperature N       Default temperature when omitted, 0..2 (0.6)\n"
                  "  --max-body-bytes N           Request body and rendered prompt limit (65536)\n"
                  "  --max-output-bytes N        Per-request serialized output limit (262144)\n"
                  "  --max-device-bytes N         Worker explicit USM device ceiling (0=unlimited)\n"
@@ -84,6 +86,13 @@ int main(int argc, char** argv) {
             else if (name == "--sessions") options.maxSessions = static_cast<uint32_t>(Number(value, 1, 4, name));
             else if (name == "--decode-batch-size") options.maxDecodeBatchSize = static_cast<uint32_t>(Number(value, 1, 4, name));
             else if (name == "--max-new-tokens") options.maxNewTokens = static_cast<uint32_t>(Number(value, 1, 32768, name));
+            else if (name == "--default-temperature") {
+                char* end = nullptr;
+                const double parsed = std::strtod(value.c_str(), &end);
+                if (value.empty() || !end || *end != '\0' || !std::isfinite(parsed) || parsed < 0.0 || parsed > 2.0 || (parsed > 0.0 && static_cast<float>(parsed) <= 0.0f))
+                    throw std::invalid_argument("Invalid --default-temperature");
+                options.defaultTemperature = parsed;
+            }
             else if (name == "--max-body-bytes") options.maxBodyBytes = static_cast<size_t>(Number(value, 65536, 4 * 1024 * 1024, name));
             else if (name == "--max-output-bytes") options.maxOutputBytes = static_cast<size_t>(Number(value, 4096, 4 * 1024 * 1024, name));
             else if (name == "--max-device-bytes") options.maxDeviceBytes = Number(value, 0, (std::numeric_limits<uint64_t>::max)(), name);

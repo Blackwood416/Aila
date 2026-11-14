@@ -221,7 +221,8 @@ public:
         return cache->CacheBytes() + (model->mtp ? Qwen4ExpMtpRuntime::SessionBytes(model->mtp->Capacity()) : 0);
     }
     bool SupportsDecodeWindow() const noexcept override { return model->mtp != nullptr; }
-    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector) override {
+    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector,
+                                                    int maxWidth = 0) override {
         if constexpr (!std::is_same_v<Backend, Qwen4ExpBnb4Backend>) return std::nullopt;
         else {
             auto& device = *model->device;
@@ -230,9 +231,12 @@ public:
             if (!model->mtp || !mtpState->valid || mtpState->length != cache->CurrentLength() ||
                 cache->CurrentLength() < 1 || cache->CurrentLength() + 2 > model->mtp->Capacity()) return std::nullopt;
             try {
-                LogSessionBoundary(device.context, "win-pre", 2, -1, pending);
-                auto window = model->mtp->ForwardWindow(*cache, *mtpState, pending, selector);
-                LogSessionBoundary(device.context, "win-post", 2, -1, window.tokenId);
+                const int effWidth = maxWidth > 0
+                    ? std::min(maxWidth, model->mtp->ConfiguredWidth())
+                    : model->mtp->ConfiguredWidth();
+                LogSessionBoundary(device.context, "win-pre", effWidth, -1, pending);
+                auto window = model->mtp->ForwardWindow(*cache, *mtpState, pending, selector, effWidth);
+                LogSessionBoundary(device.context, "win-post", effWidth, -1, window.tokenId);
                 return window;
             } catch (const std::exception& error) {
                 device.RecordFaultNoThrow(error.what()); device.DrainNoThrow();
@@ -729,7 +733,8 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
     }
     const bool hybrid = family == ModelFamily::Qwen35Hybrid;
     const bool qwen4exp = family == ModelFamily::Qwen4Exp;
-    static const bool requestedMtp = aila::env::read_flag("AILA_Q4E_SERVER_MTP", false);
+    static const bool requestedMtp = aila::env::read_flag("AILA_Q4E_SERVER_MTP", false) ||
+                                     aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false);
     bool enableMtp = qwen4exp && requestedMtp;
     const bool quantizedCache = hybrid
         ? aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")
@@ -874,7 +879,7 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         if (!backend) {
             AILA_LOG_WARN("[Q4E Warmup] Qwen4Exp backend unavailable; skipping warmup");
         } else {
-            int warmup_rows = aila::env::read_int_raw("AILA_INIT_WARMUP_ROWS", 4096);
+            int warmup_rows = aila::env::read_int_raw("AILA_INIT_WARMUP_ROWS", 16);
             warmup_rows = std::clamp(warmup_rows, 1, warmup_state->options.maxSequenceLength);
             const auto warmup_start = std::chrono::steady_clock::now();
             backend->SetColdEpochEnabled(false);
@@ -892,9 +897,22 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
                     warmup_ids[static_cast<size_t>(row)] = (row * 4099 + 12345) % warmup_vocab;
                 }
                 (void)session->ForwardLogits(warmup_ids);
+                backend->WarmupPrefillKernels(warmup_state->device->context);
                 const auto prefill_end = std::chrono::steady_clock::now();
                 std::vector<int> decode_ids{warmup_ids.back()};
                 (void)session->ForwardLogits(decode_ids);
+                if (warmup_state->mtp) {
+                    session->Reset();
+                    std::vector<int> mtp_seed{warmup_ids[0], warmup_ids[1 % warmup_ids.size()]};
+                    (void)session->ForwardLogits(mtp_seed);
+                    (void)session->ExecuteWindow(warmup_ids[2 % warmup_ids.size()],
+                                                 [](int) { return false; }, 2);
+                    for (int w = 2; w <= warmup_state->mtp->ConfiguredWidth(); ++w) {
+                        (void)session->ExecuteWindow(warmup_ids[(1 + w) % warmup_ids.size()],
+                                                     [](int) { return true; }, w);
+                    }
+                    warmup_state->mtp->ResetStats();
+                }
                 const auto decode_end = std::chrono::steady_clock::now();
                 prefill_ms = std::chrono::duration<double, std::milli>(
                     prefill_end - warmup_start).count();

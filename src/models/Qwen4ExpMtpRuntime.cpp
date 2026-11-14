@@ -51,10 +51,14 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
     try {
         if (cap < 2 || cap > target.max_seq_len())
             throw std::invalid_argument("MTP requires a draft window within the sequence budget");
-        configuredWidth = std::clamp(aila::env::read_int_raw("AILA_Q4E_MTP_WIDTH", 2), 2, 4);
+        const int serverWidth = aila::env::read_int_raw("AILA_Q4E_SERVER_MTP_WIDTH", 0);
+        const int widthDefault = (serverWidth >= 2 && serverWidth <= 4) ? serverWidth : 2;
+        configuredWidth = std::clamp(aila::env::read_int_raw("AILA_Q4E_MTP_WIDTH", widthDefault), 2, 4);
         target.ensure_runtime_buffers(ctx, std::min(cap, 64));
         draft = std::make_unique<Qwen4ExpMtpDraft>(ctx, target, weights);
-        hiddenRows = Tensor::allocate(ctx, {cap, 10240});
+        const int hiddenRowsCap = std::min(
+            cap, std::max(8192, aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 8192)));
+        hiddenRows = Tensor::allocate(ctx, {hiddenRowsCap, 10240});
         checkpoint = Tensor::allocate(ctx, {117669888 + 368640}, dnnl::memory::data_type::u8);
         linearInputs = Tensor::allocate(ctx, {48, 4, 16480});
         plePrefix = Tensor::allocate(ctx, {1, 10240}, dnnl::memory::data_type::f32);
@@ -114,11 +118,24 @@ void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector
         state.length = start + int(count);
         return;
     }
-    ctx.queue().memcpy(hiddenRows.data(), target.buf_.hidden4.data(), count * 10240 * sizeof(bf16));
+    const size_t capRows = static_cast<size_t>(std::max<int64_t>(1, hiddenRows.shape(0)));
     if (start) draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), tokens.front(), start - 1, true);
-    for (size_t r = 0; r + 1 < count; ++r)
-        draft->Step(*state.draft, hiddenRows.data_as<bf16>() + r * 10240, tokens[r + 1], start + int(r), true);
-    ctx.queue().memcpy(state.lastHidden.data(), hiddenRows.data_as<bf16>() + (count - 1) * 10240, 10240 * sizeof(bf16));
+    for (size_t base = 0; base < count; base += capRows) {
+        const size_t slice = std::min(capRows, count - base);
+        ctx.queue().memcpy(hiddenRows.data(),
+                           target.buf_.hidden4.data_as<bf16>() + base * 10240,
+                           slice * 10240 * sizeof(bf16));
+        const size_t stepEnd = std::min(slice, count - 1 - base);
+        for (size_t r = 0; r < stepEnd; ++r) {
+            draft->Step(*state.draft, hiddenRows.data_as<bf16>() + r * 10240,
+                        tokens[base + r + 1], start + int(base + r), true);
+        }
+        if (base + slice == count) {
+            ctx.queue().memcpy(state.lastHidden.data(),
+                               hiddenRows.data_as<bf16>() + (slice - 1) * 10240,
+                               10240 * sizeof(bf16));
+        }
+    }
     state.length = start + int(count);
 }
 std::array<ops::GreedyResult, 4> Qwen4ExpMtpRuntime::Select(int rows) {
@@ -278,7 +295,6 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     Qwen4ExpBnb4Backend::Session& s, State& state, int pending,
     const aila::inference::DecodeWindowSelector& acceptFirst, int maxWidth) {
     static const bool s_work_summary = aila::env::read_flag("AILA_Q4E_WORK_SUMMARY", false);
-    static const int s_server_width = std::clamp(aila::env::read_int_raw("AILA_Q4E_SERVER_MTP_WIDTH", 2), 2, 4);
     // Top-2 logit margin gates. A drafted token whose margin is below its
     // threshold rarely survives verification, so the window stops one column
     // earlier instead of paying for another draft step plus verify column.
@@ -295,7 +311,7 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
     using Clock = std::chrono::steady_clock;
     const auto t0 = s_work_summary ? Clock::now() : Clock::time_point{};
     const int start = s.CurrentLength();
-    const int reqWidth = maxWidth > 0 ? maxWidth : s_server_width;
+    const int reqWidth = maxWidth > 0 ? maxWidth : configuredWidth;
     int width = std::clamp(reqWidth, 2, std::min(4, capacity - start));
     const auto allocations = ctx.device_allocation_count();
     struct CaptureHook {

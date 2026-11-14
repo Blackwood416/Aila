@@ -161,13 +161,13 @@ ExecutionResult SessionState::Execute(const std::vector<int>& tokenIds,
 }
 
 std::optional<DecodeWindowResult> SessionState::ExecuteWindow(
-    int pendingToken, const DecodeWindowSelector& acceptFirst) {
+    int pendingToken, const DecodeWindowSelector& acceptFirst, int maxWidth) {
     std::lock_guard<std::mutex> lock(operationMutex);
     const int before = CheckedContextLength(*backend, capacity);
     if (pendingToken < 0 || pendingToken >= vocabSize)
         throw Error(ErrorCode::InvalidArgument, "Invalid pending token for decode window");
     if (capacity - before < 2) return std::nullopt;
-    auto result = backend->ForwardWindow(pendingToken, acceptFirst);
+    auto result = backend->ForwardWindow(pendingToken, acceptFirst, maxWidth);
     const int after = CheckedContextLength(*backend, capacity);
     if (!result) {
         if (after != before) throw Error(ErrorCode::RuntimeFault, "Declined decode window changed cache");

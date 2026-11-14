@@ -430,6 +430,20 @@ void DefaultsAndTemplate(const Fixture& fixture) {
     Expect(whitespace.promptIds == prepared.promptIds, "Legal JSON whitespace changed the request");
 }
 
+void DefaultTemperatureOverride(const Fixture& fixture) {
+    ChatSettings greedy = fixture.settings;
+    greedy.defaultTemperature = 0.0;
+    const auto omitted = PrepareChat(Serialize(Request()), fixture.tokenizer, greedy);
+    Expect(omitted.options.generation.temperature == 0.0, "Omitted temperature should inherit settings.defaultTemperature");
+    Expect(!omitted.options.generation.doSample, "Zero defaultTemperature should disable sampling");
+    auto body = Request();
+    body["temperature"] = 0.7;
+    const auto explicitTemp = PrepareChat(Serialize(body), fixture.tokenizer, greedy);
+    Expect(std::abs(explicitTemp.options.generation.temperature - 0.7) < 1e-6,
+           "Explicit request temperature should override settings.defaultTemperature");
+    Expect(explicitTemp.options.generation.doSample, "Non-zero request temperature should enable sampling");
+}
+
 void SupportedParameters(const Fixture& fixture) {
     auto body = Request();
     body["stream"] = true;
@@ -1738,6 +1752,7 @@ int main() {
         const Fixture fixture;
         const std::vector<std::pair<const char*, std::function<void()>>> tests = {
             {"defaults and trusted template", [&] { DefaultsAndTemplate(fixture); }},
+            {"default temperature override", [&] { DefaultTemperatureOverride(fixture); }},
             {"supported parameters and uint64 seeds", [&] { SupportedParameters(fixture); }},
             {"thinking budget aliases, bounds and model token metadata", [&] { ThinkingBudgetParameters(fixture); }},
             {"message roles and text parts", [&] { MessagesAndContentParts(fixture); }},

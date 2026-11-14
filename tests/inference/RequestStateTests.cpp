@@ -103,7 +103,8 @@ public:
         return model->batchEnabled ? model.get() : nullptr;
     }
     bool SupportsDecodeWindow() const noexcept override { return state->windowEnabled; }
-    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector) override {
+    std::optional<DecodeWindowResult> ForwardWindow(int pending, const DecodeWindowSelector& selector,
+                                                    int /*maxWidth*/ = 0) override {
         ++state->windows;
         state->context.push_back(pending);
         const int first = state->samples.at(state->samplesTaken++);

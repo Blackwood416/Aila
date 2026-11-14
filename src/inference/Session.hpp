@@ -116,7 +116,7 @@ public:
     virtual const void* DecodeBatchKey() const noexcept { return nullptr; }
     virtual bool SupportsDecodeWindow() const noexcept { return false; }
     virtual std::optional<DecodeWindowResult> ForwardWindow(int pendingToken,
-        const DecodeWindowSelector& acceptFirst) { return std::nullopt; }
+        const DecodeWindowSelector& acceptFirst, int maxWidth = 0) { return std::nullopt; }
     virtual std::vector<ExecutionResult> ForwardDecodeBatch(
         const std::vector<BackendDecodeInput>& rows);
 };
@@ -159,10 +159,11 @@ public:
 
 private:
     friend class RequestState;
+    friend class LoadedModel;
     void Acquire();
     void Release() noexcept;
     std::optional<DecodeWindowResult> ExecuteWindow(int pendingToken,
-        const DecodeWindowSelector& acceptFirst);
+        const DecodeWindowSelector& acceptFirst, int maxWidth = 0);
     void ResetCancelledWindow();
     ExecutionResult Execute(const std::vector<int>& tokenIds,
                             const SamplingInput* sampling,
