@@ -8084,6 +8084,121 @@ static void test_qsa_kv_stream(Context& ctx) {
     run_kv_stream_case(true);
 }
 
+static void test_attention_decode_qsa_rows(Context& ctx) {
+    constexpr int kHeads = 24;
+    constexpr int kKvHeads = 2;
+    constexpr int kHeadDim = 256;
+    constexpr int kBlockTopk = 512;
+    constexpr int kCompress = 4;
+    constexpr int kBlockStride = kBlockTopk + kCompress;
+    constexpr int kStartPos = 2050; // rows=4 spans pos 2050..2053 (tails 3, 0, 1, 2)
+    constexpr int kCap = 2400;
+    constexpr int kQDim = kHeads * kHeadDim;
+    constexpr int kMaxTiles = (kBlockTopk * kCompress + kCompress - 1 + 127) / 128;
+
+    auto run_case = [&](bool int8_kv) {
+        const auto dtype = int8_kv ? dnnl::memory::data_type::s8 : dnnl::memory::data_type::bf16;
+        Tensor k_cache = Tensor::allocate(ctx, {kKvHeads, kCap, kHeadDim}, dtype);
+        Tensor v_cache = Tensor::allocate(ctx, {kKvHeads, kCap, kHeadDim}, dtype);
+        Tensor k_scale, v_scale;
+        if (int8_kv) {
+            k_scale = Tensor::allocate(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32);
+            v_scale = Tensor::allocate(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32);
+            std::vector<int8_t> hk(static_cast<size_t>(kKvHeads) * kCap * kHeadDim);
+            std::vector<int8_t> hv(static_cast<size_t>(kKvHeads) * kCap * kHeadDim);
+            std::vector<float> hks(static_cast<size_t>(kKvHeads) * kCap);
+            std::vector<float> hvs(static_cast<size_t>(kKvHeads) * kCap);
+            for (size_t i = 0; i < hk.size(); ++i) {
+                hk[i] = static_cast<int8_t>(static_cast<int>((i * 29 + 7) % 199) - 99);
+                hv[i] = static_cast<int8_t>(static_cast<int>((i * 41 + 13) % 199) - 99);
+            }
+            for (size_t i = 0; i < hks.size(); ++i) {
+                hks[i] = 0.005f + 0.0001f * static_cast<float>(i % 19);
+                hvs[i] = 0.004f + 0.0001f * static_cast<float>(i % 23);
+            }
+            ctx.memcpy_h2d(k_cache.data(), hk.data(), hk.size());
+            ctx.memcpy_h2d(v_cache.data(), hv.data(), hv.size());
+            ctx.memcpy_h2d(k_scale.data(), hks.data(), hks.size() * sizeof(float));
+            ctx.memcpy_h2d(v_scale.data(), hvs.data(), hvs.size() * sizeof(float));
+        } else {
+            std::vector<bf16> hk(static_cast<size_t>(kKvHeads) * kCap * kHeadDim);
+            std::vector<bf16> hv(static_cast<size_t>(kKvHeads) * kCap * kHeadDim);
+            for (size_t i = 0; i < hk.size(); ++i) {
+                hk[i] = bf16(0.01f * static_cast<float>(static_cast<int>(i % 37) - 18));
+                hv[i] = bf16(0.01f * static_cast<float>(static_cast<int>((i * 3) % 41) - 20));
+            }
+            ctx.memcpy_h2d(k_cache.data(), hk.data(), hk.size() * sizeof(bf16));
+            ctx.memcpy_h2d(v_cache.data(), hv.data(), hv.size() * sizeof(bf16));
+        }
+
+        Tensor decode_scores = Tensor::allocate(ctx, {kHeads, kCap}, dnnl::memory::data_type::f32);
+        Tensor partials = Tensor::allocate(ctx, {4, kHeads, kMaxTiles, 272}, dnnl::memory::data_type::f32);
+        auto check_tensor_bitwise = [&](const Tensor& a, const Tensor& b, const std::string& what) {
+            if (a.size_bytes() != b.size_bytes()) throw std::runtime_error(what + " size mismatch");
+            std::vector<uint8_t> ba(a.size_bytes()), bb(b.size_bytes());
+            ctx.memcpy_d2h(ba.data(), a.data(), ba.size());
+            ctx.memcpy_d2h(bb.data(), b.data(), bb.size());
+            if (ba != bb) throw std::runtime_error(what + " bitwise mismatch");
+        };
+
+        for (int rows : {2, 3, 4}) {
+            Tensor q = Tensor::allocate(ctx, {rows, kQDim}, dnnl::memory::data_type::bf16);
+            Tensor z = Tensor::allocate(ctx, {rows, kQDim}, dnnl::memory::data_type::bf16);
+            Tensor out_batched = Tensor::allocate(ctx, {rows, kQDim}, dnnl::memory::data_type::bf16);
+            Tensor out_ref = Tensor::allocate(ctx, {rows, kQDim}, dnnl::memory::data_type::bf16);
+            Tensor active_blocks = Tensor::allocate(ctx, {rows, kBlockStride}, dnnl::memory::data_type::s32);
+
+            std::vector<bf16> hq(static_cast<size_t>(rows) * kQDim);
+            std::vector<bf16> hz(static_cast<size_t>(rows) * kQDim);
+            for (size_t i = 0; i < hq.size(); ++i) {
+                hq[i] = bf16(0.02f * static_cast<float>(static_cast<int>((i * 17) % 29) - 14));
+                hz[i] = bf16(0.05f * static_cast<float>(static_cast<int>((i * 11) % 31) - 15));
+            }
+            std::vector<int32_t> hb(static_cast<size_t>(rows) * kBlockStride, -1);
+            for (int r = 0; r < rows; ++r) {
+                const int row_len = kStartPos + r + 1;
+                const int num_comp = row_len / kCompress;
+                const int tail = row_len % kCompress;
+                for (int b = 0; b < kBlockTopk; ++b) {
+                    hb[static_cast<size_t>(r) * kBlockStride + b] = (b + r) % num_comp;
+                }
+                for (int t = 0; t < tail; ++t) {
+                    hb[static_cast<size_t>(r) * kBlockStride + kBlockTopk + t] = num_comp * kCompress + t;
+                }
+            }
+            ctx.memcpy_h2d(q.data(), hq.data(), hq.size() * sizeof(bf16));
+            ctx.memcpy_h2d(z.data(), hz.data(), hz.size() * sizeof(bf16));
+            ctx.memcpy_h2d(active_blocks.data(), hb.data(), hb.size() * sizeof(int32_t));
+
+            ops::attention_decode_qsa_rows(
+                ctx, q, k_cache, v_cache, out_batched, partials, &z,
+                active_blocks.data_as<int>(), kBlockStride, kStartPos, rows,
+                kHeads, kKvHeads, kHeadDim, kBlockTopk, kCompress,
+                int8_kv ? &k_scale : nullptr, int8_kv ? &v_scale : nullptr);
+
+            for (int r = 0; r < rows; ++r) {
+                auto q_row = Tensor::view(ctx, q.data_as<bf16>() + static_cast<size_t>(r) * kQDim, {1, kQDim});
+                auto z_row = Tensor::view(ctx, z.data_as<bf16>() + static_cast<size_t>(r) * kQDim, {1, kQDim});
+                auto o_row = Tensor::view(ctx, out_ref.data_as<bf16>() + static_cast<size_t>(r) * kQDim, {1, kQDim});
+                const int* row_blocks = active_blocks.data_as<int>() + static_cast<size_t>(r) * kBlockStride;
+                ops::attention_decode(
+                    ctx, q_row, k_cache, v_cache, o_row, decode_scores,
+                    kHeads, kKvHeads, kHeadDim, kStartPos + r + 1,
+                    &partials, &z_row, nullptr, 0, row_blocks, kBlockTopk,
+                    int8_kv ? &k_scale : nullptr, int8_kv ? &v_scale : nullptr);
+            }
+            ctx.synchronize();
+            check_tensor_bitwise(
+                out_ref, out_batched,
+                std::string("attention_decode_qsa_rows ") + (int8_kv ? "INT8" : "BF16") +
+                    " rows=" + std::to_string(rows));
+        }
+        std::cout << "[PASS] attention_decode_qsa_rows " << (int8_kv ? "INT8" : "BF16") << " rows=2..4 bitwise parity\n";
+    };
+    run_case(false);
+    run_case(true);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -8352,6 +8467,7 @@ int main(int argc, char** argv) {
         test_qsa_batched_scoring_and_selection(ctx);
         test_attention_prefill_qsa_batched(ctx);
         test_qsa_kv_stream(ctx);
+        test_attention_decode_qsa_rows(ctx);
 
         ctx.synchronize();
         ctx.release_execution_resources();

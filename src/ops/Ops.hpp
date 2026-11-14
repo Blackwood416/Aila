@@ -439,6 +439,21 @@ namespace ops {
                                int head_dim, int max_cached_len,
                                Tensor* exact_partials_buf = nullptr);
 
+    // Batched multi-row sparse QSA decode attention for 1..4 verify rows
+    // (head_dim == 256, block-native active_blocks at stride block_stride).
+    // Bit-identical to calling attention_decode per row when start_pos >=
+    // block_topk * compress_ratio.
+    void attention_decode_qsa_rows(Context& ctx,
+                                   Tensor& q, Tensor& k_cache, Tensor& v_cache,
+                                   Tensor& output, Tensor& partials_buf,
+                                   const Tensor* gate_buf,
+                                   const int* active_blocks, int block_stride,
+                                   int start_pos, int rows, int num_heads,
+                                   int num_kv_heads, int head_dim,
+                                   int block_topk, int compress_ratio,
+                                   const Tensor* k_scale = nullptr,
+                                   const Tensor* v_scale = nullptr);
+
     // Prefill Attention (seq_len > 1, initial prefill with start_pos=0)
     // q: [seq_len, num_heads * head_dim]
     // k: [seq_len, num_kv_heads * head_dim]  (本次 K, 已 RoPE)

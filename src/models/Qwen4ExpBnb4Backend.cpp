@@ -992,10 +992,20 @@ bool Qwen4ExpBnb4Backend::load(
                 static_cast<size_t>(mtp_cap) * 2304u +
                 static_cast<size_t>(std::max(1, mtp_cap / 4)) * 256u +
                 10240u * sizeof(bf16);
-            mtp_reserve = (static_cast<size_t>(705) << 20) + mtp_hidden_rows_bytes + mtp_session_bytes;
+            // Include Qwen4ExpMtpRuntime persistent device tensors:
+            // checkpoint (118,038,528 B) + linearInputs (48*4*16480*2 B) +
+            // logits (4*vocab*2 B) + verify scratch (~2 MiB).
+            const size_t mtp_runtime_bytes =
+                size_t{118038528u} +
+                size_t{48u} * 4u * 16480u * sizeof(bf16) +
+                size_t{4u} * static_cast<size_t>(cfg_.vocab_size) * sizeof(bf16) +
+                (static_cast<size_t>(2) << 20);
+            mtp_reserve = (static_cast<size_t>(705) << 20) + mtp_hidden_rows_bytes +
+                mtp_session_bytes + mtp_runtime_bytes;
         }
         // Estimate peak workspace allocated by ensure_runtime_buffers(prefill_chunk_cap)
-        // plus WarmupPrefillKernels (linear_scratch_.weight_bf16 + xmx_scratch_).
+        // plus WarmupPrefillKernels (linear_scratch_.weight_bf16 + xmx_scratch_)
+        // and PLE staging_cap.
         const int ws_attn_cap = prefill_attention_tile_ ? std::min(prefill_chunk_cap, prefill_attention_tile_) : prefill_chunk_cap;
         constexpr int ws_dense_limit = 2052;
         const int ws_dense_cap = std::min(ws_attn_cap, ws_dense_limit);
@@ -1018,17 +1028,33 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t ws_stage_peak = kv_stream_plan.enabled
             ? (std::max(ws_qsa_base, ws_kv_stage_half) + ws_qsa_tail + ws_kv_stage_half + ws_kv_stage_scales)
             : 0u;
+        const size_t ws_gdn_peak = (gdn_chunk_mode_ > 0 && grouped_xmx_supported_)
+            ? (size_t(ws_attn_cap) * size_t(linear_all_dim_) * sizeof(bf16) +
+               size_t(ws_attn_cap) * size_t(linear_kv_heads_) * 514u * sizeof(float))
+            : size_t(ws_attn_cap) * size_t(linear_all_dim_) * sizeof(bf16);
         const size_t ws_phase_peak = std::max({
             ws_qsa_base + ws_qsa_tail,
             ws_stage_peak,
+            ws_gdn_peak,
             size_t(prefill_chunk_cap) * (20480u + 320u) * sizeof(bf16),
             size_t(prefill_chunk_cap) * size_t(cfg_.num_experts_per_tok) * size_t(hidden_size_) * sizeof(float)});
+        const bool ws_xmx_c1_f32 =
+            aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_F16", 0) != 0 ||
+            aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", 0) != 0;
+        const size_t ws_xmx_scratch_bytes = prefill_expert_xmx_
+            ? (static_cast<size_t>(ws_xmx_c1_f32 ? 385 : 375) << 20)
+            : 0u;
+        const size_t ws_linear_scratch_bytes =
+            size_t(linear_all_dim_) * size_t(hidden_size_) * sizeof(bf16);
+        const size_t ws_ple_staging_bytes =
+            2u * size_t(prefill_chunk_cap) * size_t(hidden_size_) * sizeof(bf16);
         const size_t ws_persistent_bufs =
             size_t(prefill_chunk_cap) * (10240u + 2u * size_t(hidden_size_)) * sizeof(bf16) +
             size_t(ws_attn_cap) * size_t(full_q_dim_) * sizeof(bf16) +
             size_t(full_q_heads_) * size_t(max_seq_len_) * sizeof(float) +
             size_t(full_q_heads_) * size_t((max_seq_len_ + 127) / 128) * size_t(full_head_dim_ == 256 ? 272 : 144) * sizeof(float) +
-            (static_cast<size_t>(520) << 20); // linear_scratch_.weight_bf16 + xmx_scratch_ + remaining buf_ + L0/oneDNN runtime headroom
+            ws_xmx_scratch_bytes + ws_linear_scratch_bytes + ws_ple_staging_bytes +
+            (static_cast<size_t>(380) << 20); // qsa_tile_* + indexer_* + expert_*_dev + measured L0/oneDNN JIT runtime headroom
         const size_t workspace_reserve = ws_phase_peak + ws_persistent_bufs;
 
         size_t effective_vram_ceiling = vram > max_reserve ? (vram - max_reserve) : 0;
@@ -1668,13 +1694,14 @@ void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
         throw std::invalid_argument("AILA_Q4E_DECODE_TRIM_CAP requires 0 or a capacity of at least 64");
     int trim_cap = explicit_trim_cap;
     const char* trim_reason = "explicit";
+    aila::DxgiLocalVramInfo dxgi_before{};
     if (trim_cap == 0) {
         static const bool s_auto_trim = aila::env::read_flag("AILA_Q4E_AUTO_DECODE_TRIM", true);
         if (!s_auto_trim || runtime_seq_capacity_ <= 256) return;
-        const auto dxgi = aila::QueryDxgiLocalVram();
+        dxgi_before = aila::QueryDxgiLocalVram();
         const uint64_t trigger_bytes =
-            static_cast<uint64_t>(std::max(128, aila::env::read_int("AILA_Q4E_DECODE_TRIM_TRIGGER_MB", 512))) << 20;
-        if (!dxgi.valid || dxgi.availableBytes >= trigger_bytes) return;
+            static_cast<uint64_t>(std::max(128, aila::env::read_int("AILA_Q4E_DECODE_TRIM_TRIGGER_MB", 2048))) << 20;
+        if (!dxgi_before.valid || dxgi_before.availableBytes >= trigger_bytes) return;
         trim_cap = 64;
         trim_reason = "dxgi_low_headroom";
     }
@@ -1688,15 +1715,22 @@ void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
     // scratch and its host mirrors. The next large prefill grows normally.
     expert_executor_.AbortResidentCold();
     ctx.synchronize();
+    if (!dxgi_before.valid) dxgi_before = aila::QueryDxgiLocalVram();
     const int old_cap = runtime_seq_capacity_;
     const uint64_t bytes_before = ctx.current_allocated_bytes();
     runtime_seq_capacity_ = 0;
     ensure_runtime_buffers(ctx, trim_cap);
     const uint64_t bytes_after = ctx.current_allocated_bytes();
-    AILA_LOG_INFO("[Q4E DecodeTrim] reason=%s cap_before=%d cap_after=%d bytes_before=%llu bytes_after=%llu freed_bytes=%llu boundary=end_prefill",
-        trim_reason, old_cap, runtime_seq_capacity_, (unsigned long long)bytes_before,
-        (unsigned long long)bytes_after,
-        (unsigned long long)(bytes_before > bytes_after ? bytes_before - bytes_after : 0));
+    const auto dxgi_after = aila::QueryDxgiLocalVram();
+    AILA_LOG_INFO("[Q4E DecodeTrim] reason=%s cap=%d->%d usm_mb=%.1f->%.1f freed_mb=%.1f dxgi_used_mb=%.0f->%.0f/%.0f dxgi_avail_mb=%.0f->%.0f",
+        trim_reason, old_cap, runtime_seq_capacity_,
+        bytes_before / (1024.0 * 1024.0), bytes_after / (1024.0 * 1024.0),
+        (bytes_before > bytes_after ? bytes_before - bytes_after : 0) / (1024.0 * 1024.0),
+        dxgi_before.valid ? dxgi_before.currentUsageBytes / (1024.0 * 1024.0) : 0.0,
+        dxgi_after.valid ? dxgi_after.currentUsageBytes / (1024.0 * 1024.0) : 0.0,
+        dxgi_after.valid ? dxgi_after.dedicatedVideoMemoryBytes / (1024.0 * 1024.0) : 0.0,
+        dxgi_before.valid ? dxgi_before.availableBytes / (1024.0 * 1024.0) : 0.0,
+        dxgi_after.valid ? dxgi_after.availableBytes / (1024.0 * 1024.0) : 0.0);
 }
 
 void Qwen4ExpBnb4Backend::WarmupPrefillKernels(Context& ctx) {

@@ -284,19 +284,14 @@ public:
         return ForwardImpl(tokenIds, sampling, captureLogits, -1);
     }
 
-    // Prompt-phase entry point. MTP AfterForward needs complete target hidden
-    // rows, so while a chunk lands inside the draft window the phase close-out
-    // stays off and the existing path is used unchanged; a chunk that would
-    // leave the window keeps the close-out and lets the draft invalidate itself.
+    // Prompt-phase entry point. ForwardImpl defers TrimDecodeRuntimeBuffers
+    // until after MTP AfterForward reads target.buf_.hidden4.
     ExecutionResult ForwardPrefill(const std::vector<int>& tokenIds,
                                    const SamplingInput* sampling,
                                    bool captureLogits,
                                    int prefillRemaining,
                                    const int* nextTokens, int nextCount) override {
-        const int remaining = (model->mtp && mtpState && mtpState->valid &&
-                               cache->CurrentLength() + static_cast<int>(tokenIds.size()) <= model->mtp->Capacity())
-            ? -1 : prefillRemaining;
-        return ForwardImpl(tokenIds, sampling, captureLogits, remaining, nextTokens, nextCount);
+        return ForwardImpl(tokenIds, sampling, captureLogits, prefillRemaining, nextTokens, nextCount);
     }
 
 private:

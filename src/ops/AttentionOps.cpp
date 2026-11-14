@@ -786,19 +786,7 @@ void attention_decode_exact_head256_partial_merge_impl(
               float acc_lo = 0.0f;
               float acc_hi = 0.0f;
               for (int i = 0; i < tile_len; ++i) {
-                const int t = tile_start + i;
-                int cache_t = 0;
-                if (active_blocks != nullptr && num_active_blocks > 0) {
-                  if (t < num_active_blocks * 4) {
-                    cache_t = active_blocks[t / 4] * 4 + (t % 4);
-                  } else {
-                    cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
-                  }
-                } else if (active_indices) {
-                  cache_t = active_indices[t];
-                } else {
-                  cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
-                }
+                const int cache_t = token_map[i];
                 const float p = logits[i];
                 const float v_row_scale =
                     v_scale[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
@@ -812,20 +800,7 @@ void attention_decode_exact_head256_partial_merge_impl(
               for (int d = lid; d < head_dim; d += tile_wg) {
                 float acc = 0.0f;
                 for (int i = 0; i < tile_len; ++i) {
-                  const int t = tile_start + i;
-                  int cache_t = 0;
-                  if (active_blocks != nullptr && num_active_blocks > 0) {
-                    if (t < num_active_blocks * 4) {
-                      cache_t = active_blocks[t / 4] * 4 + (t % 4);
-                    } else {
-                      cache_t = active_blocks[num_active_blocks + (t - num_active_blocks * 4)];
-                    }
-                  } else if (active_indices) {
-                    cache_t = active_indices[t];
-                  } else {
-                    cache_t = ((t < sink_len) ? t : (tail_start + (t - sink_len)));
-                  }
-                  acc += logits[i] * v_acc.load(kv_head, cache_t, d);
+                  acc += logits[i] * v_acc.load(kv_head, token_map[i], d);
                 }
                 partial[kDecodeExact256PartialAccOffset + d] = acc;
               }
@@ -833,41 +808,23 @@ void attention_decode_exact_head256_partial_merge_impl(
           } else {
             for (int d = lid; d < head_dim; d += tile_wg) {
               float acc = 0.0f;
-              // Four cells per step with all four V loads issued before any FMA.
-              // The plain loop is 128 iterations of two dependent loads, i.e. a
-              // 128-deep latency chain per thread with almost no memory level
-              // parallelism, which is what three failed attempts to optimise the
-              // score phase (28.1, 30.1, 31) point at as the real cost here. The
-              // cells are still folded in ascending order, so the sums are those
-              // of the plain loop.
-              auto row_of = [&](int i) {
-                const int t = tile_start + i;
-                if (active_blocks != nullptr && num_active_blocks > 0) {
-                  return (t < num_active_blocks * 4)
-                             ? (active_blocks[t / 4] * 4 + (t % 4))
-                             : active_blocks[num_active_blocks +
-                                            (t - num_active_blocks * 4)];
-                }
-                if (active_indices) return active_indices[t];
-                return ((t < sink_len) ? t : (tail_start + (t - sink_len)));
-              };
               int i = 0;
               for (; i + 4 <= tile_len; i += 4) {
                 const float v0 =
-                    static_cast<float>(v_acc.load(kv_head, row_of(i), d));
+                    static_cast<float>(v_acc.load(kv_head, token_map[i], d));
                 const float v1 =
-                    static_cast<float>(v_acc.load(kv_head, row_of(i + 1), d));
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 1], d));
                 const float v2 =
-                    static_cast<float>(v_acc.load(kv_head, row_of(i + 2), d));
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 2], d));
                 const float v3 =
-                    static_cast<float>(v_acc.load(kv_head, row_of(i + 3), d));
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 3], d));
                 acc += logits[i] * v0;
                 acc += logits[i + 1] * v1;
                 acc += logits[i + 2] * v2;
                 acc += logits[i + 3] * v3;
               }
               for (; i < tile_len; ++i) {
-                acc += logits[i] * v_acc.load(kv_head, row_of(i), d);
+                acc += logits[i] * v_acc.load(kv_head, token_map[i], d);
               }
               partial[kDecodeExact256PartialAccOffset + d] = acc;
             }
@@ -1423,6 +1380,289 @@ void attention_decode_exact_head256_partial_merge(
   } else if (fmt == kKvFmtInt8) run(std::integral_constant<int, kKvFmtInt8>{});
   else if (fmt == kKvFmtFp8) run(std::integral_constant<int, kKvFmtFp8>{});
   else run(std::integral_constant<int, kKvFmtBf16>{});
+}
+
+template <int Quantized>
+void attention_decode_qsa_rows_impl(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, const bf16 *gate_ptr, const int *active_blocks,
+    int block_stride, int start_pos, int rows, int num_heads, int num_kv_heads,
+    int block_topk, int compress_ratio, const float *k_scale,
+    const float *v_scale) {
+  constexpr int head_dim = 256;
+  constexpr int tile_t = kDecodeExact256Tile;
+  constexpr int tile_wg = kDecodeExact256TileWg;
+  constexpr int merge_wg = kDecodeExact256MergeWg;
+
+  const bf16 *q_ptr = static_cast<bf16 *>(q.data());
+  const void *k_ptr = k_cache.data();
+  const void *v_ptr = v_cache.data();
+  bf16 *o_ptr = static_cast<bf16 *>(output.data());
+  float *partials_ptr = static_cast<float *>(partials_buf.data());
+
+  const int heads_per_kv = num_heads / num_kv_heads;
+  const float scale = 1.0f / sycl::sqrt(static_cast<float>(head_dim));
+  const int max_seq_len = static_cast<int>(k_cache.shape(1));
+  const int max_eff_len = block_topk * compress_ratio + (compress_ratio - 1);
+  const int max_row_tiles = (max_eff_len + tile_t - 1) / tile_t;
+  const int row_dim = num_heads * head_dim;
+  const bool kv_i8_vec = kv_int8_vector_reads();
+
+  // Phase 1: compute per-(row, head, tile) exact softmax stats and V partials.
+  // Group mapping puts row innermost so adjacent work-groups process the same
+  // (tile_idx, head) across verify rows, maximizing L2 KV reuse.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> q_cache(sycl::range<1>(head_dim), cgh);
+    sycl::local_accessor<float, 1> logits(sycl::range<1>(tile_t), cgh);
+    sycl::local_accessor<float, 1> stats(sycl::range<1>(2), cgh);
+    sycl::local_accessor<int, 1> token_map(sycl::range<1>(tile_t), cgh);
+
+    const size_t total_groups =
+        static_cast<size_t>(max_row_tiles) * num_heads * rows;
+    cgh.parallel_for(
+        sycl::nd_range<1>(total_groups * tile_wg, tile_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = static_cast<int>(item.get_group(0));
+          const int hr = num_heads * rows;
+          const int tile_idx = group / hr;
+          const int rem = group % hr;
+          const int head = rem / rows;
+          const int row = rem % rows;
+
+          const int row_len = start_pos + row + 1;
+          const int row_tail = row_len - (row_len / compress_ratio) * compress_ratio;
+          const int effective_len = block_topk * compress_ratio + row_tail;
+          const int tile_start = tile_idx * tile_t;
+          if (tile_start >= effective_len) return;
+
+          const int lid = static_cast<int>(item.get_local_id(0));
+          const int kv_head = head / heads_per_kv;
+          const int tile_len = sycl::min(tile_t, effective_len - tile_start);
+          const bf16 *row_q = q_ptr + static_cast<size_t>(row) * row_dim;
+          const int *row_blocks =
+              active_blocks + static_cast<size_t>(row) * block_stride;
+          float *partial = partials_ptr +
+              ((static_cast<size_t>(row) * num_heads + head) * max_row_tiles +
+               tile_idx) * kDecodeExact256PartialStride;
+
+          KVCacheAccessor<Quantized> k_acc(k_ptr, k_scale, max_seq_len, head_dim);
+          KVCacheAccessor<Quantized> v_acc(v_ptr, v_scale, max_seq_len, head_dim);
+
+          for (int d = lid; d < head_dim; d += tile_wg) {
+            q_cache[d] = static_cast<float>(row_q[head * head_dim + d]);
+          }
+          for (int i = lid; i < tile_len; i += tile_wg) {
+            const int t = tile_start + i;
+            const int cache_t = (t < block_topk * compress_ratio)
+                ? (row_blocks[t / compress_ratio] * compress_ratio +
+                   (t % compress_ratio))
+                : row_blocks[block_topk + (t - block_topk * compress_ratio)];
+            token_map[i] = cache_t;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float score = -1e30f;
+          if (lid < tile_len) {
+            const int cache_t = token_map[lid];
+            score = 0.0f;
+            if constexpr (!Quantized) {
+              using vec8 = sycl::vec<bf16, 8>;
+              const bf16 *k_tok = static_cast<const bf16 *>(k_ptr) +
+                  static_cast<size_t>(kv_head) * max_seq_len * head_dim +
+                  static_cast<size_t>(cache_t) * head_dim;
+              for (int d = 0; d < head_dim; d += 8) {
+                const vec8 k_vec = *reinterpret_cast<const vec8 *>(k_tok + d);
+                score += q_cache[d + 0] * static_cast<float>(k_vec[0]);
+                score += q_cache[d + 1] * static_cast<float>(k_vec[1]);
+                score += q_cache[d + 2] * static_cast<float>(k_vec[2]);
+                score += q_cache[d + 3] * static_cast<float>(k_vec[3]);
+                score += q_cache[d + 4] * static_cast<float>(k_vec[4]);
+                score += q_cache[d + 5] * static_cast<float>(k_vec[5]);
+                score += q_cache[d + 6] * static_cast<float>(k_vec[6]);
+                score += q_cache[d + 7] * static_cast<float>(k_vec[7]);
+              }
+            } else if constexpr (Quantized == kKvFmtInt8) {
+              if (kv_i8_vec) {
+                const int8_t *k_tok = static_cast<const int8_t *>(k_ptr) +
+                    (static_cast<size_t>(kv_head) * max_seq_len + cache_t) *
+                        head_dim;
+                const float k_row_scale =
+                    k_scale[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                for (int d = 0; d < head_dim; d += 8) {
+                  const auto codes = *reinterpret_cast<const sycl::vec<int8_t, 8> *>(
+                      k_tok + d);
+                  score += q_cache[d + 0] * (static_cast<float>(codes[0]) * k_row_scale);
+                  score += q_cache[d + 1] * (static_cast<float>(codes[1]) * k_row_scale);
+                  score += q_cache[d + 2] * (static_cast<float>(codes[2]) * k_row_scale);
+                  score += q_cache[d + 3] * (static_cast<float>(codes[3]) * k_row_scale);
+                  score += q_cache[d + 4] * (static_cast<float>(codes[4]) * k_row_scale);
+                  score += q_cache[d + 5] * (static_cast<float>(codes[5]) * k_row_scale);
+                  score += q_cache[d + 6] * (static_cast<float>(codes[6]) * k_row_scale);
+                  score += q_cache[d + 7] * (static_cast<float>(codes[7]) * k_row_scale);
+                }
+              } else {
+                for (int d = 0; d < head_dim; d += 8) {
+                  score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+                  score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+                  score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+                  score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+                  score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+                  score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+                  score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+                  score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+                }
+              }
+            } else {
+              for (int d = 0; d < head_dim; d += 8) {
+                score += q_cache[d + 0] * k_acc.load(kv_head, cache_t, d + 0);
+                score += q_cache[d + 1] * k_acc.load(kv_head, cache_t, d + 1);
+                score += q_cache[d + 2] * k_acc.load(kv_head, cache_t, d + 2);
+                score += q_cache[d + 3] * k_acc.load(kv_head, cache_t, d + 3);
+                score += q_cache[d + 4] * k_acc.load(kv_head, cache_t, d + 4);
+                score += q_cache[d + 5] * k_acc.load(kv_head, cache_t, d + 5);
+                score += q_cache[d + 6] * k_acc.load(kv_head, cache_t, d + 6);
+                score += q_cache[d + 7] * k_acc.load(kv_head, cache_t, d + 7);
+              }
+            }
+            score *= scale;
+          }
+          logits[lid] = score;
+          const float tile_max = sycl::reduce_over_group(
+              item.get_group(), score, sycl::maximum<float>());
+          if (lid == 0) {
+            stats[0] = tile_max;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          float exp_score = 0.0f;
+          if (lid < tile_len) {
+            exp_score = sycl::native::exp(logits[lid] - stats[0]);
+            logits[lid] = exp_score;
+          } else {
+            logits[lid] = 0.0f;
+          }
+          const float tile_sum = sycl::reduce_over_group(
+              item.get_group(), exp_score, sycl::plus<float>());
+          if (lid == 0) {
+            stats[1] = tile_sum;
+            partial[0] = stats[0];
+            partial[1] = stats[1];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          if constexpr (Quantized == kKvFmtInt8) {
+            if (kv_i8_vec && head_dim == 2 * tile_wg) {
+              const int8_t *v_head = static_cast<const int8_t *>(v_ptr) +
+                  static_cast<size_t>(kv_head) * max_seq_len * head_dim;
+              float acc_lo = 0.0f;
+              float acc_hi = 0.0f;
+              for (int i = 0; i < tile_len; ++i) {
+                const int cache_t = token_map[i];
+                const float p = logits[i];
+                const float v_row_scale =
+                    v_scale[static_cast<size_t>(kv_head) * max_seq_len + cache_t];
+                const int8_t *v_row = v_head + static_cast<size_t>(cache_t) * head_dim;
+                acc_lo += p * (static_cast<float>(v_row[lid]) * v_row_scale);
+                acc_hi += p * (static_cast<float>(v_row[lid + tile_wg]) * v_row_scale);
+              }
+              partial[kDecodeExact256PartialAccOffset + lid] = acc_lo;
+              partial[kDecodeExact256PartialAccOffset + lid + tile_wg] = acc_hi;
+            } else {
+              for (int d = lid; d < head_dim; d += tile_wg) {
+                float acc = 0.0f;
+                for (int i = 0; i < tile_len; ++i) {
+                  acc += logits[i] * v_acc.load(kv_head, token_map[i], d);
+                }
+                partial[kDecodeExact256PartialAccOffset + d] = acc;
+              }
+            }
+          } else {
+            for (int d = lid; d < head_dim; d += tile_wg) {
+              float acc = 0.0f;
+              int i = 0;
+              for (; i + 4 <= tile_len; i += 4) {
+                const float v0 =
+                    static_cast<float>(v_acc.load(kv_head, token_map[i], d));
+                const float v1 =
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 1], d));
+                const float v2 =
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 2], d));
+                const float v3 =
+                    static_cast<float>(v_acc.load(kv_head, token_map[i + 3], d));
+                acc += logits[i] * v0;
+                acc += logits[i + 1] * v1;
+                acc += logits[i + 2] * v2;
+                acc += logits[i + 3] * v3;
+              }
+              for (; i < tile_len; ++i) {
+                acc += logits[i] * v_acc.load(kv_head, token_map[i], d);
+              }
+              partial[kDecodeExact256PartialAccOffset + d] = acc;
+            }
+          }
+        });
+  });
+
+  // Phase 2: merge per-tile statistics and apply optional output gate per row.
+  ctx.queue().submit([&](sycl::handler &cgh) {
+    sycl::local_accessor<float, 1> tile_factors(sycl::range<1>(max_row_tiles), cgh);
+    sycl::local_accessor<float, 1> norm_sum(sycl::range<1>(1), cgh);
+
+    cgh.parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(rows) * num_heads * merge_wg, merge_wg),
+        [=](sycl::nd_item<1> item) {
+          const int group = static_cast<int>(item.get_group(0));
+          const int row = group / num_heads;
+          const int head = group % num_heads;
+          const int lid = static_cast<int>(item.get_local_id(0));
+
+          const int row_len = start_pos + row + 1;
+          const int row_tail = row_len - (row_len / compress_ratio) * compress_ratio;
+          const int effective_len = block_topk * compress_ratio + row_tail;
+          const int row_num_tiles = (effective_len + tile_t - 1) / tile_t;
+          const float *head_partials = partials_ptr +
+              (static_cast<size_t>(row) * num_heads + head) * max_row_tiles *
+                  kDecodeExact256PartialStride;
+
+          if (lid == 0) {
+            float global_max = -1e30f;
+            for (int tile_idx = 0; tile_idx < row_num_tiles; ++tile_idx) {
+              const float *partial =
+                  head_partials + tile_idx * kDecodeExact256PartialStride;
+              global_max = sycl::fmax(global_max, partial[0]);
+            }
+            float sum = 0.0f;
+            for (int tile_idx = 0; tile_idx < row_num_tiles; ++tile_idx) {
+              const float *partial =
+                  head_partials + tile_idx * kDecodeExact256PartialStride;
+              const float factor = sycl::native::exp(partial[0] - global_max);
+              tile_factors[tile_idx] = factor;
+              sum += factor * partial[1];
+            }
+            norm_sum[0] = sum;
+          }
+          item.barrier(sycl::access::fence_space::local_space);
+
+          const float inv_sum = 1.0f / norm_sum[0];
+          const size_t row_off = static_cast<size_t>(row) * row_dim + head * head_dim;
+          for (int d = lid; d < head_dim; d += merge_wg) {
+            float acc = 0.0f;
+            for (int tile_idx = 0; tile_idx < row_num_tiles; ++tile_idx) {
+              const float *partial =
+                  head_partials + tile_idx * kDecodeExact256PartialStride;
+              acc += tile_factors[tile_idx] *
+                     partial[kDecodeExact256PartialAccOffset + d];
+            }
+            float val = static_cast<float>(bf16(acc * inv_sum));
+            if (gate_ptr != nullptr) {
+              float g_v = static_cast<float>(gate_ptr[row_off + d]);
+              float s = 1.0f / (1.0f + sycl::native::exp(-g_v));
+              val = static_cast<float>(bf16(val * s));
+            }
+            o_ptr[row_off + d] = bf16(val);
+          }
+        });
+  });
 }
 
 template <int MaxTiles, bool CacheActiveTokens>
@@ -2564,6 +2804,69 @@ void attention_decode_rows_exact_merge_impl(
   });
 }
 } // namespace
+
+void attention_decode_qsa_rows(
+    Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache, Tensor &output,
+    Tensor &partials_buf, const Tensor *gate_buf, const int *active_blocks,
+    int block_stride, int start_pos, int rows, int num_heads, int num_kv_heads,
+    int head_dim, int block_topk, int compress_ratio, const Tensor *k_scale,
+    const Tensor *v_scale) {
+  if (rows < 1 || rows > 4) {
+    throw std::invalid_argument("attention_decode_qsa_rows: rows must be 1..4");
+  }
+  if (head_dim != 256 || compress_ratio != 4 || block_topk <= 0 ||
+      block_stride < block_topk + compress_ratio ||
+      start_pos < block_topk * compress_ratio ||
+      num_heads <= 0 || num_kv_heads <= 0 || (num_heads % num_kv_heads) != 0 ||
+      !active_blocks) {
+    throw std::invalid_argument("attention_decode_qsa_rows: unsupported geometry");
+  }
+  const size_t row_elems = static_cast<size_t>(rows) * num_heads * head_dim;
+  const int max_eff_len = block_topk * compress_ratio + (compress_ratio - 1);
+  const int max_row_tiles = (max_eff_len + kDecodeExact256Tile - 1) / kDecodeExact256Tile;
+  const size_t need_partials =
+      static_cast<size_t>(rows) * num_heads * max_row_tiles * kDecodeExact256PartialStride;
+  if (!q.valid() || !k_cache.valid() || !v_cache.valid() || !output.valid() ||
+      !partials_buf.valid() || q.numel() < row_elems || output.numel() < row_elems ||
+      partials_buf.dtype() != dnnl::memory::data_type::f32 ||
+      partials_buf.numel() < need_partials) {
+    throw std::invalid_argument("attention_decode_qsa_rows: invalid buffers");
+  }
+  if (gate_buf && gate_buf->valid() && gate_buf->numel() < row_elems) {
+    throw std::invalid_argument("attention_decode_qsa_rows: gate buffer too small");
+  }
+  const int fmt = kv_cache_format_of(k_cache);
+  if (kv_cache_format_of(v_cache) != fmt) {
+    throw std::invalid_argument("attention_decode_qsa_rows: KV dtype mismatch");
+  }
+  if (fmt != kKvFmtBf16 &&
+      (!k_scale || !v_scale || !k_scale->valid() || !v_scale->valid())) {
+    throw std::invalid_argument("attention_decode_qsa_rows: quantized KV requires scales");
+  }
+  const bf16 *gate_ptr =
+      (gate_buf && gate_buf->valid()) ? static_cast<const bf16 *>(gate_buf->data()) : nullptr;
+  const float *k_scale_ptr =
+      (k_scale && k_scale->valid()) ? static_cast<const float *>(k_scale->data()) : nullptr;
+  const float *v_scale_ptr =
+      (v_scale && v_scale->valid()) ? static_cast<const float *>(v_scale->data()) : nullptr;
+
+  if (fmt == kKvFmtInt8) {
+    attention_decode_qsa_rows_impl<kKvFmtInt8>(
+        ctx, q, k_cache, v_cache, output, partials_buf, gate_ptr, active_blocks,
+        block_stride, start_pos, rows, num_heads, num_kv_heads, block_topk,
+        compress_ratio, k_scale_ptr, v_scale_ptr);
+  } else if (fmt == kKvFmtFp8) {
+    attention_decode_qsa_rows_impl<kKvFmtFp8>(
+        ctx, q, k_cache, v_cache, output, partials_buf, gate_ptr, active_blocks,
+        block_stride, start_pos, rows, num_heads, num_kv_heads, block_topk,
+        compress_ratio, k_scale_ptr, v_scale_ptr);
+  } else {
+    attention_decode_qsa_rows_impl<kKvFmtBf16>(
+        ctx, q, k_cache, v_cache, output, partials_buf, gate_ptr, active_blocks,
+        block_stride, start_pos, rows, num_heads, num_kv_heads, block_topk,
+        compress_ratio, k_scale_ptr, v_scale_ptr);
+  }
+}
 
 void attention_validate_qsa_active_blocks_graph(
     Context &ctx, const Tensor &k_cache, const Tensor &v_cache,

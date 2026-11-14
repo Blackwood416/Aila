@@ -285,7 +285,7 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_KV_RESIDENT_TOKENS` | int | `auto` (`16384` fallback, tiers `8208/16384/32768/65536`) | Number of logical KV tokens kept in the VRAM slot pool per full-attention layer when `AILA_Q4E_KV_STREAM=1` (minimum `8208` = `2052` 4-token blocks). When unset, load-time DXGI headroom selects the largest fitting tier. |
 | `AILA_Q4E_DXGI_BUDGET` | bool | `true` | Query Windows DXGI `LocalBudget - OtherProcessUsage` at load so `ExpertCache` and auto-tiered KV resident slots adapt to real available VRAM without WDDM paging. |
 | `AILA_Q4E_AUTO_DECODE_TRIM` | bool | `true` | Automatically trim `phase_scratch` back to `64` rows at the end of prefill (`TrimDecodeRuntimeBuffers`) when DXGI available VRAM drops below `AILA_Q4E_DECODE_TRIM_TRIGGER_MB`. |
-| `AILA_Q4E_DECODE_TRIM_TRIGGER_MB` | int | `512` | DXGI available VRAM threshold (MiB) below which `AILA_Q4E_AUTO_DECODE_TRIM` releases large prefill workspace before decode. |
+| `AILA_Q4E_DECODE_TRIM_TRIGGER_MB` | int | `2048` | DXGI available VRAM threshold (MiB) below which `AILA_Q4E_AUTO_DECODE_TRIM` releases large prefill workspace before decode. |
 | `AILA_Q4E_DECODE_TRIM_CAP` | int | `0` | Explicit post-prefill workspace trim capacity (`0` = automatic DXGI trigger only, `>=64` = always trim to this row capacity). |
 | `AILA_Q4E_MTP_BATCH_CATCHUP` | bool | `true` | Batch MTP draft prefill catch-up (`Qwen4ExpMtpDraft::StepBatchKvOnly`) instead of stepping token-by-token inside `AfterForward`. |
 | `AILA_Q4E_EXPERT_READER` | string | `readfile` (preset) | Reader backend used during initial model load (`readfile` or `mmap`). |

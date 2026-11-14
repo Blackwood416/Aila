@@ -628,25 +628,45 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                     buf_.qsa_resolved_blocks, nullptr);
                                 resolved_base = buf_.qsa_resolved_blocks.data_as<int>();
                             }
-                            for (int row = 0; row < tile_count; ++row) {
-                                const int row_len = tile_start_pos + row + 1;
-                                const int row_blocks = row_len / compress_ratio;
-                                const int row_active_blocks = std::min(row_blocks, block_topk);
-                                const int* row_blocks_ptr = resolved_base +
-                                    static_cast<size_t>(row) * block_stride;
-                                auto q_row = Tensor::view(
-                                    ctx, q_full_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
-                                auto z_row = Tensor::view(
-                                    ctx, z_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
-                                auto out_row = Tensor::view(
-                                    ctx, attn_out_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
-                                ops::attention_decode(
-                                    ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
-                                    full_q_heads_, full_kv_heads_, full_head_dim_, row_len,
-                                    &buf_.decode_attn_partials, &z_row,
-                                    nullptr, 0, row_blocks_ptr, row_active_blocks,
+                            const int max_eff_len = block_topk * compress_ratio + (compress_ratio - 1);
+                            const int max_row_tiles = (max_eff_len + 127) / 128;
+                            const size_t need_partials = static_cast<size_t>(tile_count) *
+                                static_cast<size_t>(full_q_heads_) *
+                                static_cast<size_t>(max_row_tiles) * 272u;
+                            if (tile_count >= 2 && tile_count <= 4 &&
+                                full_head_dim_ == 256 && compress_ratio == 4 && block_topk > 0 &&
+                                tile_start_pos >= block_topk * compress_ratio &&
+                                buf_.decode_attn_partials.valid() &&
+                                buf_.decode_attn_partials.numel() >= need_partials) {
+                                ops::attention_decode_qsa_rows(
+                                    ctx, q_full_tile, cache.k, cache.v, attn_out_tile,
+                                    buf_.decode_attn_partials, &z_tile, resolved_base,
+                                    static_cast<int>(block_stride), tile_start_pos, tile_count,
+                                    full_q_heads_, full_kv_heads_, full_head_dim_,
+                                    block_topk, compress_ratio,
                                     cache.k_scale.valid() ? &cache.k_scale : nullptr,
                                     cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                            } else {
+                                for (int row = 0; row < tile_count; ++row) {
+                                    const int row_len = tile_start_pos + row + 1;
+                                    const int row_blocks = row_len / compress_ratio;
+                                    const int row_active_blocks = std::min(row_blocks, block_topk);
+                                    const int* row_blocks_ptr = resolved_base +
+                                        static_cast<size_t>(row) * block_stride;
+                                    auto q_row = Tensor::view(
+                                        ctx, q_full_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                    auto z_row = Tensor::view(
+                                        ctx, z_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                    auto out_row = Tensor::view(
+                                        ctx, attn_out_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
+                                    ops::attention_decode(
+                                        ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
+                                        full_q_heads_, full_kv_heads_, full_head_dim_, row_len,
+                                        &buf_.decode_attn_partials, &z_row,
+                                        nullptr, 0, row_blocks_ptr, row_active_blocks,
+                                        cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                        cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                                }
                             }
                         } else {
                             Tensor& attn_k = cache.kv_stream_enabled ? stage_k : cache.k;

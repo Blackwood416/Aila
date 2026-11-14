@@ -87,6 +87,21 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         std::array<ops::cpu::CpuExpertGroup, ops::cpu::kMaxExpertBatchTasks> groups{};
         std::array<int, ops::cpu::kMaxExpertBatchTasks> group_members{};
         int group_count = 0;
+
+        void reset_header() {
+            reference_tasks = nullptr;
+            count = 0; hidden = 0; intermediate = 0; tokens = 0;
+            x = nullptr; h = nullptr; out = nullptr;
+            activation = sycl::event{};
+            route_event = sycl::event{};
+            output_reader = sycl::event{};
+            transfer_reader = sycl::event{};
+            route_ids = nullptr; route_selected = nullptr; route_sources = nullptr;
+            route_sources_resident = false;
+            route_top_k = 0; route_experts = 0;
+            resident_prepared = false;
+            group_count = 0;
+        }
     };
     struct Result {
         uint64_t activation_ns = 0, begin_ns = 0, end_ns = 0;
@@ -114,7 +129,8 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
     alignas(64) std::atomic<bool> pendingSignal{false};
     alignas(64) std::atomic<bool> doneSignal{false};
     const int spinUs = std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_HANDOFF_SPIN_US", 20000), 0, 50000);
-    Job job;
+    Job jobs[2];
+    int active_job_idx = 0;
     Result result;
     tbb::task_arena arena;
     std::unique_ptr<ops::cpu::CpuTilePool> tilePool;
@@ -177,10 +193,18 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         cv.notify_one();
         thread.join();
     }
-    void submit(const Job& next) {
+    Job& stage() {
         std::lock_guard<std::mutex> lock(mutex);
         if (busy) throw std::logic_error("CPU overlap slot still busy");
-        job = next; result = {}; busy = pending = true; done = false;
+        Job& next = jobs[active_job_idx ^ 1];
+        next.reset_header();
+        return next;
+    }
+    void submit_staged() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (busy) throw std::logic_error("CPU overlap slot still busy");
+        active_job_idx ^= 1;
+        result = {}; busy = pending = true; done = false;
         if (spinUs) {
             doneSignal.store(false, std::memory_order_relaxed);
             pendingSignal.store(true, std::memory_order_release);
@@ -515,15 +539,17 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
             ops::cpu::PinCurrentThreadToCore(ops::cpu::PhysicalCoreCount() >= 4 ? 2 : -1);
         }
         for (;;) {
-            Job current;
+            Job* current_ptr = nullptr;
             if (spinUs) spin_until(pendingSignal);
             {
                 std::unique_lock<std::mutex> lock(mutex);
                 cv.wait(lock, [&] { return pending || stop; });
                 if (stop) return;
-                current = job; pending = false;
+                current_ptr = &jobs[active_job_idx];
+                pending = false;
                 if (spinUs) pendingSignal.store(false, std::memory_order_relaxed);
             }
+            Job& current = *current_ptr;
             Result completed;
             try {
                 if (current.route_ids) {
@@ -743,7 +769,7 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
         cold_count_=std::min(count,max_cpu_credits_);
         cold_cached_count_=cold_count_; cold_mapped_count_=0;
         if (!cold_count_) return 0;
-        CpuWorker::Job job;
+        CpuWorker::Job& job = cpu_worker_->stage();
         job.count=cold_count_; job.hidden=hidden_size_; job.intermediate=intermediate_size_; job.tokens=tokens;
         job.x=x_host_; job.h=scratch_h_; job.out=cpu_out_host_; job.resident_prepared=true;
         job.output_reader=cpu_output_reader_event_;
@@ -757,8 +783,9 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
                 throw std::logic_error("CPU expert has no native RAM owner or rank");
             cold_source_slots_[c]=source; cold_ids_[c]=ids[c]; cold_ranks_[c]=ranks[c];
             job.tasks[c]={source,row_token};
+            job.mapped_tasks[c]=false;
         }
-        cold_submit_ns_=steady_ns(); cpu_worker_->submit(job);
+        cold_submit_ns_=steady_ns(); cpu_worker_->submit_staged();
         if (defer_transfer_wait) prev_cpu_h2d_ev_={};
         stats_.cpu_tasks_dispatched+=cold_count_;
         stats_.cpu_cached_tasks_dispatched+=cold_count_;
@@ -911,7 +938,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         cold_layer_ = layer;
         cold_count_ = task_count;
         cold_cached_count_ = task_count; cold_mapped_count_ = 0;
-        CpuWorker::Job job;
+        CpuWorker::Job& job = cpu_worker_->stage();
         job.count = task_count; job.hidden = hidden_size_; job.intermediate = intermediate_size_;
         job.tokens = rows;
         job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
@@ -932,6 +959,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
                     throw std::logic_error("CPU expert has no native RAM owner or rank");
                 cold_source_slots_[i] = source; cold_ids_[i] = ids[i]; cold_ranks_[i] = ranks[i];
                 job.tasks[i] = {source, r};
+                job.mapped_tasks[i] = false;
             }
             offset += count;
         }
@@ -987,7 +1015,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         arena_cold_rows_ = rows; arena_cold_rows_next_row_ = 0;
         arena_cold_rows_joined_ = false; arena_cold_rows_pending_ = true;
         cold_submit_ns_ = steady_ns();
-        cpu_worker_->submit(job);
+        cpu_worker_->submit_staged();
         stats_.cpu_tasks_dispatched += task_count;
         stats_.cpu_cached_tasks_dispatched += task_count;
         if (!arena_cold_rows_logged_) {
@@ -1132,7 +1160,7 @@ const ops::MoeCpuHostDownRows* Qwen4ExpExpertExecutor::ExecuteDraftCold(
         prev_cpu_h2d_ev_.wait_and_throw();
         prev_cpu_h2d_ev_ = {};
     }
-    CpuWorker::Job job;
+    CpuWorker::Job& job = cpu_worker_->stage();
     job.count = count;
     job.hidden = hidden_size_;
     job.intermediate = intermediate_size_;
@@ -1149,8 +1177,9 @@ const ops::MoeCpuHostDownRows* Qwen4ExpExpertExecutor::ExecuteDraftCold(
             throw std::logic_error("MTP draft CPU expert has invalid source or rank");
         }
         job.tasks[c] = {sources[c], 0};
+        job.mapped_tasks[c] = false;
     }
-    cpu_worker_->submit(job);
+    cpu_worker_->submit_staged();
     const auto result = cpu_worker_->finish();
     if (result.error) std::rethrow_exception(result.error);
     cpu_host_rows_.values = cpu_out_host_;
@@ -1208,7 +1237,7 @@ int Qwen4ExpExpertExecutor::StartArenaVerifyRows(const Qwen4ExpHostArena& arena,
         for (int e = 0; e < experts; ++e) {
             arena_verify_sources_[size_t(e)] = arena.GetExpertSlotHost(layer, e);
         }
-        CpuWorker::Job job;
+        CpuWorker::Job& job = cpu_worker_->stage();
         job.hidden = hidden_size_; job.intermediate = intermediate_size_; job.tokens = rows;
         job.x = x_host_; job.h = scratch_h_; job.out = cpu_out_host_; job.resident_prepared = true;
         job.activation = resident_input_event_; job.route_event = route_event;
@@ -1217,6 +1246,8 @@ int Qwen4ExpExpertExecutor::StartArenaVerifyRows(const Qwen4ExpHostArena& arena,
         job.route_top_k = top_k_; job.route_experts = experts;
         job.route_sources_resident = true;
         job.route_sources = arena_verify_sources_.data();
+        job.mapped_tasks.fill(false);
+        job.route_cpu_eligible.fill(false);
         for (int e = 0; e < experts; ++e)
             job.route_cpu_eligible[e] = arena.GetExpertPointer(layer, e) != nullptr;
         for (int rank = 0; rank < rows * top_k_; ++rank) {
@@ -1228,7 +1259,7 @@ int Qwen4ExpExpertExecutor::StartArenaVerifyRows(const Qwen4ExpHostArena& arena,
         cold_submit_ns_ = steady_ns();
         arena_verify_pending_ = true;
         arena_verify_arena_ = &arena;
-        cpu_worker_->submit(job);
+        cpu_worker_->submit_staged();
         if (!arena_verify_logged_) {
             AILA_LOG_INFO("[Q4E ArenaVerifyRowsEnabled] layer=%d rows=%d topk=%d experts=%d capacity=%d",
                 layer, rows, top_k_, experts, ops::cpu::kMaxExpertBatchTasks);
