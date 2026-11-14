@@ -42,7 +42,7 @@ function New-Trace {
 function Invoke-Comparison {
     param([AllowEmptyString()][string]$Baseline, [AllowEmptyString()][string]$Candidate,
           [switch]$MissingBaseline, [switch]$MissingCandidate, [switch]$NoOutputPath,
-          [switch]$OutputOverwritesBaseline)
+          [switch]$OutputOverwritesBaseline, [switch]$Subprocess)
 
     ++$script:caseIndex
     $caseDirectory = Join-Path $testRoot ("case $($script:caseIndex)")
@@ -54,37 +54,51 @@ function Invoke-Comparison {
     if (-not $MissingCandidate) { [IO.File]::WriteAllText($candidatePath, $Candidate, [Text.UTF8Encoding]::new($false)) }
     if ($OutputOverwritesBaseline) { $outputPath = $baselinePath }
 
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = $pwshPath
-    $start.WorkingDirectory = $caseDirectory
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.RedirectStandardOutput = $true
-    $start.RedirectStandardError = $true
-    foreach ($argument in @('-NoProfile', '-File', $comparator, '-BaselineLog', $baselinePath,
-                             '-CandidateLog', $candidatePath)) {
-        $start.ArgumentList.Add($argument)
-    }
-    if (-not $NoOutputPath) {
-        $start.ArgumentList.Add('-OutputPath')
-        $start.ArgumentList.Add($outputPath)
-    }
-    $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $start
-    try {
-        $null = $process.Start()
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(15000)) {
-            $process.Kill($true)
-            $process.WaitForExit()
-            throw 'Offline comparator exceeded the 15-second test timeout.'
+    $stdout = ''
+    $stderr = ''
+    $exitCode = 0
+    if ($Subprocess) {
+        $start = [Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $pwshPath
+        $start.WorkingDirectory = $caseDirectory
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        foreach ($argument in @('-NoProfile', '-File', $comparator, '-BaselineLog', $baselinePath,
+                                 '-CandidateLog', $candidatePath)) {
+            $start.ArgumentList.Add($argument)
         }
-        $stdout = $stdoutTask.GetAwaiter().GetResult()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        $exitCode = $process.ExitCode
-    } finally {
-        $process.Dispose()
+        if (-not $NoOutputPath) {
+            $start.ArgumentList.Add('-OutputPath')
+            $start.ArgumentList.Add($outputPath)
+        }
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            $null = $process.Start()
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(15000)) {
+                $process.Kill($true)
+                $process.WaitForExit()
+                throw 'Offline comparator exceeded the 15-second test timeout.'
+            }
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            $exitCode = $process.ExitCode
+        } finally {
+            $process.Dispose()
+        }
+    } else {
+        $global:LASTEXITCODE = 0
+        $outLines = if ($NoOutputPath) {
+            & $comparator -BaselineLog $baselinePath -CandidateLog $candidatePath 2>$null
+        } else {
+            & $comparator -BaselineLog $baselinePath -CandidateLog $candidatePath -OutputPath $outputPath 2>$null
+        }
+        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+        $stdout = [string]::Join([Environment]::NewLine, @($outLines))
     }
     try { $json = $stdout | ConvertFrom-Json -Depth 20 }
     catch { throw "Comparator did not emit JSON. Exit=$exitCode stderr=$stderr stdout=$stdout" }
@@ -122,7 +136,7 @@ function Test-Case {
 try {
     $valid = New-Trace
     Test-Case 'equal tokens with different display text and paths containing spaces' {
-        $result = Invoke-Comparison $valid ($valid.Replace("text='hello'", "text='你好'"))
+        $result = Invoke-Comparison $valid ($valid.Replace("text='hello'", "text='你好'")) -Subprocess
         Assert-True ($result.exitCode -eq 0 -and $result.json.equal -and $result.json.integrityPassed) 'Valid equal trace failed.'
         Assert-True ($result.json.baseline.sha256 -match '^[0-9A-F]{64}$' -and
                      $result.json.baseline.sha256 -cne $result.json.candidate.sha256) 'Log content SHA256 was not recorded.'

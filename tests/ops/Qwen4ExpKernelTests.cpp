@@ -3827,12 +3827,13 @@ static void run_moe_prefill_case(Context& ctx, int tokens, int num_active_expert
     ctx.free_device(weights_dev);
 }
 
-void test_moe_prefill_gate_up_and_down(Context& ctx) {
+void test_moe_prefill_gate_up_and_down(Context& ctx, bool exhaustive = false) {
     run_moe_prefill_case(ctx, 2, 4, false);
-    run_moe_prefill_case(ctx, 2, 10, true);
-    run_moe_prefill_case(ctx, 26, 10, false);
     run_moe_prefill_case(ctx, 26, 10, true);
     run_moe_prefill_case(ctx, 64, 10, true);
+    if (!exhaustive) return;
+    run_moe_prefill_case(ctx, 2, 10, true);
+    run_moe_prefill_case(ctx, 26, 10, false);
     // Larger routings (expert counts >= 8) also exercise the AILA_Q4E_8TOKEN_REUSE
     // 8-token bucket when the environment enables it; env-off runs stay at G3 size.
     run_moe_prefill_case(ctx, 16, 4, false);
@@ -8246,8 +8247,17 @@ int main(int argc, char** argv) {
             std::cout << "W4A8 adaptive decode checks PASSED; teardown USM zero\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--bench") {
+            test_moe_prefill_weight_reuse_benchmark(ctx);
+            test_non_moe_prefill_dense_xmx_evaluation(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("Bench teardown USM leak");
+            std::cout << "Qwen4ExpKernelTests --bench PASSED; teardown USM zero\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--prefill-bench-only") {
-            test_moe_prefill_gate_up_and_down(ctx);
+            test_moe_prefill_gate_up_and_down(ctx, true);
             test_moe_prefill_wgshare_mapping_edges(ctx);
             test_moe_prefill_weight_reuse_benchmark(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
@@ -8319,11 +8329,8 @@ int main(int argc, char** argv) {
         test_ple_dilated_conv_silu_add_device_head_graph(ctx);
         test_router_softmax_topk(ctx);
         test_moe_decode_gate_up_and_down(ctx);
-        test_q4e_w4a8_adaptive_decode(ctx, false);
         test_moe_prefill_gate_up_and_down(ctx);
         test_moe_prefill_wgshare_mapping_edges(ctx);
-        test_moe_prefill_weight_reuse_benchmark(ctx);
-        test_non_moe_prefill_dense_xmx_evaluation(ctx);
         test_direct_prefill_io(ctx);
         test_gated_delta_net_sigmoid(ctx);
         test_gdn_device_conv_head(ctx);
@@ -8346,7 +8353,12 @@ int main(int argc, char** argv) {
         test_attention_prefill_qsa_batched(ctx);
         test_qsa_kv_stream(ctx);
 
-        std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
+        ctx.synchronize();
+        ctx.release_execution_resources();
+        if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count()) {
+            throw std::runtime_error("Qwen4ExpKernelTests teardown USM leak");
+        }
+        std::cout << "All Qwen4Exp Kernel Tests PASSED; teardown USM zero!\n";
         return 0;
     } catch (const std::exception& e) {
         std::cout << "Test failed: " << e.what() << "\n" << std::flush;

@@ -93,7 +93,8 @@ $ctestTargets = $fastTargets + @(
     "AilaQwen4ExpModuleTests",
     "AilaQwen4ExpGenerationTests",
     "AilaQwen4ExpToleranceTests",
-    "AilaQwen4ExpAdaptiveCacheTests"
+    "AilaQwen4ExpAdaptiveCacheTests",
+    "AilaFakeInferenceWorker"
 )
 
 if (-not $SkipBuild) {
@@ -116,7 +117,7 @@ if ($Tier -eq "build") {
 
 $results = @()
 
-if ($Tier -in @("fast", "ctest", "all")) {
+if ($Tier -eq "fast") {
     $results += Invoke-Step "Bnb4BitLinear Kernel Tests" {
         & ".\$BuildDir\AilaBnb4BitLinearKernelTests.exe"
     }
@@ -138,6 +139,15 @@ if ($Tier -in @("fast", "ctest", "all")) {
 }
 
 if ($Tier -in @("ctest", "all")) {
+    $results += Invoke-Step "Bnb4BitLinear Kernel Tests" {
+        & ".\$BuildDir\AilaBnb4BitLinearKernelTests.exe"
+    }
+    $results += Invoke-Step "GDN Chunk Scan Parity Tests" {
+        & ".\$BuildDir\AilaGdnChunkTests.exe" --scan-parity
+    }
+    $results += Invoke-Step "MoE Expert XMX Pipeline Tests" {
+        & ".\$BuildDir\AilaMoeExpertXmxTests.exe"
+    }
     $results += Invoke-Step "Qwen4Exp Operator Kernel Suite" {
         & ".\$BuildDir\AilaQwen4ExpKernelTests.exe"
     }
@@ -152,6 +162,19 @@ if ($Tier -in @("ctest", "all")) {
 if ($Tier -in @("real", "all")) {
     if (-not (Test-Path $Model)) {
         throw "Real-model tier requires model directory at '$Model'"
+    }
+    $results += Invoke-Step "Real-Model Module Checks (--real-model)" {
+        $prevModel = $env:AILA_QWEN4EXP_MODEL_DIR
+        try {
+            $env:AILA_QWEN4EXP_MODEL_DIR = $Model
+            & ".\$BuildDir\AilaQwen4ExpModuleTests.exe" --real-model
+        } finally {
+            if ($null -eq $prevModel) {
+                Remove-Item Env:\AILA_QWEN4EXP_MODEL_DIR -ErrorAction SilentlyContinue
+            } else {
+                $env:AILA_QWEN4EXP_MODEL_DIR = $prevModel
+            }
+        }
     }
     $results += Invoke-Step "Real-Model Tolerance & E2E Generation (--model)" {
         $prevWarmup = $env:AILA_INIT_WARMUP

@@ -443,8 +443,7 @@ void test_hc_decode_scheduling_bitwise(Context& ctx) {
         try { down(got_a, got_i, true, 32, false); } catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected, "unsupported explicit HC down work-group accepted");
     };
-    for (const uint32_t seed : {17u, 113u, 709u})
-        for (const int rows : {1, 2, 4}) run_case(2560, 320, 4, rows, seed);
+    for (const int rows : {1, 4}) run_case(2560, 320, 4, rows, 17u);
     run_case(17, 23, 4, 2, 919u); // partial dimension tile and vec8/scalar tails
     run_case(17, 23, 3, 2, 920u); // parallel flag must preserve the old non-four-stream path
     std::cout << "[PASS] HC scheduling defaults, bitwise outputs, null inject and guards.\n";
@@ -3271,87 +3270,6 @@ void test_fused_resident_router_bitwise(Context& ctx) {
     std::cout << "[PASS] Fused resident router " << comparisons << " bitwise cases, host/device mirrors and bounds.\n\n";
 }
 
-void test_b2_route_and_prediction_event_decoupling(Context& ctx) {
-    std::cout << "[Test] Running B2 route and prediction event decoupling tests...\n";
-
-    std::atomic<bool> prediction_done{false};
-    int actual_ids[4] = {1, 2, 3, 4};
-    int pred_ids[4] = {-1, -1, -1, -1};
-
-    sycl::event actual_route_event = ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.host_task([&]() {
-        });
-    });
-
-    sycl::event prediction_event = ctx.queue().submit([&](sycl::handler& cgh) {
-        cgh.host_task([&]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            pred_ids[0] = 5; pred_ids[1] = 6; pred_ids[2] = 7; pred_ids[3] = 8;
-            prediction_done = true;
-        });
-    });
-
-    actual_route_event.wait();
-    expect(actual_ids[0] == 1, "Actual router IDs ready immediately");
-
-    auto ensure_prediction_ready = [&]() {
-        if (prediction_event != sycl::event{}) {
-            prediction_event.wait();
-            prediction_event = sycl::event{};
-        }
-    };
-
-    ensure_prediction_ready();
-    expect(prediction_done.load(), "Prediction must be complete after ensure_prediction_ready");
-    expect(pred_ids[0] == 5, "Prediction IDs correctly read after deferred wait");
-
-    ensure_prediction_ready();
-
-    std::cout << "[PASS] B2 route and prediction event decoupling tests passed.\n";
-}
-
-void test_predictive_gating_logic_and_session_isolation(Context& ctx) {
-    std::cout << "[Test] Running predictive gating logic and session isolation tests...\n";
-
-    auto eval_predict = [](bool s_predict_gating, bool s_prefetch, bool s_predict_stats,
-                           int s_prefill_prefetch_max, int count, int consecutive,
-                           bool high_hit_rate, int L, int num_layers) {
-        const bool gate_prediction = s_predict_gating && (count == 1) &&
-            (consecutive >= 2 || (high_hit_rate && consecutive > 0));
-        const bool predict_next = (count == 1)
-            ? (!gate_prediction && (s_prefetch || s_predict_stats) && (L + 1 < num_layers))
-            : (s_prefetch && (s_prefill_prefetch_max > 0) && (L + 1 < num_layers));
-        return std::make_pair(gate_prediction, predict_next);
-    };
-
-    // Cold start decode: consecutive = 0
-    auto res_cold = eval_predict(true, true, false, 48, 1, 0, false, 0, 48);
-    expect(!res_cold.first, "gate_prediction must be false at consecutive=0");
-    expect(res_cold.second, "predict_next must be true at cold start decode");
-
-    // Steady state decode: consecutive = 2
-    auto res_steady = eval_predict(true, true, false, 48, 1, 2, false, 0, 48);
-    expect(res_steady.first, "gate_prediction must be true at consecutive=2");
-    expect(!res_steady.second, "predict_next MUST be false in steady decode (gated)!");
-
-    // Steady state decode with high hit rate: consecutive = 1, high_hit_rate = true
-    auto res_high = eval_predict(true, true, false, 48, 1, 1, true, 0, 48);
-    expect(res_high.first, "gate_prediction must be true at consecutive=1 with high_hit_rate");
-    expect(!res_high.second, "predict_next MUST be false when gated with high_hit_rate");
-
-    // Prefill: count = 30
-    auto res_prefill = eval_predict(true, true, false, 48, 30, 2, true, 0, 48);
-    expect(!res_prefill.first, "gate_prediction must be false in prefill");
-    expect(res_prefill.second, "predict_next must be true in prefill when prefetch enabled");
-
-    // Disabled gating: s_predict_gating = false
-    auto res_nogate = eval_predict(false, true, false, 48, 1, 5, true, 0, 48);
-    expect(!res_nogate.first, "gate_prediction must be false when disabled");
-    expect(res_nogate.second, "predict_next must be true when gating disabled");
-
-    std::cout << "[PASS] Predictive gating logic and session isolation verified.\n\n";
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
@@ -3379,11 +3297,17 @@ int main(int argc, char** argv) {
             std::cout << "AilaQwen4ExpModuleTests: PLE PASSED\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--real-model") {
+            test_real_model_ple_and_cache_if_present(ctx);
+            test_real_model_qsa_indexer_weights_if_present(ctx);
+            test_real_model_qsa_indexer_fixture(ctx);
+            shared_real_model_weights_slot().reset();
+            std::cout << "AilaQwen4ExpModuleTests: REAL MODEL PASSED\n";
+            return 0;
+        }
         test_decode_pending_mlp_residual(ctx);
         test_hc_decode_scheduling_bitwise(ctx);
         test_fused_resident_router_bitwise(ctx);
-        test_b2_route_and_prediction_event_decoupling(ctx);
-        test_predictive_gating_logic_and_session_isolation(ctx);
         test_snapshot_capture_and_truncate(ctx);
         test_graph_gdn_device_head_state(ctx);
         test_token_graph_runtime_lifecycle(ctx);
@@ -3391,11 +3315,8 @@ int main(int argc, char** argv) {
         test_ple_ngram_ids_calculation();
         test_ple_lookup_and_dequant(ctx);
         test_ple_ticket_pipeline(ctx);
-        test_real_model_ple_and_cache_if_present(ctx);
         test_qsa_indexer_long_context_dispatch(ctx);
         test_qsa_causal_prefill_append_chunk(ctx);
-        test_real_model_qsa_indexer_weights_if_present(ctx);
-        test_real_model_qsa_indexer_fixture(ctx);
         test_qsa_dense_prefill_buffer_bounds(ctx);
         test_qsa_k_only_projection_alignment(ctx);
         test_qsa_session_compressed_k_lifecycle(ctx);

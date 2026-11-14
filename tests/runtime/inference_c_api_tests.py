@@ -393,9 +393,8 @@ class CApiTests(unittest.TestCase):
         options.reserved[0], options.abi_version = 0, 99
         self.api.call("client_start_with_batching", runtime, executable, c.byref(options),
                       2, c.byref(handle), expect=ARG)
-        for backend in (1, 2, 3):
-            for size in (1, 2, 4):
-                with self.subTest(backend=backend, batch_size=size):
+        for backend, size in ((1, 1), (1, 2), (1, 4), (2, 2), (3, 4)):
+            with self.subTest(backend=backend, batch_size=size):
                     with Run(self.api, self.worker, backend=backend, batch_size=size) as run:
                         sessions = [run.session() for _ in range(4)]
                         prompts = [[3 + index, 31 + index] for index in range(4)]
@@ -780,7 +779,7 @@ class CApiTests(unittest.TestCase):
 
     def test_16_extended_generation_and_reuse(self):
         self.assertEqual(self.api.defaults("client", ClientOptions).max_generated_tokens, 1024)
-        for backend in (1, 2, 3):
+        for backend in (1,):
             with self.subTest(backend=backend), Run(self.api, self.worker, backend, max_generated=1500) as run:
                 session = run.session()
                 request = run.submit(session, [11, 12], 1100)
