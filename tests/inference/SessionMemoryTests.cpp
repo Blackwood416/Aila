@@ -2,6 +2,7 @@
 #include "memory/AllocationBudget.hpp"
 
 #include <climits>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -162,6 +163,34 @@ void TestQwen4ExpSessionMemory() {
     ExpectInvalid([&] {
         aila::memory::qwen4exp_session_memory(config, 2048, (std::numeric_limits<size_t>::max)());
     });
+
+    auto set_env = [](const char* k, const char* v) {
+#ifdef _WIN32
+        _putenv_s(k, v ? v : "");
+#else
+        if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+    };
+    set_env("AILA_Q4E_KV_STREAM", "1");
+    set_env("AILA_Q4E_KV_RESIDENT_TOKENS", "8208");
+    const auto planSmall = aila::memory::qwen4exp_kv_stream_plan(4096);
+    Expect(!planSmall.enabled, "KV stream must stay off when capacity fits resident tokens");
+    const auto planLarge = aila::memory::qwen4exp_kv_stream_plan(32768);
+    Expect(planLarge.enabled && planLarge.residentTokens == 8208 && planLarge.slotCount == 2052 && planLarge.blockCount == 8192,
+           "KV stream plan mismatch at 32768 capacity");
+    const auto streamedBf16 = aila::memory::qwen4exp_session_memory(config, 32768, 0, 2);
+    const auto streamedInt8 = aila::memory::qwen4exp_session_memory(config, 32768, 0, 1);
+    set_env("AILA_Q4E_KV_STREAM", nullptr);
+    set_env("AILA_Q4E_KV_RESIDENT_TOKENS", nullptr);
+    const auto unstreamedBf16 = aila::memory::qwen4exp_session_memory(config, 32768, 0, 2);
+    Expect(streamedBf16.deviceBytes < unstreamedBf16.deviceBytes,
+           "Streamed 32K BF16 device reservation must be smaller than unstreamed");
+    Expect(streamedBf16.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 2).total(),
+           "Streamed 32K BF16 host reservation must include full host KV");
+    Expect(streamedInt8.deviceBytes < streamedBf16.deviceBytes,
+           "Streamed 32K INT8 device reservation must be smaller than BF16");
+    Expect(streamedInt8.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 1).total(),
+           "Streamed 32K INT8 host reservation must include full int8 host KV");
 }
 
 } // namespace

@@ -112,15 +112,19 @@ inline SessionDigest DigestSession(Context& ctx, Qwen4ExpBnb4Backend::Session& s
     out.gdnLayers.assign(layers.size(), 0);
     for (size_t l = 0; l < layers.size(); ++l) {
         auto& c = layers[l];
+        const Tensor& kvK = c.host_k.valid() ? c.host_k : c.k;
+        const Tensor& kvV = c.host_v.valid() ? c.host_v : c.v;
+        const Tensor& kvKS = c.host_k_scale.valid() ? c.host_k_scale : c.k_scale;
+        const Tensor& kvVS = c.host_v_scale.valid() ? c.host_v_scale : c.v_scale;
         uint64_t kvLayer = 1469598103934665603ull;
-        kvLayer = DigestTensorRows(ctx, buf, kvLayer, c.k, visible);
+        kvLayer = DigestTensorRows(ctx, buf, kvLayer, kvK, visible);
         out.kvLayers[l] = kvLayer;
         out.kv = DigestBytes(out.kv, &kvLayer, sizeof(kvLayer));
         uint64_t kvv = 1469598103934665603ull;
-        kvv = DigestTensorRows(ctx, buf, kvv, c.v, visible);
+        kvv = DigestTensorRows(ctx, buf, kvv, kvV, visible);
         out.kvValue = DigestBytes(out.kvValue, &kvv, sizeof(kvv));
-        out.kvScale = DigestTensorRows(ctx, buf, out.kvScale, c.k_scale, visible);
-        out.kvScale = DigestTensorRows(ctx, buf, out.kvScale, c.v_scale, visible);
+        out.kvScale = DigestTensorRows(ctx, buf, out.kvScale, kvKS, visible);
+        out.kvScale = DigestTensorRows(ctx, buf, out.kvScale, kvVS, visible);
         out.indexerK = DigestTensorRows(ctx, buf, out.indexerK, c.indexer_k, visible);
         out.indexerC = DigestTensorRows(ctx, buf, out.indexerC, c.indexer_compressed_k,
                                         c.num_compressed_blocks);

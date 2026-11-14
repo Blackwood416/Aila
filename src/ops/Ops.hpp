@@ -4,6 +4,7 @@
 #include "../core/Tensor.hpp"
 #include "engine/Types.hpp"
 #include "GraphControl.hpp"
+#include "QsaKvStreamOps.hpp"
 
 using bf16 = sycl::ext::oneapi::bfloat16;
 #include "oneapi/dnnl/dnnl.hpp"
@@ -287,7 +288,10 @@ namespace ops {
     void copy_to_cache(Context& ctx, Tensor& new_kv, Tensor& cache,
                        int seq_len, int start_pos,
                        int num_heads, int head_dim, int max_seq_len,
-                       Tensor* scale = nullptr);
+                       Tensor* scale = nullptr,
+                       Tensor* host_cache = nullptr,
+                       const Tensor* page_table = nullptr,
+                       Tensor* host_scale = nullptr);
 
     // Decode fused prep (seq_len=1):
     // Q/K per-head RMSNorm + RoPE, and write K/V to cache at start_pos.
@@ -341,7 +345,8 @@ namespace ops {
                                             Tensor* k_scale = nullptr,
                                             Tensor* v_scale = nullptr,
                                             int rows = 1,
-                                            int qkv_row_stride = 0);
+                                            int qkv_row_stride = 0,
+                                            const QsaKvStreamWriteTarget* stream_target = nullptr);
 
     // Graph-safe decode preparation. control[start_pos] supplies RoPE and the
     // K/V cache row; control[abort] fail-closes. No host position is required.

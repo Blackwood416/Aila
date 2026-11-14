@@ -105,6 +105,44 @@ struct Qwen4ExpKvBytes {
     size_t total() const { return checked_memory_sum(kv, scales); }
 };
 
+struct Qwen4ExpKvStreamPlan {
+    bool enabled = false;
+    int residentTokens = 0; // multiple of 4
+    int slotCount = 0;      // residentTokens / 4
+    int blockCount = 0;     // (capacity + 3) / 4
+};
+
+inline Qwen4ExpKvStreamPlan qwen4exp_kv_stream_plan(int capacity) {
+    Qwen4ExpKvStreamPlan plan;
+    if (capacity <= 0) return plan;
+    plan.blockCount = (capacity + 3) / 4;
+    if (!aila::env::read_flag("AILA_Q4E_KV_STREAM", false)) {
+        return plan;
+    }
+    const int raw_resident = aila::env::read_int("AILA_Q4E_KV_RESIDENT_TOKENS", 16384);
+    // Minimum 8208 tokens (2052 slots): holds up to 4 * (512 + 1) distinct blocks
+    // for a width-4 MTP verify window without CLOCK overflow.
+    const int clamped = raw_resident < 8208 ? 8208 : raw_resident;
+    const int aligned_tokens = ((clamped + 3) / 4) * 4;
+    const int slots = aligned_tokens / 4;
+    if (slots < plan.blockCount) {
+        plan.enabled = true;
+        plan.residentTokens = aligned_tokens;
+        plan.slotCount = slots;
+    }
+    return plan;
+}
+
+inline size_t qwen4exp_kv_stream_map_bytes_per_layer(int blockCount, int slotCount) {
+    if (blockCount <= 0 || slotCount <= 0) return 0;
+    constexpr size_t kCtlInts = 16;
+    size_t bytes = checked_memory_product(static_cast<size_t>(blockCount), sizeof(int32_t));
+    bytes = checked_memory_sum(
+        bytes, checked_memory_product(static_cast<size_t>(5) * static_cast<size_t>(slotCount), sizeof(int32_t)));
+    bytes = checked_memory_sum(bytes, kCtlInts * sizeof(int32_t));
+    return bytes;
+}
+
 inline Qwen4ExpKvBytes qwen4exp_kv_bytes(
     const Qwen4ExpTextConfig& config, size_t capacity, size_t kvElementBytes) {
     if (kvElementBytes != 1 && kvElementBytes != 2)
@@ -176,7 +214,20 @@ inline SessionMemoryReservation qwen4exp_session_memory(
 
     // K and V, each `kvElementBytes` wide. The int8 layout also allocates a
     // per-token F32 scale for K and for V ({kvHeads, capacity} each).
-    const size_t fullBytes = qwen4exp_kv_bytes(config, cached, kvElementBytes).total();
+    // When QSA KV streaming is active (capacity > residentTokens), VRAM holds
+    // only the resident slot pool + residency maps while the authoritative
+    // full-context KV lives in pinned host USM.
+    const auto streamPlan = qwen4exp_kv_stream_plan(capacity);
+    const size_t fullHostBytes = qwen4exp_kv_bytes(config, cached, kvElementBytes).total();
+    size_t fullBytes = fullHostBytes;
+    if (streamPlan.enabled) {
+        const size_t residentKvBytes = qwen4exp_kv_bytes(
+            config, static_cast<size_t>(streamPlan.residentTokens), kvElementBytes).total();
+        const size_t mapBytes = checked_memory_product(
+            qwen4exp_kv_stream_map_bytes_per_layer(streamPlan.blockCount, streamPlan.slotCount),
+            fullLayers);
+        fullBytes = checked_memory_sum(residentKvBytes, mapBytes);
+    }
 
     const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
     size_t indexerBytes = checked_memory_product(
@@ -207,6 +258,9 @@ inline SessionMemoryReservation qwen4exp_session_memory(
     size_t hostBytes = checked_memory_sum(
         checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots)),
         checked_memory_product(pleBytes, maxSnapshots));
+    if (streamPlan.enabled) {
+        hostBytes = checked_memory_sum(hostBytes, fullHostBytes);
+    }
     if (aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false)) {
         const size_t headBytes = checked_memory_product(
             checked_memory_product(layers, size_t{3}), sizeof(int));

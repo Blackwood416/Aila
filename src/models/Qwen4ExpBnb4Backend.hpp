@@ -8,6 +8,7 @@
 #include "../ops/MoeExpertOps.hpp"
 #include "../ops/MoeExpertXmx.hpp"
 #include "../ops/Ops.hpp"
+#include "../ops/QsaKvStreamOps.hpp"
 #include "../core/Tensor.hpp"
 #include "Qwen4ExpExpertExecutor.hpp"
 #include "Qwen4ExpHostArena.hpp"
@@ -90,6 +91,13 @@ struct Qwen4ExpLayerCache {
     Tensor indexer_k; // [capacity, 128] bf16
     Tensor indexer_compressed_k; // [capacity / 4, 128] bf16 (A1)
     int num_compressed_blocks = 0; // Number of complete blocks compressed (A1)
+    // QSA KV Streaming (authoritative host USM + device slot pool)
+    bool kv_stream_enabled = false;
+    Tensor host_k; // [2, capacity, 256] bf16 or s8 (pinned host USM)
+    Tensor host_v; // [2, capacity, 256] bf16 or s8 (pinned host USM)
+    Tensor host_k_scale; // [2, capacity] f32 (int8 KV only)
+    Tensor host_v_scale; // [2, capacity] f32 (int8 KV only)
+    ops::QsaKvStreamMap kv_stream_map;
 
     // Linear Attention
     Tensor linear_state;
@@ -142,6 +150,19 @@ struct Qwen4ExpBuffers {
     Tensor qsa_tile_block_scores;// [kQsaQueryTile, max_blocks] f32 (Phase A4)
     Tensor qsa_tile_active_blocks;// [kQsaQueryTile, 516] s32 (Phase A4)
     Tensor qsa_tile_valid_counts;// [qsa_query_tile_, 2] s32 (Phase P2)
+    Tensor qsa_resolved_blocks;  // [4, 516] s32 (KV stream resolved physical slots)
+    Tensor qsa_resolved_tail_indices; // [16] s32 (KV stream tail-only token indices)
+    bool kv_stream_stage_in_phase_scratch = false;
+    size_t kv_stream_stage_k_max_bytes = 0;
+    size_t kv_stream_stage_v_max_bytes = 0;
+    size_t kv_stream_stage_scale_bytes = 0;
+    size_t kv_stream_stage_v_offset = 0;
+    size_t kv_stream_stage_k_scale_offset = 0;
+    size_t kv_stream_stage_v_scale_offset = 0;
+    Tensor kv_stream_stage_k;     // lazy fallback if phase_scratch unavailable
+    Tensor kv_stream_stage_v;
+    Tensor kv_stream_stage_k_scale;
+    Tensor kv_stream_stage_v_scale;
 
 
     // Linear Attention
@@ -555,6 +576,9 @@ private:
     // two independent 4096-row attention windows inside one layer pass.
     void RunAttentionWindowAt(Context& ctx, Session& session, int layer, int count,
         int startPos, int row_offset, bool allowQ8 = false);
+    void PrepareKvStagingBuffers(Context& ctx, int stageLen, bool int8Kv,
+        bool sparsePrefill, Tensor& stageK, Tensor& stageV,
+        Tensor& stageKScale, Tensor& stageVScale);
     Session& DefaultSession(Context& ctx);
     void ValidateSession(const Session& session) const;
     void CaptureSnapshot(Context& ctx, Session& session, int nextLength,

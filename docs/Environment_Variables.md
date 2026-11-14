@@ -281,6 +281,8 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_LM_HEAD_Q8` | bool | `true` (preset) | Quantize the `[248320, 2560]` LM head to block-64 INT8 at load, saving 568.4 MiB of static VRAM and halving decode LM-head memory traffic. |
 | `AILA_Q4E_STAGING_SLOTS` | int | `16` | Number of expert slots per GPU staging bank (2 banks by default). |
 | `AILA_Q4E_HOT_RAM_MB` | int | `32768` (preset) | Host RAM budget for `Qwen4ExpHostArena` large-page complement. |
+| `AILA_Q4E_KV_STREAM` | bool | `false` (`1` in `start-qwen38.ps1` at `>=64K` BF16 / `>=128K` INT8) | Enable QSA KV streaming between pinned host USM (authoritative full-context K/V) and a bounded VRAM slot pool with device-side CLOCK eviction. |
+| `AILA_Q4E_KV_RESIDENT_TOKENS` | int | `16384` | Number of logical KV tokens kept in the VRAM slot pool per full-attention layer when `AILA_Q4E_KV_STREAM=1` (minimum `8208` = `2052` 4-token blocks). |
 | `AILA_Q4E_EXPERT_READER` | string | `readfile` (preset) | Reader backend used during initial model load (`readfile` or `mmap`). |
 | `AILA_Q4E_DIRECT_STAGE_NO_HOST_WAIT` | bool | `true` | Skip host-side `staging_copy_.wait_and_throw()` when staging directly from `Qwen4ExpHostArena` onto the in-order `copy_q_`. |
 | `AILA_Q4E_STAGE_DEQUANT_FENCE` | bool | `true` | Release each prefill staging bank as soon as `submit_dequant` completes instead of waiting for `submit_scatter`. |

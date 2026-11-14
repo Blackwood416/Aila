@@ -189,6 +189,7 @@ set(LIB_SOURCES
     src/ops/MoeExpertXmx.cpp
     src/ops/Qwen4ExpCpuExpertOps.cpp
     src/ops/QsaIndexerOps.cpp
+    src/ops/QsaKvStreamOps.cpp
     src/memory/LargePages.cpp
     src/memory/KVCache.cpp
     src/core/ExecutionTrace.cpp

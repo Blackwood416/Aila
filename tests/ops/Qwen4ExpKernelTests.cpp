@@ -4,6 +4,7 @@
 #include "ops/MoeExpertOps.hpp"
 #include "ops/GatedDeltaNetOps.hpp"
 #include "ops/QsaIndexerOps.hpp"
+#include "ops/QsaKvStreamOps.hpp"
 #include "ops/Bnb4BitLinear.hpp"
 #include "ops/Ops.hpp"
 #include "ops/AttentionOps.hpp"
@@ -7919,6 +7920,169 @@ void run_decode_attn_reuse_bench(Context& ctx) {
     }
 }
 
+
+static void test_qsa_kv_stream(Context& ctx) {
+    auto run_kv_stream_case = [&](bool int8_kv) {
+        constexpr int kCap = 4096;
+        constexpr int kSlots = 600; // 2400 resident tokens < 4096 => forced CLOCK evictions
+        constexpr int kSlotTokens = kSlots * 4;
+        constexpr int kHeads = 24;
+        constexpr int kKvHeads = 2;
+        constexpr int kHeadDim = 256;
+        constexpr int kBlockTopk = 512;
+        constexpr int kCompress = 4;
+        const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8 : dnnl::memory::data_type::bf16;
+        Tensor ref_k = Tensor::allocate(ctx, {kKvHeads, kCap, kHeadDim}, kv_dtype);
+        Tensor ref_v = Tensor::allocate(ctx, {kKvHeads, kCap, kHeadDim}, kv_dtype);
+        Tensor ref_ks = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor ref_vs = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor slot_k = Tensor::allocate(ctx, {kKvHeads, kSlotTokens, kHeadDim}, kv_dtype);
+        Tensor slot_v = Tensor::allocate(ctx, {kKvHeads, kSlotTokens, kHeadDim}, kv_dtype);
+        Tensor slot_ks = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kSlotTokens}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor slot_vs = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kSlotTokens}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor host_k = Tensor::allocate_host(ctx, {kKvHeads, kCap, kHeadDim}, kv_dtype);
+        Tensor host_v = Tensor::allocate_host(ctx, {kKvHeads, kCap, kHeadDim}, kv_dtype);
+        Tensor host_ks = int8_kv ? Tensor::allocate_host(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor host_vs = int8_kv ? Tensor::allocate_host(ctx, {kKvHeads, kCap}, dnnl::memory::data_type::f32) : Tensor{};
+        if (int8_kv) {
+            std::memset(host_ks.data(), 0, host_ks.size_bytes());
+            std::memset(host_vs.data(), 0, host_vs.size_bytes());
+        }
+        ops::QsaKvStreamMap map;
+        ops::qsa_kv_stream_init_map(ctx, map, kCap, kSlots);
+
+        constexpr int kPrefill = 4090;
+        Tensor src_k = Tensor::allocate(ctx, {kPrefill, kKvHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor src_v = Tensor::allocate(ctx, {kPrefill, kKvHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        std::mt19937 rng(int8_kv ? 42 : 17);
+        std::uniform_real_distribution<float> dist(-1.5f, 1.5f);
+        std::vector<bf16> hk_in(kPrefill * kKvHeads * kHeadDim), hv_in(kPrefill * kKvHeads * kHeadDim);
+        for (size_t i = 0; i < hk_in.size(); ++i) {
+            hk_in[i] = bf16(dist(rng));
+            hv_in[i] = bf16(dist(rng));
+        }
+        ctx.memcpy_h2d(src_k.data(), hk_in.data(), hk_in.size() * sizeof(bf16));
+        ctx.memcpy_h2d(src_v.data(), hv_in.data(), hv_in.size() * sizeof(bf16));
+        ops::copy_to_cache(ctx, src_k, ref_k, kPrefill, 0, kKvHeads, kHeadDim, kCap,
+                           int8_kv ? &ref_ks : nullptr);
+        ops::copy_to_cache(ctx, src_v, ref_v, kPrefill, 0, kKvHeads, kHeadDim, kCap,
+                           int8_kv ? &ref_vs : nullptr);
+        ops::copy_to_cache(ctx, src_k, slot_k, kPrefill, 0, kKvHeads, kHeadDim, kSlotTokens,
+                           int8_kv ? &slot_ks : nullptr, &host_k, &map.page_table,
+                           int8_kv ? &host_ks : nullptr);
+        ops::copy_to_cache(ctx, src_v, slot_v, kPrefill, 0, kKvHeads, kHeadDim, kSlotTokens,
+                           int8_kv ? &slot_vs : nullptr, &host_v, &map.page_table,
+                           int8_kv ? &host_vs : nullptr);
+
+        Tensor st_k = Tensor::allocate(ctx, {kKvHeads, kPrefill, kHeadDim}, kv_dtype);
+        Tensor st_v = Tensor::allocate(ctx, {kKvHeads, kPrefill, kHeadDim}, kv_dtype);
+        Tensor st_ks = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kPrefill}, dnnl::memory::data_type::f32) : Tensor{};
+        Tensor st_vs = int8_kv ? Tensor::allocate(ctx, {kKvHeads, kPrefill}, dnnl::memory::data_type::f32) : Tensor{};
+        ops::qsa_kv_stream_stage_from_host(
+            ctx, st_k, st_v, int8_kv ? &st_ks : nullptr, int8_kv ? &st_vs : nullptr,
+            host_k, host_v, int8_kv ? &host_ks : nullptr, int8_kv ? &host_vs : nullptr, kPrefill);
+        ctx.synchronize();
+        auto check_tensor_bitwise = [&](const Tensor& a, const Tensor& b, const char* what) {
+            if (a.size_bytes() != b.size_bytes()) throw std::runtime_error(std::string(what) + " size mismatch");
+            std::vector<uint8_t> ba(a.size_bytes()), bb(b.size_bytes());
+            ctx.memcpy_d2h(ba.data(), a.data(), ba.size());
+            ctx.memcpy_d2h(bb.data(), b.data(), bb.size());
+            if (ba != bb) throw std::runtime_error(std::string(what) + " bitwise mismatch");
+        };
+        for (int h = 0; h < kKvHeads; ++h) {
+            const size_t elem = int8_kv ? 1u : sizeof(bf16);
+            std::vector<uint8_t> ba(kPrefill * kHeadDim * elem), bb(kPrefill * kHeadDim * elem);
+            ctx.memcpy_d2h(ba.data(), static_cast<const uint8_t*>(ref_k.data()) + size_t(h) * kCap * kHeadDim * elem, ba.size());
+            ctx.memcpy_d2h(bb.data(), static_cast<const uint8_t*>(st_k.data()) + size_t(h) * kPrefill * kHeadDim * elem, bb.size());
+            if (ba != bb) throw std::runtime_error("stage_from_host K bitwise mismatch");
+            ctx.memcpy_d2h(ba.data(), static_cast<const uint8_t*>(ref_v.data()) + size_t(h) * kCap * kHeadDim * elem, ba.size());
+            ctx.memcpy_d2h(bb.data(), static_cast<const uint8_t*>(st_v.data()) + size_t(h) * kPrefill * kHeadDim * elem, bb.size());
+            if (ba != bb) throw std::runtime_error("stage_from_host V bitwise mismatch");
+        }
+
+        Tensor q_norm_w = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor k_norm_w = Tensor::allocate(ctx, {kHeadDim}, dnnl::memory::data_type::bf16);
+        std::vector<bf16> ones(kHeadDim, bf16(1.0f));
+        ctx.memcpy_h2d(q_norm_w.data(), ones.data(), ones.size() * sizeof(bf16));
+        ctx.memcpy_h2d(k_norm_w.data(), ones.data(), ones.size() * sizeof(bf16));
+        const int qkv_stride = 2 * kHeads * kHeadDim + 2 * kKvHeads * kHeadDim;
+        Tensor full_qkv = Tensor::allocate(ctx, {4, qkv_stride}, dnnl::memory::data_type::bf16);
+        std::vector<bf16> hqkv(4 * qkv_stride);
+        for (size_t i = 0; i < hqkv.size(); ++i) hqkv[i] = bf16(dist(rng));
+        ctx.memcpy_h2d(full_qkv.data(), hqkv.data(), hqkv.size() * sizeof(bf16));
+        Tensor q_buf = Tensor::allocate(ctx, {4, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor z_buf = Tensor::allocate(ctx, {4, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        auto qg_v = Tensor::view(ctx, full_qkv.data_as<bf16>(), {4, 2 * kHeads * kHeadDim});
+        auto k_v = Tensor::view(ctx, full_qkv.data_as<bf16>() + 2 * kHeads * kHeadDim, {4, kKvHeads * kHeadDim});
+        auto v_v = Tensor::view(ctx, full_qkv.data_as<bf16>() + 2 * kHeads * kHeadDim + kKvHeads * kHeadDim, {4, kKvHeads * kHeadDim});
+        ops::decode_prepare_qgkv_packed_partial(
+            ctx, qg_v, k_v, v_v, q_buf, z_buf, q_norm_w, k_norm_w,
+            ref_k, ref_v, kPrefill, kHeads, kKvHeads, kHeadDim, 1e-6f, 64, 10000000.0f,
+            true, nullptr, nullptr, nullptr, 0, 0, 11, 11, 10,
+            int8_kv ? &ref_ks : nullptr, int8_kv ? &ref_vs : nullptr, 4, qkv_stride);
+        ctx.memcpy_h2d(full_qkv.data(), hqkv.data(), hqkv.size() * sizeof(bf16));
+        ops::QsaKvStreamWriteTarget wt{};
+        wt.host_k = host_k.data(); wt.host_v = host_v.data();
+        wt.host_k_scale = int8_kv ? host_ks.data_as<float>() : nullptr;
+        wt.host_v_scale = int8_kv ? host_vs.data_as<float>() : nullptr;
+        wt.page_table = map.page_table.data_as<int32_t>();
+        wt.host_capacity = kCap;
+        ops::decode_prepare_qgkv_packed_partial(
+            ctx, qg_v, k_v, v_v, q_buf, z_buf, q_norm_w, k_norm_w,
+            slot_k, slot_v, kPrefill, kHeads, kKvHeads, kHeadDim, 1e-6f, 64, 10000000.0f,
+            true, nullptr, nullptr, nullptr, 0, 0, 11, 11, 10,
+            int8_kv ? &slot_ks : nullptr, int8_kv ? &slot_vs : nullptr, 4, qkv_stride, &wt);
+
+        Tensor logical_blocks = Tensor::allocate(ctx, {1, kBlockTopk + 4}, dnnl::memory::data_type::s32);
+        Tensor resolved_blocks = Tensor::allocate(ctx, {1, kBlockTopk + 4}, dnnl::memory::data_type::s32);
+        Tensor decode_scores = Tensor::allocate(ctx, {kHeads, kCap}, dnnl::memory::data_type::f32);
+        Tensor partials = Tensor::allocate(ctx, {kHeads, 64, 272}, dnnl::memory::data_type::f32);
+        Tensor out_ref = Tensor::allocate(ctx, {1, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor out_str = Tensor::allocate(ctx, {1, kHeads * kHeadDim}, dnnl::memory::data_type::bf16);
+        Tensor q_row = Tensor::view(ctx, q_buf.data_as<bf16>(), {1, kHeads * kHeadDim});
+        Tensor z_row = Tensor::view(ctx, z_buf.data_as<bf16>(), {1, kHeads * kHeadDim});
+
+        for (int pass = 0; pass < 3; ++pass) {
+            std::vector<int32_t> h_blocks(kBlockTopk + 4, 0);
+            const int base_blk = (pass == 0) ? 0 : 500;
+            const int pos = 4093;
+            for (int i = 0; i < kBlockTopk; ++i) h_blocks[i] = base_blk + i;
+            h_blocks[kBlockTopk + 0] = 4092;
+            h_blocks[kBlockTopk + 1] = 4093;
+            ctx.memcpy_h2d(logical_blocks.data(), h_blocks.data(), h_blocks.size() * sizeof(int32_t));
+            const auto before_c = ops::qsa_kv_stream_counters(ctx, map);
+            ops::qsa_kv_stream_resolve(
+                ctx, map, slot_k, slot_v,
+                int8_kv ? &slot_ks : nullptr, int8_kv ? &slot_vs : nullptr,
+                host_k, host_v,
+                int8_kv ? &host_ks : nullptr, int8_kv ? &host_vs : nullptr,
+                logical_blocks.data_as<int32_t>(), 1, pos, kBlockTopk, kCompress,
+                resolved_blocks, nullptr);
+            const auto after_c = ops::qsa_kv_stream_counters(ctx, map);
+            if (after_c.overflow) throw std::runtime_error("KV stream unexpected overflow");
+            if (pass == 0 && after_c.misses != 513) throw std::runtime_error("Pass 0 expected 513 misses");
+            if (pass == 1 && after_c.misses <= before_c.misses) throw std::runtime_error("Pass 1 expected new misses");
+            if (pass == 2 && after_c.misses != before_c.misses) throw std::runtime_error("Pass 2 expected 0 new misses");
+
+            ops::attention_decode(
+                ctx, q_row, ref_k, ref_v, out_ref, decode_scores,
+                kHeads, kKvHeads, kHeadDim, pos + 1, &partials, &z_row,
+                nullptr, 0, logical_blocks.data_as<int32_t>(), kBlockTopk,
+                int8_kv ? &ref_ks : nullptr, int8_kv ? &ref_vs : nullptr);
+            ops::attention_decode(
+                ctx, q_row, slot_k, slot_v, out_str, decode_scores,
+                kHeads, kKvHeads, kHeadDim, pos + 1, &partials, &z_row,
+                nullptr, 0, resolved_blocks.data_as<int32_t>(), kBlockTopk,
+                int8_kv ? &slot_ks : nullptr, int8_kv ? &slot_vs : nullptr);
+            ctx.synchronize();
+            check_tensor_bitwise(out_ref, out_str, int8_kv ? "kv_stream int8 attention" : "kv_stream bf16 attention");
+        }
+        std::cout << "[PASS] QsaKvStream " << (int8_kv ? "INT8" : "BF16") << " parity + CLOCK eviction\n";
+    };
+    run_kv_stream_case(false);
+    run_kv_stream_case(true);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -8092,6 +8256,14 @@ int main(int argc, char** argv) {
             std::cout << "Prefill benchmark completed; teardown USM zero\n";
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--qsa-kv-stream-only") {
+            test_qsa_kv_stream(ctx);
+            ctx.synchronize(); ctx.release_execution_resources();
+            if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
+                throw std::runtime_error("QSA KV stream teardown USM leak");
+            std::cout << "QSA KV stream checks PASSED; teardown USM zero\n";
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--qsa-prefill-only") {
             test_attention_prefill_qsa_batched(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
@@ -8112,6 +8284,7 @@ int main(int argc, char** argv) {
             test_qsa_batched_scoring_and_selection(ctx);
             test_attention_prefill_qsa_batched(ctx);
             test_attention_decode_with_qsa_indices(ctx);
+            test_qsa_kv_stream(ctx);
             ctx.synchronize(); ctx.release_execution_resources();
             if (ctx.device_allocation_count() || ctx.pinned_host_allocation_count())
                 throw std::runtime_error("QSA tests teardown USM leak");
@@ -8171,6 +8344,7 @@ int main(int argc, char** argv) {
         test_qsa_prepare_q_batched(ctx);
         test_qsa_batched_scoring_and_selection(ctx);
         test_attention_prefill_qsa_batched(ctx);
+        test_qsa_kv_stream(ctx);
 
         std::cout << "All Qwen4Exp Kernel Tests PASSED!\n";
         return 0;

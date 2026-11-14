@@ -1266,7 +1266,7 @@ void decode_prepare_qkv_partial(Context& ctx,
     }
 }
 
-template <int Quantized>
+template <int Quantized, bool Streamed = false>
 void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              Tensor& q_gate_packed, Tensor& k, Tensor& v,
                                              Tensor& q_out, Tensor& gate_out,
@@ -1289,7 +1289,8 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                                              float* k_scale_ptr = nullptr,
                                              float* v_scale_ptr = nullptr,
                                              int rows = 1,
-                                             int qkv_row_stride = 0) {
+                                             int qkv_row_stride = 0,
+                                             const QsaKvStreamWriteTarget* stream_target = nullptr) {
     bf16* packed_base_ptr = static_cast<bf16*>(q_gate_packed.data());
     bf16* q_base_ptr = static_cast<bf16*>(q_out.data());
     bf16* gate_base_ptr = static_cast<bf16*>(gate_out.data());
@@ -1305,7 +1306,33 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 "decode_prepare_qgkv_packed_partial: int8 KV cache requires k_scale/v_scale");
         }
     }
+    void* host_k_ptr = nullptr;
+    void* host_v_ptr = nullptr;
+    float* host_k_scale_ptr = nullptr;
+    float* host_v_scale_ptr = nullptr;
+    const int32_t* stream_pt = nullptr;
+    int host_capacity = 0;
+    if constexpr (Streamed) {
+        if (!stream_target || !stream_target->host_k || !stream_target->host_v ||
+            !stream_target->page_table || stream_target->host_capacity <= 0) {
+            throw std::invalid_argument(
+                "decode_prepare_qgkv_packed_partial: invalid KV stream write target");
+        }
+        if constexpr (Quantized == kKvFmtInt8) {
+            if (!stream_target->host_k_scale || !stream_target->host_v_scale) {
+                throw std::invalid_argument(
+                    "decode_prepare_qgkv_packed_partial: int8 KV stream requires host scales");
+            }
+        }
+        host_k_ptr = stream_target->host_k;
+        host_v_ptr = stream_target->host_v;
+        host_k_scale_ptr = stream_target->host_k_scale;
+        host_v_scale_ptr = stream_target->host_v_scale;
+        stream_pt = stream_target->page_table;
+        host_capacity = stream_target->host_capacity;
+    }
     int max_seq_len = static_cast<int>(k_cache.shape(1));
+    int logical_limit = Streamed ? host_capacity : max_seq_len;
     int packed_per_head = head_dim * 2;
     int q_row_dim = num_heads_q * head_dim;
     int k_dim = num_kv_heads * head_dim;
@@ -1329,7 +1356,7 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 if (control && graph_control_aborted(control)) return;
                 const int active_pos =
                     (control ? control[graph_control::start_pos] : start_pos) + row;
-                if (active_pos < 0 || active_pos >= max_seq_len) {
+                if (active_pos < 0 || active_pos >= logical_limit) {
                     if (control) graph_control_mark_abort(control);
                     return;
                 }
@@ -1454,8 +1481,18 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 }
                 item.barrier(sycl::access::fence_space::local_space);
 
-                int cache_base =
-                    head * max_seq_len * head_dim + active_pos * head_dim;
+                int phys_slot = -1;
+                int phys_pos = active_pos;
+                if constexpr (Streamed) {
+                    phys_slot = stream_pt[active_pos >> 2];
+                    phys_pos = (phys_slot << 2) | (active_pos & 3);
+                }
+                const size_t cache_base =
+                    static_cast<size_t>(head) * max_seq_len * head_dim + static_cast<size_t>(phys_pos) * head_dim;
+                const size_t host_base = Streamed
+                    ? (static_cast<size_t>(head) * host_capacity * head_dim + static_cast<size_t>(active_pos) * head_dim)
+                    : 0u;
+                const bool write_slot = (!Streamed) || (phys_slot >= 0);
                 if constexpr (Quantized == kKvFmtInt8) {
                     // Opt-in INT8/INT8 KV: K is quantized after RoPE, V as-is.
                     // One subgroup-wide amax per (head, token) yields the
@@ -1471,8 +1508,14 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                         item.barrier(sycl::access::fence_space::local_space);
                     }
                     const float k_scale = local_sum[0] / 127.0f;
-                    if (lid == 0)
-                        k_scale_ptr[head * max_seq_len + active_pos] = k_scale;
+                    if (lid == 0) {
+                        if constexpr (Streamed) {
+                            host_k_scale_ptr[static_cast<size_t>(head) * host_capacity + active_pos] = k_scale;
+                        }
+                        if (write_slot) {
+                            k_scale_ptr[static_cast<size_t>(head) * max_seq_len + phys_pos] = k_scale;
+                        }
+                    }
                     item.barrier(sycl::access::fence_space::local_space);
 
                     float vamax = 0.0f;
@@ -1486,29 +1529,55 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                         item.barrier(sycl::access::fence_space::local_space);
                     }
                     const float v_scale = local_sum[0] / 127.0f;
-                    if (lid == 0)
-                        v_scale_ptr[head * max_seq_len + active_pos] = v_scale;
+                    if (lid == 0) {
+                        if constexpr (Streamed) {
+                            host_v_scale_ptr[static_cast<size_t>(head) * host_capacity + active_pos] = v_scale;
+                        }
+                        if (write_slot) {
+                            v_scale_ptr[static_cast<size_t>(head) * max_seq_len + phys_pos] = v_scale;
+                        }
+                    }
 
                     int8_t* k_cache_i8 = static_cast<int8_t*>(k_cache_ptr);
                     int8_t* v_cache_i8 = static_cast<int8_t*>(v_cache_ptr);
+                    int8_t* host_k_i8 = static_cast<int8_t*>(host_k_ptr);
+                    int8_t* host_v_i8 = static_cast<int8_t*>(host_v_ptr);
                     for (int d = lid; d < head_dim; d += wg_size) {
-                        k_cache_i8[cache_base + d] =
-                            float_to_int8_kv(static_cast<float>(k_ptr[k_base + d]), k_scale);
-                        v_cache_i8[cache_base + d] =
-                            float_to_int8_kv(static_cast<float>(v_ptr[k_base + d]), v_scale);
+                        const int8_t kq = float_to_int8_kv(static_cast<float>(k_ptr[k_base + d]), k_scale);
+                        const int8_t vq = float_to_int8_kv(static_cast<float>(v_ptr[k_base + d]), v_scale);
+                        if constexpr (Streamed) {
+                            host_k_i8[host_base + d] = kq;
+                            host_v_i8[host_base + d] = vq;
+                        }
+                        if (write_slot) {
+                            k_cache_i8[cache_base + d] = kq;
+                            v_cache_i8[cache_base + d] = vq;
+                        }
                     }
                 } else {
                     for (int d = lid; d < head_dim; d += wg_size) {
                         if constexpr (Quantized == kKvFmtFp8) {
-                            uint8_t* k_cache_fp8 = static_cast<uint8_t*>(k_cache_ptr);
-                            uint8_t* v_cache_fp8 = static_cast<uint8_t*>(v_cache_ptr);
-                            k_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
-                            v_cache_fp8[cache_base + d] = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
+                            const uint8_t kf = float_to_fp8_e4m3fn(static_cast<float>(k_ptr[k_base + d]));
+                            const uint8_t vf = float_to_fp8_e4m3fn(static_cast<float>(v_ptr[k_base + d]));
+                            if constexpr (Streamed) {
+                                static_cast<uint8_t*>(host_k_ptr)[host_base + d] = kf;
+                                static_cast<uint8_t*>(host_v_ptr)[host_base + d] = vf;
+                            }
+                            if (write_slot) {
+                                static_cast<uint8_t*>(k_cache_ptr)[cache_base + d] = kf;
+                                static_cast<uint8_t*>(v_cache_ptr)[cache_base + d] = vf;
+                            }
                         } else {
-                            bf16* k_cache_bf16 = static_cast<bf16*>(k_cache_ptr);
-                            bf16* v_cache_bf16 = static_cast<bf16*>(v_cache_ptr);
-                            k_cache_bf16[cache_base + d] = k_ptr[k_base + d];
-                            v_cache_bf16[cache_base + d] = v_ptr[k_base + d];
+                            const bf16 kb = k_ptr[k_base + d];
+                            const bf16 vb = v_ptr[k_base + d];
+                            if constexpr (Streamed) {
+                                static_cast<bf16*>(host_k_ptr)[host_base + d] = kb;
+                                static_cast<bf16*>(host_v_ptr)[host_base + d] = vb;
+                            }
+                            if (write_slot) {
+                                static_cast<bf16*>(k_cache_ptr)[cache_base + d] = kb;
+                                static_cast<bf16*>(v_cache_ptr)[cache_base + d] = vb;
+                            }
                         }
                     }
                 }
@@ -1536,11 +1605,17 @@ void decode_prepare_qgkv_packed_partial(Context& ctx,
                                         Tensor* k_scale,
                                         Tensor* v_scale,
                                         int rows,
-                                        int qkv_row_stride) {
+                                        int qkv_row_stride,
+                                        const QsaKvStreamWriteTarget* stream_target) {
     float* k_scale_ptr = (k_scale && k_scale->valid()) ? k_scale->data_as<float>() : nullptr;
     float* v_scale_ptr = (v_scale && v_scale->valid()) ? v_scale->data_as<float>() : nullptr;
+    const bool streamed = (stream_target != nullptr && stream_target->page_table != nullptr);
     auto dispatch = [&](auto tag) {
-        decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr, rows, qkv_row_stride);
+        if (streamed) {
+            decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value, true>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr, rows, qkv_row_stride, stream_target);
+        } else {
+            decode_prepare_qgkv_packed_partial_impl<decltype(tag)::value, false>(ctx, q_gate_packed, k, v, q_out, gate_out, q_norm_weight, k_norm_weight, k_cache, v_cache, start_pos, nullptr, 0, num_heads_q, num_kv_heads, head_dim, eps, rotary_dim, theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w, k_scale_ptr, v_scale_ptr, rows, qkv_row_stride, nullptr);
+        }
     };
     if (k_cache.dtype() == dnnl::memory::data_type::s8) {
         dispatch(std::integral_constant<int, kKvFmtInt8>{});

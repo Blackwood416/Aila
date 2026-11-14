@@ -227,7 +227,7 @@ bool Qwen4ExpBnb4Backend::WholeTokenGraphEligible(
             cache.indexer_k.dtype() != dnnl::memory::data_type::bf16 ||
             cache.indexer_compressed_k.dtype() !=
                 dnnl::memory::data_type::bf16 ||
-            cache.k_scale.valid() || cache.v_scale.valid() ||
+            cache.kv_stream_enabled || cache.kv_stream_enabled || cache.k_scale.valid() || cache.v_scale.valid() ||
             cache.num_compressed_blocks < target_blocks - 1 ||
             cache.num_compressed_blocks > target_blocks) {
             return reject("full_attention_layout");

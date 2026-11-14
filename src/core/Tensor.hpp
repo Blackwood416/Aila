@@ -30,6 +30,20 @@ public:
         return t;
     }
 
+    // 在 pinned host USM 上分配新 tensor（device-accessible，释放走 host_budget_）
+    static Tensor allocate_host(Context& ctx,
+                                const std::vector<int64_t>& shape,
+                                dnnl::memory::data_type dtype = dnnl::memory::data_type::bf16) {
+        Tensor t;
+        t.shape_ = shape;
+        t.dtype_ = dtype;
+        t.ctx_ = &ctx;
+        t.owns_memory_ = true;
+        size_t bytes = t.size_bytes();
+        t.data_ptr_ = ctx.alloc_host(bytes);
+        return t;
+    }
+
     // 从已有 USM 指针创建 view（不拥有内存）
     static Tensor view(Context& ctx, void* ptr,
                        const std::vector<int64_t>& shape,

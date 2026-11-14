@@ -288,11 +288,30 @@ Qwen4ExpBnb4Backend::Session::Session(
         } else {
             const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8
                                           : dnnl::memory::data_type::bf16;
-            cache.k = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
-            cache.v = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
-            if (int8_kv) {
-                cache.k_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
-                cache.v_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+            const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(capacity);
+            if (kv_stream_plan.enabled) {
+                cache.kv_stream_enabled = true;
+                const int slot_tokens = kv_stream_plan.residentTokens;
+                cache.k = Tensor::allocate(ctx, {2, slot_tokens, 256}, kv_dtype);
+                cache.v = Tensor::allocate(ctx, {2, slot_tokens, 256}, kv_dtype);
+                cache.host_k = Tensor::allocate_host(ctx, {2, capacity, 256}, kv_dtype);
+                cache.host_v = Tensor::allocate_host(ctx, {2, capacity, 256}, kv_dtype);
+                if (int8_kv) {
+                    cache.k_scale = Tensor::allocate(ctx, {2, slot_tokens}, dnnl::memory::data_type::f32);
+                    cache.v_scale = Tensor::allocate(ctx, {2, slot_tokens}, dnnl::memory::data_type::f32);
+                    cache.host_k_scale = Tensor::allocate_host(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+                    cache.host_v_scale = Tensor::allocate_host(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+                    std::memset(cache.host_k_scale.data(), 0, cache.host_k_scale.size_bytes());
+                    std::memset(cache.host_v_scale.data(), 0, cache.host_v_scale.size_bytes());
+                }
+                ops::qsa_kv_stream_init_map(ctx, cache.kv_stream_map, capacity, kv_stream_plan.slotCount);
+            } else {
+                cache.k = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
+                cache.v = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
+                if (int8_kv) {
+                    cache.k_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+                    cache.v_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
+                }
             }
             cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
             const int max_blocks = std::max(1, capacity / 4);
@@ -925,14 +944,22 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t full_layers = static_cast<size_t>(
             std::count_if(layers_.begin(), layers_.end(), [](const Qwen4ExpLayer& l) { return !l.is_linear; }));
         const size_t linear_layers = layers_.size() - full_layers;
+        const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
+        const size_t device_kv_cap = kv_stream_plan.enabled
+            ? static_cast<size_t>(kv_stream_plan.residentTokens)
+            : static_cast<size_t>(max_seq_len_);
         const auto kv_layout = aila::memory::qwen4exp_kv_bytes(
-            cfg_, static_cast<size_t>(max_seq_len_), kv_element_bytes);
+            cfg_, device_kv_cap, kv_element_bytes);
         const size_t kv_bytes = kv_layout.kv;
         const size_t kv_scale_bytes = kv_layout.scales;
+        const size_t kv_stream_map_bytes = kv_stream_plan.enabled
+            ? full_layers * aila::memory::qwen4exp_kv_stream_map_bytes_per_layer(
+                kv_stream_plan.blockCount, kv_stream_plan.slotCount)
+            : 0;
         const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
         const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
-        const size_t total_session_state = kv_bytes + kv_scale_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
+        const size_t total_session_state = kv_bytes + kv_scale_bytes + kv_stream_map_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 1400))) << 20;
         const int prefill_chunk_cap = std::min(
@@ -972,8 +999,18 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t ws_qsa_tail =
             size_t(ws_attn_cap) * (size_t(full_q_dim_) * 2u + size_t(full_kv_dim_) * 2u +
                                    size_t(ws_idx_out_dim) + size_t(ws_idx_q_dim)) * sizeof(bf16);
+        const size_t ws_kv_stage_half = kv_stream_plan.enabled
+            ? size_t(full_kv_heads_) * size_t(max_seq_len_) * size_t(full_head_dim_) * kv_element_bytes
+            : 0u;
+        const size_t ws_kv_stage_scales = (kv_stream_plan.enabled && int8_kv)
+            ? 2u * size_t(full_kv_heads_) * size_t(max_seq_len_) * sizeof(float)
+            : 0u;
+        const size_t ws_stage_peak = kv_stream_plan.enabled
+            ? (std::max(ws_qsa_base, ws_kv_stage_half) + ws_qsa_tail + ws_kv_stage_half + ws_kv_stage_scales)
+            : 0u;
         const size_t ws_phase_peak = std::max({
             ws_qsa_base + ws_qsa_tail,
+            ws_stage_peak,
             size_t(prefill_chunk_cap) * (20480u + 320u) * sizeof(bf16),
             size_t(prefill_chunk_cap) * size_t(cfg_.num_experts_per_tok) * size_t(hidden_size_) * sizeof(float)});
         const size_t ws_persistent_bufs =
@@ -1006,6 +1043,16 @@ bool Qwen4ExpBnb4Backend::load(
             workspace_reserve / (1024.0 * 1024.0),
             max_reserve / (1024.0 * 1024.0),
             expert_cache_bytes / (1024.0 * 1024.0));
+        if (kv_stream_plan.enabled) {
+            const size_t host_kv_bytes = aila::memory::qwen4exp_kv_bytes(
+                cfg_, static_cast<size_t>(max_seq_len_), kv_element_bytes).total();
+            AILA_LOG_INFO(
+                "[Qwen4Exp] KV Streaming: enabled=1 resident_tokens=%d n_slots=%d logical_blocks=%d "
+                "device_kv_mb=%.1f host_kv_mb=%.1f",
+                kv_stream_plan.residentTokens, kv_stream_plan.slotCount, kv_stream_plan.blockCount,
+                (kv_bytes + kv_scale_bytes + kv_stream_map_bytes) / (1024.0 * 1024.0),
+                host_kv_bytes / (1024.0 * 1024.0));
+        }
     }
     // GPU experts and native RAM experts are complementary owners. Allocate
     // the contiguous embedding before the smaller large-page expert chunks.
@@ -1241,10 +1288,26 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         (alias_prefill_phases ? (moe_router_bytes + moe_h_bytes + moe_sh_gu_bytes + moe_sh_in_bytes + moe_sh_out_bytes) : 0u);
     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
     const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
-    const size_t qsa_base_bytes = align256(std::max({
+    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
+    const bool int8_kv = aila::env::read_flag("AILA_KV_QUANT", false) &&
+                         aila::env::kv_quant_format_is_int8();
+    const size_t kv_elem_bytes = int8_kv ? 1u : sizeof(bf16);
+    const size_t kv_stage_k_max = (alias_prefill_phases && kv_stream_plan.enabled)
+        ? align256(size_t(full_kv_heads_) * size_t(max_seq_len_) * size_t(full_head_dim_) * kv_elem_bytes)
+        : 0u;
+    const size_t kv_stage_v_max = kv_stage_k_max;
+    const size_t kv_stage_scale_max = (alias_prefill_phases && kv_stream_plan.enabled && int8_kv)
+        ? align256(size_t(full_kv_heads_) * size_t(max_seq_len_) * sizeof(float))
+        : 0u;
+    const size_t kv_stage_dense_pair = (alias_prefill_phases && kv_stream_plan.enabled)
+        ? (align256(size_t(full_kv_heads_) * size_t(dense_kv_cap) * size_t(full_head_dim_) * kv_elem_bytes) * 2u +
+           (int8_kv ? align256(size_t(full_kv_heads_) * size_t(dense_kv_cap) * sizeof(float)) * 2u : 0u))
+        : 0u;
+    const size_t qsa_base_bytes_raw = align256(std::max({
         size_t(attn_cap) * size_t(full_fused_qkv_dim_) * sizeof(bf16),
         size_t(full_q_heads_) * size_t(dense_cap) * size_t(dense_cap) * sizeof(float),
         size_t(full_q_heads_) * size_t(dense_cap) * size_t(dense_kv_cap) * sizeof(float)}));
+    const size_t qsa_base_bytes = std::max(qsa_base_bytes_raw, kv_stage_k_max);
     const size_t qsa_q_bytes = align256(size_t(attn_cap) * size_t(full_q_dim_) * sizeof(bf16));
     const size_t qsa_z_bytes = align256(size_t(attn_cap) * size_t(full_q_dim_) * sizeof(bf16));
     const size_t qsa_k_bytes = align256(size_t(attn_cap) * size_t(full_kv_dim_) * sizeof(bf16));
@@ -1252,6 +1315,16 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     const size_t qsa_idx_qk_bytes = align256(size_t(attn_cap) * size_t(indexer_out_dim) * sizeof(bf16));
     const size_t qsa_idx_q_bytes = align256(size_t(attn_cap) * size_t(indexer_q_dim) * sizeof(bf16));
     const size_t qsa_tail_bytes = qsa_q_bytes + qsa_z_bytes + qsa_k_bytes + qsa_v_bytes + qsa_idx_qk_bytes + qsa_idx_q_bytes;
+    const size_t qsa_stage_tail_bytes = (alias_prefill_phases && kv_stream_plan.enabled)
+        ? std::max(kv_stage_v_max + 2u * kv_stage_scale_max, kv_stage_dense_pair)
+        : 0u;
+    buf_.kv_stream_stage_in_phase_scratch = (alias_prefill_phases && kv_stream_plan.enabled);
+    buf_.kv_stream_stage_k_max_bytes = kv_stage_k_max;
+    buf_.kv_stream_stage_v_max_bytes = kv_stage_v_max;
+    buf_.kv_stream_stage_scale_bytes = kv_stage_scale_max;
+    buf_.kv_stream_stage_v_offset = qsa_base_bytes + qsa_tail_bytes;
+    buf_.kv_stream_stage_k_scale_offset = buf_.kv_stream_stage_v_offset + kv_stage_v_max;
+    buf_.kv_stream_stage_v_scale_offset = buf_.kv_stream_stage_k_scale_offset + kv_stage_scale_max;
     if (s_phase_scratch) {
         // Disjoint per-layer lifetimes on the in-order compute queue:
         //   (0) Layer-1 PLE intermediates (key/val/norm/gv)
@@ -1270,7 +1343,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             size_t(full_q_heads_)*dense_cap*dense_kv_cap*sizeof(float),
             s_expert_major ? moe_phase_bytes : 0,
             alias_prefill_phases ? hc_phase_bytes : 0,
-            alias_prefill_phases ? (qsa_base_bytes + qsa_tail_bytes) : 0};
+            alias_prefill_phases ? (qsa_base_bytes + qsa_tail_bytes + qsa_stage_tail_bytes) : 0};
         size_t peak=0,total=0;for(size_t n:bytes){peak=std::max(peak,n);total+=n;}
         buf_.phase_scratch=Tensor::allocate(ctx,{int64_t(peak)},dnnl::memory::data_type::u8);
         AILA_LOG_INFO("[Q4E PhaseScratch] cap=%d bytes=%zu separate_bytes=%zu saved_bytes=%zu",
@@ -1359,6 +1432,10 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     const int max_qsa_tile_rows = std::max(qsa_query_tile_, 1024);
     buf_.qsa_tile_active_blocks = Tensor::allocate(ctx, {max_qsa_tile_rows, block_topk + 4}, dnnl::memory::data_type::s32);
     buf_.qsa_tile_valid_counts = Tensor::allocate(ctx, {max_qsa_tile_rows, 2}, dnnl::memory::data_type::s32);
+    if (kv_stream_plan.enabled && !buf_.qsa_resolved_blocks.valid()) {
+        buf_.qsa_resolved_blocks = Tensor::allocate(ctx, {4, block_topk + 4}, dnnl::memory::data_type::s32);
+        buf_.qsa_resolved_tail_indices = Tensor::allocate(ctx, {16}, dnnl::memory::data_type::s32);
+    }
 
 
     // Linear Attention buffers
@@ -4199,6 +4276,9 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
             cache.device_state_dirty = false;
         } else {
             cache.num_compressed_blocks = snap_layer.num_compressed_blocks;
+            if (cache.kv_stream_enabled) {
+                ops::qsa_kv_stream_reset(*session.context_, cache.kv_stream_map);
+            }
         }
     }
     if (last_h2d_event != sycl::event{}) {
@@ -4242,6 +4322,9 @@ void Qwen4ExpBnb4Backend::Reset(Session& session) {
             cache.linear_conv_head = 0;
         } else {
             cache.num_compressed_blocks = 0;
+            if (cache.kv_stream_enabled) {
+                ops::qsa_kv_stream_reset(*session.context_, cache.kv_stream_map);
+            }
         }
     }
     PublishGdnHostHeadsToDevice(*session.context_, session);
@@ -4284,7 +4367,14 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
         for (const Tensor* tensor : {&cache.k, &cache.v, &cache.indexer_k,
                                      &cache.indexer_compressed_k, &cache.linear_state,
                                      &cache.linear_conv_state, &cache.k_scale,
-                                     &cache.v_scale}) {
+                                     &cache.v_scale,
+                                     &cache.kv_stream_map.page_table,
+                                     &cache.kv_stream_map.slot_block,
+                                     &cache.kv_stream_map.slot_stamp,
+                                     &cache.kv_stream_map.slot_ref,
+                                     &cache.kv_stream_map.miss_block,
+                                     &cache.kv_stream_map.miss_slot,
+                                     &cache.kv_stream_map.ctl}) {
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
         }
     }
@@ -4304,6 +4394,52 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
         }
     }
     return session;
+}
+
+void Qwen4ExpBnb4Backend::PrepareKvStagingBuffers(
+    Context& ctx, int stageLen, bool int8Kv, bool sparsePrefill,
+    Tensor& stageK, Tensor& stageV, Tensor& stageKScale, Tensor& stageVScale) {
+    const auto dtype = int8Kv ? dnnl::memory::data_type::s8 : dnnl::memory::data_type::bf16;
+    const size_t elemBytes = int8Kv ? 1u : sizeof(bf16);
+    const size_t kvBytes = static_cast<size_t>(full_kv_heads_) * stageLen * full_head_dim_ * elemBytes;
+    const size_t scaleBytes = int8Kv ? (static_cast<size_t>(full_kv_heads_) * stageLen * sizeof(float)) : 0u;
+    if (buf_.kv_stream_stage_in_phase_scratch && buf_.phase_scratch.valid()) {
+        uint8_t* base = buf_.phase_scratch.data_as<uint8_t>();
+        if (sparsePrefill) {
+            stageK = Tensor::view(ctx, base, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+            stageV = Tensor::view(ctx, base + buf_.kv_stream_stage_v_offset, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+            if (int8Kv) {
+                stageKScale = Tensor::view(ctx, base + buf_.kv_stream_stage_k_scale_offset, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+                stageVScale = Tensor::view(ctx, base + buf_.kv_stream_stage_v_scale_offset, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+            }
+        } else {
+            const size_t kvAligned = (kvBytes + 255u) & ~size_t(255u);
+            const size_t scaleAligned = (scaleBytes + 255u) & ~size_t(255u);
+            uint8_t* ptr = base + buf_.kv_stream_stage_v_offset;
+            stageK = Tensor::view(ctx, ptr, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+            stageV = Tensor::view(ctx, ptr + kvAligned, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+            if (int8Kv) {
+                stageKScale = Tensor::view(ctx, ptr + 2u * kvAligned, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+                stageVScale = Tensor::view(ctx, ptr + 2u * kvAligned + scaleAligned, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+            }
+        }
+        return;
+    }
+    if (!buf_.kv_stream_stage_k.valid() || buf_.kv_stream_stage_k.dtype() != dtype ||
+        buf_.kv_stream_stage_k.shape(1) < stageLen) {
+        buf_.kv_stream_stage_k = Tensor::allocate(ctx, {full_kv_heads_, max_seq_len_, full_head_dim_}, dtype);
+        buf_.kv_stream_stage_v = Tensor::allocate(ctx, {full_kv_heads_, max_seq_len_, full_head_dim_}, dtype);
+        if (int8Kv) {
+            buf_.kv_stream_stage_k_scale = Tensor::allocate(ctx, {full_kv_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
+            buf_.kv_stream_stage_v_scale = Tensor::allocate(ctx, {full_kv_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
+        }
+    }
+    stageK = Tensor::view(ctx, buf_.kv_stream_stage_k.data(), {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+    stageV = Tensor::view(ctx, buf_.kv_stream_stage_v.data(), {full_kv_heads_, stageLen, full_head_dim_}, dtype);
+    if (int8Kv) {
+        stageKScale = Tensor::view(ctx, buf_.kv_stream_stage_k_scale.data(), {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+        stageVScale = Tensor::view(ctx, buf_.kv_stream_stage_v_scale.data(), {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
+    }
 }
 
 Tensor& Qwen4ExpBnb4Backend::Forward(

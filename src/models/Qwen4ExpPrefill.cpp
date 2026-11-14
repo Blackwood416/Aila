@@ -246,6 +246,17 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             cache.device_state_dirty = d_state.device_state_dirty;
         }
     } else {
+        ops::QsaKvStreamWriteTarget stream_write_target{};
+        if (cache.kv_stream_enabled) {
+            stream_write_target.host_k = cache.host_k.data();
+            stream_write_target.host_v = cache.host_v.data();
+            stream_write_target.host_k_scale = cache.host_k_scale.valid() ? cache.host_k_scale.data_as<float>() : nullptr;
+            stream_write_target.host_v_scale = cache.host_v_scale.valid() ? cache.host_v_scale.data_as<float>() : nullptr;
+            stream_write_target.page_table = cache.kv_stream_map.page_table.data_as<int32_t>();
+            stream_write_target.host_capacity = session.Capacity();
+        }
+        const ops::QsaKvStreamWriteTarget* stream_write_ptr =
+            cache.kv_stream_enabled ? &stream_write_target : nullptr;
         if (count == 1) {
             if (L == kQsaGraphLayer && qsa_layer_graph_enabled() &&
                 ForwardQsaLayerGraph(ctx, session, input, output, start_pos)) {
@@ -272,7 +283,8 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 cfg_.rope.mrope_section[1],
                 cfg_.rope.mrope_section[2],
                 cache.k_scale.valid() ? &cache.k_scale : nullptr,
-                cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                1, 0, stream_write_ptr);
 
             const int* active_indices = nullptr;
             int num_active_tokens = 0;
@@ -319,7 +331,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     DenseLinear(ctx, layer.index_qk_proj, layer.index_qk_weight, input, buf_.indexer_qk,
                                 1, indexer_out_dim, hidden_size_);
 
-                    if (s_qsa_block_native) {
+                    if (s_qsa_block_native || cache.kv_stream_enabled) {
                         num_active_blocks = ops::qsa_prepare_causal_query_and_select_blocks(
                             ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
                             cache.indexer_k, buf_.indexer_q, buf_.indexer_block_scores,
@@ -352,6 +364,32 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             active_indices = buf_.indexer_active_tokens.data_as<int>();
                         }
                     }
+                }
+            }
+
+            if (cache.kv_stream_enabled) {
+                const int compress_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+                const int block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / compress_ratio;
+                const int num_complete_blocks = cached_len / compress_ratio;
+                ops::qsa_kv_stream_resolve(
+                    ctx, cache.kv_stream_map, cache.k, cache.v,
+                    cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                    cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                    cache.host_k, cache.host_v,
+                    cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                    cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                    active_blocks, 1, start_pos, block_topk, compress_ratio,
+                    buf_.qsa_resolved_blocks, &buf_.qsa_resolved_tail_indices);
+                if (num_complete_blocks > 0) {
+                    active_blocks = buf_.qsa_resolved_blocks.data_as<int>();
+                    num_active_blocks = std::min(num_complete_blocks, block_topk);
+                    active_indices = nullptr;
+                    num_active_tokens = 0;
+                } else {
+                    active_blocks = nullptr;
+                    num_active_blocks = 0;
+                    active_indices = buf_.qsa_resolved_tail_indices.data_as<int>();
+                    num_active_tokens = cached_len;
                 }
             }
 
@@ -438,7 +476,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
                     cache.k_scale.valid() ? &cache.k_scale : nullptr,
                     cache.v_scale.valid() ? &cache.v_scale : nullptr,
-                    count, qkv_stride);
+                    count, qkv_stride, stream_write_ptr);
             } else {
                 ops::split_qgkv(ctx, buf_.full_qkv, buf_.q, buf_.z, buf_.k, buf_.v, count,
                                 full_q_heads_, full_kv_heads_, full_head_dim_);
@@ -456,10 +494,18 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                         cfg_.rope.mrope_section[2]);
 
                 if (count > 1) {
-                    ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity(),
-                                       cache.k_scale.valid() ? &cache.k_scale : nullptr);
-                    ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, session.Capacity(),
-                                       cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                    const int cache_stride = cache.kv_stream_enabled
+                        ? static_cast<int>(cache.k.shape(1)) : session.Capacity();
+                    ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, cache_stride,
+                                       cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                       cache.kv_stream_enabled ? &cache.host_k : nullptr,
+                                       cache.kv_stream_enabled ? &cache.kv_stream_map.page_table : nullptr,
+                                       cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr);
+                    ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, cache_stride,
+                                       cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                                       cache.kv_stream_enabled ? &cache.host_v : nullptr,
+                                       cache.kv_stream_enabled ? &cache.kv_stream_map.page_table : nullptr,
+                                       cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr);
                 }
             }
 
@@ -501,6 +547,27 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         static_cast<size_t>(window_max_blocks));
                     static const int s_qsa_query_tile_env =
                         aila::env::read_int_raw("AILA_QSA_QUERY_TILE", 0);
+                    static const bool verify_decode_attention =
+                        aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", true);
+                    static const bool s_qsa_block_native =
+                        aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
+                    const bool use_verify_decode_attn =
+                        verify_decode_attention && allowQ8 && !interior && count >= 2 && count <= 4 &&
+                        (s_qsa_block_native || cache.kv_stream_enabled) && !verify_rows_alignment_;
+                    Tensor stage_k, stage_v, stage_k_scale, stage_v_scale;
+                    if (cache.kv_stream_enabled && !use_verify_decode_attn) {
+                        const bool int8_kv = (cache.k.dtype() == dnnl::memory::data_type::s8);
+                        PrepareKvStagingBuffers(ctx, start_pos + count, int8_kv, true,
+                                                stage_k, stage_v, stage_k_scale, stage_v_scale);
+                        ops::qsa_kv_stream_stage_from_host(
+                            ctx, stage_k, stage_v,
+                            int8_kv ? &stage_k_scale : nullptr,
+                            int8_kv ? &stage_v_scale : nullptr,
+                            cache.host_k, cache.host_v,
+                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            start_pos + count);
+                    }
                     const int query_tile = s_qsa_query_tile_env > 0
                         ? std::min(qsa_query_tile_, max_tile_rows)
                         : std::clamp(score_fit_rows, 16, std::min(max_tile_rows, 1024));
@@ -538,18 +605,27 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             tile_count, tile_max_blocks, tile_start_pos, block_topk, compress_ratio,
                             &valid_counts_tile);
 
-                        static const bool verify_decode_attention =
-                            aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", true);
-                        static const bool s_qsa_block_native =
-                            aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
-                        if (verify_decode_attention && allowQ8 && !interior && count >= 2 && count <= 4 &&
-                            s_qsa_block_native && !verify_rows_alignment_) {
+                        if (use_verify_decode_attn) {
                             const size_t block_stride = static_cast<size_t>(block_topk + 4);
+                            const int* resolved_base = buf_.qsa_tile_active_blocks.data_as<int>();
+                            if (cache.kv_stream_enabled) {
+                                ops::qsa_kv_stream_resolve(
+                                    ctx, cache.kv_stream_map, cache.k, cache.v,
+                                    cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                    cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                                    cache.host_k, cache.host_v,
+                                    cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                                    cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                                    buf_.qsa_tile_active_blocks.data_as<int>(),
+                                    tile_count, tile_start_pos, block_topk, compress_ratio,
+                                    buf_.qsa_resolved_blocks, nullptr);
+                                resolved_base = buf_.qsa_resolved_blocks.data_as<int>();
+                            }
                             for (int row = 0; row < tile_count; ++row) {
                                 const int row_len = tile_start_pos + row + 1;
                                 const int row_blocks = row_len / compress_ratio;
                                 const int row_active_blocks = std::min(row_blocks, block_topk);
-                                const int* row_blocks_ptr = buf_.qsa_tile_active_blocks.data_as<int>() +
+                                const int* row_blocks_ptr = resolved_base +
                                     static_cast<size_t>(row) * block_stride;
                                 auto q_row = Tensor::view(
                                     ctx, q_full_tile.data_as<bf16>() + static_cast<size_t>(row) * q_dim, {1, q_dim});
@@ -566,11 +642,15 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                     cache.v_scale.valid() ? &cache.v_scale : nullptr);
                             }
                         } else {
+                            Tensor& attn_k = cache.kv_stream_enabled ? stage_k : cache.k;
+                            Tensor& attn_v = cache.kv_stream_enabled ? stage_v : cache.v;
+                            const Tensor* attn_ks = cache.kv_stream_enabled ? &stage_k_scale : &cache.k_scale;
+                            const Tensor* attn_vs = cache.kv_stream_enabled ? &stage_v_scale : &cache.v_scale;
                             ops::attention_prefill_qsa_batched(
-                                ctx, q_full_tile, cache.k, cache.v, buf_.qsa_tile_active_blocks, attn_out_tile,
+                                ctx, q_full_tile, attn_k, attn_v, buf_.qsa_tile_active_blocks, attn_out_tile,
                                 tile_count, tile_start_pos, full_q_heads_, full_kv_heads_, full_head_dim_,
                                 block_topk, compress_ratio, &z_tile, &valid_counts_tile,
-                                &cache.k_scale, &cache.v_scale);
+                                attn_ks, attn_vs);
                         }
                     }
                 } else {
@@ -590,6 +670,20 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
                             cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
                         cache.num_compressed_blocks = total_complete_blocks;
+                    }
+                    Tensor fb_stage_k, fb_stage_v, fb_stage_k_scale, fb_stage_v_scale;
+                    if (cache.kv_stream_enabled) {
+                        const bool int8_kv = (cache.k.dtype() == dnnl::memory::data_type::s8);
+                        PrepareKvStagingBuffers(ctx, start_pos + count, int8_kv, true,
+                                                fb_stage_k, fb_stage_v, fb_stage_k_scale, fb_stage_v_scale);
+                        ops::qsa_kv_stream_stage_from_host(
+                            ctx, fb_stage_k, fb_stage_v,
+                            int8_kv ? &fb_stage_k_scale : nullptr,
+                            int8_kv ? &fb_stage_v_scale : nullptr,
+                            cache.host_k, cache.host_v,
+                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            start_pos + count);
                     }
                     // The upstream indexer builds a separate mask from each query's
                     // causal visible prefix. Keep this row-wise path as the correctness
@@ -630,14 +724,20 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                 ctx, buf_.indexer_block_scores, visible_len / compress_ratio,
                                 block_topk, visible_len, compress_ratio, buf_.indexer_active_tokens);
                         }
+                        Tensor& fb_k = cache.kv_stream_enabled ? fb_stage_k : cache.k;
+                        Tensor& fb_v = cache.kv_stream_enabled ? fb_stage_v : cache.v;
+                        const Tensor* fb_ks = cache.kv_stream_enabled
+                            ? (fb_stage_k_scale.valid() ? &fb_stage_k_scale : nullptr)
+                            : (cache.k_scale.valid() ? &cache.k_scale : nullptr);
+                        const Tensor* fb_vs = cache.kv_stream_enabled
+                            ? (fb_stage_v_scale.valid() ? &fb_stage_v_scale : nullptr)
+                            : (cache.v_scale.valid() ? &cache.v_scale : nullptr);
                         ops::attention_decode(
-                            ctx, q_row, cache.k, cache.v, attn_out_row, buf_.decode_scores,
+                            ctx, q_row, fb_k, fb_v, attn_out_row, buf_.decode_scores,
                             full_q_heads_, full_kv_heads_, full_head_dim_, visible_len,
                             &buf_.decode_attn_partials, &z_row,
                             buf_.indexer_active_tokens.data_as<int>(), attention_active_tokens,
-                            nullptr, 0,
-                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
-                            cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                            nullptr, 0, fb_ks, fb_vs);
                     }
                 }
                 project_prefill(layer.o_proj, buf_.attn_out, output);
@@ -671,6 +771,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 static const int decode_sink = aila::env::read_int_raw("AILA_ATTN_DECODE_SINK", 0);
                 if (verify_decode_attention && verify_attention_pair && allowQ8 && count >= 2 && count <= 4 &&
                     start_pos + 1 >= 1 && !interior && decode_window <= 0 && decode_sink <= 0 &&
+                    !cache.kv_stream_enabled &&
                     cache.k.dtype()==dnnl::memory::data_type::bf16 &&
                     (start_pos + count - 1 < 1024 || buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272) &&
                     !verify_rows_alignment_) {
@@ -705,24 +806,72 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     // Verification queries share KV storage but each sees only its
                     // own causal prefix. Reuse decode's exact-merge and fused gate;
                     // the in-order queue safely reuses the single-row scratch.
+                    if (cache.kv_stream_enabled) {
+                        ops::qsa_kv_stream_resolve(
+                            ctx, cache.kv_stream_map, cache.k, cache.v,
+                            cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                            cache.v_scale.valid() ? &cache.v_scale : nullptr,
+                            cache.host_k, cache.host_v,
+                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            nullptr, count, start_pos, block_topk, compress_ratio,
+                            buf_.qsa_resolved_blocks, &buf_.qsa_resolved_tail_indices);
+                    }
                     const int q_dim = full_q_heads_ * full_head_dim_;
+                    const size_t block_stride = static_cast<size_t>(block_topk + 4);
                     for (int row = 0; row < count; ++row) {
+                        const int row_len = start_pos + row + 1;
+                        const int row_blocks = row_len / compress_ratio;
+                        const int* row_active_indices = nullptr;
+                        int row_active_tokens = 0;
+                        const int* row_active_blocks = nullptr;
+                        int row_active_block_count = 0;
+                        if (cache.kv_stream_enabled) {
+                            if (row_blocks > 0) {
+                                row_active_blocks = buf_.qsa_resolved_blocks.data_as<int>() +
+                                    static_cast<size_t>(row) * block_stride;
+                                row_active_block_count = row_blocks;
+                            } else {
+                                row_active_indices = buf_.qsa_resolved_tail_indices.data_as<int>() +
+                                    static_cast<size_t>(row) * compress_ratio;
+                                row_active_tokens = row_len;
+                            }
+                        }
                         auto q_row = Tensor::view(ctx, buf_.q.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
                         auto z_row = Tensor::view(ctx, buf_.z.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
                         auto out_row = Tensor::view(ctx, buf_.attn_out.data_as<bf16>() + size_t(row) * q_dim, {1, q_dim});
                         ops::attention_decode(ctx, q_row, cache.k, cache.v, out_row, buf_.decode_scores,
-                            full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + row + 1,
+                            full_q_heads_, full_kv_heads_, full_head_dim_, row_len,
                             &buf_.decode_attn_partials, &z_row,
-                            nullptr, 0, nullptr, 0,
+                            row_active_indices, row_active_tokens,
+                            row_active_blocks, row_active_block_count,
                             cache.k_scale.valid() ? &cache.k_scale : nullptr,
                             cache.v_scale.valid() ? &cache.v_scale : nullptr);
                     }
                 } else if (start_pos == 0) {
                     ops::attention_prefill(ctx, buf_.q, buf_.k, buf_.v, buf_.attn_out, buf_.scores, count, full_q_heads_, full_kv_heads_, full_head_dim_, &buf_.z);
                 } else {
-                    ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z,
-                                                  cache.k_scale.valid() ? &cache.k_scale : nullptr,
-                                                  cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                    if (cache.kv_stream_enabled) {
+                        Tensor stage_k, stage_v, stage_k_scale, stage_v_scale;
+                        const bool int8_kv = (cache.k.dtype() == dnnl::memory::data_type::s8);
+                        PrepareKvStagingBuffers(ctx, start_pos + count, int8_kv, false,
+                                                stage_k, stage_v, stage_k_scale, stage_v_scale);
+                        ops::qsa_kv_stream_stage_from_host(
+                            ctx, stage_k, stage_v,
+                            int8_kv ? &stage_k_scale : nullptr,
+                            int8_kv ? &stage_v_scale : nullptr,
+                            cache.host_k, cache.host_v,
+                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
+                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            start_pos + count);
+                        ops::attention_prefill_cached(ctx, buf_.q, stage_k, stage_v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + count, &buf_.z,
+                                                      int8_kv ? &stage_k_scale : nullptr,
+                                                      int8_kv ? &stage_v_scale : nullptr);
+                    } else {
+                        ops::attention_prefill_cached(ctx, buf_.q, cache.k, cache.v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, session.Capacity(), &buf_.z,
+                                                      cache.k_scale.valid() ? &cache.k_scale : nullptr,
+                                                      cache.v_scale.valid() ? &cache.v_scale : nullptr);
+                    }
                 }
                 project_prefill(layer.o_proj, buf_.attn_out, output);
             }
@@ -828,7 +977,7 @@ bool Qwen4ExpBnb4Backend::QsaLayerGraphEligible(
         layer.index_k_norm_weight->shape(0) != kQsaGraphIndexerHeadDim) {
         return reject("layer_weights");
     }
-    if (!cache.k.valid() || !cache.v.valid() ||
+    if (cache.kv_stream_enabled || !cache.k.valid() || !cache.v.valid() ||
         cache.k.dtype() != dnnl::memory::data_type::bf16 ||
         cache.v.dtype() != dnnl::memory::data_type::bf16 ||
         cache.k.ndim() != 3 || cache.v.ndim() != 3 ||

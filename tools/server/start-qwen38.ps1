@@ -59,6 +59,14 @@ if ($resolvedKvType -eq 'int8') {
     $env:AILA_KV_QUANT = '0'
 }
 
+# At >= 64K BF16 or >= 128K INT8, full QSA KV consumes 1.5-3.1 GiB VRAM and
+# displaces ~600-1,200 GPU experts; enable QSA KV streaming unless overridden.
+if (-not (Test-Path Env:AILA_Q4E_KV_STREAM)) {
+    if (($resolvedKvType -eq 'bf16' -and $Context -ge 65536) -or ($resolvedKvType -eq 'int8' -and $Context -ge 131072)) {
+        $env:AILA_Q4E_KV_STREAM = '1'
+    }
+}
+
 # Standard Level Zero / SYCL runtime environment aligned with CLI benchmarks.
 if ($env:AILA_KEEP_SYCL_CACHE_PERSISTENT -ne '1') {
     $env:SYCL_CACHE_PERSISTENT = '0'
