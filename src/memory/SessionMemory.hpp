@@ -112,14 +112,16 @@ struct Qwen4ExpKvStreamPlan {
     int blockCount = 0;     // (capacity + 3) / 4
 };
 
-inline Qwen4ExpKvStreamPlan qwen4exp_kv_stream_plan(int capacity) {
+inline Qwen4ExpKvStreamPlan qwen4exp_kv_stream_plan(int capacity, int residentTokensOverride = 0) {
     Qwen4ExpKvStreamPlan plan;
     if (capacity <= 0) return plan;
     plan.blockCount = (capacity + 3) / 4;
     if (!aila::env::read_flag("AILA_Q4E_KV_STREAM", false)) {
         return plan;
     }
-    const int raw_resident = aila::env::read_int("AILA_Q4E_KV_RESIDENT_TOKENS", 16384);
+    const int raw_resident = residentTokensOverride > 0
+        ? residentTokensOverride
+        : aila::env::read_int("AILA_Q4E_KV_RESIDENT_TOKENS", 16384);
     // Minimum 8208 tokens (2052 slots): holds up to 4 * (512 + 1) distinct blocks
     // for a width-4 MTP verify window without CLOCK overflow.
     const int clamped = raw_resident < 8208 ? 8208 : raw_resident;
@@ -165,12 +167,30 @@ inline Qwen4ExpKvBytes qwen4exp_kv_bytes(
     return bytes;
 }
 
+inline int qwen4exp_kv_stream_select_auto_resident_tokens(
+    const Qwen4ExpTextConfig& config, int capacity, size_t availableBytesForKv, size_t kvElementBytes) {
+    constexpr int kTiers[] = {65536, 32768, 16384, 8208};
+    const int blockCount = (capacity + 3) / 4;
+    const size_t fullLayers = positive_memory_dimension(config.num_hidden_layers) / kQwen4ExpFullAttentionInterval;
+    for (int tier : kTiers) {
+        const int slots = tier / 4;
+        if (slots >= blockCount) continue;
+        const size_t kvTotal = qwen4exp_kv_bytes(config, static_cast<size_t>(tier), kvElementBytes).total();
+        const size_t mapTotal = checked_memory_product(
+            qwen4exp_kv_stream_map_bytes_per_layer(blockCount, slots), fullLayers);
+        if (checked_memory_sum(kvTotal, mapTotal) <= availableBytesForKv) {
+            return tier;
+        }
+    }
+    return 8208;
+}
+
 // convolution history (F32), and the PLE convolution state (F32). The host
 // payload is the persistent DeltaNet mirror plus retained snapshots; the PLE
 // convolution state is device-only but every snapshot keeps a float copy.
 inline SessionMemoryReservation qwen4exp_session_memory(
     const Qwen4ExpTextConfig& config, int capacity, size_t maxSnapshots,
-    size_t kvElementBytes = 2) {
+    size_t kvElementBytes = 2, int kvStreamResidentTokens = 0) {
     if (!is_exact_qwen4exp_text_spec(config)) {
         throw std::invalid_argument("Unsupported Qwen4Exp text dimensions");
     }
@@ -215,9 +235,9 @@ inline SessionMemoryReservation qwen4exp_session_memory(
     // K and V, each `kvElementBytes` wide. The int8 layout also allocates a
     // per-token F32 scale for K and for V ({kvHeads, capacity} each).
     // When QSA KV streaming is active (capacity > residentTokens), VRAM holds
-    // only the resident slot pool + residency maps while the authoritative
-    // full-context KV lives in pinned host USM.
-    const auto streamPlan = qwen4exp_kv_stream_plan(capacity);
+    // only the resident slot pool, residency maps, and compressed indexer keys,
+    // while authoritative full-context KV and raw indexer_k live in pinned host USM.
+    const auto streamPlan = qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens);
     const size_t fullHostBytes = qwen4exp_kv_bytes(config, cached, kvElementBytes).total();
     size_t fullBytes = fullHostBytes;
     if (streamPlan.enabled) {
@@ -230,10 +250,15 @@ inline SessionMemoryReservation qwen4exp_session_memory(
     }
 
     const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
-    size_t indexerBytes = checked_memory_product(
-        checked_memory_product(checked_memory_sum(cached, compressed),
-                               static_cast<size_t>(kIndexerHeadDim)), size_t{2});
-    indexerBytes = checked_memory_product(indexerBytes, fullLayers);
+    const size_t indexerRawBytes = checked_memory_product(
+        checked_memory_product(cached, static_cast<size_t>(kIndexerHeadDim)),
+        checked_memory_product(size_t{2}, fullLayers));
+    const size_t indexerCompressedBytes = checked_memory_product(
+        checked_memory_product(compressed, static_cast<size_t>(kIndexerHeadDim)),
+        checked_memory_product(size_t{2}, fullLayers));
+    const size_t indexerBytes = streamPlan.enabled
+        ? indexerCompressedBytes
+        : checked_memory_sum(indexerRawBytes, indexerCompressedBytes);
 
     const auto keyHeads = positive_memory_dimension(config.linear_num_key_heads);
     const auto valueHeads = positive_memory_dimension(config.linear_num_value_heads);
@@ -259,7 +284,7 @@ inline SessionMemoryReservation qwen4exp_session_memory(
         checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots)),
         checked_memory_product(pleBytes, maxSnapshots));
     if (streamPlan.enabled) {
-        hostBytes = checked_memory_sum(hostBytes, fullHostBytes);
+        hostBytes = checked_memory_sum(hostBytes, checked_memory_sum(fullHostBytes, indexerRawBytes));
     }
     if (aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false)) {
         const size_t headBytes = checked_memory_product(

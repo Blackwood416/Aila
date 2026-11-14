@@ -118,6 +118,7 @@ void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector
         state.length = start + int(count);
         return;
     }
+    static const bool s_batch_catchup = aila::env::read_flag("AILA_Q4E_MTP_BATCH_CATCHUP", true);
     const size_t capRows = static_cast<size_t>(std::max<int64_t>(1, hiddenRows.shape(0)));
     if (start) draft->Step(*state.draft, state.lastHidden.data_as<bf16>(), tokens.front(), start - 1, true);
     for (size_t base = 0; base < count; base += capRows) {
@@ -126,9 +127,17 @@ void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector
                            target.buf_.hidden4.data_as<bf16>() + base * 10240,
                            slice * 10240 * sizeof(bf16));
         const size_t stepEnd = std::min(slice, count - 1 - base);
-        for (size_t r = 0; r < stepEnd; ++r) {
-            draft->Step(*state.draft, hiddenRows.data_as<bf16>() + r * 10240,
-                        tokens[base + r + 1], start + int(base + r), true);
+        // StepBatchKvOnly reuses target.buf_.hidden4, so only batch the final slice
+        // once no later slice remains to be copied out of target.buf_.hidden4.
+        if (s_batch_catchup && stepEnd > 1 && base + slice == count) {
+            draft->StepBatchKvOnly(*state.draft, hiddenRows.data_as<bf16>(),
+                                   tokens.data() + base + 1, static_cast<int>(stepEnd),
+                                   start + static_cast<int>(base));
+        } else {
+            for (size_t r = 0; r < stepEnd; ++r) {
+                draft->Step(*state.draft, hiddenRows.data_as<bf16>() + r * 10240,
+                            tokens[base + r + 1], start + int(base + r), true);
+            }
         }
         if (base + slice == count) {
             ctx.queue().memcpy(state.lastHidden.data(),

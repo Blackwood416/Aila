@@ -36,6 +36,8 @@ public:
     void Step(State& state, const sycl::ext::oneapi::bfloat16* hidden, int token,
               int position, bool kvOnly = false,
               void (*onBeforeCpuCold)(void*) = nullptr, void* onBeforeCpuColdCtx = nullptr);
+    void StepBatchKvOnly(State& state, const sycl::ext::oneapi::bfloat16* hidden,
+                         const int* tokens, int count, int startPosition);
 
 private:
     static constexpr int kMtpExperts = 512;
@@ -107,6 +109,9 @@ private:
     uint64_t hostEmbedTick_ = 0;
     HostTensorView embeddingTable_;
 
+    static constexpr int kMtpBatchEmbedTile = 512;
+    sycl::ext::oneapi::bfloat16* batchEmbedHost_ = nullptr;
+    sycl::event batchEmbedEvent_{};
     void FreeHostEmbed() noexcept;
 
     SlotLayout layout_{};

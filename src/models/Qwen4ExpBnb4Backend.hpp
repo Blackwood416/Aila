@@ -315,7 +315,8 @@ public:
         Session(Context& ctx, int capacity,
                 std::shared_ptr<const SessionOwner> owner,
                 std::size_t maxSnapshots, uint64_t instanceId,
-                aila::TokenGraphRuntime* tokenGraphRuntime);
+                aila::TokenGraphRuntime* tokenGraphRuntime,
+                int kvStreamResidentTokens = 0);
 
         Context* context_ = nullptr;
         std::shared_ptr<const SessionOwner> owner_;
@@ -383,6 +384,10 @@ public:
     std::size_t qsa_layer_graph_node_count() const noexcept {
         return qsa_layer_graph_.node_count;
     }
+    int ResolvedKvResidentTokens() const noexcept {
+        return resolved_kv_resident_tokens_;
+    }
+    void TrimDecodeRuntimeBuffers(Context& ctx);
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
     // All token-graph submissions must pass through this host wrapper.
@@ -651,7 +656,6 @@ private:
     friend class Qwen4ExpMtpRuntime;
     friend class InferenceEngine;
     void ensure_runtime_buffers(Context& ctx, int seq_len);
-    void TrimDecodeRuntimeBuffers(Context& ctx);
     void free_pinned_host_buffers();
     sycl::event RunGroupedExperts(Context& ctx, int layer, int count,
         int firstUnique, int numUnique, int& actStart, int& tileStart,
@@ -735,6 +739,7 @@ private:
     bool component_profile_active_for_test_ = false;
     std::array<double, 5> component_profile_ms_for_test_{};
     int qsa_query_tile_ = 64;
+    int resolved_kv_resident_tokens_ = 0;
 
     Context* context_ = nullptr;
     std::shared_ptr<const SessionOwner> sessionOwner_;

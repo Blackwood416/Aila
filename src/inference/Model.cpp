@@ -392,6 +392,7 @@ private:
                         // token only update state; their LM head is never read.
                         options.need_logits = sampling != nullptr || captureLogits;
                         options.prefill_remaining = prefillRemaining;
+                        options.defer_decode_trim = (model->mtp != nullptr && prefillRemaining == 0);
                         // The ids are still in this std::vector, so the host
                         // embedding gather needs no device readback.
                         options.host_token_ids = tokenIds.data();
@@ -416,6 +417,11 @@ private:
             const auto sampleEnd = workSummary ? WorkClock::now() : WorkClock::time_point{};
             if (model->mtp) model->mtp->AfterForward(*mtpState,
                 cache->CurrentLength() - static_cast<int>(tokenIds.size()), tokenIds);
+            if constexpr (std::is_same_v<Backend, Qwen4ExpBnb4Backend>) {
+                if (model->mtp && prefillRemaining == 0) {
+                    ModelBackend().TrimDecodeRuntimeBuffers(context);
+                }
+            }
             // No device work may still refer to borrowed input or mutable
             // bindings when the caller destroys/switches the session.
             context.synchronize();
@@ -845,6 +851,21 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         else loaded->backend = std::make_unique<Qwen3Bnb4Backend>();
         if (!loaded->backend->load(context, *loaded->weights, spec, options.maxSequenceLength, &error)) {
             throw Error(ErrorCode::UnsupportedModel, error);
+        }
+        if (qwen4exp) {
+            const size_t kvElementBytes =
+                (quantizedCache && aila::env::kv_quant_format_is_int8()) ? 1 : 2;
+            const int resolvedKvResident =
+                static_cast<const Qwen4ExpBnb4Backend&>(*loaded->backend).ResolvedKvResidentTokens();
+            auto updatedRes = aila::memory::qwen4exp_session_memory(
+                spec.qwen4exp_text, options.maxSequenceLength, options.maxRecurrentSnapshots,
+                kvElementBytes, resolvedKvResident);
+            if (enableMtp) {
+                updatedRes.deviceBytes = aila::memory::checked_memory_sum(
+                    updatedRes.deviceBytes, Qwen4ExpMtpRuntime::SessionBytes(mtpCapacity));
+            }
+            loaded->sessionReservationBytes = updatedRes.deviceBytes;
+            loaded->sessionHostReservationBytes = updatedRes.hostBytes;
         }
         if (enableMtp) loaded->mtp = std::make_unique<Qwen4ExpMtpRuntime>(context,
             static_cast<Qwen4ExpBnb4Backend&>(*loaded->backend), *loaded->weights, mtpCapacity);

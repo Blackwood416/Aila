@@ -9,6 +9,7 @@
 #include "models/Qwen4ExpMoeCopyQueue.hpp"
 #include "Qwen4ExpDecodeFusion.hpp"
 #include "../utils/EnvUtils.hpp"
+#include "../utils/DxgiMemory.hpp"
 #include "../profile/Profiling.hpp"
 #include <sycl/sycl.hpp>
 #include <algorithm>
@@ -242,7 +243,8 @@ Qwen4ExpBnb4Backend::Session::Session(
     Context& ctx, int capacity,
     std::shared_ptr<const SessionOwner> owner,
     std::size_t maxSnapshots, uint64_t instanceId,
-    aila::TokenGraphRuntime* tokenGraphRuntime)
+    aila::TokenGraphRuntime* tokenGraphRuntime,
+    int kvStreamResidentTokens)
     : context_(&ctx), owner_(std::move(owner)),
       token_graph_runtime_(tokenGraphRuntime),
       session_instance_id_(instanceId),
@@ -288,7 +290,7 @@ Qwen4ExpBnb4Backend::Session::Session(
         } else {
             const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8
                                           : dnnl::memory::data_type::bf16;
-            const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(capacity);
+            const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens);
             if (kv_stream_plan.enabled) {
                 cache.kv_stream_enabled = true;
                 const int slot_tokens = kv_stream_plan.residentTokens;
@@ -305,6 +307,7 @@ Qwen4ExpBnb4Backend::Session::Session(
                     std::memset(cache.host_v_scale.data(), 0, cache.host_v_scale.size_bytes());
                 }
                 ops::qsa_kv_stream_init_map(ctx, cache.kv_stream_map, capacity, kv_stream_plan.slotCount);
+                cache.indexer_k = Tensor::allocate_host(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
             } else {
                 cache.k = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
                 cache.v = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
@@ -312,8 +315,8 @@ Qwen4ExpBnb4Backend::Session::Session(
                     cache.k_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
                     cache.v_scale = Tensor::allocate(ctx, {2, capacity}, dnnl::memory::data_type::f32);
                 }
+                cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
             }
-            cache.indexer_k = Tensor::allocate(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
             const int max_blocks = std::max(1, capacity / 4);
             cache.indexer_compressed_k = Tensor::allocate(ctx, {max_blocks, 128}, dnnl::memory::data_type::bf16);
             cache.num_compressed_blocks = 0;
@@ -936,6 +939,12 @@ bool Qwen4ExpBnb4Backend::load(
     const int expert_cache_mb = aila::env::read_int("AILA_Q4E_EXPERT_CACHE_MB", 0);
     const bool mtp_enabled = aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false) ||
                              aila::env::read_flag("AILA_Q4E_SERVER_MTP", false);
+    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
+    const bool dxgi_budget_enabled = aila::env::read_flag("AILA_Q4E_DXGI_BUDGET", true);
+    const auto dxgi_info = dxgi_budget_enabled ? aila::QueryDxgiLocalVram() : aila::DxgiLocalVramInfo{};
+    size_t auto_vram_ceiling = 0;
+    size_t auto_non_kv_reserve = 0;
+    resolved_kv_resident_tokens_ = kv_stream_plan.enabled ? kv_stream_plan.residentTokens : 0;
     if (expert_cache_mb > 0) {
         expert_cache_bytes = static_cast<size_t>(expert_cache_mb) << 20;
     } else {
@@ -944,7 +953,6 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t full_layers = static_cast<size_t>(
             std::count_if(layers_.begin(), layers_.end(), [](const Qwen4ExpLayer& l) { return !l.is_linear; }));
         const size_t linear_layers = layers_.size() - full_layers;
-        const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
         const size_t device_kv_cap = kv_stream_plan.enabled
             ? static_cast<size_t>(kv_stream_plan.residentTokens)
             : static_cast<size_t>(max_seq_len_);
@@ -957,9 +965,11 @@ bool Qwen4ExpBnb4Backend::load(
                 kv_stream_plan.blockCount, kv_stream_plan.slotCount)
             : 0;
         const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
+        const size_t device_indexer_k_bytes = kv_stream_plan.enabled ? 0u : indexer_k_bytes;
         const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
-        const size_t total_session_state = kv_bytes + kv_scale_bytes + kv_stream_map_bytes + indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
+        const size_t non_kv_session_state = device_indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
+        const size_t total_session_state = kv_bytes + kv_scale_bytes + kv_stream_map_bytes + non_kv_session_state;
         const size_t max_reserve =
             static_cast<size_t>(std::max(0, aila::env::read_int("AILA_Q4E_VRAM_RESERVE_MB", 1400))) << 20;
         const int prefill_chunk_cap = std::min(
@@ -1020,10 +1030,35 @@ bool Qwen4ExpBnb4Backend::load(
             size_t(full_q_heads_) * size_t((max_seq_len_ + 127) / 128) * size_t(full_head_dim_ == 256 ? 272 : 144) * sizeof(float) +
             (static_cast<size_t>(520) << 20); // linear_scratch_.weight_bf16 + xmx_scratch_ + remaining buf_ + L0/oneDNN runtime headroom
         const size_t workspace_reserve = ws_phase_peak + ws_persistent_bufs;
-        const size_t reserve = max_reserve + total_session_state + mtp_reserve + workspace_reserve;
+
+        size_t effective_vram_ceiling = vram > max_reserve ? (vram - max_reserve) : 0;
+        if (dxgi_info.valid && ctx.device_allocation_limit() == 0) {
+            const uint64_t own_alloc = ctx.current_allocated_bytes();
+            const uint64_t other_used = dxgi_info.currentUsageBytes > own_alloc
+                ? (dxgi_info.currentUsageBytes - own_alloc) : 0;
+            const size_t dxgi_avail_proc = dxgi_info.budgetBytes > other_used
+                ? static_cast<size_t>(dxgi_info.budgetBytes - other_used) : 0;
+            constexpr size_t kDxgiDriverSafetyMargin = static_cast<size_t>(512) << 20;
+            const size_t dxgi_ceiling = dxgi_avail_proc > kDxgiDriverSafetyMargin
+                ? (dxgi_avail_proc - kDxgiDriverSafetyMargin) : 0;
+            effective_vram_ceiling = std::min(effective_vram_ceiling, dxgi_ceiling);
+            AILA_LOG_INFO(
+                "[Qwen4Exp] DXGI VRAM Budget: hw=%.0f MB budget=%.0f MB other_used=%.0f MB avail=%.0f MB ceiling=%.0f MB",
+                vram / (1024.0 * 1024.0),
+                dxgi_info.budgetBytes / (1024.0 * 1024.0),
+                other_used / (1024.0 * 1024.0),
+                dxgi_info.availableBytes / (1024.0 * 1024.0),
+                effective_vram_ceiling / (1024.0 * 1024.0));
+        }
+
+        const size_t reserve = total_session_state + mtp_reserve + workspace_reserve;
         const size_t min_bytes = static_cast<size_t>(1024) << 20;
         const size_t used = ctx.current_allocated_bytes() + reserve;
-        expert_cache_bytes = vram > used + min_bytes ? vram - used : min_bytes;
+        expert_cache_bytes = effective_vram_ceiling > used + min_bytes
+            ? effective_vram_ceiling - used
+            : min_bytes;
+        auto_vram_ceiling = effective_vram_ceiling;
+        auto_non_kv_reserve = non_kv_session_state + mtp_reserve + workspace_reserve;
 
         AILA_LOG_INFO(
             "[Qwen4Exp] Memory Admission Accounting: Total VRAM=%.0f MB, Static Weights=%.1f MB, "
@@ -1036,7 +1071,7 @@ bool Qwen4ExpBnb4Backend::load(
             kv_bytes / (1024.0 * 1024.0),
             kv_element_bytes,
             kv_scale_bytes / (1024.0 * 1024.0),
-            indexer_k_bytes / (1024.0 * 1024.0),
+            device_indexer_k_bytes / (1024.0 * 1024.0),
             indexer_compressed_k_bytes / (1024.0 * 1024.0),
             recurrent_bytes / (1024.0 * 1024.0),
             mtp_reserve / (1024.0 * 1024.0),
@@ -1047,11 +1082,12 @@ bool Qwen4ExpBnb4Backend::load(
             const size_t host_kv_bytes = aila::memory::qwen4exp_kv_bytes(
                 cfg_, static_cast<size_t>(max_seq_len_), kv_element_bytes).total();
             AILA_LOG_INFO(
-                "[Qwen4Exp] KV Streaming: enabled=1 resident_tokens=%d n_slots=%d logical_blocks=%d "
-                "device_kv_mb=%.1f host_kv_mb=%.1f",
+                "[Qwen4Exp] KV Streaming: enabled=1 initial_resident_tokens=%d n_slots=%d logical_blocks=%d "
+                "device_kv_mb=%.1f host_kv_mb=%.1f host_indexer_k_mb=%.1f",
                 kv_stream_plan.residentTokens, kv_stream_plan.slotCount, kv_stream_plan.blockCount,
                 (kv_bytes + kv_scale_bytes + kv_stream_map_bytes) / (1024.0 * 1024.0),
-                host_kv_bytes / (1024.0 * 1024.0));
+                host_kv_bytes / (1024.0 * 1024.0),
+                indexer_k_bytes / (1024.0 * 1024.0));
         }
     }
     // GPU experts and native RAM experts are complementary owners. Allocate
@@ -1146,6 +1182,21 @@ bool Qwen4ExpBnb4Backend::load(
     }
     load_mark("weights+embedding prep (before adaptive allocate)");
     if (!adaptive_cache_.Allocate(ctx,cache_cfg,error_message)) return false;
+    if (kv_stream_plan.enabled && auto_vram_ceiling > 0 &&
+        aila::env::read_string("AILA_Q4E_KV_RESIDENT_TOKENS", "").empty()) {
+        const size_t committed = ctx.current_allocated_bytes() + auto_non_kv_reserve;
+        const size_t budget_for_kv = auto_vram_ceiling > committed ? (auto_vram_ceiling - committed) : 0;
+        resolved_kv_resident_tokens_ = aila::memory::qwen4exp_kv_stream_select_auto_resident_tokens(
+            cfg_, max_seq_len_, budget_for_kv, kv_element_bytes);
+        const auto auto_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_, resolved_kv_resident_tokens_);
+        const size_t auto_kv_bytes = aila::memory::qwen4exp_kv_bytes(
+            cfg_, static_cast<size_t>(auto_plan.residentTokens), kv_element_bytes).total();
+        AILA_LOG_INFO(
+            "[Qwen4Exp] KV Streaming AutoTier: budget_for_kv_mb=%.1f resident_tokens=%d n_slots=%d device_kv_mb=%.1f",
+            budget_for_kv / (1024.0 * 1024.0),
+            auto_plan.residentTokens, auto_plan.slotCount,
+            auto_kv_bytes / (1024.0 * 1024.0));
+    }
     auto gpu_owners=adaptive_cache_.InitializeResidency(
         profile_hotset ? &initial_ranked_profile : nullptr);
     load_mark("adaptive_cache.Allocate+InitializeResidency");
@@ -1612,8 +1663,21 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // ============================================================================
 
 void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
-    static const int trim_cap = aila::env::read_int_raw("AILA_Q4E_DECODE_TRIM_CAP", 0);
-    if (trim_cap == 0) return;
+    static const int explicit_trim_cap = aila::env::read_int_raw("AILA_Q4E_DECODE_TRIM_CAP", 0);
+    if (explicit_trim_cap < 0)
+        throw std::invalid_argument("AILA_Q4E_DECODE_TRIM_CAP requires 0 or a capacity of at least 64");
+    int trim_cap = explicit_trim_cap;
+    const char* trim_reason = "explicit";
+    if (trim_cap == 0) {
+        static const bool s_auto_trim = aila::env::read_flag("AILA_Q4E_AUTO_DECODE_TRIM", true);
+        if (!s_auto_trim || runtime_seq_capacity_ <= 256) return;
+        const auto dxgi = aila::QueryDxgiLocalVram();
+        const uint64_t trigger_bytes =
+            static_cast<uint64_t>(std::max(128, aila::env::read_int("AILA_Q4E_DECODE_TRIM_TRIGGER_MB", 512))) << 20;
+        if (!dxgi.valid || dxgi.availableBytes >= trigger_bytes) return;
+        trim_cap = 64;
+        trim_reason = "dxgi_low_headroom";
+    }
     if (trim_cap < 64)
         throw std::invalid_argument("AILA_Q4E_DECODE_TRIM_CAP requires 0 or a capacity of at least 64");
     if (runtime_seq_capacity_ <= trim_cap) return;
@@ -1629,8 +1693,8 @@ void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
     runtime_seq_capacity_ = 0;
     ensure_runtime_buffers(ctx, trim_cap);
     const uint64_t bytes_after = ctx.current_allocated_bytes();
-    AILA_LOG_INFO("[Q4E DecodeTrim] cap_before=%d cap_after=%d bytes_before=%llu bytes_after=%llu freed_bytes=%llu boundary=end_prefill",
-        old_cap, runtime_seq_capacity_, (unsigned long long)bytes_before,
+    AILA_LOG_INFO("[Q4E DecodeTrim] reason=%s cap_before=%d cap_after=%d bytes_before=%llu bytes_after=%llu freed_bytes=%llu boundary=end_prefill",
+        trim_reason, old_cap, runtime_seq_capacity_, (unsigned long long)bytes_before,
         (unsigned long long)bytes_after,
         (unsigned long long)(bytes_before > bytes_after ? bytes_before - bytes_after : 0));
 }
@@ -3954,7 +4018,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         }
     }
     session.currentLength_ = cached_len;
-    if (options.prefill_remaining == 0) TrimDecodeRuntimeBuffers(ctx);
+    if (options.prefill_remaining == 0 && !options.defer_decode_trim) TrimDecodeRuntimeBuffers(ctx);
 
     if (expert_histogram_enabled_ && count > 1) {
         for (int b = 0; b < 6; ++b) {
@@ -4357,14 +4421,14 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
     const uint64_t instanceId = next_session_instance_id_++;
     auto session = std::unique_ptr<Session>(
         new Session(ctx, max_seq_len_, sessionOwner_, maxSnapshots, instanceId,
-                    &token_graph_runtime_));
+                    &token_graph_runtime_, resolved_kv_resident_tokens_));
     ple_.init_state(ctx, session->ple_state_);
     // Exact device payload of the tensors this Session owns, matching
     // qwen4exp_session_memory's device reservation. Model weights, expert
     // cache and shared execution scratch are budgeted elsewhere.
     size_t cacheBytes = 0;
     for (const auto& cache : session->layerCaches_) {
-        for (const Tensor* tensor : {&cache.k, &cache.v, &cache.indexer_k,
+        for (const Tensor* tensor : {&cache.k, &cache.v,
                                      &cache.indexer_compressed_k, &cache.linear_state,
                                      &cache.linear_conv_state, &cache.k_scale,
                                      &cache.v_scale,
@@ -4376,6 +4440,9 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
                                      &cache.kv_stream_map.miss_slot,
                                      &cache.kv_stream_map.ctl}) {
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
+        }
+        if (!cache.kv_stream_enabled) {
+            cacheBytes = aila::memory::checked_memory_sum(cacheBytes, cache.indexer_k.size_bytes());
         }
     }
     cacheBytes = aila::memory::checked_memory_sum(
@@ -4405,16 +4472,22 @@ void Qwen4ExpBnb4Backend::PrepareKvStagingBuffers(
     const size_t scaleBytes = int8Kv ? (static_cast<size_t>(full_kv_heads_) * stageLen * sizeof(float)) : 0u;
     if (buf_.kv_stream_stage_in_phase_scratch && buf_.phase_scratch.valid()) {
         uint8_t* base = buf_.phase_scratch.data_as<uint8_t>();
-        if (sparsePrefill) {
+        const size_t scratchBytes = buf_.phase_scratch.size_bytes();
+        const size_t kvAligned = (kvBytes + 255u) & ~size_t(255u);
+        const size_t scaleAligned = (scaleBytes + 255u) & ~size_t(255u);
+        if (sparsePrefill && stageLen <= max_seq_len_ &&
+            buf_.kv_stream_stage_v_offset + kvAligned + 2u * scaleAligned <= scratchBytes &&
+            kvBytes <= buf_.kv_stream_stage_k_max_bytes) {
             stageK = Tensor::view(ctx, base, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
             stageV = Tensor::view(ctx, base + buf_.kv_stream_stage_v_offset, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
             if (int8Kv) {
                 stageKScale = Tensor::view(ctx, base + buf_.kv_stream_stage_k_scale_offset, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
                 stageVScale = Tensor::view(ctx, base + buf_.kv_stream_stage_v_scale_offset, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
             }
-        } else {
-            const size_t kvAligned = (kvBytes + 255u) & ~size_t(255u);
-            const size_t scaleAligned = (scaleBytes + 255u) & ~size_t(255u);
+            return;
+        }
+        if (!sparsePrefill &&
+            buf_.kv_stream_stage_v_offset + 2u * kvAligned + 2u * scaleAligned <= scratchBytes) {
             uint8_t* ptr = base + buf_.kv_stream_stage_v_offset;
             stageK = Tensor::view(ctx, ptr, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
             stageV = Tensor::view(ctx, ptr + kvAligned, {full_kv_heads_, stageLen, full_head_dim_}, dtype);
@@ -4422,8 +4495,8 @@ void Qwen4ExpBnb4Backend::PrepareKvStagingBuffers(
                 stageKScale = Tensor::view(ctx, ptr + 2u * kvAligned, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
                 stageVScale = Tensor::view(ctx, ptr + 2u * kvAligned + scaleAligned, {full_kv_heads_, stageLen}, dnnl::memory::data_type::f32);
             }
+            return;
         }
-        return;
     }
     if (!buf_.kv_stream_stage_k.valid() || buf_.kv_stream_stage_k.dtype() != dtype ||
         buf_.kv_stream_stage_k.shape(1) < stageLen) {

@@ -428,6 +428,13 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, in_row, k_row,
                                         1, k_dim, hidden_size_);
                         }
+                    } else if (cache.kv_stream_enabled && count > 1) {
+                        Tensor k_dev = Tensor::view(ctx, buf_.indexer_qk.data(), {count, k_dim}, dnnl::memory::data_type::bf16);
+                        DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_dev,
+                                    count, k_dim, hidden_size_);
+                        ctx.queue().memcpy(
+                            cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            k_dev.data(), static_cast<size_t>(count) * k_dim * sizeof(bf16));
                     } else {
                         Tensor k_target = Tensor::view(
                             ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,

@@ -15,6 +15,7 @@ struct ForwardOptions {
     bool capture_snapshot = false; // Force a checkpoint at an explicit prefix boundary.
     int checkpoint_after = 0; // Tokens within this forward; zero disables the interior checkpoint.
     int prefill_remaining = -1; // Known prompt tokens after this slice; -1 for decode/unspecified.
+    bool defer_decode_trim = false; // Caller will invoke TrimDecodeRuntimeBuffers after reading scratch buffers.
     bool decode_verification = false; // Explicit multi-token decode, not a new prompt slice.
     // Borrowed through Forward only. Pure input preparation may copy one known
     // future prompt chunk without advancing any session state.

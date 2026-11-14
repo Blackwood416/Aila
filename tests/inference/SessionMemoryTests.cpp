@@ -183,14 +183,19 @@ void TestQwen4ExpSessionMemory() {
     set_env("AILA_Q4E_KV_STREAM", nullptr);
     set_env("AILA_Q4E_KV_RESIDENT_TOKENS", nullptr);
     const auto unstreamedBf16 = aila::memory::qwen4exp_session_memory(config, 32768, 0, 2);
+    const size_t expectedIndexerRaw32K = size_t{12} * 32768 * 128 * 2;
     Expect(streamedBf16.deviceBytes < unstreamedBf16.deviceBytes,
            "Streamed 32K BF16 device reservation must be smaller than unstreamed");
-    Expect(streamedBf16.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 2).total(),
-           "Streamed 32K BF16 host reservation must include full host KV");
+    Expect(streamedBf16.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 2).total() + expectedIndexerRaw32K,
+           "Streamed 32K BF16 host reservation must include full host KV and raw indexer_k");
     Expect(streamedInt8.deviceBytes < streamedBf16.deviceBytes,
            "Streamed 32K INT8 device reservation must be smaller than BF16");
-    Expect(streamedInt8.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 1).total(),
-           "Streamed 32K INT8 host reservation must include full int8 host KV");
+    Expect(streamedInt8.hostBytes == unstreamedBf16.hostBytes + aila::memory::qwen4exp_kv_bytes(config, 32768, 1).total() + expectedIndexerRaw32K,
+           "Streamed 32K INT8 host reservation must include full int8 host KV and raw indexer_k");
+    Expect(aila::memory::qwen4exp_kv_stream_select_auto_resident_tokens(config, 262144, size_t{500} << 20, 1) == 32768,
+           "Auto resident tier should pick 32768 for 500 MiB INT8 262K budget");
+    Expect(aila::memory::qwen4exp_kv_stream_select_auto_resident_tokens(config, 262144, size_t{120} << 20, 1) == 8208,
+           "Auto resident tier should fall back to 8208 for tight 120 MiB budget");
 }
 
 } // namespace

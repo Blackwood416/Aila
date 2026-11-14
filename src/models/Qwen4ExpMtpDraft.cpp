@@ -39,6 +39,7 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
         layer_.index_qk_weight = &weights_.upload("mtp.layers.0.self_attn.indexer.index_qk_proj.weight", ctx_);
         layer_.index_k_weight = Tensor::view(ctx_, layer_.index_qk_weight->data_as<bf16>() + 512 * 2560,
                                              {128, 2560});
+        layer_.index_k_proj.init(ctx_, layer_.index_k_weight, 2560, 128, false);
         layer_.index_k_norm_weight = Norm("mtp.layers.0.self_attn.indexer.k_layernorm.weight", true);
         layer_.index_q_norm_weight = Norm("mtp.layers.0.self_attn.indexer.q_layernorm.weight", true);
         layer_.router_w = &weights_.upload("mtp.layers.0.mlp.gate.weight", ctx_);
@@ -84,6 +85,14 @@ Qwen4ExpMtpDraft::~Qwen4ExpMtpDraft() {
 }
 
 void Qwen4ExpMtpDraft::FreeHostEmbed() noexcept {
+    if (batchEmbedHost_) {
+        try {
+            if (batchEmbedEvent_ != sycl::event{}) batchEmbedEvent_.wait_and_throw();
+        } catch (...) {}
+        batchEmbedEvent_ = sycl::event{};
+        try { ctx_.free_host(batchEmbedHost_); } catch (...) {}
+        batchEmbedHost_ = nullptr;
+    }
     if (!hostEmbed_) return;
     for (auto& ev : hostEmbedEvents_) {
         try {
@@ -142,8 +151,13 @@ void Qwen4ExpMtpDraft::EraseFusedSource(const std::string& name) {
 void Qwen4ExpMtpDraft::Hc(const std::string& prefix, Qwen4ExpHyperConnectionLayer& hc, bool inject) {
     hc.hc_norm_weight = Norm(prefix + "hc_norm.weight");
     hc.mix_down_w = &weights_.upload(prefix + "input_mix_weight_down.weight", ctx_);
+    hc.input_mix_weight_down.init(ctx_, *hc.mix_down_w, 10240, 320, false);
     hc.mix_up_w = &weights_.upload(prefix + "input_mix_weight_up.weight", ctx_);
-    if (inject) hc.inject_w = &weights_.upload(prefix + "block_inject_weight.weight", ctx_);
+    hc.input_mix_weight_up.init(ctx_, *hc.mix_up_w, 320, 10240, false);
+    if (inject) {
+        hc.inject_w = &weights_.upload(prefix + "block_inject_weight.weight", ctx_);
+        hc.block_inject_weight.init(ctx_, *hc.inject_w, 10240, 4, false);
+    }
 }
 
 void Qwen4ExpMtpDraft::InitExpertCache() {
@@ -606,4 +620,107 @@ void Qwen4ExpMtpDraft::Step(State& state, const sycl::ext::oneapi::bfloat16* hid
     target_.RunHyperConnectionCombined(ctx_, mixer_, 1, false,
                                        b.y.data_as<bf16>(), b.hc_inject_f32.data_as<float>());
     target_.ForwardLmHead(ctx_, b.x, b.logits, 1);
+}
+
+void Qwen4ExpMtpDraft::StepBatchKvOnly(State& state, const bf16* hidden,
+                                       const int* tokens, int count, int startPosition) {
+    if (count <= 0) return;
+    if (count == 1 || target_.runtime_seq_capacity_ <= 1) {
+        for (int i = 0; i < count; ++i) {
+            Step(state, hidden + size_t(i) * 10240, tokens[i], startPosition + i, true);
+        }
+        return;
+    }
+    auto& cache = state.cache;
+    const int capacity = static_cast<int>(cache.k.shape(1));
+    Require(startPosition >= 0 && startPosition + count <= capacity,
+            "MTP batched position outside draft capacity");
+    if (!batchEmbedHost_) {
+        batchEmbedHost_ = static_cast<bf16*>(ctx_.alloc_host(
+            static_cast<size_t>(kMtpBatchEmbedTile) * static_cast<size_t>(kMtpHidden) * sizeof(bf16)));
+    }
+    const int vocabSize = target_.cfg_.vocab_size;
+    const int maxTile = std::min(kMtpBatchEmbedTile, target_.runtime_seq_capacity_);
+    auto& b = target_.buf_;
+    auto& scratch = target_.linear_scratch_;
+
+    for (int offset = 0; offset < count;) {
+        const int n = std::min(count - offset, maxTile);
+        const int pos = startPosition + offset;
+        if (n == 1) {
+            Step(state, hidden + size_t(offset) * 10240, tokens[offset], pos, true);
+            offset += 1;
+            continue;
+        }
+        if (batchEmbedEvent_ != sycl::event{}) {
+            batchEmbedEvent_.wait_and_throw();
+            batchEmbedEvent_ = sycl::event{};
+        }
+        for (int r = 0; r < n; ++r) {
+            const int tok = tokens[offset + r];
+            Require(tok >= 0 && tok < vocabSize, "MTP token out of range");
+            std::memcpy(batchEmbedHost_ + size_t(r) * kMtpHidden,
+                        embeddingTable_.ptr + size_t(tok) * kMtpHidden * sizeof(bf16),
+                        size_t(kMtpHidden) * sizeof(bf16));
+        }
+        ctx_.queue().memcpy(b.x.data(), batchEmbedHost_, size_t(n) * kMtpHidden * sizeof(bf16));
+        batchEmbedEvent_ = ctx_.queue().ext_oneapi_submit_barrier();
+
+        ops::grouped_rms_norm(ctx_, b.x.data_as<bf16>(), normEmbedding_->data_as<float>(), 1e-6f,
+                              b.y.data_as<bf16>(), n, 1, kMtpHidden, true);
+        auto fcEmbIn = Tensor::view(ctx_, b.y.data_as<bf16>(), {n, kMtpHidden});
+        auto fcEmbOut = Tensor::view(ctx_, b.attn_out.data_as<bf16>(), {n, kMtpHidden});
+        fcEmbedding_.forward(ctx_, scratch, fcEmbIn, fcEmbOut, n);
+
+        auto hidNormOut = Tensor::view(ctx_, b.full_qkv.data_as<bf16>(), {4 * n, kMtpHidden});
+        ops::grouped_rms_norm(ctx_, hidden + size_t(offset) * 10240, normHidden_->data_as<float>(), 1e-6f,
+                              hidNormOut.data_as<bf16>(), n, 4, kMtpHidden, true);
+        auto hidFcOut = Tensor::view(ctx_, b.hidden4.data_as<bf16>(), {4 * n, kMtpHidden});
+        fcHidden_.forward(ctx_, scratch, hidNormOut, hidFcOut, 4 * n);
+
+        auto* h = b.hidden4.data_as<bf16>();
+        const auto* e = b.attn_out.data_as<bf16>();
+        const size_t total = static_cast<size_t>(n) * 10240u;
+        ctx_.queue().parallel_for(sycl::range<1>(total), [=](sycl::id<1> idx) {
+            const size_t i = idx[0];
+            const size_t row = i / 10240u;
+            const size_t col = i % 2560u;
+            h[i] = bf16(float(h[i]) + float(e[row * 2560u + col]));
+        });
+
+        target_.RunHyperConnectionCombined(ctx_, layer_.attn_hc, n, true, nullptr, nullptr);
+
+        auto xIn = Tensor::view(ctx_, b.x.data_as<bf16>(), {n, kMtpHidden});
+        auto qkvOut = Tensor::view(ctx_, b.full_qkv.data_as<bf16>(), {n, 13312});
+        layer_.qkv_proj.forward(ctx_, scratch, xIn, qkvOut, n);
+
+        auto qView = Tensor::view(ctx_, b.q.data_as<bf16>(), {n, 6144});
+        auto zView = Tensor::view(ctx_, b.z.data_as<bf16>(), {n, 6144});
+        auto kView = Tensor::view(ctx_, b.k.data_as<bf16>(), {n, 512});
+        auto vView = Tensor::view(ctx_, b.v.data_as<bf16>(), {n, 512});
+        ops::split_qgkv(ctx_, qkvOut, qView, zView, kView, vView, n, 24, 2, 256);
+        ops::head_rms_norm(ctx_, qView, *layer_.q_norm_weight, 1e-6f, n, 24, 256);
+        ops::head_rms_norm(ctx_, kView, *layer_.k_norm_weight, 1e-6f, n, 2, 256);
+        ops::apply_rope_partial(ctx_, qView, kView, n, pos, 24, 2, 256, 64, 10000000.0f, true,
+                                nullptr, nullptr, nullptr, 0, 0, 11, 11, 10);
+        const int kvStride = static_cast<int>(cache.k.shape(1));
+        ops::copy_to_cache(ctx_, kView, cache.k, n, pos, 2, 256, kvStride,
+                           cache.k_scale.valid() ? &cache.k_scale : nullptr);
+        ops::copy_to_cache(ctx_, vView, cache.v, n, pos, 2, 256, kvStride,
+                           cache.v_scale.valid() ? &cache.v_scale : nullptr);
+
+        auto idxKOut = Tensor::view(ctx_, cache.indexer_k.data_as<bf16>() + size_t(pos) * 128, {n, 128});
+        layer_.index_k_proj.forward(ctx_, xIn, idxKOut, n);
+
+        const int num_complete_blocks = (pos + n) / 4;
+        if (num_complete_blocks > cache.num_compressed_blocks && cache.indexer_compressed_k.valid()) {
+            const int blocks_to_compress = num_complete_blocks - cache.num_compressed_blocks;
+            ops::qsa_compress_key_blocks(ctx_, cache.indexer_k, *layer_.index_k_norm_weight,
+                                         cache.indexer_compressed_k, cache.num_compressed_blocks,
+                                         blocks_to_compress, 10000000.0f, true, nullptr, nullptr,
+                                         nullptr, 0, 0, 11, 11, 10);
+            cache.num_compressed_blocks = num_complete_blocks;
+        }
+        offset += n;
+    }
 }
