@@ -291,7 +291,8 @@ namespace ops {
                        Tensor* scale = nullptr,
                        Tensor* host_cache = nullptr,
                        const Tensor* page_table = nullptr,
-                       Tensor* host_scale = nullptr);
+                       Tensor* host_scale = nullptr,
+                       const QsaKvSingleHostSegments* host_segments = nullptr);
 
     // Decode fused prep (seq_len=1):
     // Q/K per-head RMSNorm + RoPE, and write K/V to cache at start_pos.

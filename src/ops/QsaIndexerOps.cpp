@@ -190,7 +190,8 @@ void qsa_prepare_q_and_cache_k_impl(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    int k_cache_base_token = 0) {
     (void)mrope_section_t;
     if (!control && pos < 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
@@ -198,6 +199,7 @@ void qsa_prepare_q_and_cache_k_impl(
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
     bf16* q_out_ptr = q_out.data_as<bf16>();
     const int capacity = static_cast<int>(k_cache.shape(0));
+    const int cache_base = control ? 0 : k_cache_base_token;
 
     constexpr int kHeadDim = 128;
     constexpr int kRotaryDim = 64;
@@ -224,7 +226,7 @@ void qsa_prepare_q_and_cache_k_impl(
                         return;
                     active_pos = visible_len - 1;
                 }
-                if (active_pos < 0 || active_pos >= capacity) {
+                if (active_pos < cache_base || active_pos - cache_base >= capacity) {
                     if (control) graph_control_mark_abort(control);
                     return;
                 }
@@ -269,7 +271,7 @@ void qsa_prepare_q_and_cache_k_impl(
 
                 // If head 0, copy raw token_k into k_cache
                 if (head == 0) {
-                    k_cache_ptr[static_cast<size_t>(active_pos) * kHeadDim + lid] =
+                    k_cache_ptr[static_cast<size_t>(active_pos - cache_base) * kHeadDim + lid] =
                         qk_ptr[kNumHeads * kHeadDim + lid];
                 }
             });
@@ -294,11 +296,12 @@ void qsa_prepare_q_and_cache_k(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    int k_cache_base_token) {
     qsa_prepare_q_and_cache_k_impl(
         ctx, indexer_qk, q_norm_w, k_cache, q_out, pos, nullptr, 0, theta,
         interleaved, pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
-        mrope_section_t, mrope_section_h, mrope_section_w);
+        mrope_section_t, mrope_section_h, mrope_section_w, k_cache_base_token);
 }
 
 void qsa_prepare_q_and_cache_k_graph(
@@ -354,7 +357,8 @@ void qsa_cache_k_batched(
     const Tensor& indexer_qk,
     Tensor& k_cache,
     int start_pos,
-    int count) {
+    int count,
+    int k_cache_base_token) {
     if (count <= 0) return;
     const bf16* qk_ptr = indexer_qk.data_as<bf16>();
     bf16* k_cache_ptr = k_cache.data_as<bf16>();
@@ -362,6 +366,7 @@ void qsa_cache_k_batched(
     constexpr int kHeadDim = 128;
     constexpr int kNumHeads = 4;
     constexpr int kTotalDim = (kNumHeads + 1) * kHeadDim; // 640
+    const int rel_start = start_pos - k_cache_base_token;
 
     ctx.queue().submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
@@ -370,7 +375,7 @@ void qsa_cache_k_batched(
                 const int i = static_cast<int>(idx[0]);
                 const int t = i / kHeadDim;
                 const int d = i % kHeadDim;
-                k_cache_ptr[static_cast<size_t>(start_pos + t) * kHeadDim + d] =
+                k_cache_ptr[static_cast<size_t>(rel_start + t) * kHeadDim + d] =
                     qk_ptr[static_cast<size_t>(t) * kTotalDim + kNumHeads * kHeadDim + d];
             });
     });
@@ -1031,7 +1036,8 @@ void qsa_compress_key_blocks_impl(
     int mrope_section_h,
     int mrope_section_w,
     GraphControl control,
-    int layer) {
+    int layer,
+    int k_cache_base_token = 0) {
     (void)mrope_section_t;
     if (!GraphMode && num_blocks <= 0) return;
     if (GraphMode && !control) {
@@ -1049,8 +1055,11 @@ void qsa_compress_key_blocks_impl(
     const int max_blocks =
         static_cast<int>(compressed_k.numel() / kHeadDim);
     const int cache_capacity = static_cast<int>(k_cache.shape(0));
+    const int k_cache_base_block = GraphMode ? 0 : (k_cache_base_token / 4);
     if constexpr (!GraphMode) {
-        if (start_block < 0 || num_blocks > max_blocks - start_block)
+        if (start_block < k_cache_base_block || num_blocks > max_blocks - start_block ||
+            static_cast<size_t>(start_block - k_cache_base_block + num_blocks - 1) * 4 + 3 >=
+                static_cast<size_t>(cache_capacity))
             throw std::invalid_argument("QSA compression block range is invalid");
     }
 
@@ -1092,10 +1101,11 @@ void qsa_compress_key_blocks_impl(
                 if (!active) return;
 
                 // 1. Mean-pool 4 tokens
-                const size_t b0 = (static_cast<size_t>(4 * b + 0) * kHeadDim) + lid;
-                const size_t b1 = (static_cast<size_t>(4 * b + 1) * kHeadDim) + lid;
-                const size_t b2 = (static_cast<size_t>(4 * b + 2) * kHeadDim) + lid;
-                const size_t b3 = (static_cast<size_t>(4 * b + 3) * kHeadDim) + lid;
+                const int src_b = b - k_cache_base_block;
+                const size_t b0 = (static_cast<size_t>(4 * src_b + 0) * kHeadDim) + lid;
+                const size_t b1 = (static_cast<size_t>(4 * src_b + 1) * kHeadDim) + lid;
+                const size_t b2 = (static_cast<size_t>(4 * src_b + 2) * kHeadDim) + lid;
+                const size_t b3 = (static_cast<size_t>(4 * src_b + 3) * kHeadDim) + lid;
 
                 const float k0 = static_cast<float>(k_cache_ptr[b0]);
                 const float k1 = static_cast<float>(k_cache_ptr[b1]);
@@ -1166,12 +1176,13 @@ void qsa_compress_key_blocks(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    int k_cache_base_token) {
     qsa_compress_key_blocks_impl<false>(
         ctx, k_cache, k_norm_w, compressed_k, start_block, num_blocks,
         theta, interleaved, pos_t, pos_h, pos_w, prompt_pos_len,
         text_pos_delta, mrope_section_t, mrope_section_h,
-        mrope_section_w, nullptr, 0);
+        mrope_section_w, nullptr, 0, k_cache_base_token);
 }
 
 void qsa_compress_one_completed_block_graph(
@@ -2267,7 +2278,8 @@ int qsa_prepare_causal_query_and_select_blocks(
     int mrope_section_h,
     int mrope_section_w,
     Tensor* compressed_k,
-    int* num_compressed_blocks) {
+    int* num_compressed_blocks,
+    int k_cache_base_token) {
     if (pos < 0 || block_topk <= 0 || compress_ratio <= 0) {
         throw std::invalid_argument("qsa_prepare_causal_query_and_select_blocks: invalid position or block geometry");
     }
@@ -2275,7 +2287,7 @@ int qsa_prepare_causal_query_and_select_blocks(
     qsa_prepare_q_and_cache_k(
         ctx, indexer_qk_row, q_norm_w, k_cache, q_out_row, pos, theta, interleaved,
         pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
-        mrope_section_t, mrope_section_h, mrope_section_w);
+        mrope_section_t, mrope_section_h, mrope_section_w, k_cache_base_token);
 
     const int num_complete_blocks = visible_len / compress_ratio;
 
@@ -2285,7 +2297,8 @@ int qsa_prepare_causal_query_and_select_blocks(
             qsa_compress_key_blocks(
                 ctx, k_cache, k_norm_w, *compressed_k, *num_compressed_blocks,
                 blocks_to_compress, theta, interleaved, pos_t, pos_h, pos_w,
-                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w);
+                prompt_pos_len, text_pos_delta, mrope_section_t, mrope_section_h, mrope_section_w,
+                k_cache_base_token);
             *num_compressed_blocks = num_complete_blocks;
         }
     }
@@ -2906,11 +2919,12 @@ void qsa_pre_indexer_batched(
     int text_pos_delta,
     int mrope_section_t,
     int mrope_section_h,
-    int mrope_section_w) {
+    int mrope_section_w,
+    int k_cache_base_token) {
     if (count <= 0) return;
 
     // 1. Cache raw K tokens for this chunk
-    qsa_cache_k_batched(ctx, indexer_qk, k_cache, start_pos, count);
+    qsa_cache_k_batched(ctx, indexer_qk, k_cache, start_pos, count, k_cache_base_token);
 
     // 2. Compress newly completed blocks if compressed_k is valid
     if (compressed_k != nullptr && compressed_k->valid() && num_compressed_blocks != nullptr) {
@@ -2922,7 +2936,7 @@ void qsa_pre_indexer_batched(
                 ctx, k_cache, k_norm_w, *compressed_k,
                 start_block, blocks_to_compress, theta, interleaved,
                 pos_t, pos_h, pos_w, prompt_pos_len, text_pos_delta,
-                mrope_section_t, mrope_section_h, mrope_section_w);
+                mrope_section_t, mrope_section_h, mrope_section_w, k_cache_base_token);
             *num_compressed_blocks = total_complete_blocks;
         }
     }

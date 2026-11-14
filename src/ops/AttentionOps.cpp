@@ -5532,8 +5532,8 @@ template <int Quantized, bool Streamed = false>
 void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
                         int start_pos, int num_heads, int head_dim,
                         int max_seq_len, float *scale = nullptr,
-                        void *host_void = nullptr, const int32_t *page_table = nullptr,
-                        float *host_scale = nullptr, int host_max_seq_len = 0) {
+                        const QsaKvSingleHostSegments &host_segs = {},
+                        const int32_t *page_table = nullptr) {
   bf16 *src = static_cast<bf16 *>(new_kv.data());
   void *dst_void = cache.data();
   int total_dim = num_heads * head_dim;
@@ -5543,7 +5543,6 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
     // computes the row amax, publishes scale = amax/127, and stores codes.
     // A single pass, so no extra device traffic beyond the write itself.
     int8_t *dst = static_cast<int8_t *>(dst_void);
-    int8_t *host_dst = static_cast<int8_t *>(host_void);
     constexpr int wg_size = 128;
     ctx.queue().submit([&](sycl::handler &cgh) {
       sycl::local_accessor<float, 1> row_max(sycl::range<1>(wg_size), cgh);
@@ -5571,14 +5570,23 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
             const int logical_pos = start_pos + s;
             int sl = -1;
             int phys_pos = logical_pos;
+            int host_seg = 0;
+            int host_local_pos = logical_pos;
+            int host_seg_stride = 0;
+            int8_t *host_dst = nullptr;
             if constexpr (Streamed) {
               sl = page_table[logical_pos >> 2];
               phys_pos = (sl << 2) | (logical_pos & 3);
+              host_seg = logical_pos / host_segs.segment_tokens;
+              host_local_pos = logical_pos - host_seg * host_segs.segment_tokens;
+              host_seg_stride = (host_seg + 1 < host_segs.num_segments)
+                  ? host_segs.segment_tokens : host_segs.last_segment_tokens;
+              host_dst = static_cast<int8_t *>(host_segs.data[host_seg]);
             }
             const bool write_slot = (!Streamed) || (sl >= 0);
             if (lid == 0) {
               if constexpr (Streamed) {
-                host_scale[static_cast<size_t>(h) * host_max_seq_len + logical_pos] = row_scale;
+                host_segs.scale[host_seg][static_cast<size_t>(h) * host_seg_stride + host_local_pos] = row_scale;
               }
               if (write_slot) {
                 scale[static_cast<size_t>(h) * max_seq_len + phys_pos] = row_scale;
@@ -5587,7 +5595,7 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
             const size_t dst_base =
                 static_cast<size_t>(h) * max_seq_len * head_dim + static_cast<size_t>(phys_pos) * head_dim;
             const size_t host_base = Streamed
-                ? (static_cast<size_t>(h) * host_max_seq_len * head_dim + static_cast<size_t>(logical_pos) * head_dim)
+                ? (static_cast<size_t>(h) * host_seg_stride * head_dim + static_cast<size_t>(host_local_pos) * head_dim)
                 : 0u;
             for (int d = lid; d < head_dim; d += wg_size) {
               const int8_t qv =
@@ -5615,16 +5623,25 @@ void copy_to_cache_impl(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len
                              const int logical_pos = start_pos + s;
                              int sl = -1;
                              int phys_pos = logical_pos;
+                             int host_seg = 0;
+                             int host_local_pos = logical_pos;
+                             int host_seg_stride = 0;
+                             void *host_void = nullptr;
                              if constexpr (Streamed) {
                                sl = page_table[logical_pos >> 2];
                                phys_pos = (sl << 2) | (logical_pos & 3);
+                               host_seg = logical_pos / host_segs.segment_tokens;
+                               host_local_pos = logical_pos - host_seg * host_segs.segment_tokens;
+                               host_seg_stride = (host_seg + 1 < host_segs.num_segments)
+                                   ? host_segs.segment_tokens : host_segs.last_segment_tokens;
+                               host_void = host_segs.data[host_seg];
                              }
                              const bool write_slot = (!Streamed) || (sl >= 0);
                              const size_t dst_idx = static_cast<size_t>(h) * max_seq_len * head_dim +
                                                     static_cast<size_t>(phys_pos) * head_dim + d;
                              const size_t host_idx = Streamed
-                                 ? (static_cast<size_t>(h) * host_max_seq_len * head_dim +
-                                    static_cast<size_t>(logical_pos) * head_dim + d)
+                                 ? (static_cast<size_t>(h) * host_seg_stride * head_dim +
+                                    static_cast<size_t>(host_local_pos) * head_dim + d)
                                  : 0u;
                              if constexpr (Quantized == kKvFmtFp8) {
                                const uint8_t val = float_to_fp8_e4m3fn(static_cast<float>(src[src_idx]));
@@ -5650,7 +5667,8 @@ void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
                    int start_pos, int num_heads, int head_dim,
                    int max_seq_len, Tensor* scale_arg,
                    Tensor* host_cache, const Tensor* page_table,
-                   Tensor* host_scale_arg) {
+                   Tensor* host_scale_arg,
+                   const QsaKvSingleHostSegments* host_segments) {
   const int fmt = kv_cache_format_of(cache);
   // copy_to_cache writes a single tensor, so the caller passes that tensor's
   // own scale (k_scale for K, v_scale for V).
@@ -5658,25 +5676,44 @@ void copy_to_cache(Context &ctx, Tensor &new_kv, Tensor &cache, int seq_len,
   if (fmt == kKvFmtInt8 && !scale) {
     throw std::invalid_argument("copy_to_cache: int8 KV cache requires a scale tensor");
   }
-  const bool streamed = (host_cache && host_cache->valid() && page_table && page_table->valid());
+  const bool use_segments = (host_segments && host_segments->num_segments > 0 && page_table && page_table->valid());
+  const bool streamed = use_segments || (host_cache && host_cache->valid() && page_table && page_table->valid());
   if (streamed) {
-    if (host_cache->dtype() != cache.dtype() || host_cache->ndim() != 3 ||
-        host_cache->shape(0) != num_heads || host_cache->shape(2) != head_dim) {
-      throw std::invalid_argument("copy_to_cache: streamed host_cache layout mismatch");
-    }
-    float *host_scale = kv_scale_write_ptr(host_scale_arg);
-    if (fmt == kKvFmtInt8 && !host_scale) {
-      throw std::invalid_argument("copy_to_cache: int8 KV stream requires host_scale tensor");
-    }
-    void *host_void = host_cache->data();
-    const int32_t *pt_ptr = page_table->data_as<int32_t>();
-    const int host_msl = static_cast<int>(host_cache->shape(1));
-    if (fmt == kKvFmtInt8) {
-      copy_to_cache_impl<kKvFmtInt8, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, scale, host_void, pt_ptr, host_scale, host_msl);
-    } else if (fmt == kKvFmtFp8) {
-      copy_to_cache_impl<kKvFmtFp8, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, nullptr, host_void, pt_ptr, nullptr, host_msl);
+    QsaKvSingleHostSegments segs{};
+    if (use_segments) {
+      segs = *host_segments;
+      for (int s = 0; s < segs.num_segments; ++s) {
+        if (!segs.data[s]) {
+          throw std::invalid_argument("copy_to_cache: unallocated host KV segment");
+        }
+        if (fmt == kKvFmtInt8 && !segs.scale[s]) {
+          throw std::invalid_argument("copy_to_cache: int8 KV stream requires host segment scale");
+        }
+      }
     } else {
-      copy_to_cache_impl<kKvFmtBf16, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, nullptr, host_void, pt_ptr, nullptr, host_msl);
+      if (host_cache->dtype() != cache.dtype() || host_cache->ndim() != 3 ||
+          host_cache->shape(0) != num_heads || host_cache->shape(2) != head_dim) {
+        throw std::invalid_argument("copy_to_cache: streamed host_cache layout mismatch");
+      }
+      float *host_scale = kv_scale_write_ptr(host_scale_arg);
+      if (fmt == kKvFmtInt8 && !host_scale) {
+        throw std::invalid_argument("copy_to_cache: int8 KV stream requires host_scale tensor");
+      }
+      const int host_msl = static_cast<int>(host_cache->shape(1));
+      segs.host_capacity = host_msl;
+      segs.segment_tokens = host_msl;
+      segs.last_segment_tokens = host_msl;
+      segs.num_segments = 1;
+      segs.data[0] = host_cache->data();
+      segs.scale[0] = host_scale;
+    }
+    const int32_t *pt_ptr = page_table->data_as<int32_t>();
+    if (fmt == kKvFmtInt8) {
+      copy_to_cache_impl<kKvFmtInt8, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, scale, segs, pt_ptr);
+    } else if (fmt == kKvFmtFp8) {
+      copy_to_cache_impl<kKvFmtFp8, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, nullptr, segs, pt_ptr);
+    } else {
+      copy_to_cache_impl<kKvFmtBf16, true>(ctx, new_kv, cache, seq_len, start_pos, num_heads, head_dim, max_seq_len, nullptr, segs, pt_ptr);
     }
     return;
   }

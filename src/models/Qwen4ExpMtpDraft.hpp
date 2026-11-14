@@ -24,6 +24,7 @@
 
 class Qwen4ExpMtpDraft {
 public:
+    static constexpr int kMtpBatchEmbedTile = 512;
     struct State {
         Qwen4ExpLayerCache cache;
     };
@@ -109,7 +110,6 @@ private:
     uint64_t hostEmbedTick_ = 0;
     HostTensorView embeddingTable_;
 
-    static constexpr int kMtpBatchEmbedTile = 512;
     sycl::ext::oneapi::bfloat16* batchEmbedHost_ = nullptr;
     sycl::event batchEmbedEvent_{};
     void FreeHostEmbed() noexcept;

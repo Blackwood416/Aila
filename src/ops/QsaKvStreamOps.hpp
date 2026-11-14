@@ -26,6 +26,28 @@ struct QsaKvStreamMap {
     }
 };
 
+struct QsaKvHostSegments {
+    static constexpr int kMaxSegments = 16;
+    void* k[kMaxSegments]{};
+    void* v[kMaxSegments]{};
+    float* k_scale[kMaxSegments]{};
+    float* v_scale[kMaxSegments]{};
+    int host_capacity = 0;
+    int segment_tokens = 0;
+    int last_segment_tokens = 0;
+    int num_segments = 0;
+};
+
+struct QsaKvSingleHostSegments {
+    static constexpr int kMaxSegments = 16;
+    void* data[kMaxSegments]{};
+    float* scale[kMaxSegments]{};
+    int host_capacity = 0;
+    int segment_tokens = 0;
+    int last_segment_tokens = 0;
+    int num_segments = 0;
+};
+
 // Optional dual-write target for decode_prepare_qgkv_packed_partial when KV is streamed:
 // writes always go to host_k/host_v at logical active_pos, and also to VRAM slots if
 // page_table[active_pos / 4] >= 0.
@@ -34,6 +56,7 @@ struct QsaKvStreamWriteTarget {
     void* host_v = nullptr;
     float* host_k_scale = nullptr;
     float* host_v_scale = nullptr;
+    QsaKvHostSegments segments{};
     const int32_t* page_table = nullptr;
     int host_capacity = 0;
 };
@@ -67,6 +90,22 @@ void qsa_kv_stream_resolve(
     Tensor& resolved_blocks_out,
     Tensor* resolved_tail_indices_out = nullptr);
 
+void qsa_kv_stream_resolve(
+    Context& ctx,
+    QsaKvStreamMap& map,
+    Tensor& slots_k,
+    Tensor& slots_v,
+    Tensor* slots_k_scale,
+    Tensor* slots_v_scale,
+    const QsaKvHostSegments& host_segs,
+    const int32_t* logical_blocks,
+    int num_rows,
+    int start_pos,
+    int block_topk,
+    int compress_ratio,
+    Tensor& resolved_blocks_out,
+    Tensor* resolved_tail_indices_out = nullptr);
+
 void qsa_kv_stream_stage_from_host(
     Context& ctx,
     Tensor& stage_k,
@@ -77,6 +116,15 @@ void qsa_kv_stream_stage_from_host(
     const Tensor& host_v,
     const Tensor* host_k_scale,
     const Tensor* host_v_scale,
+    int stage_len);
+
+void qsa_kv_stream_stage_from_host(
+    Context& ctx,
+    Tensor& stage_k,
+    Tensor& stage_v,
+    Tensor* stage_k_scale,
+    Tensor* stage_v_scale,
+    const QsaKvHostSegments& host_segs,
     int stage_len);
 
 QsaKvStreamCounters qsa_kv_stream_counters(Context& ctx, const QsaKvStreamMap& map);

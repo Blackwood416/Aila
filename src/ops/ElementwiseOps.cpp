@@ -1306,30 +1306,50 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 "decode_prepare_qgkv_packed_partial: int8 KV cache requires k_scale/v_scale");
         }
     }
-    void* host_k_ptr = nullptr;
-    void* host_v_ptr = nullptr;
-    float* host_k_scale_ptr = nullptr;
-    float* host_v_scale_ptr = nullptr;
+    QsaKvHostSegments host_segs{};
     const int32_t* stream_pt = nullptr;
     int host_capacity = 0;
     if constexpr (Streamed) {
-        if (!stream_target || !stream_target->host_k || !stream_target->host_v ||
-            !stream_target->page_table || stream_target->host_capacity <= 0) {
+        if (!stream_target || !stream_target->page_table || stream_target->host_capacity <= 0) {
             throw std::invalid_argument(
                 "decode_prepare_qgkv_packed_partial: invalid KV stream write target");
         }
-        if constexpr (Quantized == kKvFmtInt8) {
-            if (!stream_target->host_k_scale || !stream_target->host_v_scale) {
-                throw std::invalid_argument(
-                    "decode_prepare_qgkv_packed_partial: int8 KV stream requires host scales");
-            }
-        }
-        host_k_ptr = stream_target->host_k;
-        host_v_ptr = stream_target->host_v;
-        host_k_scale_ptr = stream_target->host_k_scale;
-        host_v_scale_ptr = stream_target->host_v_scale;
         stream_pt = stream_target->page_table;
         host_capacity = stream_target->host_capacity;
+        if (stream_target->segments.num_segments > 0) {
+            host_segs = stream_target->segments;
+            for (int s = 0; s < host_segs.num_segments; ++s) {
+                if (!host_segs.k[s] || !host_segs.v[s]) {
+                    throw std::invalid_argument(
+                        "decode_prepare_qgkv_packed_partial: unallocated host KV segment");
+                }
+                if constexpr (Quantized == kKvFmtInt8) {
+                    if (!host_segs.k_scale[s] || !host_segs.v_scale[s]) {
+                        throw std::invalid_argument(
+                            "decode_prepare_qgkv_packed_partial: int8 KV stream requires host scales");
+                    }
+                }
+            }
+        } else {
+            if (!stream_target->host_k || !stream_target->host_v) {
+                throw std::invalid_argument(
+                    "decode_prepare_qgkv_packed_partial: invalid KV stream write target");
+            }
+            if constexpr (Quantized == kKvFmtInt8) {
+                if (!stream_target->host_k_scale || !stream_target->host_v_scale) {
+                    throw std::invalid_argument(
+                        "decode_prepare_qgkv_packed_partial: int8 KV stream requires host scales");
+                }
+            }
+            host_segs.host_capacity = host_capacity;
+            host_segs.segment_tokens = host_capacity;
+            host_segs.last_segment_tokens = host_capacity;
+            host_segs.num_segments = 1;
+            host_segs.k[0] = stream_target->host_k;
+            host_segs.v[0] = stream_target->host_v;
+            host_segs.k_scale[0] = stream_target->host_k_scale;
+            host_segs.v_scale[0] = stream_target->host_v_scale;
+        }
     }
     int max_seq_len = static_cast<int>(k_cache.shape(1));
     int logical_limit = Streamed ? host_capacity : max_seq_len;
@@ -1489,9 +1509,26 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                 }
                 const size_t cache_base =
                     static_cast<size_t>(head) * max_seq_len * head_dim + static_cast<size_t>(phys_pos) * head_dim;
-                const size_t host_base = Streamed
-                    ? (static_cast<size_t>(head) * host_capacity * head_dim + static_cast<size_t>(active_pos) * head_dim)
-                    : 0u;
+                int host_seg = 0;
+                int host_local_pos = active_pos;
+                int host_seg_stride = host_capacity;
+                void* host_k_ptr = nullptr;
+                void* host_v_ptr = nullptr;
+                float* host_k_scale_ptr = nullptr;
+                float* host_v_scale_ptr = nullptr;
+                size_t host_base = 0u;
+                if constexpr (Streamed) {
+                    host_seg = active_pos / host_segs.segment_tokens;
+                    host_local_pos = active_pos - host_seg * host_segs.segment_tokens;
+                    host_seg_stride = (host_seg + 1 < host_segs.num_segments)
+                        ? host_segs.segment_tokens : host_segs.last_segment_tokens;
+                    host_k_ptr = host_segs.k[host_seg];
+                    host_v_ptr = host_segs.v[host_seg];
+                    host_k_scale_ptr = host_segs.k_scale[host_seg];
+                    host_v_scale_ptr = host_segs.v_scale[host_seg];
+                    host_base = static_cast<size_t>(head) * host_seg_stride * head_dim +
+                                static_cast<size_t>(host_local_pos) * head_dim;
+                }
                 const bool write_slot = (!Streamed) || (phys_slot >= 0);
                 if constexpr (Quantized == kKvFmtInt8) {
                     // Opt-in INT8/INT8 KV: K is quantized after RoPE, V as-is.
@@ -1510,7 +1547,7 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                     const float k_scale = local_sum[0] / 127.0f;
                     if (lid == 0) {
                         if constexpr (Streamed) {
-                            host_k_scale_ptr[static_cast<size_t>(head) * host_capacity + active_pos] = k_scale;
+                            host_k_scale_ptr[static_cast<size_t>(head) * host_seg_stride + host_local_pos] = k_scale;
                         }
                         if (write_slot) {
                             k_scale_ptr[static_cast<size_t>(head) * max_seq_len + phys_pos] = k_scale;
@@ -1531,7 +1568,7 @@ void decode_prepare_qgkv_packed_partial_impl(Context& ctx,
                     const float v_scale = local_sum[0] / 127.0f;
                     if (lid == 0) {
                         if constexpr (Streamed) {
-                            host_v_scale_ptr[static_cast<size_t>(head) * host_capacity + active_pos] = v_scale;
+                            host_v_scale_ptr[static_cast<size_t>(head) * host_seg_stride + host_local_pos] = v_scale;
                         }
                         if (write_slot) {
                             v_scale_ptr[static_cast<size_t>(head) * max_seq_len + phys_pos] = v_scale;

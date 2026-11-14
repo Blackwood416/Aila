@@ -59,7 +59,9 @@ Qwen4ExpMtpDraft::Qwen4ExpMtpDraft(Context& ctx, Qwen4ExpBnb4Backend& target, Mo
         draftDown_ = Allocate(kMtpExpertsPerStep, kMtpHidden, dnnl::memory::data_type::f32);
         hostEmbed_ = static_cast<bf16*>(ctx_.alloc_host(
             static_cast<size_t>(kMtpHostEmbedRing) * static_cast<size_t>(kMtpHidden) * sizeof(bf16)));
-        embeddingTable_ = weights_.host_view("model.language_model.embed_tokens.weight");
+        embeddingTable_ = (target_.embed_host_.valid() && target_.embed_host_.dtype == DT_BF16)
+            ? target_.embed_host_
+            : weights_.host_view("model.language_model.embed_tokens.weight");
         Require(embeddingTable_.valid() && embeddingTable_.dtype == DT_BF16, "MTP shared embedding missing");
 
         InitExpertCache();

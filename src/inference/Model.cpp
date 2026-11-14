@@ -864,6 +864,20 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
         }
         if (enableMtp) loaded->mtp = std::make_unique<Qwen4ExpMtpRuntime>(context,
             static_cast<Qwen4ExpBnb4Backend&>(*loaded->backend), *loaded->weights, mtpCapacity);
+        if (qwen4exp && loaded->weights) {
+            const auto& q4e = static_cast<const Qwen4ExpBnb4Backend&>(*loaded->backend);
+            std::vector<std::string> keep_prefixes{
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."};
+            if (enableMtp) keep_prefixes.emplace_back("mtp.layers.0.mlp.experts.");
+            if (!q4e.HasResidentEmbedding()) {
+                keep_prefixes.emplace_back("model.language_model.embed_tokens.weight");
+            }
+            const size_t released_shards = loaded->weights->release_unused_shards(keep_prefixes);
+            if (released_shards > 0) {
+                AILA_LOG_INFO("[Qwen4Exp] Released %zu unused safetensors shard mapping(s)",
+                              released_shards);
+            }
+        }
         loaded->workspace = std::make_unique<detail::ExecutionWorkspace>();
         if (qwen4exp) {
             // Shared execution scratch is owned and budgeted once, before decode.

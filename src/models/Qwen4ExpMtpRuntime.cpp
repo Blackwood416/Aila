@@ -56,8 +56,7 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
         configuredWidth = std::clamp(aila::env::read_int_raw("AILA_Q4E_MTP_WIDTH", widthDefault), 2, 4);
         target.ensure_runtime_buffers(ctx, std::min(cap, 64));
         draft = std::make_unique<Qwen4ExpMtpDraft>(ctx, target, weights);
-        const int hiddenRowsCap = std::min(
-            cap, std::max(8192, aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 8192)));
+        const int hiddenRowsCap = std::min(cap, Qwen4ExpMtpDraft::kMtpBatchEmbedTile);
         hiddenRows = Tensor::allocate(ctx, {hiddenRowsCap, 10240});
         checkpoint = Tensor::allocate(ctx, {117669888 + 368640}, dnnl::memory::data_type::u8);
         linearInputs = Tensor::allocate(ctx, {48, 4, 16480});
@@ -127,9 +126,10 @@ void Qwen4ExpMtpRuntime::AfterForward(State& state, int start, const std::vector
                            target.buf_.hidden4.data_as<bf16>() + base * 10240,
                            slice * 10240 * sizeof(bf16));
         const size_t stepEnd = std::min(slice, count - 1 - base);
-        // StepBatchKvOnly reuses target.buf_.hidden4, so only batch the final slice
-        // once no later slice remains to be copied out of target.buf_.hidden4.
-        if (s_batch_catchup && stepEnd > 1 && base + slice == count) {
+        // StepBatchKvOnly reuses target.buf_.hidden4[0 .. slice - 1], which has
+        // already been copied into hiddenRows; later rows of target.buf_.hidden4
+        // remain untouched, so every slice <= kMtpBatchEmbedTile can batch.
+        if (s_batch_catchup && stepEnd > 1) {
             draft->StepBatchKvOnly(*state.draft, hiddenRows.data_as<bf16>(),
                                    tokens.data() + base + 1, static_cast<int>(stepEnd),
                                    start + static_cast<int>(base));
@@ -286,7 +286,12 @@ void Qwen4ExpMtpRuntime::Restore(Qwen4ExpBnb4Backend::Session& s, int keepPleRow
     // were prepared against the speculative target state.
     s.InvalidateMtpRestoreState();
     for (size_t l = 0; l < s.layerCaches_.size(); ++l) {
-        auto& c = s.layerCaches_[l]; c.linear_conv_head = convHeads[l]; c.num_compressed_blocks = blocks[l];
+        auto& c = s.layerCaches_[l]; c.linear_conv_head = convHeads[l];
+        if (c.indexer_k_tail_only) {
+            c.num_compressed_blocks = std::min(c.num_compressed_blocks, (length + keepPleRows) / 4);
+        } else {
+            c.num_compressed_blocks = blocks[l];
+        }
         if (c.linear_state.valid()) c.device_state_dirty = true;
     }
     RecurrentCheckpointPtrs ptrs{};
@@ -478,6 +483,7 @@ aila::inference::DecodeWindowResult Qwen4ExpMtpRuntime::ForwardWindow(
         target.ple_.compute_ngram_ids_pure(s.ple_state_, proposal.data(), emitted, ngrams.data(), prev);
         s.ple_state_.prev_tokens = prev; s.currentLength_ = start + emitted; s.consecutive_no_miss_layers_ = 0;
     }
+    target.CommitStreamedIndexerTail(ctx, s, start, start + emitted);
     if (kvOnlyPreSubmitted) {
         // j = 0 was submitted before the verify barrier from the same staged
         // rows, so only the rest of the accepted prefix is replayed here.

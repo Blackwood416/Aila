@@ -249,15 +249,16 @@ inline SessionMemoryReservation qwen4exp_session_memory(
         fullBytes = checked_memory_sum(residentKvBytes, mapBytes);
     }
 
+    const bool tailOnlyIndexer = streamPlan.enabled && aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
     const size_t compressed = cached / kIndexerCompressRatio > 0 ? cached / kIndexerCompressRatio : 1;
     const size_t indexerRawBytes = checked_memory_product(
-        checked_memory_product(cached, static_cast<size_t>(kIndexerHeadDim)),
+        checked_memory_product(tailOnlyIndexer ? size_t{8} : cached, static_cast<size_t>(kIndexerHeadDim)),
         checked_memory_product(size_t{2}, fullLayers));
     const size_t indexerCompressedBytes = checked_memory_product(
         checked_memory_product(compressed, static_cast<size_t>(kIndexerHeadDim)),
         checked_memory_product(size_t{2}, fullLayers));
     const size_t indexerBytes = streamPlan.enabled
-        ? indexerCompressedBytes
+        ? (tailOnlyIndexer ? checked_memory_sum(indexerRawBytes, indexerCompressedBytes) : indexerCompressedBytes)
         : checked_memory_sum(indexerRawBytes, indexerCompressedBytes);
 
     const auto keyHeads = positive_memory_dimension(config.linear_num_key_heads);
@@ -284,7 +285,10 @@ inline SessionMemoryReservation qwen4exp_session_memory(
         checked_memory_product(recurrentBytes, checked_memory_sum(1, maxSnapshots)),
         checked_memory_product(pleBytes, maxSnapshots));
     if (streamPlan.enabled) {
-        hostBytes = checked_memory_sum(hostBytes, checked_memory_sum(fullHostBytes, indexerRawBytes));
+        hostBytes = checked_memory_sum(hostBytes, fullHostBytes);
+        if (!tailOnlyIndexer) {
+            hostBytes = checked_memory_sum(hostBytes, indexerRawBytes);
+        }
     }
     if (aila::env::read_flag("AILA_Q4E_GRAPH_GDN_STATE", false)) {
         const size_t headBytes = checked_memory_product(

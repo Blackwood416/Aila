@@ -247,13 +247,14 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
         }
     } else {
         ops::QsaKvStreamWriteTarget stream_write_target{};
+        ops::QsaKvSingleHostSegments stream_k_segs{};
+        ops::QsaKvSingleHostSegments stream_v_segs{};
         if (cache.kv_stream_enabled) {
-            stream_write_target.host_k = cache.host_k.data();
-            stream_write_target.host_v = cache.host_v.data();
-            stream_write_target.host_k_scale = cache.host_k_scale.valid() ? cache.host_k_scale.data_as<float>() : nullptr;
-            stream_write_target.host_v_scale = cache.host_v_scale.valid() ? cache.host_v_scale.data_as<float>() : nullptr;
+            stream_write_target.segments = cache.KvHostSegments(session.Capacity());
             stream_write_target.page_table = cache.kv_stream_map.page_table.data_as<int32_t>();
             stream_write_target.host_capacity = session.Capacity();
+            stream_k_segs = cache.KvSingleHostSegments(session.Capacity(), false);
+            stream_v_segs = cache.KvSingleHostSegments(session.Capacity(), true);
         }
         const ops::QsaKvStreamWriteTarget* stream_write_ptr =
             cache.kv_stream_enabled ? &stream_write_target : nullptr;
@@ -301,11 +302,14 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 static const bool s_qsa_block_native = aila::env::read_flag("AILA_QSA_BLOCK_NATIVE", true);
                 const bool dense_phase = (num_complete_blocks <= block_topk);
 
+                const int idx_k_base = cache.indexer_k_tail_only
+                    ? ((start_pos / compress_ratio) * compress_ratio)
+                    : 0;
                 if (dense_phase && s_qsa_k_only_proj && layer.index_k_weight.valid()) {
                     // A2: K-only projection for visible_len <= 2051. Eliminates 80% GEMV output rows (512 Q rows skipped).
                     const int k_dim = cfg_.indexer_kv_heads * cfg_.indexer_head_dim;
                     Tensor k_target = Tensor::view(
-                        ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                        ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos - idx_k_base) * k_dim,
                         {1, k_dim});
                     DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_target,
                                 1, k_dim, hidden_size_);
@@ -322,7 +326,8 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                             (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
-                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                            idx_k_base);
                         cache.num_compressed_blocks = num_complete_blocks;
                     }
                     num_active_tokens = 0;
@@ -343,7 +348,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
                             cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
                             (s_qsa_compressed_k && cache.indexer_compressed_k.valid() ? &cache.indexer_compressed_k : nullptr),
-                            &cache.num_compressed_blocks);
+                            &cache.num_compressed_blocks, idx_k_base);
                         if (num_active_blocks > 0) {
                             active_blocks = buf_.indexer_active_blocks.data_as<int>();
                         }
@@ -375,9 +380,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     ctx, cache.kv_stream_map, cache.k, cache.v,
                     cache.k_scale.valid() ? &cache.k_scale : nullptr,
                     cache.v_scale.valid() ? &cache.v_scale : nullptr,
-                    cache.host_k, cache.host_v,
-                    cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                    cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                    stream_write_target.segments,
                     active_blocks, 1, start_pos, block_topk, compress_ratio,
                     buf_.qsa_resolved_blocks, &buf_.qsa_resolved_tail_indices);
                 if (num_complete_blocks > 0) {
@@ -412,6 +415,38 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
 
             static const bool s_qsa_compressed_k = aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
             static const bool s_qsa_k_only_proj = aila::env::read_flag("AILA_QSA_K_ONLY_PROJ", true);
+            const bool use_direct_tail_buf = cache.indexer_k_tail_only &&
+                ((start_pos % compress_ratio) + count <= static_cast<int>(cache.indexer_k.shape(0))) &&
+                allowQ8;
+            const int idx_k_base = cache.indexer_k_tail_only
+                ? ((start_pos / compress_ratio) * compress_ratio)
+                : 0;
+            Tensor& idx_k_buf = cache.indexer_k_tail_only
+                ? (use_direct_tail_buf ? cache.indexer_k : buf_.indexer_k_stage)
+                : cache.indexer_k;
+            auto sync_indexer_tail_out = [&]() {
+                if (!cache.indexer_k_tail_only || use_direct_tail_buf) return;
+                const int end_pos = start_pos + count;
+                const int rem_out = end_pos % compress_ratio;
+                if (rem_out > 0) {
+                    const int tail_src_off = (end_pos - rem_out) - idx_k_base;
+                    ctx.queue().memcpy(
+                        cache.indexer_k.data(),
+                        idx_k_buf.data_as<bf16>() + static_cast<size_t>(tail_src_off) * cfg_.indexer_head_dim,
+                        static_cast<size_t>(rem_out) * cfg_.indexer_head_dim * sizeof(bf16));
+                }
+            };
+            if (has_qsa_indexer && cache.indexer_k_tail_only && !use_direct_tail_buf) {
+                if (!idx_k_buf.valid() || idx_k_buf.shape(0) < (start_pos - idx_k_base) + count) {
+                    throw std::runtime_error("Qwen4Exp: indexer_k_stage buffer too small for prefill chunk");
+                }
+                const int rem_in = start_pos - idx_k_base;
+                if (rem_in > 0) {
+                    ctx.queue().memcpy(
+                        idx_k_buf.data(), cache.indexer_k.data(),
+                        static_cast<size_t>(rem_in) * cfg_.indexer_head_dim * sizeof(bf16));
+                }
+            }
 
             if (has_qsa_indexer) {
                 if (!sparse_prefill && s_qsa_k_only_proj && layer.index_k_weight.valid()) {
@@ -423,21 +458,21 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         // window matches sequential B1 decode bit-for-bit.
                         for (int r = 0; r < count; ++r) {
                             auto in_row = Tensor::view(ctx, input.data_as<bf16>() + size_t(r) * hidden_size_, {1, hidden_size_});
-                            auto k_row = Tensor::view(ctx, cache.indexer_k.data_as<bf16>() +
-                                static_cast<size_t>(start_pos + r) * k_dim, {1, k_dim});
+                            auto k_row = Tensor::view(ctx, idx_k_buf.data_as<bf16>() +
+                                static_cast<size_t>(start_pos - idx_k_base + r) * k_dim, {1, k_dim});
                             DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, in_row, k_row,
                                         1, k_dim, hidden_size_);
                         }
-                    } else if (cache.kv_stream_enabled && count > 1) {
+                    } else if (cache.kv_stream_enabled && !cache.indexer_k_tail_only && count > 1) {
                         Tensor k_dev = Tensor::view(ctx, buf_.indexer_qk.data(), {count, k_dim}, dnnl::memory::data_type::bf16);
                         DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_dev,
                                     count, k_dim, hidden_size_);
                         ctx.queue().memcpy(
-                            cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            idx_k_buf.data_as<bf16>() + static_cast<size_t>(start_pos - idx_k_base) * k_dim,
                             k_dev.data(), static_cast<size_t>(count) * k_dim * sizeof(bf16));
                     } else {
                         Tensor k_target = Tensor::view(
-                            ctx, cache.indexer_k.data_as<bf16>() + static_cast<size_t>(start_pos) * k_dim,
+                            ctx, idx_k_buf.data_as<bf16>() + static_cast<size_t>(start_pos - idx_k_base) * k_dim,
                             {count, k_dim});
                         DenseLinear(ctx, layer.index_k_proj, &layer.index_k_weight, input, k_target,
                                     count, k_dim, hidden_size_);
@@ -505,14 +540,16 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         ? static_cast<int>(cache.k.shape(1)) : session.Capacity();
                     ops::copy_to_cache(ctx, buf_.k, cache.k, count, start_pos, full_kv_heads_, full_head_dim_, cache_stride,
                                        cache.k_scale.valid() ? &cache.k_scale : nullptr,
-                                       cache.kv_stream_enabled ? &cache.host_k : nullptr,
+                                       nullptr,
                                        cache.kv_stream_enabled ? &cache.kv_stream_map.page_table : nullptr,
-                                       cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr);
+                                       nullptr,
+                                       cache.kv_stream_enabled ? &stream_k_segs : nullptr);
                     ops::copy_to_cache(ctx, buf_.v, cache.v, count, start_pos, full_kv_heads_, full_head_dim_, cache_stride,
                                        cache.v_scale.valid() ? &cache.v_scale : nullptr,
-                                       cache.kv_stream_enabled ? &cache.host_v : nullptr,
+                                       nullptr,
                                        cache.kv_stream_enabled ? &cache.kv_stream_map.page_table : nullptr,
-                                       cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr);
+                                       nullptr,
+                                       cache.kv_stream_enabled ? &stream_v_segs : nullptr);
                 }
             }
 
@@ -531,7 +568,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     // Phase P2 (R4d): Reentrant fused pre-indexer (raw K caching + block compression + Q norm/RoPE)
                     ops::qsa_pre_indexer_batched(
                         ctx, buf_.indexer_qk, *layer.index_q_norm_weight, *layer.index_k_norm_weight,
-                        cache.indexer_k, buf_.indexer_q,
+                        idx_k_buf, buf_.indexer_q,
                         (s_qsa_compressed_k && cache.indexer_compressed_k.valid() ? &cache.indexer_compressed_k : nullptr),
                         &cache.num_compressed_blocks,
                         start_pos, count, compress_ratio,
@@ -540,7 +577,9 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                         (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                         (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                         session.mropePromptLength_, session.mropeTextPositionDelta_,
-                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                        cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                        idx_k_base);
+                    sync_indexer_tail_out();
 
                     // Dynamic query tiling: the block-score buffer bounds how
                     // many rows one tile may score at this window's block count.
@@ -570,9 +609,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, stage_k, stage_v,
                             int8_kv ? &stage_k_scale : nullptr,
                             int8_kv ? &stage_v_scale : nullptr,
-                            cache.host_k, cache.host_v,
-                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            stream_write_target.segments,
                             start_pos + count);
                     }
                     const int query_tile = s_qsa_query_tile_env > 0
@@ -620,9 +657,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                                     ctx, cache.kv_stream_map, cache.k, cache.v,
                                     cache.k_scale.valid() ? &cache.k_scale : nullptr,
                                     cache.v_scale.valid() ? &cache.v_scale : nullptr,
-                                    cache.host_k, cache.host_v,
-                                    cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                                    cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                                    stream_write_target.segments,
                                     buf_.qsa_tile_active_blocks.data_as<int>(),
                                     tile_count, tile_start_pos, block_topk, compress_ratio,
                                     buf_.qsa_resolved_blocks, nullptr);
@@ -707,9 +742,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, fb_stage_k, fb_stage_v,
                             int8_kv ? &fb_stage_k_scale : nullptr,
                             int8_kv ? &fb_stage_v_scale : nullptr,
-                            cache.host_k, cache.host_v,
-                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            stream_write_target.segments,
                             start_pos + count);
                     }
                     // The upstream indexer builds a separate mask from each query's
@@ -774,23 +807,25 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     // only a query whose visible prefix exceeds the block budget uses
                     // the row-wise QSA correctness path above.
                     if (!s_qsa_k_only_proj || !layer.index_k_weight.valid()) {
-                        ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, cache.indexer_k, start_pos, count);
+                        ops::qsa_cache_k_batched(ctx, buf_.indexer_qk, idx_k_buf, start_pos, count, idx_k_base);
                     }
                     const int total_complete_blocks = (start_pos + count) / compress_ratio;
                     if (s_qsa_compressed_k && total_complete_blocks > cache.num_compressed_blocks &&
                         cache.indexer_compressed_k.valid()) {
                         const int blocks_to_compress = total_complete_blocks - cache.num_compressed_blocks;
                         ops::qsa_compress_key_blocks(
-                            ctx, cache.indexer_k, *layer.index_k_norm_weight, cache.indexer_compressed_k,
+                            ctx, idx_k_buf, *layer.index_k_norm_weight, cache.indexer_compressed_k,
                             cache.num_compressed_blocks, blocks_to_compress, cfg_.rope.rope_theta,
                             cfg_.rope.mrope_interleaved,
                             (session.mropePosT_.valid() ? session.mropePosT_.data_as<int>() : nullptr),
                             (session.mropePosH_.valid() ? session.mropePosH_.data_as<int>() : nullptr),
                             (session.mropePosW_.valid() ? session.mropePosW_.data_as<int>() : nullptr),
                             session.mropePromptLength_, session.mropeTextPositionDelta_,
-                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2]);
+                            cfg_.rope.mrope_section[0], cfg_.rope.mrope_section[1], cfg_.rope.mrope_section[2],
+                            idx_k_base);
                         cache.num_compressed_blocks = total_complete_blocks;
                     }
+                    sync_indexer_tail_out();
                 }
                 static const bool verify_decode_attention = aila::env::read_flag("AILA_Q4E_VERIFY_DECODE_ATTN", true);
                 static const bool verify_attention_pair = aila::env::read_flag("AILA_Q4E_VERIFY_ATTN_PAIR", true);
@@ -838,9 +873,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, cache.kv_stream_map, cache.k, cache.v,
                             cache.k_scale.valid() ? &cache.k_scale : nullptr,
                             cache.v_scale.valid() ? &cache.v_scale : nullptr,
-                            cache.host_k, cache.host_v,
-                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            stream_write_target.segments,
                             nullptr, count, start_pos, block_topk, compress_ratio,
                             buf_.qsa_resolved_blocks, &buf_.qsa_resolved_tail_indices);
                     }
@@ -887,9 +920,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                             ctx, stage_k, stage_v,
                             int8_kv ? &stage_k_scale : nullptr,
                             int8_kv ? &stage_v_scale : nullptr,
-                            cache.host_k, cache.host_v,
-                            cache.host_k_scale.valid() ? &cache.host_k_scale : nullptr,
-                            cache.host_v_scale.valid() ? &cache.host_v_scale : nullptr,
+                            stream_write_target.segments,
                             start_pos + count);
                         ops::attention_prefill_cached(ctx, buf_.q, stage_k, stage_v, buf_.attn_out, buf_.incr_scores, count, start_pos, full_q_heads_, full_kv_heads_, full_head_dim_, start_pos + count, &buf_.z,
                                                       int8_kv ? &stage_k_scale : nullptr,

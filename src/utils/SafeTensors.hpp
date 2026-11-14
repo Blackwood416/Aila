@@ -197,6 +197,9 @@ public:
     HostTensorView host_view(const std::string& name) const;
     std::vector<std::string> host_names() const;
     size_t host_size() const;
+    // Unmaps shard files that hold no host tensor matching any keep_prefix.
+    // Returns the number of shard mappings released.
+    size_t release_unused_shards(const std::vector<std::string>& keep_prefixes);
 
     Tensor& upload(const std::string& name);
     Tensor& upload(const std::string& name, Context& ctx);

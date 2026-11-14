@@ -24,6 +24,12 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -293,21 +299,33 @@ Qwen4ExpBnb4Backend::Session::Session(
             const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens);
             if (kv_stream_plan.enabled) {
                 cache.kv_stream_enabled = true;
+                kv_host_int8_ = int8_kv;
                 const int slot_tokens = kv_stream_plan.residentTokens;
                 cache.k = Tensor::allocate(ctx, {2, slot_tokens, 256}, kv_dtype);
                 cache.v = Tensor::allocate(ctx, {2, slot_tokens, 256}, kv_dtype);
-                cache.host_k = Tensor::allocate_host(ctx, {2, capacity, 256}, kv_dtype);
-                cache.host_v = Tensor::allocate_host(ctx, {2, capacity, 256}, kv_dtype);
+                int seg_tokens = std::clamp(
+                    aila::env::read_int("AILA_Q4E_KV_HOST_SEGMENT_TOKENS", 16384),
+                    4096, std::max(4096, capacity));
+                seg_tokens = ((seg_tokens + 3) / 4) * 4;
+                const int min_seg = (((capacity + ops::QsaKvHostSegments::kMaxSegments - 1) /
+                                      ops::QsaKvHostSegments::kMaxSegments + 3) / 4) * 4;
+                seg_tokens = std::max(seg_tokens, min_seg);
+                seg_tokens = std::min(seg_tokens, capacity);
+                const int total_segs = (capacity + seg_tokens - 1) / seg_tokens;
+                cache.kv_host_segment_tokens = seg_tokens;
+                cache.kv_host_total_segments = total_segs;
+                cache.kv_host_last_segment_tokens = capacity - (total_segs - 1) * seg_tokens;
                 if (int8_kv) {
                     cache.k_scale = Tensor::allocate(ctx, {2, slot_tokens}, dnnl::memory::data_type::f32);
                     cache.v_scale = Tensor::allocate(ctx, {2, slot_tokens}, dnnl::memory::data_type::f32);
-                    cache.host_k_scale = Tensor::allocate_host(ctx, {2, capacity}, dnnl::memory::data_type::f32);
-                    cache.host_v_scale = Tensor::allocate_host(ctx, {2, capacity}, dnnl::memory::data_type::f32);
-                    std::memset(cache.host_k_scale.data(), 0, cache.host_k_scale.size_bytes());
-                    std::memset(cache.host_v_scale.data(), 0, cache.host_v_scale.size_bytes());
                 }
                 ops::qsa_kv_stream_init_map(ctx, cache.kv_stream_map, capacity, kv_stream_plan.slotCount);
-                cache.indexer_k = Tensor::allocate_host(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
+                if (aila::env::read_flag("AILA_QSA_COMPRESSED_K", true)) {
+                    cache.indexer_k_tail_only = true;
+                    cache.indexer_k = Tensor::allocate(ctx, {8, 128}, dnnl::memory::data_type::bf16);
+                } else {
+                    cache.indexer_k = Tensor::allocate_host(ctx, {capacity, 128}, dnnl::memory::data_type::bf16);
+                }
             } else {
                 cache.k = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
                 cache.v = Tensor::allocate(ctx, {2, capacity, 256}, kv_dtype);
@@ -322,6 +340,38 @@ Qwen4ExpBnb4Backend::Session::Session(
             cache.num_compressed_blocks = 0;
         }
     }
+    EnsureKvHostCapacity(ctx, 1);
+}
+
+void Qwen4ExpBnb4Backend::Session::EnsureKvHostCapacity(Context& ctx, int requiredTokens) {
+    const int needed = std::min(capacity_, std::max(1, requiredTokens));
+    if (needed <= kv_host_allocated_tokens_) return;
+    int max_covered = capacity_;
+    for (auto& cache : layerCaches_) {
+        if (!cache.kv_stream_enabled) continue;
+        const auto kv_dtype = kv_host_int8_ ? dnnl::memory::data_type::s8
+                                            : dnnl::memory::data_type::bf16;
+        const int seg_tokens = cache.kv_host_segment_tokens;
+        const int total_segs = cache.kv_host_total_segments;
+        const int target_segs = std::min(total_segs, (needed + seg_tokens - 1) / seg_tokens);
+        while (static_cast<int>(cache.host_k_segs.size()) < target_segs) {
+            const int s = static_cast<int>(cache.host_k_segs.size());
+            const int rows = (s + 1 == total_segs) ? cache.kv_host_last_segment_tokens : seg_tokens;
+            cache.host_k_segs.push_back(Tensor::allocate_host(ctx, {2, rows, 256}, kv_dtype));
+            cache.host_v_segs.push_back(Tensor::allocate_host(ctx, {2, rows, 256}, kv_dtype));
+            if (kv_host_int8_) {
+                Tensor ks = Tensor::allocate_host(ctx, {2, rows}, dnnl::memory::data_type::f32);
+                Tensor vs = Tensor::allocate_host(ctx, {2, rows}, dnnl::memory::data_type::f32);
+                std::memset(ks.data(), 0, ks.size_bytes());
+                std::memset(vs.data(), 0, vs.size_bytes());
+                cache.host_k_scale_segs.push_back(std::move(ks));
+                cache.host_v_scale_segs.push_back(std::move(vs));
+            }
+        }
+        const int covered = (target_segs == total_segs) ? capacity_ : (target_segs * seg_tokens);
+        max_covered = std::min(max_covered, covered);
+    }
+    kv_host_allocated_tokens_ = max_covered;
 }
 
 Qwen4ExpBnb4Backend::Session::~Session() {
@@ -510,7 +560,18 @@ Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     }
     adaptive_cache_.Release();
     host_arena_.Release();
-    if (resident_embedding_ && context_) context_->free_host(resident_embedding_);
+    if (resident_embedding_) {
+        if (resident_embedding_large_pages_) {
+            if (context_) context_->free_host(resident_embedding_);
+        } else {
+#ifdef _WIN32
+            VirtualFree(resident_embedding_, 0, MEM_RELEASE);
+#else
+            std::free(resident_embedding_);
+#endif
+        }
+        resident_embedding_ = nullptr;
+    }
 }
 
 void Qwen4ExpBnb4Backend::PrepareDecodeVerification(Context& ctx) {
@@ -750,10 +811,10 @@ bool Qwen4ExpBnb4Backend::load(
     }
 
     static const bool s_lm_head_q8 = aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", false);
-    lm_head_host_ = weights.has_host("lm_head.weight") ? weights.host_view("lm_head.weight") : HostTensorView{};
+    const HostTensorView lm_head_host = weights.has_host("lm_head.weight") ? weights.host_view("lm_head.weight") : HostTensorView{};
     const bool use_q8_head = s_lm_head_q8 && hidden_size_ == 2560 && cfg_.vocab_size == 248320 &&
-        lm_head_host_.valid() && lm_head_host_.dtype == DT_BF16 && lm_head_host_.shape.size() == 2 &&
-        lm_head_host_.shape[0] == cfg_.vocab_size && lm_head_host_.shape[1] == hidden_size_ &&
+        lm_head_host.valid() && lm_head_host.dtype == DT_BF16 && lm_head_host.shape.size() == 2 &&
+        lm_head_host.shape[0] == cfg_.vocab_size && lm_head_host.shape[1] == hidden_size_ &&
         ops::bf16_q8_head_supported(ctx, hidden_size_, cfg_.vocab_size);
     Tensor& raw_lm_head = weights.upload("lm_head.weight", ctx);
     if (use_q8_head) {
@@ -965,7 +1026,11 @@ bool Qwen4ExpBnb4Backend::load(
                 kv_stream_plan.blockCount, kv_stream_plan.slotCount)
             : 0;
         const size_t indexer_k_bytes = full_layers * cfg_.indexer_head_dim * sizeof(bf16) * static_cast<size_t>(max_seq_len_);
-        const size_t device_indexer_k_bytes = kv_stream_plan.enabled ? 0u : indexer_k_bytes;
+        const bool tail_only_indexer_k = kv_stream_plan.enabled && aila::env::read_flag("AILA_QSA_COMPRESSED_K", true);
+        const size_t device_indexer_k_bytes = tail_only_indexer_k
+            ? (full_layers * 8u * cfg_.indexer_head_dim * sizeof(bf16))
+            : (kv_stream_plan.enabled ? 0u : indexer_k_bytes);
+        const size_t host_indexer_k_bytes = (kv_stream_plan.enabled && !tail_only_indexer_k) ? indexer_k_bytes : 0u;
         const size_t indexer_compressed_k_bytes = full_layers * (static_cast<size_t>(max_seq_len_) / 4) * cfg_.indexer_head_dim * sizeof(bf16);
         const size_t recurrent_bytes = linear_layers * (48 * 128 * 128 + 3 * 10240) * sizeof(float);
         const size_t non_kv_session_state = device_indexer_k_bytes + indexer_compressed_k_bytes + recurrent_bytes;
@@ -985,7 +1050,7 @@ bool Qwen4ExpBnb4Backend::load(
                 aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048),
                 2,
                 std::max(2, max_seq_len_));
-            const int mtp_hidden_rows_cap = std::min(mtp_cap, std::max(8192, prefill_chunk_cap));
+            const int mtp_hidden_rows_cap = std::min(mtp_cap, 512);
             const size_t mtp_hidden_rows_bytes =
                 static_cast<size_t>(mtp_hidden_rows_cap) * 10240u * sizeof(bf16);
             const size_t mtp_session_bytes =
@@ -1048,11 +1113,20 @@ bool Qwen4ExpBnb4Backend::load(
             size_t(linear_all_dim_) * size_t(hidden_size_) * sizeof(bf16);
         const size_t ws_ple_staging_bytes =
             2u * size_t(prefill_chunk_cap) * size_t(hidden_size_) * sizeof(bf16);
+        const bool ws_has_qsa = layers_.size() > 3 && layers_[3].index_qk_weight != nullptr;
+        const int ws_comp_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+        const int ws_block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / ws_comp_ratio;
+        const int ws_decode_scores_cap = ws_has_qsa
+            ? std::min(max_seq_len_, std::max(4096, ws_block_topk * ws_comp_ratio + 128))
+            : max_seq_len_;
+        const int ws_decode_tiles = ws_has_qsa
+            ? std::max(68, (ws_decode_scores_cap + 127) / 128)
+            : ((max_seq_len_ + 127) / 128);
         const size_t ws_persistent_bufs =
             size_t(prefill_chunk_cap) * (10240u + 2u * size_t(hidden_size_)) * sizeof(bf16) +
             size_t(ws_attn_cap) * size_t(full_q_dim_) * sizeof(bf16) +
-            size_t(full_q_heads_) * size_t(max_seq_len_) * sizeof(float) +
-            size_t(full_q_heads_) * size_t((max_seq_len_ + 127) / 128) * size_t(full_head_dim_ == 256 ? 272 : 144) * sizeof(float) +
+            size_t(full_q_heads_) * size_t(ws_decode_scores_cap) * sizeof(float) +
+            size_t(full_q_heads_) * size_t(ws_decode_tiles) * size_t(full_head_dim_ == 256 ? 272 : 144) * sizeof(float) +
             ws_xmx_scratch_bytes + ws_linear_scratch_bytes + ws_ple_staging_bytes +
             (static_cast<size_t>(380) << 20); // qsa_tile_* + indexer_* + expert_*_dev + measured L0/oneDNN JIT runtime headroom
         const size_t workspace_reserve = ws_phase_peak + ws_persistent_bufs;
@@ -1113,15 +1187,30 @@ bool Qwen4ExpBnb4Backend::load(
                 kv_stream_plan.residentTokens, kv_stream_plan.slotCount, kv_stream_plan.blockCount,
                 (kv_bytes + kv_scale_bytes + kv_stream_map_bytes) / (1024.0 * 1024.0),
                 host_kv_bytes / (1024.0 * 1024.0),
-                indexer_k_bytes / (1024.0 * 1024.0));
+                host_indexer_k_bytes / (1024.0 * 1024.0));
         }
     }
-    // GPU experts and native RAM experts are complementary owners. Allocate
-    // the contiguous embedding before the smaller large-page expert chunks.
+    // GPU experts and native RAM experts are complementary owners. Keep
+    // embed_tokens in pageable host memory by default (large-page lock is opt-in)
+    // so 1.18 GiB does not stay pinned against PLE's mmap working set.
     if (embed_host_.valid()) {
-        resident_embedding_=ctx.alloc_large_host(embed_host_.bytes);
-        std::memcpy(resident_embedding_,embed_host_.ptr,embed_host_.bytes);
-        embed_host_.ptr=static_cast<const uint8_t*>(resident_embedding_);
+        static const bool s_embed_large_pages =
+            aila::env::read_flag("AILA_Q4E_EMBED_LARGE_PAGES", false);
+        if (s_embed_large_pages) {
+            resident_embedding_ = ctx.alloc_large_host(embed_host_.bytes);
+            resident_embedding_large_pages_ = true;
+        } else {
+#ifdef _WIN32
+            resident_embedding_ = VirtualAlloc(nullptr, embed_host_.bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!resident_embedding_) throw std::bad_alloc();
+#else
+            resident_embedding_ = std::malloc(embed_host_.bytes);
+            if (!resident_embedding_) throw std::bad_alloc();
+#endif
+            resident_embedding_large_pages_ = false;
+        }
+        std::memcpy(resident_embedding_, embed_host_.ptr, embed_host_.bytes);
+        embed_host_.ptr = static_cast<const uint8_t*>(resident_embedding_);
     }
     aila::AdaptiveCacheConfig cache_cfg;
     cache_cfg.num_layers=cfg_.num_hidden_layers;
@@ -1459,10 +1548,18 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     buf_.k = phase_at(off_qsa_k, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
     buf_.v = phase_at(off_qsa_v, {attn_cap, full_kv_dim_}, dnnl::memory::data_type::bf16);
     buf_.attn_out = Tensor::allocate(ctx, {attn_cap, full_q_dim_}, dnnl::memory::data_type::bf16);
-    buf_.decode_scores = Tensor::allocate(ctx, {full_q_heads_, max_seq_len_}, dnnl::memory::data_type::f32);
+    const bool has_qsa_buf = layers_.size() > 3 && layers_[3].index_qk_weight != nullptr;
+    const int buf_comp_ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+    const int buf_block_topk = (cfg_.indexer_budget > 0 ? cfg_.indexer_budget : 2048) / buf_comp_ratio;
+    const int decode_scores_cap = has_qsa_buf
+        ? std::min(max_seq_len_, std::max(4096, buf_block_topk * buf_comp_ratio + 128))
+        : max_seq_len_;
+    buf_.decode_scores = Tensor::allocate(ctx, {full_q_heads_, decode_scores_cap}, dnnl::memory::data_type::f32);
     constexpr int kDecodeExactTile = 128;
     const int partial_stride = (full_head_dim_ == 256) ? 272 : 144;
-    const int max_tiles = (max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile;
+    const int max_tiles = has_qsa_buf
+        ? std::max(68, (decode_scores_cap + kDecodeExactTile - 1) / kDecodeExactTile)
+        : ((max_seq_len_ + kDecodeExactTile - 1) / kDecodeExactTile);
     buf_.decode_attn_partials = Tensor::allocate(
         ctx,
         {(int64_t)full_q_heads_, (int64_t)max_tiles, (int64_t)partial_stride},
@@ -1476,6 +1573,11 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     // QSA Indexer buffers (M2, A3, A4)
     buf_.indexer_qk = phase_at(off_qsa_idx_qk, {attn_cap, indexer_out_dim}, dnnl::memory::data_type::bf16);
     buf_.indexer_q = phase_at(off_qsa_idx_q, {attn_cap, indexer_q_dim}, dnnl::memory::data_type::bf16);
+    if (kv_stream_plan.enabled && aila::env::read_flag("AILA_QSA_COMPRESSED_K", true)) {
+        buf_.indexer_k_stage = Tensor::allocate(ctx, {attn_cap + 4, cfg_.indexer_head_dim}, dnnl::memory::data_type::bf16);
+    } else {
+        buf_.indexer_k_stage = Tensor{};
+    }
     const int max_complete_blocks = (max_seq_len_ + 3) / 4;
     buf_.indexer_block_scores = Tensor::allocate(ctx, {max_complete_blocks}, dnnl::memory::data_type::f32);
     buf_.indexer_active_tokens = Tensor::allocate(ctx, {std::max(max_seq_len_, cfg_.indexer_budget + cfg_.indexer_compress_ratio)}, dnnl::memory::data_type::s32);
@@ -1650,10 +1752,12 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             xmx_ranks_off_ = int(ranks_off);
             xmx_slots_off_ = int(slots_off);
             if (s_prefill_expert_xmx) {
-                xmx_plan_host_[0].assign(size_t(xmx_plan_bytes_), 0);
-                xmx_plan_host_[1].assign(size_t(xmx_plan_bytes_), 0);
                 xmx_plan_pinned_[0] = static_cast<unsigned char*>(ctx.alloc_host(size_t(xmx_plan_bytes_)));
                 xmx_plan_pinned_[1] = static_cast<unsigned char*>(ctx.alloc_host(size_t(xmx_plan_bytes_)));
+                if (!xmx_plan_pinned_[0]) xmx_plan_host_[0].assign(size_t(xmx_plan_bytes_), 0);
+                else xmx_plan_host_[0].clear();
+                if (!xmx_plan_pinned_[1]) xmx_plan_host_[1].assign(size_t(xmx_plan_bytes_), 0);
+                else xmx_plan_host_[1].clear();
                 xmx_plan_dev_[0] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
                 xmx_plan_dev_[1] = static_cast<unsigned char*>(ctx.alloc_device(size_t(xmx_plan_bytes_)));
                 const bool scratch_ok = (xmx_scratch_.impl != nullptr) ||
@@ -1687,6 +1791,25 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
 // ============================================================================
 // Forward Implementation
 // ============================================================================
+
+void Qwen4ExpBnb4Backend::CommitStreamedIndexerTail(
+    Context& ctx, Session& session, int prevLen, int committedLen) {
+    if (committedLen <= prevLen) return;
+    const int ratio = cfg_.indexer_compress_ratio > 0 ? cfg_.indexer_compress_ratio : 4;
+    const int baseBlock = prevLen / ratio;
+    const int committedBlock = committedLen / ratio;
+    const int rem = committedLen % ratio;
+    if (committedBlock <= baseBlock || rem <= 0) return;
+    const int srcOff = (committedBlock - baseBlock) * ratio;
+    for (size_t i = 0; i < session.layerCaches_.size(); ++i) {
+        auto& cache = session.layerCaches_[i];
+        if (!cache.indexer_k_tail_only || !cache.indexer_k.valid()) continue;
+        ctx.queue().memcpy(
+            cache.indexer_k.data(),
+            cache.indexer_k.data_as<bf16>() + static_cast<size_t>(srcOff) * cfg_.indexer_head_dim,
+            static_cast<size_t>(rem) * cfg_.indexer_head_dim * sizeof(bf16));
+    }
+}
 
 void Qwen4ExpBnb4Backend::TrimDecodeRuntimeBuffers(Context& ctx) {
     static const int explicit_trim_cap = aila::env::read_int_raw("AILA_Q4E_DECODE_TRIM_CAP", 0);
@@ -1802,8 +1925,9 @@ void Qwen4ExpBnb4Backend::WarmupPrefillKernels(Context& ctx) {
                 }
             }
             if (warm_slot >= 0 && down_off + down_bytes <= scratch_bytes) {
-                std::fill(xmx_plan_host_[0].begin(), xmx_plan_host_[0].end(), 0);
-                unsigned char* plan_host = xmx_plan_host_[0].data();
+                unsigned char* plan_host = xmx_plan_pinned_[0] ? xmx_plan_pinned_[0] : xmx_plan_host_[0].data();
+                const size_t plan_bytes = size_t(xmx_slots_off_) + sizeof(ops::MoeExpertSlotDev);
+                std::memset(plan_host, 0, plan_bytes);
                 auto* plan_bases = reinterpret_cast<int*>(plan_host);
                 auto* plan_tokens = reinterpret_cast<int*>(plan_host + xmx_tokens_off_);
                 auto* plan_ranks = reinterpret_cast<int*>(plan_host + xmx_ranks_off_);
@@ -1815,7 +1939,6 @@ void Qwen4ExpBnb4Backend::WarmupPrefillKernels(Context& ctx) {
                 plan_ranks[0] = 0;
                 plan_slots[0] = adaptive_cache_.GetResidentSlotDev(
                     warm_slot, &host_arena_.GetLayerNestedMetadata(warm_layer));
-                const size_t plan_bytes = size_t(xmx_slots_off_) + sizeof(ops::MoeExpertSlotDev);
                 ctx.queue().memcpy(xmx_plan_dev_[0], plan_host, plan_bytes);
                 ops::MoeExpertXmxChunk chunk{};
                 chunk.num_experts = 1;
@@ -3190,6 +3313,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     if (!preserve_l3_graph) (void)AbortTokenGraph();
     if (count <= 0) return buf_.logits;
     if (!preserve_l3_graph) session.InvalidateTokenGraphState();
+    session.EnsureKvHostCapacity(ctx, session.CurrentLength() + count);
     ValidateGdnHeadPath(session, count);
     if (count == 1 && session.graph_gdn_state_enabled_) {
         int linear_rows = 0;
@@ -4023,6 +4147,9 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
     // No-logits forwards must also leave a materialized stack before snapshot,
     // state publication or return. This is a no-op after the final mixer.
     pending_mlp.Materialize();
+    if (!options.decode_verification && !is_prefill && count > 1 && count <= 4) {
+        CommitStreamedIndexerTail(ctx, session, start_pos, start_pos + count);
+    }
     if (moe_compact_tile_ && count > 4) {
         int invalid=0;ctx.memcpy_d2h(&invalid,buf_.moe_compact_invalid.data(),sizeof(invalid));
         if(invalid)throw std::runtime_error("Compact MoE Q36 contribution is nonfinite or exceeds 2^20; window not committed");
@@ -4317,6 +4444,15 @@ void Qwen4ExpBnb4Backend::CaptureSnapshot(
                 snapshot.layers[i].linear_conv_head = cache.linear_conv_head;
             } else {
                 snapshot.layers[i].num_compressed_blocks = cache.num_compressed_blocks;
+                const int rem = nextLength % 4;
+                if (cache.indexer_k_tail_only && rem > 0 && cache.indexer_k.valid()) {
+                    snapshot.layers[i].indexer_k_tail.resize(static_cast<size_t>(rem) * 128u);
+                    ctx.memcpy_d2h(snapshot.layers[i].indexer_k_tail.data(),
+                                   cache.indexer_k.data(),
+                                   snapshot.layers[i].indexer_k_tail.size() * sizeof(bf16));
+                } else {
+                    snapshot.layers[i].indexer_k_tail.clear();
+                }
             }
         }
         ple_.capture_snapshot(ctx, session.ple_state_, snapshot.ple_snapshot);
@@ -4374,6 +4510,12 @@ int Qwen4ExpBnb4Backend::Truncate(Session& session, int newLength) {
             cache.device_state_dirty = false;
         } else {
             cache.num_compressed_blocks = snap_layer.num_compressed_blocks;
+            if (cache.indexer_k_tail_only && !snap_layer.indexer_k_tail.empty() && cache.indexer_k.valid()) {
+                session.context_->memcpy_h2d(
+                    cache.indexer_k.data(),
+                    snap_layer.indexer_k_tail.data(),
+                    snap_layer.indexer_k_tail.size() * sizeof(bf16));
+            }
             if (cache.kv_stream_enabled) {
                 ops::qsa_kv_stream_reset(*session.context_, cache.kv_stream_map);
             }
@@ -4475,7 +4617,7 @@ std::unique_ptr<Qwen4ExpBnb4Backend::Session> Qwen4ExpBnb4Backend::CreateSession
                                      &cache.kv_stream_map.ctl}) {
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, tensor->size_bytes());
         }
-        if (!cache.kv_stream_enabled) {
+        if (!cache.kv_stream_enabled || cache.indexer_k_tail_only) {
             cacheBytes = aila::memory::checked_memory_sum(cacheBytes, cache.indexer_k.size_bytes());
         }
     }

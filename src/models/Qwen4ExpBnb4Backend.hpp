@@ -88,16 +88,58 @@ struct Qwen4ExpLayerCache {
     // Only allocated when AILA_KV_QUANT=1 AILA_KV_QUANT_FORMAT=int8.
     Tensor k_scale; // [2, capacity]
     Tensor v_scale; // [2, capacity]
-    Tensor indexer_k; // [capacity, 128] bf16
+    Tensor indexer_k; // [capacity, 128] bf16, or [8, 128] device tail when indexer_k_tail_only
+    bool indexer_k_tail_only = false;
     Tensor indexer_compressed_k; // [capacity / 4, 128] bf16 (A1)
     int num_compressed_blocks = 0; // Number of complete blocks compressed (A1)
-    // QSA KV Streaming (authoritative host USM + device slot pool)
+    // QSA KV Streaming (authoritative segmented host USM + device slot pool)
     bool kv_stream_enabled = false;
-    Tensor host_k; // [2, capacity, 256] bf16 or s8 (pinned host USM)
-    Tensor host_v; // [2, capacity, 256] bf16 or s8 (pinned host USM)
-    Tensor host_k_scale; // [2, capacity] f32 (int8 KV only)
-    Tensor host_v_scale; // [2, capacity] f32 (int8 KV only)
+    int kv_host_segment_tokens = 0;
+    int kv_host_last_segment_tokens = 0;
+    int kv_host_total_segments = 0;
+    std::vector<Tensor> host_k_segs; // each [2, seg_tokens, 256] bf16 or s8 (pinned host USM)
+    std::vector<Tensor> host_v_segs; // each [2, seg_tokens, 256] bf16 or s8 (pinned host USM)
+    std::vector<Tensor> host_k_scale_segs; // each [2, seg_tokens] f32 (int8 KV only)
+    std::vector<Tensor> host_v_scale_segs; // each [2, seg_tokens] f32 (int8 KV only)
     ops::QsaKvStreamMap kv_stream_map;
+
+    ops::QsaKvHostSegments KvHostSegments(int capacity) const noexcept {
+        ops::QsaKvHostSegments segs{};
+        segs.host_capacity = capacity;
+        segs.segment_tokens = kv_host_segment_tokens;
+        segs.last_segment_tokens = (static_cast<int>(host_k_segs.size()) == kv_host_total_segments)
+            ? kv_host_last_segment_tokens
+            : kv_host_segment_tokens;
+        segs.num_segments = static_cast<int>(host_k_segs.size());
+        for (int s = 0; s < segs.num_segments && s < ops::QsaKvHostSegments::kMaxSegments; ++s) {
+            segs.k[s] = const_cast<void*>(host_k_segs[s].data());
+            segs.v[s] = const_cast<void*>(host_v_segs[s].data());
+            if (static_cast<size_t>(s) < host_k_scale_segs.size() && host_k_scale_segs[s].valid()) {
+                segs.k_scale[s] = const_cast<float*>(host_k_scale_segs[s].data_as<float>());
+                segs.v_scale[s] = const_cast<float*>(host_v_scale_segs[s].data_as<float>());
+            }
+        }
+        return segs;
+    }
+
+    ops::QsaKvSingleHostSegments KvSingleHostSegments(int capacity, bool is_value) const noexcept {
+        ops::QsaKvSingleHostSegments segs{};
+        const auto& data_vecs = is_value ? host_v_segs : host_k_segs;
+        const auto& scale_vecs = is_value ? host_v_scale_segs : host_k_scale_segs;
+        segs.host_capacity = capacity;
+        segs.segment_tokens = kv_host_segment_tokens;
+        segs.last_segment_tokens = (static_cast<int>(data_vecs.size()) == kv_host_total_segments)
+            ? kv_host_last_segment_tokens
+            : kv_host_segment_tokens;
+        segs.num_segments = static_cast<int>(data_vecs.size());
+        for (int s = 0; s < segs.num_segments && s < ops::QsaKvSingleHostSegments::kMaxSegments; ++s) {
+            segs.data[s] = const_cast<void*>(data_vecs[s].data());
+            if (static_cast<size_t>(s) < scale_vecs.size() && scale_vecs[s].valid()) {
+                segs.scale[s] = const_cast<float*>(scale_vecs[s].data_as<float>());
+            }
+        }
+        return segs;
+    }
 
     // Linear Attention
     Tensor linear_state;
@@ -144,6 +186,7 @@ struct Qwen4ExpBuffers {
     // QSA Indexer
     Tensor indexer_qk;           // [max_seq, 640]
     Tensor indexer_q;            // [max_seq, 512]
+    Tensor indexer_k_stage;      // [attn_cap + 4, 128] bf16 (device window for tail-only streamed indexer)
     Tensor indexer_block_scores; // [max_blocks] f32
     Tensor indexer_active_tokens;// [2051] s32
     Tensor indexer_active_blocks;// [516] s32 (Phase A3)
@@ -198,6 +241,7 @@ class Qwen4ExpBnb4Backend : public IModelBackend {
     struct LayerStateSnapshot {
         std::vector<float> linear_state_host;
         std::vector<float> linear_conv_state_host;
+        std::vector<sycl::ext::oneapi::bfloat16> indexer_k_tail;
         int linear_conv_head = 0;
         int num_compressed_blocks = 0;
     };
@@ -306,6 +350,7 @@ public:
         int& consecutive_no_miss_layers_for_testing() { return consecutive_no_miss_layers_; }
         Qwen4ExpPleState& ple_state_for_testing() { return ple_state_; }
         int consecutive_no_miss_layers() const { return consecutive_no_miss_layers_; }
+        void EnsureKvHostCapacity(Context& ctx, int requiredTokens);
 
     private:
         friend class Qwen4ExpBnb4Backend;
@@ -326,6 +371,8 @@ public:
         uint64_t session_instance_id_ = 0;
         int currentLength_ = 0;
         int capacity_ = 0;
+        int kv_host_allocated_tokens_ = 0;
+        bool kv_host_int8_ = false;
         std::size_t cacheBytes_ = 0;
         uint64_t generation_ = 1;
         uint64_t ple_ticket_epoch_ = 1;
@@ -388,6 +435,7 @@ public:
         return resolved_kv_resident_tokens_;
     }
     void TrimDecodeRuntimeBuffers(Context& ctx);
+    void CommitStreamedIndexerTail(Context& ctx, Session& session, int prevLen, int committedLen);
 
     std::unique_ptr<Session> CreateSession(Context& ctx, std::size_t maxSnapshots = 4);
     // All token-graph submissions must pass through this host wrapper.
@@ -524,6 +572,7 @@ public:
     aila::Qwen4ExpHostArena& host_arena() noexcept { return host_arena_; }
     const aila::Qwen4ExpAdaptiveCache& adaptive_cache() const noexcept { return adaptive_cache_; }
     aila::Qwen4ExpAdaptiveCache& adaptive_cache() noexcept { return adaptive_cache_; }
+    bool HasResidentEmbedding() const noexcept { return embed_host_.valid() && resident_embedding_ != nullptr; }
 
 private:
     bool decodeHcReferenceForTest_ = false;
@@ -762,6 +811,7 @@ private:
     std::unique_ptr<sycl::queue> copy_q_;
     int ping_pong_index_ = 0;
     void* resident_embedding_ = nullptr;
+    bool resident_embedding_large_pages_ = false;
     std::vector<ops::MoeExpertSlotDev> adaptive_prefill_slots_;
     sycl::event RunAdaptivePrefill(Context& ctx,int layer,bool fuse_shared,int count);
     int resident_decode_mode_ = 0; // 0 legacy, 1 host Ready binding, 2 GPU resident selection
@@ -802,9 +852,6 @@ private:
     sycl::event embed_h2d_event_{};
     Tensor lm_head_weight_transposed_;
     Linear lm_head_;
-    // Experimental head replacement. Original host mmap remains owned by the
-    // model weights; no resident BF16 head/oneDNN head exists when enabled.
-    HostTensorView lm_head_host_{};
     Tensor lm_head_q8_weight_;
     Tensor lm_head_q8_scale_;
     Tensor lm_head_q8_input_;

@@ -31,7 +31,8 @@ void qsa_prepare_q_and_cache_k(
     int text_pos_delta = 0,
     int mrope_section_t = 0,
     int mrope_section_h = 0,
-    int mrope_section_w = 0);
+    int mrope_section_w = 0,
+    int k_cache_base_token = 0);
 
 // Graph-safe decode variant. position_dev points to one device int32 slot.
 // The fixed 4-head grid reads the current position and writes that token's raw
@@ -63,7 +64,8 @@ void qsa_cache_k_batched(
     const Tensor& indexer_qk,
     Tensor& k_cache,
     int start_pos,
-    int count);
+    int count,
+    int k_cache_base_token = 0);
 
 // Computes attention scores for complete key blocks (each block is 4 tokens).
 // For block b = 0 .. num_complete_blocks - 1:
@@ -203,7 +205,8 @@ void qsa_compress_key_blocks(
     int text_pos_delta = 0,
     int mrope_section_t = 0,
     int mrope_section_h = 0,
-    int mrope_section_w = 0);
+    int mrope_section_w = 0,
+    int k_cache_base_token = 0);
 
 // Graph-safe one-token block update. A fixed single workgroup reads the unified
 // GraphControl start position, block count and sticky abort flag. When
@@ -370,7 +373,8 @@ int qsa_prepare_causal_query_and_select_blocks(
     int mrope_section_h = 0,
     int mrope_section_w = 0,
     Tensor* compressed_k = nullptr,
-    int* num_compressed_blocks = nullptr);
+    int* num_compressed_blocks = nullptr,
+    int k_cache_base_token = 0);
 
 int qsa_prepare_causal_query_and_select_blocks_host(
     const bf16* indexer_qk,
@@ -499,7 +503,8 @@ void qsa_pre_indexer_batched(
     int text_pos_delta = 0,
     int mrope_section_t = 0,
     int mrope_section_h = 0,
-    int mrope_section_w = 0);
+    int mrope_section_w = 0,
+    int k_cache_base_token = 0);
 
 void qsa_pre_indexer_batched_host(
     const bf16* indexer_qk,

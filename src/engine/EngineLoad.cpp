@@ -450,6 +450,19 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                 mtp_state_ = mtp_->CreateState();
             }
         }
+        if (q4e_warmup_backend && weights_) {
+            std::vector<std::string> keep_prefixes{
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding."};
+            if (mtp_) keep_prefixes.emplace_back("mtp.layers.0.mlp.experts.");
+            if (!q4e_warmup_backend->HasResidentEmbedding()) {
+                keep_prefixes.emplace_back("model.language_model.embed_tokens.weight");
+            }
+            const size_t released_shards = weights_->release_unused_shards(keep_prefixes);
+            if (released_shards > 0) {
+                AILA_LOG_INFO("[Qwen4Exp] Released %zu unused safetensors shard mapping(s)",
+                              released_shards);
+            }
+        }
         bool is_exact_q35_0p8b_spec =
             (model_spec_.family == ModelFamily::Qwen35Hybrid) &&
             is_exact_qwen35_hybrid_0p8b_spec(model_spec_.qwen35_text);

@@ -108,6 +108,38 @@ size_t ModelWeights::host_size() const {
     return host_index_.size();
 }
 
+size_t ModelWeights::release_unused_shards(const std::vector<std::string>& keep_prefixes) {
+    if (mmaps_.empty()) return 0;
+    std::vector<bool> keep(mmaps_.size(), false);
+    for (const auto& [name, entry] : host_index_) {
+        if (entry.shard_index >= keep.size() || keep[entry.shard_index]) continue;
+        for (const auto& prefix : keep_prefixes) {
+            if (!prefix.empty() && name.rfind(prefix, 0) == 0) {
+                keep[entry.shard_index] = true;
+                break;
+            }
+        }
+    }
+    size_t released = 0;
+    for (size_t i = 0; i < mmaps_.size(); ++i) {
+        if (!keep[i] && mmaps_[i]) {
+            mmaps_[i].reset();
+            ++released;
+        }
+    }
+    if (released > 0) {
+        for (auto it = host_index_.begin(); it != host_index_.end();) {
+            const size_t idx = it->second.shard_index;
+            if (idx < keep.size() && !keep[idx]) {
+                it = host_index_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return released;
+}
+
 
 // ============================================================
 // DataType -> oneDNN data_type 转换

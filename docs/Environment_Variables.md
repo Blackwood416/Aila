@@ -283,6 +283,7 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_HOT_RAM_MB` | int | `32768` (preset) | Host RAM budget for `Qwen4ExpHostArena` large-page complement. |
 | `AILA_Q4E_KV_STREAM` | bool | `false` (`1` in `start-qwen38.ps1` at `>=64K` BF16 / `>=128K` INT8) | Enable QSA KV streaming: keeps authoritative full-context K/V (and INT8 scales) plus raw `indexer_k` in pinned host USM while holding a bounded VRAM slot pool with device-side CLOCK eviction and `indexer_compressed_k` in VRAM. |
 | `AILA_Q4E_KV_RESIDENT_TOKENS` | int | `auto` (`16384` fallback, tiers `8208/16384/32768/65536`) | Number of logical KV tokens kept in the VRAM slot pool per full-attention layer when `AILA_Q4E_KV_STREAM=1` (minimum `8208` = `2052` 4-token blocks). When unset, load-time DXGI headroom selects the largest fitting tier. |
+| `AILA_Q4E_KV_HOST_SEGMENT_TOKENS` | int | `16384` | Tokens per pinned host USM KV segment when `AILA_Q4E_KV_STREAM=1` (clamped to `[4096, capacity]`, auto-scaled so segment count <= `16`). Segments are allocated lazily as context grows instead of pinning full `capacity` upfront. |
 | `AILA_Q4E_DXGI_BUDGET` | bool | `true` | Query Windows DXGI `LocalBudget - OtherProcessUsage` at load so `ExpertCache` and auto-tiered KV resident slots adapt to real available VRAM without WDDM paging. |
 | `AILA_Q4E_AUTO_DECODE_TRIM` | bool | `true` | Automatically trim `phase_scratch` back to `64` rows at the end of prefill (`TrimDecodeRuntimeBuffers`) when DXGI available VRAM drops below `AILA_Q4E_DECODE_TRIM_TRIGGER_MB`. |
 | `AILA_Q4E_DECODE_TRIM_TRIGGER_MB` | int | `2048` | DXGI available VRAM threshold (MiB) below which `AILA_Q4E_AUTO_DECODE_TRIM` releases large prefill workspace before decode. |
@@ -350,7 +351,8 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_INLINE_CHECKPOINT` | bool | `true` (preset) | Enable inline recurrent/KV checkpoint capture at `checkpoint_after`. |
 | `AILA_Q4E_LONG_INLINE_CHECKPOINT` | bool | `true` (preset) | Allow inline checkpoint capture inside long untiled prefill slices (`count > 64`), collapsing `7760 + 4` splits into a single forward. |
 | `AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT` | bool | `true` | Skip the redundant end-of-slice `CaptureSnapshot` when an inline interior checkpoint was already captured. |
-| `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from large-page host memory instead of keeping the 1.3 GB table in VRAM. |
+| `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from host memory instead of keeping the 1.3 GB table in VRAM. |
+| `AILA_Q4E_EMBED_LARGE_PAGES` | bool | `false` | Lock the `1.18 GiB` host `embed_tokens` copy in non-pageable `MEM_LARGE_PAGES` instead of pageable `VirtualAlloc` (default `false` saves `1.18 GiB` locked physical RAM and shares the copy with MTP draft). |
 | `AILA_Q4E_DENSE_GEMV` | bool | `true` | Single-row bf16 projections use native GEMV instead of oneDNN. |
 | `AILA_Q4E_HC_FUSED` | bool | `true` | Decode hyper-connection runs as two fused kernels (down + inject, up + mix). |
 | `AILA_Q4E_TOKEN_GRAPH` | bool | `false` | Experimental whole-token SYCL command-graph capture and replay for single-token decode. |

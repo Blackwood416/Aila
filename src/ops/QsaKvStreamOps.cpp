@@ -270,10 +270,7 @@ void qsa_kv_stream_resolve(
     Tensor& slots_v,
     Tensor* slots_k_scale,
     Tensor* slots_v_scale,
-    const Tensor& host_k,
-    const Tensor& host_v,
-    const Tensor* host_k_scale,
-    const Tensor* host_v_scale,
+    const QsaKvHostSegments& host_segs,
     const int32_t* logical_blocks,
     int num_rows,
     int start_pos,
@@ -291,26 +288,33 @@ void qsa_kv_stream_resolve(
     if (map.n_slots < 256) {
         throw std::invalid_argument("qsa_kv_stream_resolve: n_slots must be >= 256");
     }
-    if (!slots_k.valid() || !slots_v.valid() || !host_k.valid() || !host_v.valid() ||
-        slots_k.dtype() != slots_v.dtype() || slots_k.dtype() != host_k.dtype() ||
-        slots_k.dtype() != host_v.dtype() ||
+    if (!slots_k.valid() || !slots_v.valid() || slots_k.dtype() != slots_v.dtype() ||
         slots_k.ndim() != 3 || slots_v.ndim() != 3 ||
-        host_k.ndim() != 3 || host_v.ndim() != 3 ||
-        slots_k.shape(0) != host_k.shape(0) || slots_k.shape(2) != host_k.shape(2)) {
-        throw std::invalid_argument("qsa_kv_stream_resolve: KV pool shape or dtype mismatch");
+        slots_k.shape(0) != slots_v.shape(0) || slots_k.shape(2) != slots_v.shape(2) ||
+        host_segs.num_segments <= 0 || host_segs.num_segments > QsaKvHostSegments::kMaxSegments ||
+        host_segs.segment_tokens <= 0 || (host_segs.segment_tokens % 4) != 0 ||
+        host_segs.host_capacity <= 0) {
+        throw std::invalid_argument("qsa_kv_stream_resolve: KV pool or host segments mismatch");
     }
     const int kv_heads = static_cast<int>(slots_k.shape(0));
     const int slot_tokens = static_cast<int>(slots_k.shape(1));
-    const int host_capacity = static_cast<int>(host_k.shape(1));
+    const int host_capacity = host_segs.host_capacity;
     const int head_dim = static_cast<int>(slots_k.shape(2));
     if (slot_tokens < map.n_slots * 4 || head_dim % 16 != 0) {
         throw std::invalid_argument("qsa_kv_stream_resolve: invalid slot_tokens or head_dim alignment");
     }
     const bool is_int8 = (slots_k.dtype() == dnnl::memory::data_type::s8);
     if (is_int8 && (!slots_k_scale || !slots_v_scale || !slots_k_scale->valid() ||
-                    !slots_v_scale->valid() || !host_k_scale || !host_v_scale ||
-                    !host_k_scale->valid() || !host_v_scale->valid())) {
+                    !slots_v_scale->valid())) {
         throw std::invalid_argument("qsa_kv_stream_resolve: int8 KV requires scale tensors");
+    }
+    for (int s = 0; s < host_segs.num_segments; ++s) {
+        if (!host_segs.k[s] || !host_segs.v[s]) {
+            throw std::invalid_argument("qsa_kv_stream_resolve: unallocated host KV segment");
+        }
+        if (is_int8 && (!host_segs.k_scale[s] || !host_segs.v_scale[s])) {
+            throw std::invalid_argument("qsa_kv_stream_resolve: unallocated host KV scale segment");
+        }
     }
     const int stride = block_topk + 4;
     if (!resolved_blocks_out.valid() ||
@@ -343,20 +347,16 @@ void qsa_kv_stream_resolve(
                             compress_ratio, resolved_ptr, resolved_tail_ptr);
     }
 
-    const uint8_t* hk_ptr = static_cast<const uint8_t*>(host_k.data());
-    const uint8_t* hv_ptr = static_cast<const uint8_t*>(host_v.data());
     uint8_t* sk_ptr = static_cast<uint8_t*>(slots_k.data());
     uint8_t* sv_ptr = static_cast<uint8_t*>(slots_v.data());
-    const float* hks_ptr = (is_int8 && host_k_scale) ? host_k_scale->data_as<float>() : nullptr;
-    const float* hvs_ptr = (is_int8 && host_v_scale) ? host_v_scale->data_as<float>() : nullptr;
     float* sks_ptr = (is_int8 && slots_k_scale) ? slots_k_scale->data_as<float>() : nullptr;
     float* svs_ptr = (is_int8 && slots_v_scale) ? slots_v_scale->data_as<float>() : nullptr;
 
     const size_t elem_bytes = is_int8 ? 1u : 2u;
     const size_t token_bytes = static_cast<size_t>(head_dim) * elem_bytes;
     const int token_uint4s = static_cast<int>(token_bytes / 16u);
-    const size_t host_head_bytes = static_cast<size_t>(host_capacity) * token_bytes;
     const size_t slot_head_bytes = static_cast<size_t>(slot_tokens) * token_bytes;
+    const QsaKvHostSegments segs = host_segs;
 
     constexpr int kCopyGroups = 96;
     constexpr int kCopyWg = 128;
@@ -372,7 +372,14 @@ void qsa_kv_stream_resolve(
                 const int tok0 = b * 4;
                 const int valid_tokens = sycl::min(4, host_capacity - tok0);
                 const int copy_uint4s = valid_tokens * token_uint4s;
-                const size_t src_tok_off = static_cast<size_t>(tok0) * token_bytes;
+                const int seg = tok0 / segs.segment_tokens;
+                const int local_tok0 = tok0 - seg * segs.segment_tokens;
+                const int seg_stride = (seg + 1 < segs.num_segments)
+                    ? segs.segment_tokens : segs.last_segment_tokens;
+                const uint8_t* hk_ptr = static_cast<const uint8_t*>(segs.k[seg]);
+                const uint8_t* hv_ptr = static_cast<const uint8_t*>(segs.v[seg]);
+                const size_t host_head_bytes = static_cast<size_t>(seg_stride) * token_bytes;
+                const size_t src_tok_off = static_cast<size_t>(local_tok0) * token_bytes;
                 const size_t dst_tok_off = static_cast<size_t>(sl * 4) * token_bytes;
                 for (int h = 0; h < kv_heads; ++h) {
                     const auto* src_k = reinterpret_cast<const sycl::uint4*>(
@@ -388,10 +395,152 @@ void qsa_kv_stream_resolve(
                         dst_v[i] = src_v[i];
                     }
                     if (is_int8 && lid < valid_tokens) {
-                        const size_t h_off = static_cast<size_t>(h) * host_capacity + tok0;
+                        const float* hks_ptr = segs.k_scale[seg];
+                        const float* hvs_ptr = segs.v_scale[seg];
+                        const size_t h_off = static_cast<size_t>(h) * seg_stride + local_tok0;
                         const size_t s_off = static_cast<size_t>(h) * slot_tokens + (sl * 4);
                         sks_ptr[s_off + lid] = hks_ptr[h_off + lid];
                         svs_ptr[s_off + lid] = hvs_ptr[h_off + lid];
+                    }
+                }
+            }
+        });
+}
+
+void qsa_kv_stream_resolve(
+    Context& ctx,
+    QsaKvStreamMap& map,
+    Tensor& slots_k,
+    Tensor& slots_v,
+    Tensor* slots_k_scale,
+    Tensor* slots_v_scale,
+    const Tensor& host_k,
+    const Tensor& host_v,
+    const Tensor* host_k_scale,
+    const Tensor* host_v_scale,
+    const int32_t* logical_blocks,
+    int num_rows,
+    int start_pos,
+    int block_topk,
+    int compress_ratio,
+    Tensor& resolved_blocks_out,
+    Tensor* resolved_tail_indices_out) {
+    if (num_rows <= 0) return;
+    if (!host_k.valid() || !host_v.valid() || !slots_k.valid() ||
+        slots_k.dtype() != host_k.dtype() || slots_k.dtype() != host_v.dtype() ||
+        host_k.ndim() != 3 || host_v.ndim() != 3 ||
+        slots_k.shape(0) != host_k.shape(0) || slots_k.shape(2) != host_k.shape(2) ||
+        host_k.shape(1) != host_v.shape(1)) {
+        throw std::invalid_argument("qsa_kv_stream_resolve: KV pool shape or dtype mismatch");
+    }
+    const bool is_int8 = (slots_k.dtype() == dnnl::memory::data_type::s8);
+    if (is_int8 && (!host_k_scale || !host_v_scale ||
+                    !host_k_scale->valid() || !host_v_scale->valid())) {
+        throw std::invalid_argument("qsa_kv_stream_resolve: int8 KV requires scale tensors");
+    }
+    QsaKvHostSegments segs{};
+    segs.host_capacity = static_cast<int>(host_k.shape(1));
+    segs.segment_tokens = segs.host_capacity;
+    segs.last_segment_tokens = segs.host_capacity;
+    segs.num_segments = 1;
+    segs.k[0] = const_cast<void*>(host_k.data());
+    segs.v[0] = const_cast<void*>(host_v.data());
+    if (is_int8) {
+        segs.k_scale[0] = const_cast<float*>(host_k_scale->data_as<float>());
+        segs.v_scale[0] = const_cast<float*>(host_v_scale->data_as<float>());
+    }
+    qsa_kv_stream_resolve(
+        ctx, map, slots_k, slots_v, slots_k_scale, slots_v_scale, segs,
+        logical_blocks, num_rows, start_pos, block_topk, compress_ratio,
+        resolved_blocks_out, resolved_tail_indices_out);
+}
+
+void qsa_kv_stream_stage_from_host(
+    Context& ctx,
+    Tensor& stage_k,
+    Tensor& stage_v,
+    Tensor* stage_k_scale,
+    Tensor* stage_v_scale,
+    const QsaKvHostSegments& host_segs,
+    int stage_len) {
+    if (stage_len <= 0) return;
+    if (!stage_k.valid() || !stage_v.valid() ||
+        stage_k.dtype() != stage_v.dtype() ||
+        stage_k.shape(0) != stage_v.shape(0) || stage_k.shape(2) != stage_v.shape(2) ||
+        stage_k.shape(1) < stage_len ||
+        host_segs.num_segments <= 0 || host_segs.num_segments > QsaKvHostSegments::kMaxSegments ||
+        host_segs.segment_tokens <= 0 || host_segs.host_capacity < stage_len) {
+        throw std::invalid_argument("qsa_kv_stream_stage_from_host: invalid tensor shapes");
+    }
+    const int kv_heads = static_cast<int>(stage_k.shape(0));
+    const int stage_stride = static_cast<int>(stage_k.shape(1));
+    const int head_dim = static_cast<int>(stage_k.shape(2));
+    const bool is_int8 = (stage_k.dtype() == dnnl::memory::data_type::s8);
+    if (is_int8 && (!stage_k_scale || !stage_v_scale || !stage_k_scale->valid() ||
+                    !stage_v_scale->valid())) {
+        throw std::invalid_argument("qsa_kv_stream_stage_from_host: int8 KV requires scale tensors");
+    }
+    const int need_segs = (stage_len + host_segs.segment_tokens - 1) / host_segs.segment_tokens;
+    for (int s = 0; s < need_segs; ++s) {
+        if (!host_segs.k[s] || !host_segs.v[s]) {
+            throw std::invalid_argument("qsa_kv_stream_stage_from_host: unallocated host KV segment");
+        }
+        if (is_int8 && (!host_segs.k_scale[s] || !host_segs.v_scale[s])) {
+            throw std::invalid_argument("qsa_kv_stream_stage_from_host: unallocated host KV scale segment");
+        }
+    }
+
+    const size_t elem_bytes = is_int8 ? 1u : 2u;
+    const size_t token_bytes = static_cast<size_t>(head_dim) * elem_bytes;
+    const size_t token_uint4s = token_bytes / 16u;
+    const size_t total_uint4s = static_cast<size_t>(stage_len) * token_uint4s;
+    const size_t stage_head_bytes = static_cast<size_t>(stage_stride) * token_bytes;
+
+    uint8_t* dk_ptr = static_cast<uint8_t*>(stage_k.data());
+    uint8_t* dv_ptr = static_cast<uint8_t*>(stage_v.data());
+    float* dks_ptr = (is_int8 && stage_k_scale) ? stage_k_scale->data_as<float>() : nullptr;
+    float* dvs_ptr = (is_int8 && stage_v_scale) ? stage_v_scale->data_as<float>() : nullptr;
+    const QsaKvHostSegments segs = host_segs;
+
+    constexpr int kWg = 256;
+    const int n_blocks = std::min(512, std::max(1, static_cast<int>((total_uint4s + kWg - 1) / kWg)));
+    ctx.queue().parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(n_blocks) * kWg, kWg),
+        [=](sycl::nd_item<1> it) {
+            const size_t gid = it.get_global_id(0);
+            const size_t stride = it.get_global_range(0);
+            for (int h = 0; h < kv_heads; ++h) {
+                auto* dst_k = reinterpret_cast<sycl::uint4*>(
+                    dk_ptr + static_cast<size_t>(h) * stage_head_bytes);
+                auto* dst_v = reinterpret_cast<sycl::uint4*>(
+                    dv_ptr + static_cast<size_t>(h) * stage_head_bytes);
+                for (size_t i = gid; i < total_uint4s; i += stride) {
+                    const size_t tok = i / token_uint4s;
+                    const size_t v_idx = i - tok * token_uint4s;
+                    const int seg = static_cast<int>(tok / static_cast<size_t>(segs.segment_tokens));
+                    const size_t local_tok = tok - static_cast<size_t>(seg) * segs.segment_tokens;
+                    const int seg_stride = (seg + 1 < segs.num_segments)
+                        ? segs.segment_tokens : segs.last_segment_tokens;
+                    const size_t host_head_bytes = static_cast<size_t>(seg_stride) * token_bytes;
+                    const auto* src_k = reinterpret_cast<const sycl::uint4*>(
+                        static_cast<const uint8_t*>(segs.k[seg]) +
+                        static_cast<size_t>(h) * host_head_bytes + local_tok * token_bytes);
+                    const auto* src_v = reinterpret_cast<const sycl::uint4*>(
+                        static_cast<const uint8_t*>(segs.v[seg]) +
+                        static_cast<size_t>(h) * host_head_bytes + local_tok * token_bytes);
+                    dst_k[i] = src_k[v_idx];
+                    dst_v[i] = src_v[v_idx];
+                }
+                if (is_int8) {
+                    const size_t s_off = static_cast<size_t>(h) * stage_stride;
+                    for (size_t t = gid; t < static_cast<size_t>(stage_len); t += stride) {
+                        const int seg = static_cast<int>(t / static_cast<size_t>(segs.segment_tokens));
+                        const size_t local_t = t - static_cast<size_t>(seg) * segs.segment_tokens;
+                        const int seg_stride = (seg + 1 < segs.num_segments)
+                            ? segs.segment_tokens : segs.last_segment_tokens;
+                        const size_t h_off = static_cast<size_t>(h) * seg_stride;
+                        dks_ptr[s_off + t] = segs.k_scale[seg][h_off + local_t];
+                        dvs_ptr[s_off + t] = segs.v_scale[seg][h_off + local_t];
                     }
                 }
             }
@@ -416,62 +565,24 @@ void qsa_kv_stream_stage_from_host(
         stage_k.shape(1) < stage_len || host_k.shape(1) < stage_len) {
         throw std::invalid_argument("qsa_kv_stream_stage_from_host: invalid tensor shapes");
     }
-    const int kv_heads = static_cast<int>(stage_k.shape(0));
-    const int stage_stride = static_cast<int>(stage_k.shape(1));
-    const int host_capacity = static_cast<int>(host_k.shape(1));
-    const int head_dim = static_cast<int>(stage_k.shape(2));
     const bool is_int8 = (stage_k.dtype() == dnnl::memory::data_type::s8);
-    if (is_int8 && (!stage_k_scale || !stage_v_scale || !stage_k_scale->valid() ||
-                    !stage_v_scale->valid() || !host_k_scale || !host_v_scale ||
+    if (is_int8 && (!host_k_scale || !host_v_scale ||
                     !host_k_scale->valid() || !host_v_scale->valid())) {
         throw std::invalid_argument("qsa_kv_stream_stage_from_host: int8 KV requires scale tensors");
     }
-
-    const size_t elem_bytes = is_int8 ? 1u : 2u;
-    const size_t token_bytes = static_cast<size_t>(head_dim) * elem_bytes;
-    const size_t total_uint4s = static_cast<size_t>(stage_len) * (token_bytes / 16u);
-    const size_t host_head_bytes = static_cast<size_t>(host_capacity) * token_bytes;
-    const size_t stage_head_bytes = static_cast<size_t>(stage_stride) * token_bytes;
-
-    const uint8_t* hk_ptr = static_cast<const uint8_t*>(host_k.data());
-    const uint8_t* hv_ptr = static_cast<const uint8_t*>(host_v.data());
-    uint8_t* dk_ptr = static_cast<uint8_t*>(stage_k.data());
-    uint8_t* dv_ptr = static_cast<uint8_t*>(stage_v.data());
-    const float* hks_ptr = (is_int8 && host_k_scale) ? host_k_scale->data_as<float>() : nullptr;
-    const float* hvs_ptr = (is_int8 && host_v_scale) ? host_v_scale->data_as<float>() : nullptr;
-    float* dks_ptr = (is_int8 && stage_k_scale) ? stage_k_scale->data_as<float>() : nullptr;
-    float* dvs_ptr = (is_int8 && stage_v_scale) ? stage_v_scale->data_as<float>() : nullptr;
-
-    constexpr int kWg = 256;
-    const int n_blocks = std::min(512, std::max(1, static_cast<int>((total_uint4s + kWg - 1) / kWg)));
-    ctx.queue().parallel_for(
-        sycl::nd_range<1>(static_cast<size_t>(n_blocks) * kWg, kWg),
-        [=](sycl::nd_item<1> it) {
-            const size_t gid = it.get_global_id(0);
-            const size_t stride = it.get_global_range(0);
-            for (int h = 0; h < kv_heads; ++h) {
-                const auto* src_k = reinterpret_cast<const sycl::uint4*>(
-                    hk_ptr + static_cast<size_t>(h) * host_head_bytes);
-                const auto* src_v = reinterpret_cast<const sycl::uint4*>(
-                    hv_ptr + static_cast<size_t>(h) * host_head_bytes);
-                auto* dst_k = reinterpret_cast<sycl::uint4*>(
-                    dk_ptr + static_cast<size_t>(h) * stage_head_bytes);
-                auto* dst_v = reinterpret_cast<sycl::uint4*>(
-                    dv_ptr + static_cast<size_t>(h) * stage_head_bytes);
-                for (size_t i = gid; i < total_uint4s; i += stride) {
-                    dst_k[i] = src_k[i];
-                    dst_v[i] = src_v[i];
-                }
-                if (is_int8) {
-                    const size_t h_off = static_cast<size_t>(h) * host_capacity;
-                    const size_t s_off = static_cast<size_t>(h) * stage_stride;
-                    for (size_t t = gid; t < static_cast<size_t>(stage_len); t += stride) {
-                        dks_ptr[s_off + t] = hks_ptr[h_off + t];
-                        dvs_ptr[s_off + t] = hvs_ptr[h_off + t];
-                    }
-                }
-            }
-        });
+    QsaKvHostSegments segs{};
+    segs.host_capacity = static_cast<int>(host_k.shape(1));
+    segs.segment_tokens = segs.host_capacity;
+    segs.last_segment_tokens = segs.host_capacity;
+    segs.num_segments = 1;
+    segs.k[0] = const_cast<void*>(host_k.data());
+    segs.v[0] = const_cast<void*>(host_v.data());
+    if (is_int8) {
+        segs.k_scale[0] = const_cast<float*>(host_k_scale->data_as<float>());
+        segs.v_scale[0] = const_cast<float*>(host_v_scale->data_as<float>());
+    }
+    qsa_kv_stream_stage_from_host(
+        ctx, stage_k, stage_v, stage_k_scale, stage_v_scale, segs, stage_len);
 }
 
 QsaKvStreamCounters qsa_kv_stream_counters(Context& ctx, const QsaKvStreamMap& map) {
