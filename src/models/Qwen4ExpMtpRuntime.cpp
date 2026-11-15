@@ -72,13 +72,13 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
         AILA_LOG_INFO("[Q4E Server MTP] enabled=1 experimental=1 bitwise_t1_guarantee=0 width=%d capacity=%d draft_slots=64", configuredWidth, cap);
     } catch (...) {
         try { ctx.synchronize(); } catch (...) {}
-        if (greedyResultHost) { ctx.free_device(greedyResultHost); greedyResultHost = nullptr; }
+        if (greedyResultHost) { ctx.free_host(greedyResultHost); greedyResultHost = nullptr; }
         throw;
     }
 }
 Qwen4ExpMtpRuntime::~Qwen4ExpMtpRuntime() {
     try { ctx.synchronize(); } catch (...) {}
-    if (greedyResultHost) { ctx.free_device(greedyResultHost); greedyResultHost = nullptr; }
+    if (greedyResultHost) { ctx.free_host(greedyResultHost); greedyResultHost = nullptr; }
     AILA_LOG_INFO("[Q4E Server MTP] windows=%llu accepted=%llu",
         static_cast<unsigned long long>(windows), static_cast<unsigned long long>(accepted));
 }

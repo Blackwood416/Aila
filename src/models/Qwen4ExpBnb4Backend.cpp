@@ -2090,26 +2090,45 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
         static const bool s_verify_cpu_batch = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_BATCH", true);
         bool verify_cpu_batch = s_verify_cpu_batch && verify_cpu_cold && !d1_stash_valid &&
             expert_executor_.CanExecuteArenaColdRows(count);
-        std::array<std::array<int, kMaxTopK>, 4> batch_experts{}, batch_ranks{};
+        bool batch_all_hits = false;
+        std::array<std::array<int, kMaxTopK>, 4> pre_hit_slots{}, pre_hit_ranks{}, pre_miss_experts{}, pre_miss_ranks{};
+        std::array<int, 4> pre_hit_count{}, pre_miss_count{};
+        bool pre_classified = false;
         std::array<int, 4> batch_begin{}, batch_count{};
         if (verify_cpu_batch) {
+            pre_classified = true;
             int batch_total = 0;
-            for (int t = 0; t < count && verify_cpu_batch; ++t) {
+            for (int t = 0; t < count; ++t) {
                 const int* b_ids = router_host_ids_ + t * top_k;
-                int b_miss = 0;
-                for (int k = 0; k < top_k; ++k)
-                    if (adaptive_cache_.GetSlot(layer, b_ids[k]) < 0) {
-                        batch_experts[t][b_miss] = b_ids[k];
-                        batch_ranks[t][b_miss] = k;
+                int b_hit = 0, b_miss = 0;
+                for (int k = 0; k < top_k; ++k) {
+                    const int exp_id = b_ids[k];
+                    const int slot = adaptive_cache_.GetSlot(layer, exp_id);
+                    if (slot >= 0) {
+                        pre_hit_slots[t][b_hit] = slot;
+                        pre_hit_ranks[t][b_hit] = k;
+                        ++b_hit;
+                    } else {
+                        pre_miss_experts[t][b_miss] = exp_id;
+                        pre_miss_ranks[t][b_miss] = k;
                         ++b_miss;
                     }
+                }
+                pre_hit_count[t] = b_hit;
+                pre_miss_count[t] = b_miss;
                 for (int c = 0; c < b_miss && verify_cpu_batch; ++c)
-                    verify_cpu_batch = host_arena_.GetExpertPointer(layer, batch_experts[t][c]) != nullptr;
+                    verify_cpu_batch = host_arena_.GetExpertPointer(layer, pre_miss_experts[t][c]) != nullptr;
                 batch_count[t] = std::min(b_miss, expert_executor_.max_cpu_credits());
                 batch_begin[t] = batch_total;
                 batch_total += batch_count[t];
             }
-            if (batch_total < 1 || batch_total > ops::cpu::kMaxExpertBatchTasks) verify_cpu_batch = false;
+            if (batch_total == 0 && verify_cpu_batch && verify_down_.valid() &&
+                expert_executor_.cpu_out_host_ptr() != nullptr) {
+                verify_cpu_batch = false;
+                batch_all_hits = true;
+            } else if (batch_total < 1 || batch_total > ops::cpu::kMaxExpertBatchTasks) {
+                verify_cpu_batch = false;
+            }
             if (verify_cpu_batch) {
                 // Strict row-major partition: the flattened list is exactly the
                 // per-row miss prefix the loop below would send one row at a
@@ -2118,8 +2137,8 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 int offset = 0;
                 for (int t = 0; t < count; ++t)
                     for (int c = 0; c < batch_count[t]; ++c, ++offset) {
-                        flat_experts[offset] = batch_experts[t][c];
-                        flat_ranks[offset] = batch_ranks[t][c];
+                        flat_experts[offset] = pre_miss_experts[t][c];
+                        flat_ranks[offset] = pre_miss_ranks[t][c];
                     }
                 expert_executor_.StartArenaColdRows(host_arena_, layer, count, flat_experts.data(),
                     flat_ranks.data(), batch_begin.data(), batch_count.data(), batch_total,
@@ -2128,7 +2147,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             }
         }
 
-        const bool batch_split_gpu_join = verify_cpu_batch && verify_down_.valid();
+        const bool batch_split_gpu_join = (verify_cpu_batch || batch_all_hits) && verify_down_.valid();
         const bool batch_pack_gpu_hot = batch_split_gpu_join;
         std::array<ops::MoeExpertSlotDev, 16> combined_hot{};
         std::array<int, 16> combined_tokens{}, combined_ranks{};
@@ -2158,17 +2177,30 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             std::array<int, kMaxTopK> miss_experts{};
             std::array<int, kMaxTopK> miss_ranks{};
 
-            for (int k = 0; k < top_k; ++k) {
-                const int exp_id = t_ids[k];
-                const int slot = adaptive_cache_.GetSlot(layer, exp_id);
-                if (slot >= 0) {
-                    hit_slots[hit_count] = slot;
-                    hit_ranks[hit_count] = k;
-                    hit_count++;
-                } else {
-                    miss_experts[miss_count] = exp_id;
-                    miss_ranks[miss_count] = k;
-                    miss_count++;
+            if (pre_classified) {
+                hit_count = pre_hit_count[t];
+                miss_count = pre_miss_count[t];
+                for (int i = 0; i < hit_count; ++i) {
+                    hit_slots[i] = pre_hit_slots[t][i];
+                    hit_ranks[i] = pre_hit_ranks[t][i];
+                }
+                for (int i = 0; i < miss_count; ++i) {
+                    miss_experts[i] = pre_miss_experts[t][i];
+                    miss_ranks[i] = pre_miss_ranks[t][i];
+                }
+            } else {
+                for (int k = 0; k < top_k; ++k) {
+                    const int exp_id = t_ids[k];
+                    const int slot = adaptive_cache_.GetSlot(layer, exp_id);
+                    if (slot >= 0) {
+                        hit_slots[hit_count] = slot;
+                        hit_ranks[hit_count] = k;
+                        hit_count++;
+                    } else {
+                        miss_experts[miss_count] = exp_id;
+                        miss_ranks[miss_count] = k;
+                        miss_count++;
+                    }
                 }
             }
 
@@ -2187,7 +2219,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
             // path whenever a routed miss has no native RAM owner, mirroring
             // the per-rank ownership the count==1 branch would have required.
             bool cpu_cold_ok = true;
-            if (verify_cpu_cold && count > 1)
+            if (verify_cpu_cold && count > 1 && !pre_classified)
                 for (int c = 0; c < miss_count && cpu_cold_ok; ++c)
                     cpu_cold_ok = host_arena_.GetExpertPointer(layer, miss_experts[c]) != nullptr;
             if (d1_stash_valid && d1_stash_layer == layer) {
@@ -2203,13 +2235,9 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                         throw std::logic_error("Qwen4Exp: early CPU route classification changed");
                 d1_stash_valid=false;
             } else if (verify_cpu_batch) {
-                // G1b: this row's CPU share already runs inside the window's
-                // single job; the prefix must be exactly what was classified
-                // above or the CPU set would silently change, so fail closed.
                 cpu_count = batch_count[t];
-                for (int c = 0; c < cpu_count; ++c)
-                    if (batch_experts[t][c] != miss_experts[c] || batch_ranks[t][c] != miss_ranks[c])
-                        throw std::logic_error("Qwen4Exp: batched CPU route classification changed");
+            } else if (batch_all_hits) {
+                cpu_count = 0;
             } else if (expert_executor_.cpu_overlap_enabled() &&
                        (count==1 || (verify_cpu_cold && cpu_cold_ok))) {
                 // x_base equals x_t for count==1, so the single-row call is
@@ -2405,9 +2433,31 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     verify_down_.data_as<float>(), combined_hot_count, top_k, intermediate, hidden_size_, 64,
                     combined_tokens.data(), nullptr, &last, nested, nested_fixed256);
                 adaptive_cache_.RecordResidentConsumer(last);
+                batch_any_device_live = true;
                 for (int t = 0; t < count; ++t) {
                     if (batch_device_live[t]) batch_device_last[t] = last;
                 }
+            }
+            if (batch_all_hits) {
+                const sycl::event gpu_hot_done = last;
+                const bool gpu_hot_live = batch_any_device_live;
+                std::array<ops::MoeCpuHostDownRows, 4> deferred_rows_batch{};
+                for (int t = 0; t < count; ++t) {
+                    const float* t_weights = router_host_weights_ + t * top_k;
+                    auto& hr = deferred_rows_batch[static_cast<size_t>(t)];
+                    hr.values = expert_executor_.cpu_out_host_ptr();
+                    hr.rows = 1;
+                    hr.rank_to_row.fill(-1);
+                    hr.has_host_weights = true;
+                    for (int k = 0; k < top_k; ++k)
+                        hr.host_weights[static_cast<size_t>(k)] = t_weights[k];
+                }
+                last = ops::moe_ordered_accumulate_cpu_host_rows_batch(
+                    ctx, verify_down_.data_as<float>(), y_base, count, top_k, hidden_size_,
+                    deferred_rows_batch.data(), sh_out_base, sh_gate_base,
+                    gpu_hot_live ? &gpu_hot_done : nullptr);
+                if (resident_probe_) resident_probe_(resident_probe_data_, *this, layer);
+                return last;
             }
             // Release all queued GPU expert kernels across the entire multi-row
             // window before blocking on the single batched CPU job, so row 1..N
