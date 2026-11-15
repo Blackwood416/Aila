@@ -1,5 +1,4 @@
 #include "engine/Engine.hpp"
-#include "utils/Qwen38A770Preset.hpp"
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/dot_product.hpp>
 #include <sycl/ext/intel/math.hpp>

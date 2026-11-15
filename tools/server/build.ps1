@@ -69,7 +69,24 @@ if ($workerInfo.schemaVersion -ne 2 -or $workerInfo.git.fullCommit -notmatch '^[
     throw 'Worker build_info.json must contain schemaVersion 2 and a full git.fullCommit'
 }
 $workerCommit = $workerInfo.git.fullCommit.ToLowerInvariant()
-$workerBuildId = "aila-0.2.0-abi1-$workerCommit"
+$versionFile = Join-Path $repoRoot 'VERSION.txt'
+if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+    throw "Missing VERSION.txt file: $versionFile"
+}
+$repoVersion = ([IO.File]::ReadAllText($versionFile)).Trim()
+if ($repoVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Invalid VERSION.txt file contents: '$repoVersion'"
+}
+$workerVersion = if ($workerInfo.PSObject.Properties['version'] -and -not [string]::IsNullOrWhiteSpace($workerInfo.version)) {
+    [string]$workerInfo.version
+} else {
+    $repoVersion
+}
+$workerBuildId = if ($workerInfo.PSObject.Properties['buildId'] -and -not [string]::IsNullOrWhiteSpace($workerInfo.buildId)) {
+    [string]$workerInfo.buildId
+} else {
+    "aila-$workerVersion-abi1-$workerCommit"
+}
 
 function Get-LfSha256 {
     param([string]$Path)

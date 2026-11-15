@@ -17,7 +17,6 @@ class InferenceEngine;
 struct CLIOptions {
     std::string model_dir;         // -m, --model
     std::string lora_dir;          // --lora
-    std::string performance_preset; // --performance-preset (explicit opt-in)
     int max_seq_len = 4096;        // -s, --max-seq
     int max_new_tokens = 1024;     // --max-tokens
     float temperature = 0.7f;      // -t, --temperature
@@ -90,8 +89,12 @@ struct CLIOptions {
     // Qwen3.5 prefill checkpoint step
     int q35_prefill_step = 64;       // --q35-prefill-step
 
-    // KV Cache quantization (FP8)
+    // KV Cache quantization
     bool kv_quant = false;           // --kv-quant
+    std::string kv_type = "auto";    // --kv-type (auto, bf16, int8)
+    int prefill_chunk_size = 0;      // --prefill-chunk (0 = model default)
+    int mtp_mode = -1;               // --mtp / --no-mtp (-1 = env default)
+    int mtp_max_context = 0;         // --mtp-max-context (0 = default)
 };
 
 // Parse command-line arguments

@@ -255,7 +255,7 @@ struct IntegerQualityReplay {
 };
 
 void test_integer_quality(const std::string& directory,bool state_only=false){
-    std::cout<<std::unitbuf<<std::setprecision(10);aila::ApplyQwen38A770Preset();
+    std::cout<<std::unitbuf<<std::setprecision(10);
     _putenv_s("AILA_Q35_PREFILL_CHUNK","2048");
     InferenceEngine engine;expect(engine.init(directory,2560),"R2b quality model init");
     auto& ctx=Access::Ctx(engine);auto& b=Access::Backend(engine);

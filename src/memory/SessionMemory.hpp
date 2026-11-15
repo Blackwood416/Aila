@@ -112,11 +112,17 @@ struct Qwen4ExpKvStreamPlan {
     int blockCount = 0;     // (capacity + 3) / 4
 };
 
-inline Qwen4ExpKvStreamPlan qwen4exp_kv_stream_plan(int capacity, int residentTokensOverride = 0) {
+inline Qwen4ExpKvStreamPlan qwen4exp_kv_stream_plan(
+    int capacity, int residentTokensOverride = 0, size_t kvElementBytes = 2) {
     Qwen4ExpKvStreamPlan plan;
     if (capacity <= 0) return plan;
     plan.blockCount = (capacity + 3) / 4;
-    if (!aila::env::read_flag("AILA_Q4E_KV_STREAM", false)) {
+    bool stream_enabled = false;
+    if (!aila::env::read_flag_if_present("AILA_Q4E_KV_STREAM", &stream_enabled)) {
+        stream_enabled = (kvElementBytes == 1 && capacity >= 131072) ||
+                         (kvElementBytes == 2 && capacity >= 65536);
+    }
+    if (!stream_enabled) {
         return plan;
     }
     const int raw_resident = residentTokensOverride > 0
@@ -237,7 +243,7 @@ inline SessionMemoryReservation qwen4exp_session_memory(
     // When QSA KV streaming is active (capacity > residentTokens), VRAM holds
     // only the resident slot pool, residency maps, and compressed indexer keys,
     // while authoritative full-context KV and raw indexer_k live in pinned host USM.
-    const auto streamPlan = qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens);
+    const auto streamPlan = qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens, kvElementBytes);
     const size_t fullHostBytes = qwen4exp_kv_bytes(config, cached, kvElementBytes).total();
     size_t fullBytes = fullHostBytes;
     if (streamPlan.enabled) {

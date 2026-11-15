@@ -18,12 +18,11 @@ Approximate prompt size. The prompt is built from repeated sentences, so the
 engine reports the exact token count and that is what the throughput uses.
 
 .PARAMETER Chunk
-Value for AILA_Q35_PREFILL_CHUNK. The qwen38-a770 preset sets 512; 2048 keeps a
-2K-token prompt in a single chunk, which avoids paying expert staging twice.
+Value for AILA_Q35_PREFILL_CHUNK (default Qwen4Exp prefill chunk is 8192).
 #>
 param(
     [object[]]$Tokens = @(1024, 2048, 4096),
-    [int]$Chunk = 2048,
+    [int]$Chunk = 8192,
     # Must exceed the largest prompt: the CLI rejects a prompt longer than the
     # context window instead of truncating it. max-seq also sizes the KV cache
     # and therefore the admitted resident expert pool, so it is part of the
@@ -38,16 +37,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $work = Join-Path $repo 'tmp/prefill-bench'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-# Baseline environment the decode work already established as neutral: no
-# immediate command lists, copy engine on, persistent SYCL cache.
-$env:UR_L0_USE_COPY_ENGINE = '1'
-$env:SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE = '1'
-$env:UR_L0_BATCH_SIZE = '64'
-$env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
-$env:UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
-$env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
-$env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'
-$env:SYCL_CACHE_PERSISTENT = '0'
+# UR/Level Zero defaults are configured directly by the binary before SYCL init.
 $env:AILA_Q35_PREFILL_CHUNK = [string]$Chunk
 
 $sentence = 'The quick brown fox jumps over the lazy dog and then writes a long report about inference engines. '
@@ -60,7 +50,7 @@ foreach ($target in $Tokens) {
         ConvertTo-Json -Depth 5 -Compress
     Set-Content -Path $prompt -Value $body -Encoding UTF8
 
-    $out = & $Exe -m $Model --performance-preset qwen38-a770 --max-seq $MaxSeq --greedy `
+    $out = & $Exe -m $Model --max-seq $MaxSeq --greedy `
         --thinking-budget 0 --max-tokens 1 --messages-json $prompt `
         --no-stream --chat-output-json --log-level info 2>&1 | Out-String
     Set-Content -Path (Join-Path $work "engine-$target.log") -Value $out -Encoding UTF8

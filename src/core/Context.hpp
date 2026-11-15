@@ -14,6 +14,7 @@
 #include "core/AsyncErrorState.hpp"
 #include "core/ExecutionTrace.hpp"
 #include "core/UncachedHostAllocation.hpp"
+#include "utils/EnvUtils.hpp"
 
 // ============================================================
 // SYCL + oneDNN 运行时上下文
@@ -26,7 +27,7 @@ public:
     Context() : Context(nullptr) {}
     explicit Context(Trace* trace, bool enableProfiling = false)
         : trace_(trace), async_errors_(std::make_shared<aila::AsyncErrorState>()),
-          q_(sycl::default_selector_v,
+          q_(select_default_device(),
              [errors = async_errors_](sycl::exception_list exceptions) noexcept {
                  for (const auto& error : exceptions) errors->Record(error);
              },
@@ -329,6 +330,11 @@ public:
     size_t pinned_host_allocation_limit() const { return host_budget_.Limit(); }
 
 private:
+    static inline sycl::device select_default_device() {
+        aila::env::ensure_sycl_runtime_initialized();
+        return sycl::device(sycl::default_selector_v);
+    }
+
     // Borrowed from DeviceState, whose writer is destroyed after this Context.
     Trace* trace_ = nullptr;
     void CheckTrace() const { if (trace_) trace_->Check(); }

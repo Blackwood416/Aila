@@ -7,7 +7,6 @@
 #include "profile/Device.hpp"
 #include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
-#include "utils/Qwen38A770Preset.hpp"
 #include "utils/ModelSpec.hpp"
 #include "vision/DetectionRenderer.hpp"
 #include <algorithm>
@@ -94,7 +93,7 @@ void convert_args_to_utf8(int& argc, char**& argv) {
 #endif
 
 int main(int argc, char** argv) {
-    aila::env::enable_l0_copy_engine();
+    aila::env::configure_sycl_runtime_defaults();
     if (aila::env::disable_persistent_sycl_cache()) {
         std::fprintf(
             stderr,
@@ -148,26 +147,33 @@ int main(int argc, char** argv) {
     // Apply log level from CLI / environment
     aila::set_log_level(opts.log_level);
 
-    // Check GPU device
-    if (!opts.performance_preset.empty()) {
-        try {
-            ModelSpec spec;
-            std::string error;
-            if (!aila::modelspec::load_from_dir(opts.model_dir, spec, &error) ||
-                spec.family != ModelFamily::Qwen4Exp || !spec.is_bitsandbytes_4bit() ||
-                spec.quantization.bnb_4bit_quant_type != "nf4")
-                throw std::runtime_error("qwen38-a770 requires a Qwen3.8-Flash-Next NF4 model: " + error);
-            const sycl::device device(sycl::default_selector_v);
-            if (device.get_backend() != sycl::backend::ext_oneapi_level_zero ||
-                device.get_info<sycl::info::device::vendor_id>() != 0x8086 ||
-                device.get_info<sycl::info::device::name>().find("A770") == std::string::npos)
-                throw std::runtime_error("qwen38-a770 requires an Intel Arc A770 with Level Zero");
-            aila::ApplyQwen38A770Preset();
-        } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
-            return 1;
-        }
+    auto set_process_env = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+        _putenv_s(name, value.c_str());
+#else
+        setenv(name, value.c_str(), 1);
+#endif
+    };
+    if (opts.kv_type == "int8") {
+        set_process_env("AILA_KV_QUANT", "1");
+        set_process_env("AILA_KV_QUANT_FORMAT", "int8");
+    } else if (opts.kv_type == "bf16" && !opts.kv_quant) {
+        set_process_env("AILA_KV_QUANT", "0");
     }
+    if (opts.prefill_chunk_size > 0) {
+        set_process_env("AILA_Q35_PREFILL_CHUNK", std::to_string(opts.prefill_chunk_size));
+    }
+    if (opts.mtp_mode == 1) {
+        set_process_env("AILA_Q4E_MTP_DRAFT", "1");
+    } else if (opts.mtp_mode == 0) {
+        set_process_env("AILA_Q4E_MTP_DRAFT", "0");
+        set_process_env("AILA_Q4E_SERVER_MTP", "0");
+    }
+    if (opts.mtp_max_context > 0) {
+        set_process_env("AILA_Q4E_MTP_MAX_CONTEXT", std::to_string(opts.mtp_max_context));
+    }
+
+    // Check GPU device
     CheckDevice();
     AILA_LOG_INFO("[Config] log_level=%s max_seq_len=%d",
                   aila::log_level_name(opts.log_level), opts.max_seq_len);

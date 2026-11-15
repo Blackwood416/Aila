@@ -277,11 +277,10 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 |----------|------|---------|-------------|
 | `AILA_Q4E_EXPERT_CACHE_MB` | int | `0` (auto) | GPU expert slot pool budget. Auto = device memory minus static weights, session KV/recurrent state for `max_seq_len`, and `AILA_Q4E_VRAM_RESERVE_MB` (floored at 1024 MB). |
 | `AILA_Q4E_VRAM_RESERVE_MB` | int | `1400` | Headroom kept free by the auto cache size for runtime buffers, oneDNN scratchpad, and display (~1.2–1.4 GB free VRAM at peak 8K prefill). |
-| `AILA_Q4E_MAX_GPU_SLOTS` | int | `3456` (non-MTP) / `3072` (MTP) | Maximum number of resident expert slots allocated in GPU VRAM (`72 × 48 = 3,456` slots when MTP is disabled and `AILA_Q4E_LM_HEAD_Q8=1`, or `64 × 48 = 3,072` slots under `qwen38-a770` when `AILA_Q4E_MTP_DRAFT=1` / `AILA_Q4E_SERVER_MTP=1` to reserve `705 MiB` for the draft model + 8K prefill scratch headroom). |
-| `AILA_Q4E_LM_HEAD_Q8` | bool | `true` (preset) | Quantize the `[248320, 2560]` LM head to block-64 INT8 at load, saving 568.4 MiB of static VRAM and halving decode LM-head memory traffic. |
+| `AILA_Q4E_MAX_GPU_SLOTS` | int | `3456` (non-MTP) / `3072` (MTP) | Maximum number of resident expert slots allocated in GPU VRAM (`72 × 48 = 3,456` slots when MTP is disabled and `AILA_Q4E_LM_HEAD_Q8=1`, or `64 × 48 = 3,072` slots when `AILA_Q4E_MTP_DRAFT=1` / `AILA_Q4E_SERVER_MTP=1` to reserve `705 MiB` for the draft model + 8K prefill scratch headroom). |
+| `AILA_Q4E_LM_HEAD_Q8` | bool | `true` | Quantize the `[248320, 2560]` LM head to block-64 INT8 at load, saving 568.4 MiB of static VRAM and halving decode LM-head memory traffic. |
 | `AILA_Q4E_STAGING_SLOTS` | int | `16` | Number of expert slots per GPU staging bank (2 banks by default). |
-| `AILA_Q4E_HOT_RAM_MB` | int | `32768` (preset) | Host RAM budget for `Qwen4ExpHostArena` large-page complement. |
-| `AILA_Q4E_KV_STREAM` | bool | `false` (`1` in `start-qwen38.ps1` at `>=64K` BF16 / `>=128K` INT8) | Enable QSA KV streaming: keeps authoritative full-context K/V (and INT8 scales) plus raw `indexer_k` in pinned host USM while holding a bounded VRAM slot pool with device-side CLOCK eviction and `indexer_compressed_k` in VRAM. |
+| `AILA_Q4E_KV_STREAM` | bool | `auto` (`true` at `>=64K` BF16 / `>=128K` INT8) | Enable QSA KV streaming: keeps authoritative full-context K/V (and INT8 scales) plus raw `indexer_k` in pinned host USM while holding a bounded VRAM slot pool with device-side CLOCK eviction and `indexer_compressed_k` in VRAM. Auto-enabled in `SessionMemory` when `AILA_Q4E_KV_STREAM` is unset. |
 | `AILA_Q4E_KV_RESIDENT_TOKENS` | int | `auto` (`16384` fallback, tiers `8208/16384/32768/65536`) | Number of logical KV tokens kept in the VRAM slot pool per full-attention layer when `AILA_Q4E_KV_STREAM=1` (minimum `8208` = `2052` 4-token blocks). When unset, load-time DXGI headroom selects the largest fitting tier. |
 | `AILA_Q4E_KV_HOST_SEGMENT_TOKENS` | int | `16384` | Tokens per pinned host USM KV segment when `AILA_Q4E_KV_STREAM=1` (clamped to `[4096, capacity]`, auto-scaled so segment count <= `16`). Segments are allocated lazily as context grows instead of pinning full `capacity` upfront. |
 | `AILA_Q4E_DXGI_BUDGET` | bool | `true` | Query Windows DXGI `LocalBudget - OtherProcessUsage` at load so `ExpertCache` and auto-tiered KV resident slots adapt to real available VRAM without WDDM paging. |
@@ -289,7 +288,6 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_DECODE_TRIM_TRIGGER_MB` | int | `2048` | DXGI available VRAM threshold (MiB) below which `AILA_Q4E_AUTO_DECODE_TRIM` releases large prefill workspace before decode. |
 | `AILA_Q4E_DECODE_TRIM_CAP` | int | `0` | Explicit post-prefill workspace trim capacity (`0` = automatic DXGI trigger only, `>=64` = always trim to this row capacity). |
 | `AILA_Q4E_MTP_BATCH_CATCHUP` | bool | `true` | Batch MTP draft prefill catch-up (`Qwen4ExpMtpDraft::StepBatchKvOnly`) instead of stepping token-by-token inside `AfterForward`. |
-| `AILA_Q4E_EXPERT_READER` | string | `readfile` (preset) | Reader backend used during initial model load (`readfile` or `mmap`). |
 | `AILA_Q4E_DIRECT_STAGE_NO_HOST_WAIT` | bool | `true` | Skip host-side `staging_copy_.wait_and_throw()` when staging directly from `Qwen4ExpHostArena` onto the in-order `copy_q_`. |
 | `AILA_Q4E_STAGE_DEQUANT_FENCE` | bool | `true` | Release each prefill staging bank as soon as `submit_dequant` completes instead of waiting for `submit_scatter`. |
 
@@ -297,11 +295,11 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `AILA_Q35_PREFILL_CHUNK` | int | `8192` (preset) | Maximum prompt slice length per prefill forward. |
-| `AILA_Q4E_PREFILL_XMX` | bool | `true` (preset) | Enable XMX joint-matrix / oneDNN paths for dense NF4 prefill projections. |
+| `AILA_Q35_PREFILL_CHUNK` | int | `8192` (Qwen4Exp) / `512` (Qwen3.5) | Maximum prompt slice length per prefill forward. |
+| `AILA_Q4E_PREFILL_XMX` | bool | `true` | Enable XMX joint-matrix / oneDNN paths for dense NF4 prefill projections. |
 | `AILA_BNB4_ONEDNN_MIN_M` | int | `128` | Minimum sequence length `M` at which dense NF4 projections (`N = 2560` etc.) route to vectorized `dequantize_weight` + oneDNN `ab` MatMul. |
-| `AILA_Q4E_DIRECT_PREFILL_IO` | bool | `true` (preset) | Read/write prefill projection inputs and outputs directly without intermediate scratch copies. |
-| `AILA_Q4E_PHASE_SCRATCH` | bool | `true` (preset) | Share one phase-multiplexed device buffer across non-overlapping attention, GDN (`raw`), and MoE (`moe_down_acc`) prefill tensors. |
+| `AILA_Q4E_DIRECT_PREFILL_IO` | bool | `true` | Read/write prefill projection inputs and outputs directly without intermediate scratch copies. |
+| `AILA_Q4E_PHASE_SCRATCH` | bool | `true` | Share one phase-multiplexed device buffer across non-overlapping attention, GDN (`raw`), and MoE (`moe_down_acc`) prefill tensors. |
 | `AILA_Q4E_PREFILL_EXPERT_XMX` | bool | `true` | Use batched oneDNN XMX GEMM for prefill MoE chunks (`count >= AILA_Q4E_PREFILL_EXPERT_XMX_GATE_ROWS`, default `1024`; adaptive band `MIN_M = 64` for `count < 4096` and `192` for `count >= 4096`). |
 | `AILA_Q4E_CPU_OVERLAP` | bool | `true` | Enable CPU/GPU heterogeneous decode MoE execution: GPU computes resident hot experts while the physical-core-pinned CPU pool computes cold experts from `Qwen4ExpHostArena`. |
 | `AILA_Q4E_CPU_POOL_PIN` | bool | `true` | Pin host decode thread to Core 0, PLE worker to Core 1, `CpuWorker` to Core 2, and `CpuTilePool` workers to Cores 3..N-1. |
@@ -310,7 +308,7 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_MOE_COPY_VIA_COPYQ` | bool | `true` | Route CPU-complement host copies through the dedicated in-order copy queue. |
 | `AILA_Q4E_CPU_THREADS` | int | `clamp(cores - 3, 1, 15)` | Number of `CpuTilePool` worker threads (`15` on an 18-core host, leaving 3 cores for the main submit thread, PLE worker, and OS). `PinCurrentThreadToNonWorkerCores()` automatically tracks this count. |
 | `AILA_Q4E_CPU_POOL_CLAIM` | int | `1` | Number of tiles claimed per atomic fetch in `CpuTilePool::Consume`. |
-| `AILA_Q4E_DECODE_DEFER_CPU_JOIN` | bool | `true` | Defer `JoinResidentCold` / `FinishResidentCpuRead` from layer `L` to layer `L+1` after `router_softmax_topk_device(L+1)` submission (requires `UR_L0_BATCH_SIZE >= 32`, preset to `64`). |
+| `AILA_Q4E_DECODE_DEFER_CPU_JOIN` | bool | `true` | Defer `JoinResidentCold` / `FinishResidentCpuRead` from layer `L` to layer `L+1` after `router_softmax_topk_device(L+1)` submission (requires `UR_L0_BATCH_SIZE >= 32`; `Context` / `EnvUtils` automatically sets `UR_L0_BATCH_SIZE=64`, `UR_L0_USE_COPY_ENGINE=1`, `UR_L0_USE_IMMEDIATE_COMMANDLISTS=0`, `SYCL_UR_USE_LEVEL_ZERO_V2=0`, and `SYCL_CACHE_PERSISTENT=0` before SYCL init). |
 | `AILA_Q4E_DECODE_EXACT256_MIN_LEN` | int | `256` | Minimum attended length to dispatch `attention_decode_exact_head256_partial_merge` for `head_dim=256`. |
 | `AILA_Q4E_ADAPTIVE_SWAP_FREQ` | int | `8` | Decode token interval for online hot-expert promotion into `Qwen4ExpAdaptiveCache`. |
 | `AILA_Q4E_MAX_SWAPS` | int | `4` | Maximum expert swaps executed per swap interval. |
@@ -325,11 +323,11 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_MTP_MARGIN_TH2` | float | `-1` (off) | Draft step-2 top-2 logit margin threshold (`> 0` to enable). If `margin2 < threshold`, a `width = 4` window stops drafting at `width = 3`. |
 | `AILA_Q4E_MTP_VERIFY_MARGIN_TH2` | float | `-1` (off) | Post-draft verify-width gate for `width = 3` (`> 0` to enable). If `margin2 < threshold`, drops the 3rd column before `ForwardImpl` and verifies `width = 2`. |
 | `AILA_Q4E_MTP_VERIFY_MARGIN_TH3` | float | `-1` (off) | Post-draft verify-width gate for `width = 4` (`> 0` to enable). If `margin3 < threshold`, drops the 4th column before `ForwardImpl` and verifies `width = 3`. |
-| `AILA_Q4E_MTP_MAX_CONTEXT` | int | `2048` | Maximum sequence context length tracked by `Qwen4ExpMtpRuntime` before gracefully falling back to standard T1 decode. |
+| `AILA_Q4E_MTP_MAX_CONTEXT` | int | `32768` | Maximum sequence context length tracked by `Qwen4ExpMtpRuntime` before gracefully falling back to standard T1 decode. |
 | `AILA_Q4E_CPU_COMPLETION_SINGLE_PASS` | bool | `true` | Fuse CPU cold-expert `gate_up`, inline `h` quantization, and completion-ordered `down` tiles into a single `CpuTilePool::ParallelFor` pass per layer. |
 | `AILA_Q4E_DECODE_STRIDE_SNAPSHOT` | bool | `false` | Capture periodic `AILA_Q4E_PREFILL_STEP` recurrent snapshots during unforced single-token decode steps (off by default to avoid 64-token D2H stalls and preserve prompt checkpoints). |
 | `AILA_BNB4_GEMV_INPUT_PREFETCH_OFF` | bool | `true` | Skip redundant per-subgroup LSC input prefetches in BF16 NF4 decode GEMV kernels. |
-| `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` | int | `192` (preset) | Minimum padded band height `M` for prefill expert XMX batched GEMMs. |
+| `AILA_Q4E_PREFILL_EXPERT_XMX_MIN_M` | int | `192` | Minimum padded band height `M` for prefill expert XMX batched GEMMs. |
 | `AILA_Q4E_PREFILL_EXPERT_XMX_MAX_M` | int | `256` | Maximum band height for `count >= 1024` prefills: hot experts are split into `<= MAX_M` bands and the resulting `M` is rounded up to a 64-row multiple, so every full chunk hits one of the pre-warmed `(B=16, M in {64,128,192,256})` oneDNN primitives instead of compiling mid-prefill. Requires the bucketed route (`AILA_Q4E_XMX_BUCKET_ROUTE`). |
 | `AILA_Q4E_VERIFY_CPU_COLD` | bool | `true` | Serve a 2..4-row verification window's cold experts through the same arena CPU batch path as `count == 1` decode, one row at a time and capped by `AILA_Q4E_CPU_MAX_EXPERTS`. |
 | `AILA_Q4E_VERIFY_CPU_BATCH` | bool | `true` | Run the whole 2..4-row verification window's cold experts as ONE `CpuWorker` job (one join per window) via `StartArenaColdRows` / `JoinArenaColdRowsRow`. |
@@ -341,15 +339,15 @@ Routed experts are partitioned across two cooperating resident tiers: `Qwen4ExpA
 | `AILA_Q4E_PLE_PREFETCH_MIN` | int | `1` | Minimum token count at which `Qwen4ExpPle::prefetch_gather_pages` issues batched Win32 `PrefetchVirtualMemory` calls over per-head PLE NF4 weight/absmax ranges. |
 | `AILA_Q4E_XMX_BUCKET_ROUTE` | bool | `true` | Bucket `(token, rank)` by expert once per layer in `O(count * top_k)` instead of rescanning routes per chunk. |
 | `AILA_Q4E_XMX_SINGLE_PLAN_COPY` | bool | `true` | Pack each XMX chunk's `bases + tokens + ranks + slots` into a disjoint slice of pinned host USM and upload in a single `memcpy`. |
-| `AILA_Q4E_GDN_CHUNK_MODE` | int | `1` (preset) | GDN prefill mode: `0` = recurrent, `1` = fused FP32 `chunk_scan` (`T = 16`), `2` = BF16 XMX products. |
+| `AILA_Q4E_GDN_CHUNK_MODE` | int | `1` | GDN prefill mode: `0` = recurrent, `1` = fused FP32 `chunk_scan` (`T = 16`), `2` = BF16 XMX products. |
 | `AILA_QSA_HEADS_PER_WG` | int | `25` | QSA prefill attention kernel mode (`25` = 4 Q heads in registers + `vec4` KV loads + 1 barrier per 4-token block; `2` = 2-head fallback). |
 | `AILA_QSA_FAST_BLOCK_SCORES` | bool | `true` | Use 8-block sub-group shuffle kernel for QSA compressed-K block scoring. |
 | `AILA_QSA_SKIP_DENSE_SCORES` | bool | `true` | Skip QSA block scoring on wholly dense query tiles (`tile_max_blocks <= block_topk`). |
 | `AILA_QSA_QUERY_TILE` | int | unset (budget-derived, 16..1024) | Query rows per QSA prefill tile. When unset the tile grows to whatever the `AILA_QSA_LOGITS_BUDGET_BYTES` score buffer allows at the window's block count (clamped to 16..1024), cutting the three launches per tile at long context; an explicit value is honored as-is. |
 | `AILA_Q4E_HC_FUSED_SIGMOID` | bool | `true` | Fuse mix-up sigmoid directly into `ops::hc_mix_reduce`. |
 | `AILA_Q4E_MOE_SHARED_FUSED` | bool | `true` | Fuse gated shared-expert addition into `ops::moe_ordered_accumulate_down_rows`. |
-| `AILA_Q4E_INLINE_CHECKPOINT` | bool | `true` (preset) | Enable inline recurrent/KV checkpoint capture at `checkpoint_after`. |
-| `AILA_Q4E_LONG_INLINE_CHECKPOINT` | bool | `true` (preset) | Allow inline checkpoint capture inside long untiled prefill slices (`count > 64`), collapsing `7760 + 4` splits into a single forward. |
+| `AILA_Q4E_INLINE_CHECKPOINT` | bool | `true` | Enable inline recurrent/KV checkpoint capture at `checkpoint_after`. |
+| `AILA_Q4E_LONG_INLINE_CHECKPOINT` | bool | `true` | Allow inline checkpoint capture inside long untiled prefill slices (`count > 64`), collapsing `7760 + 4` splits into a single forward. |
 | `AILA_Q4E_SKIP_REDUNDANT_END_SNAPSHOT` | bool | `true` | Skip the redundant end-of-slice `CaptureSnapshot` when an inline interior checkpoint was already captured. |
 | `AILA_Q4E_HOST_EMBED` | bool | `true` | Gather input embedding rows from host memory instead of keeping the 1.3 GB table in VRAM. |
 | `AILA_Q4E_EMBED_LARGE_PAGES` | bool | `false` | Lock the `1.18 GiB` host `embed_tokens` copy in non-pageable `MEM_LARGE_PAGES` instead of pageable `VirtualAlloc` (default `false` saves `1.18 GiB` locked physical RAM and shares the copy with MTP draft). |

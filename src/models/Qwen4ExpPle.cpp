@@ -258,7 +258,7 @@ bool Qwen4ExpPle::init(Context& ctx,
     // 5. Linear projections key_proj & value_proj
     static const bool s_q4e_async_dequant = aila::env::read_flag("AILA_Q4E_ASYNC_DEQUANT", true);
     static const bool s_q4e_prefill_xmx =
-        aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+        aila::env::read_flag("AILA_Q4E_PREFILL_XMX", true) ||
         aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
     static const bool s_direct_prefill_io =
         aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);

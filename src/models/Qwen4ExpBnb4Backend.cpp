@@ -296,7 +296,8 @@ Qwen4ExpBnb4Backend::Session::Session(
         } else {
             const auto kv_dtype = int8_kv ? dnnl::memory::data_type::s8
                                           : dnnl::memory::data_type::bf16;
-            const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(capacity, kvStreamResidentTokens);
+            const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(
+                capacity, kvStreamResidentTokens, int8_kv ? 1 : 2);
             if (kv_stream_plan.enabled) {
                 cache.kv_stream_enabled = true;
                 kv_host_int8_ = int8_kv;
@@ -527,7 +528,7 @@ Qwen4ExpBnb4Backend::~Qwen4ExpBnb4Backend() {
     }
     if (!ReleaseQsaLayerGraph(context_, idle_confirmed)) {
         AILA_LOG_ERROR(
-            "[Q4E Graph] P10 executable drain failed during backend teardown");
+            "[Q4E Graph] QSA layer executable drain failed during backend teardown");
     }
     if (context_ && xmx_scratch_.impl) ops::moe_expert_xmx_scratch_destroy(*context_, xmx_scratch_);
     if (context_) {
@@ -750,7 +751,7 @@ bool Qwen4ExpBnb4Backend::load(
             linear.set_allow_async_dequant(true);
         }
         static const bool s_q4e_prefill_xmx =
-            aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+            aila::env::read_flag("AILA_Q4E_PREFILL_XMX", true) ||
             aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
         static const bool s_direct_prefill_io =
             aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
@@ -810,7 +811,7 @@ bool Qwen4ExpBnb4Backend::load(
         embed_weight_ = &weights.upload(embed_name, ctx);
     }
 
-    static const bool s_lm_head_q8 = aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", false);
+    static const bool s_lm_head_q8 = aila::env::read_flag("AILA_Q4E_LM_HEAD_Q8", true);
     const HostTensorView lm_head_host = weights.has_host("lm_head.weight") ? weights.host_view("lm_head.weight") : HostTensorView{};
     const bool use_q8_head = s_lm_head_q8 && hidden_size_ == 2560 && cfg_.vocab_size == 248320 &&
         lm_head_host.valid() && lm_head_host.dtype == DT_BF16 && lm_head_host.shape.size() == 2 &&
@@ -831,14 +832,14 @@ bool Qwen4ExpBnb4Backend::load(
         ctx.synchronize(); // Raw BF16 cannot be freed until conversion drains.
         weights.erase("lm_head.weight"); // Keeps host mmap; no transposed BF16 or oneDNN head.
         lmHeadQ8Enabled_ = true;
-        AILA_LOG_INFO("[Q4E LM Head Q8 Load] actual_enabled=1 hidden=%d vocab=%d block=64 weight_bytes=%llu scale_bytes=%llu saved_head_bytes=%llu host_original_bf16=1 experimental=1",
+        AILA_LOG_DEBUG("[Q4E LM Head Q8 Load] actual_enabled=1 hidden=%d vocab=%d block=64 weight_bytes=%llu scale_bytes=%llu saved_head_bytes=%llu host_original_bf16=1",
             hidden_size_, cfg_.vocab_size,
             static_cast<unsigned long long>(lm_head_q8_weight_.size_bytes()),
             static_cast<unsigned long long>(lm_head_q8_scale_.size_bytes()),
             static_cast<unsigned long long>(size_t(hidden_size_) * cfg_.vocab_size * sizeof(bf16) -
                 lm_head_q8_weight_.size_bytes() - lm_head_q8_scale_.size_bytes()));
     } else {
-        if (s_lm_head_q8) AILA_LOG_INFO("[Q4E LM Head Q8 Load] requested=1 actual_enabled=0 unsupported_shape_or_context=1");
+        if (s_lm_head_q8) AILA_LOG_DEBUG("[Q4E LM Head Q8 Load] requested=1 actual_enabled=0 unsupported_shape_or_context=1");
         lm_head_weight_transposed_ = Tensor::allocate(ctx, {hidden_size_, cfg_.vocab_size}, dnnl::memory::data_type::bf16);
         ops::transpose(ctx, raw_lm_head, lm_head_weight_transposed_);
         ctx.synchronize();
@@ -1000,7 +1001,7 @@ bool Qwen4ExpBnb4Backend::load(
     const int expert_cache_mb = aila::env::read_int("AILA_Q4E_EXPERT_CACHE_MB", 0);
     const bool mtp_enabled = aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false) ||
                              aila::env::read_flag("AILA_Q4E_SERVER_MTP", false);
-    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
+    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_, 0, kv_element_bytes);
     const bool dxgi_budget_enabled = aila::env::read_flag("AILA_Q4E_DXGI_BUDGET", true);
     const auto dxgi_info = dxgi_budget_enabled ? aila::QueryDxgiLocalVram() : aila::DxgiLocalVramInfo{};
     size_t auto_vram_ceiling = 0;
@@ -1047,7 +1048,7 @@ bool Qwen4ExpBnb4Backend::load(
         size_t mtp_reserve = 0;
         if (mtp_enabled) {
             const int mtp_cap = std::clamp(
-                aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048),
+                aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 32768),
                 2,
                 std::max(2, max_seq_len_));
             const int mtp_hidden_rows_cap = std::min(mtp_cap, 512);
@@ -1303,7 +1304,8 @@ bool Qwen4ExpBnb4Backend::load(
         const size_t budget_for_kv = auto_vram_ceiling > committed ? (auto_vram_ceiling - committed) : 0;
         resolved_kv_resident_tokens_ = aila::memory::qwen4exp_kv_stream_select_auto_resident_tokens(
             cfg_, max_seq_len_, budget_for_kv, kv_element_bytes);
-        const auto auto_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_, resolved_kv_resident_tokens_);
+        const auto auto_plan = aila::memory::qwen4exp_kv_stream_plan(
+            max_seq_len_, resolved_kv_resident_tokens_, kv_element_bytes);
         const size_t auto_kv_bytes = aila::memory::qwen4exp_kv_bytes(
             cfg_, static_cast<size_t>(auto_plan.residentTokens), kv_element_bytes).total();
         AILA_LOG_INFO(
@@ -1360,7 +1362,7 @@ bool Qwen4ExpBnb4Backend::load(
     }
     resident_down_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok, hidden_size_}, dnnl::memory::data_type::f32);
     resident_weights_ = Tensor::allocate(ctx, {cfg_.num_experts_per_tok}, dnnl::memory::data_type::f32);
-    AILA_LOG_INFO("[Q4E ResidentDecode] mode=%d adaptive_pipeline=1", resident_decode_mode_);
+    AILA_LOG_DEBUG("[Q4E ResidentDecode] mode=%d adaptive_pipeline=1", resident_decode_mode_);
     expert_executor_.init(ctx,1,cfg_.num_experts_per_tok,hidden_size_,cfg_.moe_intermediate_size);
     expert_executor_.set_copy_queue(copy_q_.get());
 
@@ -1384,23 +1386,22 @@ bool Qwen4ExpBnb4Backend::load(
     const bool s_expert_major = true;
     const bool s_moe_rows = aila::env::read_flag("AILA_Q4E_PREFILL_MOE_ROWS", false);
     const bool s_pred_ids_only = aila::env::read_flag("AILA_Q4E_PRED_IDS_ONLY", true);
-    const bool s_dense_xmx = aila::env::read_flag("AILA_Q4E_PREFILL_XMX", false) ||
+    const bool s_dense_xmx = aila::env::read_flag("AILA_Q4E_PREFILL_XMX", true) ||
                              aila::env::read_flag("AILA_Q4E_FUSED_PREFILL", false);
     const bool s_direct_io = aila::env::read_flag("AILA_Q4E_DIRECT_PREFILL_IO", true);
-    const char* prefill_mode = s_expert_major ? "S4 (expert-major W4/G3)" : (s_moe_rows ? "S1 (batched-rows)" : "baseline (token-by-token)");
+    const char* prefill_mode = s_expert_major ? "expert-major" : (s_moe_rows ? "batched-rows" : "token-by-token");
     AILA_LOG_INFO("[Qwen4Exp] Prefill MoE mode: %s, Router pred: %s",
                   prefill_mode, s_pred_ids_only ? "ids-only" : "full-softmax");
     AILA_LOG_INFO("[Qwen4Exp] Prefill Dense Linear: %s (direct_io=%s)",
                   s_dense_xmx ? "XMX Joint Matrix" : "oneDNN on-demand",
                   s_direct_io ? "enabled" : "disabled");
     AILA_LOG_INFO("[Qwen4Exp] Backend successfully loaded (48 layers, max_seq_len=%d)", max_seq_len_);
-    AILA_LOG_INFO("[Q4E ExecutionConfig] preset=%s chunk=%d native_ram_mib=%.1f slots=%d dense_xmx=%d direct_io=%d phase_scratch=%d staging_experts=%d checkpoint=%s attn_tile=%d compact_acts=%d",
-        aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "none").c_str(),
-        aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 512),
+    AILA_LOG_DEBUG("[Q4E ExecutionConfig] chunk=%d native_ram_mib=%.1f slots=%d dense_xmx=%d direct_io=%d phase_scratch=%d staging_experts=%d checkpoint=%s attn_tile=%d compact_acts=%d",
+        aila::env::read_int("AILA_Q35_PREFILL_CHUNK", 8192),
         (host_arena_.TotalAllocatedBytes() + (resident_embedding_ ? aila::memory::LargePageAllocationSize(embed_host_.bytes) : 0)) / double(1ULL<<20), adaptive_cache_.NumGpuSlots(),
-        int(s_dense_xmx), int(s_direct_io), int(aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", false)),
+        int(s_dense_xmx), int(s_direct_io), int(aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", true)),
         adaptive_cache_.StagingSlotsPerBuffer(),
-        aila::env::read_string("AILA_Q4E_INLINE_CHECKPOINT", "auto-30/26").c_str(), prefill_attention_tile_, moe_compact_tile_);
+        aila::env::read_string("AILA_Q4E_INLINE_CHECKPOINT", "1").c_str(), prefill_attention_tile_, moe_compact_tile_);
     return true;
 }
 
@@ -1425,7 +1426,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
     // Growth is outside decode's steady-state path. Drain readers before any
     // old tensor/view backing store is replaced (including oneDNN consumers).
     ctx.synchronize();
-    static const bool s_phase_scratch = aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", false);
+    static const bool s_phase_scratch = aila::env::read_flag("AILA_Q4E_PHASE_SCRATCH", true);
     const bool s_expert_major = true;
     constexpr int kDensePrefillLimit = 2052;
     const int attn_cap = prefill_attention_tile_ ? std::min(cap, prefill_attention_tile_) : cap;
@@ -1454,10 +1455,10 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
         (alias_prefill_phases ? (moe_router_bytes + moe_h_bytes + moe_sh_gu_bytes + moe_sh_in_bytes + moe_sh_out_bytes) : 0u);
     const int indexer_out_dim = (cfg_.indexer_n_heads + cfg_.indexer_kv_heads) * cfg_.indexer_head_dim;
     const int indexer_q_dim = cfg_.indexer_n_heads * cfg_.indexer_head_dim;
-    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_);
     const bool int8_kv = aila::env::read_flag("AILA_KV_QUANT", false) &&
                          aila::env::kv_quant_format_is_int8();
     const size_t kv_elem_bytes = int8_kv ? 1u : sizeof(bf16);
+    const auto kv_stream_plan = aila::memory::qwen4exp_kv_stream_plan(max_seq_len_, 0, kv_elem_bytes);
     const size_t kv_stage_k_max = (alias_prefill_phases && kv_stream_plan.enabled)
         ? align256(size_t(full_kv_heads_) * size_t(max_seq_len_) * size_t(full_head_dim_) * kv_elem_bytes)
         : 0u;
@@ -1512,7 +1513,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
             alias_prefill_phases ? (qsa_base_bytes + qsa_tail_bytes + qsa_stage_tail_bytes) : 0};
         size_t peak=0,total=0;for(size_t n:bytes){peak=std::max(peak,n);total+=n;}
         buf_.phase_scratch=Tensor::allocate(ctx,{int64_t(peak)},dnnl::memory::data_type::u8);
-        AILA_LOG_INFO("[Q4E PhaseScratch] cap=%d bytes=%zu separate_bytes=%zu saved_bytes=%zu",
+        AILA_LOG_DEBUG("[Q4E PhaseScratch] cap=%d bytes=%zu separate_bytes=%zu saved_bytes=%zu",
             cap,peak,total,total-peak);
     }
     auto phase = [&](const std::vector<int64_t>& shape,dnnl::memory::data_type type) {
@@ -1767,7 +1768,7 @@ void Qwen4ExpBnb4Backend::ensure_runtime_buffers(Context& ctx, int seq_len) {
                     prefill_expert_xmx_ = true;
                     const int c1_f32 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_C1_F32", 0);
                     const int w_f16 = aila::env::read_int("AILA_Q4E_PREFILL_EXPERT_XMX_W_F16", 0);
-                    AILA_LOG_INFO(
+                    AILA_LOG_DEBUG(
                         "[Q4E PrefillExpertXmx] enabled=1 max_chunk_rows=4096 channels=%d/%d "
                         "plan_bytes=%d c1_f32=%d w_f16=%d", hidden_size_, cfg_.moe_intermediate_size,
                         xmx_plan_bytes_, (c1_f32 != 0 || w_f16 != 0) ? 1 : 0, w_f16 != 0 ? 1 : 0);
@@ -1963,7 +1964,7 @@ void Qwen4ExpBnb4Backend::WarmupPrefillKernels(Context& ctx) {
         }
 
         ctx.synchronize();
-        AILA_LOG_INFO("[Warmup] Q4E prefill kernels warmed: dense_onednn=%d (M=%d weight_scratch=%zu B) "
+        AILA_LOG_DEBUG("[Warmup] Q4E prefill kernels warmed: dense_onednn=%d (M=%d weight_scratch=%zu B) "
                       "expert_xmx=%d phase_scratch=%zu B",
                       dense_warmed, kWarmSeq, size_t(linear_scratch_.weight_bf16.size_bytes()),
                       xmx_warmed, scratch_bytes);
@@ -2257,7 +2258,7 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                     static bool split_logged = false;
                     if (!split_logged) {
                         split_logged = true;
-                        AILA_LOG_INFO("[Q4E DirectColdSplit] enabled=1 share=%d/256 "
+                        AILA_LOG_DEBUG("[Q4E DirectColdSplit] enabled=1 share=%d/256 "
                                       "scope=token cpu_max=%d direct_dma=1",
                             cold_split_num_, expert_executor_.max_cpu_credits());
                     }
@@ -2613,7 +2614,7 @@ sycl::event Qwen4ExpBnb4Backend::RunAdaptivePrefill(Context& ctx,int layer,bool 
     const int lookahead=std::max(1,staging_banks-1);
     const int slots_per_chunk=adaptive_cache_.StagingSlotsPerBuffer();
     static const bool staging_pump_logged=[&](){
-        AILA_LOG_INFO("[Q4E PrefillStage] banks=%d lookahead=%d slots_per_bank=%d",staging_banks,lookahead,slots_per_chunk);
+        AILA_LOG_DEBUG("[Q4E PrefillStage] banks=%d lookahead=%d slots_per_bank=%d",staging_banks,lookahead,slots_per_chunk);
         return true;
     }();
     (void)staging_pump_logged;
@@ -2784,7 +2785,7 @@ sycl::event Qwen4ExpBnb4Backend::RunGroupedExperts(
         // (see docs/plans/qwen38-r1-moe-kernel-slmbound-2026-10-16.md).
         static const bool act_slm_reported = [&] {
             static const bool act_slm = aila::env::read_flag("AILA_Q4E_PREFILL_ACT_SLM", false);
-            AILA_LOG_INFO(
+            AILA_LOG_DEBUG(
                 "[Q4E PrefillActSlm] enabled=%d in_features=%d intermediate_size=%d "
                 "gate_up_quad_tile_bytes=%d",
                 act_slm ? 1 : 0, hidden_size_, cfg_.moe_intermediate_size,
@@ -3070,7 +3071,7 @@ sycl::event Qwen4ExpBnb4Backend::ForwardLmHead(
         ++lmHeadQ8ForwardCount_;
         lmHeadQ8RowCount_ += static_cast<uint64_t>(rows);
         if (lmHeadQ8ForwardCount_ == 1)
-            AILA_LOG_INFO("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1 experimental=1",
+            AILA_LOG_DEBUG("[Q4E LM Head Q8] actual_enabled=1 rows=%d hidden=%d vocab=%d activation_block=64 input_quantization=1",
                 rows, hidden_size_, cfg_.vocab_size);
         return ev;
     }
@@ -3628,7 +3629,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
         if (!s_host_pinned) {
             ops::cpu::PinCurrentThreadToNonWorkerCores();
             s_host_pinned = true;
-            AILA_LOG_INFO("[Q4E HostThreadPin] pinned_non_worker_cores=1 worker_threads=%d physical_cores=%d",
+            AILA_LOG_DEBUG("[Q4E HostThreadPin] pinned_non_worker_cores=1 worker_threads=%d physical_cores=%d",
                           ops::cpu::ConfiguredTilePoolThreads(), ops::cpu::PhysicalCoreCount());
         }
     }
@@ -3863,7 +3864,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             aila::q4e::moe_copy_via_copyq();
         static bool stagein_after_route_logged = false;
         if (stagein_after_route && !stagein_after_route_logged) {
-            AILA_LOG_INFO("[Q4E StageInAfterRoute] enabled=1 count=1 copy_q_gate=1");
+            AILA_LOG_DEBUG("[Q4E StageInAfterRoute] enabled=1 count=1 copy_q_gate=1");
             stagein_after_route_logged = true;
         }
         if (stagein_hoisted)
@@ -3884,7 +3885,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
                 fused_x_stagein ? expert_executor_.x_host_ptr() : nullptr,
                 count);
             if (!moeFrontFusedLogged_) {
-                AILA_LOG_INFO("[Q4E MoE Front Fused] actual_enabled=1 hidden=%d experts=%d shared_gate=1 q8_input=0 launches_saved_per_layer=1",
+                AILA_LOG_DEBUG("[Q4E MoE Front Fused] actual_enabled=1 hidden=%d experts=%d shared_gate=1 q8_input=0 launches_saved_per_layer=1",
                     hidden_size_, cfg_.num_experts);
                 moeFrontFusedLogged_ = true;
             }
@@ -3911,7 +3912,7 @@ Tensor& Qwen4ExpBnb4Backend::ForwardImpl(
             count, cfg_.num_experts, top_k, true);
         if (s_profile && L == 0) {
             const auto t_after_topk = std::chrono::steady_clock::now();
-            AILA_LOG_INFO(
+            AILA_LOG_DEBUG(
                 "[Q4E RouteSplit] count=%d topk_submit_us=%.1f classify_submit_us=0 (no epoch)",
                 count,
                 std::chrono::duration<double, std::micro>(t_after_topk - t_route_split).count());
@@ -4777,7 +4778,7 @@ Tensor& Qwen4ExpBnb4Backend::forward(
 
 bool Qwen4ExpBnb4Backend::CanCaptureInteriorCheckpoint(
     const Session& session, int count, int checkpointAfter) const {
-    const bool allow_long = aila::env::read_flag("AILA_Q4E_LONG_INLINE_CHECKPOINT", false) &&
+    const bool allow_long = aila::env::read_flag("AILA_Q4E_LONG_INLINE_CHECKPOINT", true) &&
                             prefill_attention_tile_ == 0;
     const int max_count = allow_long ? session.Capacity() : 64;
     if (count < 4 || count > max_count || checkpointAfter < 2 || checkpointAfter > count - 2 ||
@@ -4792,17 +4793,12 @@ bool Qwen4ExpBnb4Backend::CanCaptureInteriorCheckpoint(
 }
 
 bool Qwen4ExpBnb4Backend::supports_interior_checkpoint(int count, int checkpoint_after) const {
-    bool explicit_inline = false;
-    const bool has_env = aila::env::read_flag_if_present("AILA_Q4E_INLINE_CHECKPOINT", &explicit_inline);
-    if (has_env && !explicit_inline) return false;
+    if (!aila::env::read_flag("AILA_Q4E_INLINE_CHECKPOINT", true)) return false;
     auto* self = const_cast<Qwen4ExpBnb4Backend*>(this);
     if (!defaultSession_ && context_) {
         self->DefaultSession(*context_);
     }
-    if (!defaultSession_ || !CanCaptureInteriorCheckpoint(*defaultSession_, count, checkpoint_after)) return false;
-    // X2 measured default: initial 30-token text prefill with a 26-token reusable prefix.
-    // Explicit opt-in enables other structurally valid anchors, without a bitwise whitelist.
-    return has_env || (defaultSession_->CurrentLength() == 0 && count == 30 && checkpoint_after == 26);
+    return defaultSession_ && CanCaptureInteriorCheckpoint(*defaultSession_, count, checkpoint_after);
 }
 
 Tensor& Qwen4ExpBnb4Backend::forward(

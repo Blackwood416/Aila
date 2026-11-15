@@ -155,7 +155,7 @@ typedef void (*AilaLogCallback)(int level, const char* message, void* user_data)
 
 /* -------------- API functions -------------- */
 
-/** Get library version string (e.g. "0.2.0"). The returned pointer is static. */
+/** Get library version string (e.g. "0.3.0"). The returned pointer is static. */
 AILA_API const char* aila_version(void);
 
 /**

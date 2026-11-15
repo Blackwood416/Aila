@@ -762,7 +762,7 @@ void moe_expert_xmx_warmup_primitives(Context& ctx, MoeExpertXmxScratch& scratch
                     .scratchpad_bytes);
         }
     }
-    AILA_LOG_INFO("[Q4E PrefillExpertXmxWarmup] prewarmed_prims=%zu B_buckets=6 M_bands=4 "
+    AILA_LOG_DEBUG("[Q4E PrefillExpertXmxWarmup] prewarmed_prims=%zu B_buckets=6 M_bands=4 "
                   "onednn_scratchpad_max_bytes=%zu hidden=%d intermediate=%d",
                   cache_of(scratch).prims.size(), scratchpad_max, hidden, intermediate);
 }

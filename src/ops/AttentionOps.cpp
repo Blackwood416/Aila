@@ -3124,7 +3124,7 @@ void attention_decode(Context &ctx, Tensor &q, Tensor &k_cache, Tensor &v_cache,
     } else {
       status = "-> fallback baseline";
     }
-    AILA_LOG_INFO("[JM] mode=%d, supported=%d, tile_id=%d, decode_wg=%d, decode_window=%d, decode_window_start=%d, decode_sink=%d %s",
+    AILA_LOG_DEBUG("[JM] mode=%d, supported=%d, tile_id=%d, decode_wg=%d, decode_window=%d, decode_window_start=%d, decode_sink=%d %s",
                   jm_mode, jm_supported, jm_tile_id, decode_wg, decode_window,
                   decode_window_start, decode_sink, status);
     jm_log_once = true;

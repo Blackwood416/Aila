@@ -69,7 +69,7 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
             target.buf_.logits = Tensor::allocate(ctx, {4, target.vocab_size()});
         target.PrepareDecodeVerification(ctx);
         ctx.synchronize();
-        AILA_LOG_INFO("[Q4E Server MTP] enabled=1 experimental=1 bitwise_t1_guarantee=0 width=%d capacity=%d draft_slots=64", configuredWidth, cap);
+        AILA_LOG_INFO("[Q4E MTP] enabled=1 width=%d capacity=%d draft_slots=64", configuredWidth, cap);
     } catch (...) {
         try { ctx.synchronize(); } catch (...) {}
         if (greedyResultHost) { ctx.free_host(greedyResultHost); greedyResultHost = nullptr; }
@@ -79,7 +79,7 @@ Qwen4ExpMtpRuntime::Qwen4ExpMtpRuntime(Context& c, Qwen4ExpBnb4Backend& b,
 Qwen4ExpMtpRuntime::~Qwen4ExpMtpRuntime() {
     try { ctx.synchronize(); } catch (...) {}
     if (greedyResultHost) { ctx.free_host(greedyResultHost); greedyResultHost = nullptr; }
-    AILA_LOG_INFO("[Q4E Server MTP] windows=%llu accepted=%llu",
+    AILA_LOG_DEBUG("[Q4E MTP] windows=%llu accepted=%llu",
         static_cast<unsigned long long>(windows), static_cast<unsigned long long>(accepted));
 }
 size_t Qwen4ExpMtpRuntime::SessionBytes(int cap) {
@@ -92,7 +92,7 @@ int Qwen4ExpMtpRuntime::EffectiveCapacity(int maxSequenceLength) {
     // reproduces the original hard gate (dense draft within the QSA indexer
     // budget); raising it must pay for draft KV (2.25 KB/token) and one draft
     // catch-up step per prompt token, see qwen38-r1-mtp-longctx-2026-10-15.md.
-    static const int requested = aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 2048);
+    static const int requested = aila::env::read_int("AILA_Q4E_MTP_MAX_CONTEXT", 32768);
     return std::clamp(requested, 2, std::max(2, maxSequenceLength));
 }
 std::unique_ptr<Qwen4ExpMtpRuntime::State> Qwen4ExpMtpRuntime::CreateState() {

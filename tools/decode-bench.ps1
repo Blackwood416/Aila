@@ -80,16 +80,7 @@ $Prompt = Resolve-RepoPath $Prompt
 $work = Resolve-RepoPath $OutDir
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-# Baseline environment the decode work already established as neutral: no
-# immediate command lists, copy engine on, persistent SYCL cache.
-$env:UR_L0_USE_COPY_ENGINE = '1'
-$env:SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE = '1'
-$env:UR_L0_USE_IMMEDIATE_COMMANDLISTS = '0'
-$env:SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = '0'
-$env:SYCL_UR_USE_LEVEL_ZERO_V2 = '0'
-$env:UR_L0_BATCH_SIZE = '64'
-$env:SYCL_PI_LEVEL_ZERO_BATCH_SIZE = '64'
-$env:SYCL_CACHE_PERSISTENT = '0'
+# UR/Level Zero defaults are configured directly by the binary before SYCL init.
 
 # Both flags are read once per process, so they are set before the first run
 # rather than per iteration.
@@ -146,7 +137,7 @@ $MaxTokens = @($MaxTokens | ForEach-Object { "$_" -split ',' } | Where-Object { 
 $rows = @()
 foreach ($target in $MaxTokens) {
     $logPath = Join-Path $work "engine-$target.log"
-    & $Exe -m $Model --performance-preset qwen38-a770 --max-seq $MaxSeq --greedy `
+    & $Exe -m $Model --max-seq $MaxSeq --greedy `
         --thinking-budget 0 --max-tokens $target --messages-json $Prompt `
         --no-stream --chat-output-json --log-level info > $logPath 2>&1
     if ($LASTEXITCODE -ne 0) {

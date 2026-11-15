@@ -33,8 +33,15 @@ endif()
 option(AILA_ALLOW_LEGACY_ONEAPI_BASELINE
     "Allow the temporary oneAPI 2025.3 comparison build" OFF)
 
-set(AILA_PUBLIC_API_VERSION "0.2.0")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" AILA_VERSION_RAW)
+string(STRIP "${AILA_VERSION_RAW}" AILA_PUBLIC_API_VERSION)
+if(NOT AILA_PUBLIC_API_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "Invalid VERSION.txt file contents: '${AILA_PUBLIC_API_VERSION}'")
+endif()
+set_property(DIRECTORY APPEND PROPERTY
+    CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt")
 set(AILA_PUBLIC_ABI_VERSION "1")
+add_compile_definitions("AILA_VERSION=\"${AILA_PUBLIC_API_VERSION}\"")
 find_package(Git QUIET)
 
 function(aila_register_git_configure_dependency git_path_name)

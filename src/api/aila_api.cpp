@@ -18,7 +18,11 @@
 // ============================================================
 // Version
 // ============================================================
-static const char* AILA_VERSION_STRING = "0.2.0";
+#ifdef AILA_VERSION
+static const char* AILA_VERSION_STRING = AILA_VERSION;
+#else
+static const char* AILA_VERSION_STRING = "0.3.0";
+#endif
 
 // ============================================================
 // Opaque handle wraps InferenceEngine

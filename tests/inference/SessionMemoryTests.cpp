@@ -197,6 +197,14 @@ void TestQwen4ExpSessionMemory() {
            "Auto resident tier should pick 32768 for 500 MiB INT8 262K budget");
     Expect(aila::memory::qwen4exp_kv_stream_select_auto_resident_tokens(config, 262144, size_t{120} << 20, 1) == 8208,
            "Auto resident tier should fall back to 8208 for tight 120 MiB budget");
+    Expect(!aila::memory::qwen4exp_kv_stream_plan(32768, 0, 2).enabled,
+           "Auto KV stream stays off at 32K BF16");
+    Expect(aila::memory::qwen4exp_kv_stream_plan(65536, 0, 2).enabled,
+           "Auto KV stream turns on at 64K BF16");
+    Expect(!aila::memory::qwen4exp_kv_stream_plan(65536, 0, 1).enabled,
+           "Auto KV stream stays off at 64K INT8");
+    Expect(aila::memory::qwen4exp_kv_stream_plan(131072, 0, 1).enabled,
+           "Auto KV stream turns on at 128K INT8");
 }
 
 } // namespace

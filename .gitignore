@@ -11,6 +11,7 @@ build*/
 bitsandbytes/
 /models/
 *.txt
+!VERSION.txt
 *.png
 tmp/
 .claude/HANDOVER.md

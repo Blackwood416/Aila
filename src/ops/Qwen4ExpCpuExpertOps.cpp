@@ -1,4 +1,5 @@
 #include "Qwen4ExpCpuExpertOps.hpp"
+#include "profile/Profiling.hpp"
 #include "utils/EnvUtils.hpp"
 #include "ops/CpuTilePool.hpp"
 
@@ -555,7 +556,7 @@ inline void mark_a64_specialize_enabled(A64ScaleMode mode) {
     static std::atomic<bool> reported{false};
     if (!reported.load(std::memory_order_relaxed) &&
         !reported.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[Q4E A64SpecializeEnabled] source=%s\n",
+        AILA_LOG_DEBUG("[Q4E A64SpecializeEnabled] source=%s",
             mode == A64ScaleMode::FlatF32 ? "flat_f32" : "nested256");
 }
 
@@ -904,7 +905,7 @@ inline void mark_a64_row2_enabled() {
     static std::atomic<bool> reported{false};
     if (!reported.load(std::memory_order_relaxed) &&
         !reported.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[Q4E A64Row2Enabled] rows=2\n");
+        AILA_LOG_DEBUG("[Q4E A64Row2Enabled] rows=2");
 }
 
 template <A64ScaleMode Mode>
@@ -1218,7 +1219,7 @@ static void nf4_q8_batch_forward(const CpuExpertTask* tasks, int count,
         }
         static std::atomic<bool> reported{false};
         if(!reported.exchange(true,std::memory_order_relaxed))
-            std::fprintf(stderr,"[Q4E CpuExpertDagEnabled] actual=1 gate_tile=16 down_tile=32 expert_dependency=1\n");
+            AILA_LOG_DEBUG("[Q4E CpuExpertDagEnabled] actual=1 gate_tile=16 down_tile=32 expert_dependency=1");
         nf4_q8_activation64_dag_tiles(tasks,count,input,input_scales,h,out,
             intermediate,intermediate_scales,lut,lut_scale,nf4_scale_shift,a64_specialize,a64_row2,dag_test_hooks);
         return;

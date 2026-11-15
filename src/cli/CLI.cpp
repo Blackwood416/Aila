@@ -199,7 +199,6 @@ Usage: aila [options]
 
 Options:
   -m, --model <path>       Model directory (required, or set AILA_MODEL_DIR)
-  --performance-preset qwen38-a770  Qwen3.8 NF4 on A770; 32 GiB host pool, GPU experts
   -s, --max-seq <N>        Maximum sequence length (default: 4096, or AILA_MAX_SEQ_LEN)
   -t, --temperature <F>    Sampling temperature (default: 0.7)
   -k, --top-k <N>          Top-K sampling (default: 15)
@@ -252,7 +251,11 @@ Options:
   --align-audio <path>     ForceAligner: audio file path for alignment
   --align-lang <lang>      ForceAligner: language (default: Chinese)
   --q35-prefill-step <N>   Qwen3.5 prefill checkpoint step (default: 64)
+  --prefill-chunk <N>      Prefill chunk size (default: 8192 for Qwen4Exp, 512 for Qwen3.5)
+  --kv-type <type>         KV cache type: auto (default), bf16, or int8
   --kv-quant               Enable KV cache quantization (FP8, E4M3)
+  --mtp / --no-mtp         Enable or disable speculative MTP draft decoding (Qwen4Exp)
+  --mtp-max-context <N>    Maximum context tracked by MTP (default: 32768)
   -h, --help               Show this help message
   -v, --version            Show version
 
@@ -289,7 +292,11 @@ Interactive Commands:
 }
 
 void print_version() {
-    std::cout << "Aila v0.2.0" << std::endl;
+#ifdef AILA_VERSION
+    std::cout << "Aila v" << AILA_VERSION << std::endl;
+#else
+    std::cout << "Aila v0.3.0" << std::endl;
+#endif
 }
 
 bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
@@ -324,14 +331,6 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if ((arg == "-m" || arg == "--model") && i + 1 < argc) {
             opts.model_dir = argv[++i];
-            continue;
-        }
-        if (arg == "--performance-preset") {
-            if (i + 1 >= argc || std::string(argv[i + 1]) != "qwen38-a770") {
-                std::cerr << "Error: --performance-preset requires qwen38-a770" << std::endl;
-                return false;
-            }
-            opts.performance_preset = argv[++i];
             continue;
         }
         if ((arg == "-s" || arg == "--max-seq") && i + 1 < argc) {
@@ -426,6 +425,38 @@ bool parse_cli_args(int argc, char** argv, CLIOptions& opts) {
         }
         if (arg == "--kv-quant") {
             opts.kv_quant = true;
+            continue;
+        }
+        if (arg == "--kv-type" && i + 1 < argc) {
+            opts.kv_type = argv[++i];
+            if (opts.kv_type != "auto" && opts.kv_type != "bf16" && opts.kv_type != "int8") {
+                std::cerr << "Error: --kv-type must be auto, bf16, or int8" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--prefill-chunk" && i + 1 < argc) {
+            opts.prefill_chunk_size = std::atoi(argv[++i]);
+            if (opts.prefill_chunk_size <= 0) {
+                std::cerr << "Error: --prefill-chunk must be a positive integer" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--mtp") {
+            opts.mtp_mode = 1;
+            continue;
+        }
+        if (arg == "--no-mtp") {
+            opts.mtp_mode = 0;
+            continue;
+        }
+        if (arg == "--mtp-max-context" && i + 1 < argc) {
+            opts.mtp_max_context = std::atoi(argv[++i]);
+            if (opts.mtp_max_context < 2) {
+                std::cerr << "Error: --mtp-max-context must be >= 2" << std::endl;
+                return false;
+            }
             continue;
         }
         if (arg == "--rep-penalty" && i + 1 < argc) {

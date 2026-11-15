@@ -1454,16 +1454,20 @@ void test_supports_interior_checkpoint_whitelist(Context& ctx) {
     Qwen4ExpBnb4Backend backend;
     backend.init_for_testing(ctx, 4);
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=");
-    expect(backend.supports_interior_checkpoint(30, 26), "Measured story shape must default on");
-    expect(!backend.supports_interior_checkpoint(30, 28), "Unmeasured defaults stay opt-in");
-    expect(!backend.supports_interior_checkpoint(30, 16), "General anchors stay opt-in");
+    _putenv("AILA_Q4E_LONG_INLINE_CHECKPOINT=");
+    expect(backend.supports_interior_checkpoint(30, 26), "Valid text anchor must default on");
+    expect(backend.supports_interior_checkpoint(30, 28), "Valid text anchor must default on");
+    expect(backend.supports_interior_checkpoint(30, 16), "General valid anchors must default on");
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=1");
     for (int anchor : {2, 16, 26, 28})
         expect(backend.supports_interior_checkpoint(30, anchor), "Valid text anchors must support opt-in");
     expect(backend.supports_interior_checkpoint(64, 32), "Largest dense chunk must support opt-in");
     for (int anchor : {-1, 0, 1, 29, 30, 31})
         expect(!backend.supports_interior_checkpoint(30, anchor), "Invalid sides must be rejected");
-    expect(!backend.supports_interior_checkpoint(65, 26), "count > 64 must be rejected");
+    _putenv("AILA_Q4E_LONG_INLINE_CHECKPOINT=0");
+    expect(!backend.supports_interior_checkpoint(65, 26), "count > 64 must be rejected when long inline is disabled");
+    _putenv("AILA_Q4E_LONG_INLINE_CHECKPOINT=");
+    expect(!backend.supports_interior_checkpoint(65, 26), "count > capacity must be rejected");
     backend.set_embedding_overrides({0}, {bf16(0)}, 1);
     expect(!backend.supports_interior_checkpoint(30, 26), "Vision override must fall back");
     backend.clear_embedding_overrides();
@@ -1473,18 +1477,22 @@ void test_supports_interior_checkpoint_whitelist(Context& ctx) {
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=0");
     expect(!backend.supports_interior_checkpoint(30, 26), "Explicit opt-out must retain split prefill");
     _putenv("AILA_Q4E_INLINE_CHECKPOINT=");
-    expect(backend.supports_interior_checkpoint(30, 26), "Clearing override restores measured default");
+    expect(backend.supports_interior_checkpoint(30, 26), "Clearing override restores default");
     Qwen4ExpBnb4Backend large;
     large.init_for_testing(ctx, 4, 4096);
+    expect(large.supports_interior_checkpoint(65, 26), "count > 64 must default on when capacity allows");
     auto session = large.CreateSession(ctx, 2);
     session->current_length_for_testing() = 2021;
-    expect(Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2051 must remain dense");
+    expect(Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2051 must remain valid");
     session->current_length_for_testing() = 2022;
-    expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2052 is sparse and must be rejected");
+    expect(Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "Long inline checkpoint defaults on for sparse positions");
+    _putenv("AILA_Q4E_LONG_INLINE_CHECKPOINT=0");
+    expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *session, 30, 26), "2052 is sparse and must be rejected when long inline is disabled");
     bool rejected = false;
     try { large.Forward(ctx, *session, nullptr, 30, {SnapshotPolicy::ReusablePrefix, true, false, 26}); }
     catch (const std::invalid_argument&) { rejected = true; }
-    expect(rejected && session->CurrentLength() == 2022, "Direct forward must reject sparse capture before advancing");
+    expect(rejected && session->CurrentLength() == 2022, "Direct forward must reject sparse capture when long inline is disabled");
+    _putenv("AILA_Q4E_LONG_INLINE_CHECKPOINT=");
     auto single_slot = large.CreateSession(ctx, 1);
     expect(!Qwen4ExpGenerationTestAccess::CanCapture(large, *single_slot, 30, 26), "Capture needs two slots");
     session->current_length_for_testing() = 4090;

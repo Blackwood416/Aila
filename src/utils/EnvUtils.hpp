@@ -1,8 +1,9 @@
 #pragma once
 
 #include <cstdlib>
-#include <string>
 #include <cstring>
+#include <mutex>
+#include <string>
 
 // ============================================================
 // Cross-platform environment variable utilities
@@ -172,42 +173,46 @@ inline bool disable_persistent_sycl_cache() {
 #endif
 }
 
-// UR_L0_USE_COPY_ENGINE=1 enables the dedicated hardware Copy Engine (Blitter)
-// in Level Zero / Unified Runtime for PCIe DMA operations, preventing memory
-// copies from stalling the Xe Core compute engine. Must be set before the
-// Level Zero driver initializes (i.e. before the first Context/device creation).
-inline void enable_l0_copy_engine() {
+// Configure Intel Level Zero / Unified Runtime defaults before the first SYCL
+// platform/device/queue initialization. Explicit user environment overrides are
+// preserved. Must execute before the Level Zero adapter initializes.
+inline void configure_sycl_runtime_defaults() {
+    auto set_if_unset = [](const char* name, const char* value) {
 #ifdef _WIN32
-    char* existing = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&existing, &len, "UR_L0_USE_COPY_ENGINE") == 0 && existing) {
-        free(existing);
-    } else {
-        _putenv_s("UR_L0_USE_COPY_ENGINE", "1");
-    }
-    if (_dupenv_s(&existing, &len, "SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE") == 0 && existing) {
-        free(existing);
-    } else {
-        _putenv_s("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1");
-    }
-    if (_dupenv_s(&existing, &len, "UR_L0_BATCH_SIZE") == 0 && existing) {
-        free(existing);
-    } else {
-        _putenv_s("UR_L0_BATCH_SIZE", "64");
-    }
-    if (_dupenv_s(&existing, &len, "SYCL_PI_LEVEL_ZERO_BATCH_SIZE") == 0 && existing) {
-        free(existing);
-    } else {
-        _putenv_s("SYCL_PI_LEVEL_ZERO_BATCH_SIZE", "64");
-    }
+        char* existing = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&existing, &len, name) == 0 && existing) {
+            const bool has_value = existing[0] != '\0';
+            free(existing);
+            if (has_value) return;
+        }
+        _putenv_s(name, value);
 #else
-    if (!std::getenv("UR_L0_USE_COPY_ENGINE")) {
-        setenv("UR_L0_USE_COPY_ENGINE", "1", 1);
-    }
-    if (!std::getenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE")) {
-        setenv("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1", 1);
-    }
+        const char* existing = std::getenv(name);
+        if (!existing || existing[0] == '\0') {
+            setenv(name, value, 1);
+        }
 #endif
+    };
+    set_if_unset("UR_L0_USE_COPY_ENGINE", "1");
+    set_if_unset("SYCL_PI_LEVEL_ZERO_USE_COPY_ENGINE", "1");
+    set_if_unset("UR_L0_USE_IMMEDIATE_COMMANDLISTS", "0");
+    set_if_unset("SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS", "0");
+    set_if_unset("UR_L0_BATCH_SIZE", "64");
+    set_if_unset("SYCL_PI_LEVEL_ZERO_BATCH_SIZE", "64");
+    set_if_unset("SYCL_UR_USE_LEVEL_ZERO_V2", "0");
+}
+
+inline void enable_l0_copy_engine() {
+    configure_sycl_runtime_defaults();
+}
+
+inline void ensure_sycl_runtime_initialized() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        configure_sycl_runtime_defaults();
+        (void)disable_persistent_sycl_cache();
+    });
 }
 
 } // namespace env

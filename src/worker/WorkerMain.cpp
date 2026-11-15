@@ -4,7 +4,6 @@
 #include "ipc/IpcProtocol.hpp"
 #include "ipc/Win32Pipe.hpp"
 #include "utils/EnvUtils.hpp"
-#include "utils/Qwen38A770Preset.hpp"
 #include "worker/CApiWorkerEngine.hpp"
 #include "worker/WorkerDispatcher.hpp"
 #include "worker/InferenceWorkerMain.hpp"
@@ -492,17 +491,12 @@ int run(const Handles& handles) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
-    aila::env::enable_l0_copy_engine();
+    aila::env::configure_sycl_runtime_defaults();
     if (aila::env::disable_persistent_sycl_cache()) {
         std::fprintf(
             stderr,
             "[Aila] SYCL_CACHE_PERSISTENT was inherited enabled; forcing 0 "
             "(known runtime crash; set AILA_KEEP_SYCL_CACHE_PERSISTENT=1 to keep)\n");
-    }
-    // Explicit environment always wins; the preset only fills unset flags and
-    // must run before any model/queue construction reads a flag.
-    if (aila::env::read_string("AILA_Q4E_ACTIVE_PRESET", "") == "qwen38-a770") {
-        aila::ApplyQwen38A770Preset();
     }
     try {
         const Handles handles = parse_arguments(argc, argv);

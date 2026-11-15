@@ -177,13 +177,13 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         init_scale_cache();
         if (aila::env::read_flag("AILA_Q4E_CPU_TILE_POOL", true)) {
             tilePool = std::make_unique<ops::cpu::CpuTilePool>(threads);
-            AILA_LOG_INFO("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=%d bounded_spin_us=%d "
+            AILA_LOG_DEBUG("[Q4E CpuTilePool] threads=%d caller_participates=1 claim_tiles=%d bounded_spin_us=%d "
                           "pinned=1 coordinator_core=2 worker_core_begin=3 physical_cores=%d",
                 threads, std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_CLAIM", 1), 1, 16),
                 std::clamp(aila::env::read_int_raw("AILA_Q4E_CPU_POOL_SPIN_US", 20000), 0, 100000),
                 ops::cpu::PhysicalCoreCount());
         }
-        if (spinUs) AILA_LOG_INFO("[Q4E CpuHandoffSpin] spin_us=%d mutex_publication=1 bounded_idle=1", spinUs);
+        if (spinUs) AILA_LOG_DEBUG("[Q4E CpuHandoffSpin] spin_us=%d mutex_publication=1 bounded_idle=1", spinUs);
         thread = std::thread([this] { run(); });
     }
     ~CpuWorker() {
@@ -250,7 +250,7 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
         scale_cache_data.resize(count * kScaleCount);
         scale_cache_entries.resize(count);
         scale_cache_buckets.assign(buckets, -1);
-        AILA_LOG_INFO("[Q4E CpuScaleCacheEnabled] requested_mb=%d slots=%llu bytes=%llu packed_copy=0",
+        AILA_LOG_DEBUG("[Q4E CpuScaleCacheEnabled] requested_mb=%d slots=%llu bytes=%llu packed_copy=0",
             mb, static_cast<unsigned long long>(count), static_cast<unsigned long long>(scale_cache_bytes()));
     }
     uint64_t scale_cache_bytes() const {
@@ -468,11 +468,11 @@ struct Qwen4ExpExpertExecutor::CpuWorker {
                 if (verify_a64 && (!nf4_q8 || !nf4_q8_activation64))
                     throw std::invalid_argument("CPU A64 verification requires the NF4Q8 Activation64 primary backend");
                 if (current.resident_prepared && nf4_q8 && nf4_q8_activation64 && !activation64_logged) {
-                    AILA_LOG_INFO("[Q4E CpuActivation64Enabled] activation_block=64 merged_integer_halves=1");
+                    AILA_LOG_DEBUG("[Q4E CpuActivation64Enabled] activation_block=64 merged_integer_halves=1");
                     activation64_logged = true;
                 }
                 if (current.resident_prepared && nf4_q8 && nf4_scale_shift && !scale_shift_logged) {
-                    AILA_LOG_INFO("[Q4E CpuScaleShiftEnabled] nested_block256=shift8 other_blocks=division");
+                    AILA_LOG_DEBUG("[Q4E CpuScaleShiftEnabled] nested_block256=shift8 other_blocks=division");
                     scale_shift_logged = true;
                 }
                 const auto batch_backend = current.resident_prepared
@@ -693,7 +693,7 @@ void Qwen4ExpExpertExecutor::init(
         throw std::invalid_argument("CPU_RESULT_HOST_READ and CPU_RESULT_PACKET are mutually exclusive");
     cpu_result_host_read_=result_host_read && top_k_>0 && top_k_<=16 &&
         ctx_->queue().get_device().has(sycl::aspect::usm_host_allocations);
-    if(cpu_result_host_read_) AILA_LOG_INFO("[Q4E CpuResultHostRead] enabled=1 resident_b1=1 topk=%d merge_reader_fence=1",top_k_);
+    if(cpu_result_host_read_) AILA_LOG_DEBUG("[Q4E CpuResultHostRead] enabled=1 resident_b1=1 topk=%d merge_reader_fence=1",top_k_);
     x_host_ = static_cast<bf16*>(ctx_->alloc_host(4ULL * hidden_size_ * sizeof(bf16)));
     cpu_out_host_ = static_cast<float*>(ctx_->alloc_host(static_cast<size_t>(ops::cpu::kMaxExpertBatchTasks) * hidden_size_ * sizeof(float)));
     scratch_h_ = static_cast<bf16*>(ctx_->alloc_host(static_cast<size_t>(ops::cpu::kMaxExpertBatchTasks) * intermediate_size_ * sizeof(bf16)));
@@ -722,10 +722,10 @@ sycl::queue* Qwen4ExpExpertExecutor::copy_queue() const {
     if (!logged.load(std::memory_order_relaxed) &&
         !logged.exchange(true, std::memory_order_relaxed)) {
         if (q) {
-            AILA_LOG_INFO("[Q4E MoeCopyViaCopyQ] enabled=1 source=owner "
+            AILA_LOG_DEBUG("[Q4E MoeCopyViaCopyQ] enabled=1 source=owner "
                           "host_copies=x_d2h+cpu_result_h2d (compute-queue barrier ordered)");
         } else {
-            AILA_LOG_INFO("[Q4E MoeCopyViaCopyQ] enabled=1 but no copy queue is "
+            AILA_LOG_DEBUG("[Q4E MoeCopyViaCopyQ] enabled=1 but no copy queue is "
                           "available; host copies stay on the compute queue");
         }
     }
@@ -751,7 +751,7 @@ int Qwen4ExpExpertExecutor::StartArenaCold(const Qwen4ExpHostArena& arena, int l
     if (tokens >= 2) {
         static const bool s_merge = aila::env::read_flag("AILA_Q4E_VERIFY_CPU_MERGE", false);
         if (s_merge && !merge_inactive_logged_) {
-            AILA_LOG_INFO("[Q4E VerifyCpuMerge] inactive: window job requires AILA_Q4E_VERIFY_CPU_BATCH=1");
+            AILA_LOG_DEBUG("[Q4E VerifyCpuMerge] inactive: window job requires AILA_Q4E_VERIFY_CPU_BATCH=1");
             merge_inactive_logged_ = true;
         }
     }
@@ -1005,7 +1005,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
                     const double cum_f = merge_stat_pairs_ > 0
                         ? 1.0 - static_cast<double>(merge_stat_groups_) / static_cast<double>(merge_stat_pairs_)
                         : 0.0;
-                    AILA_LOG_INFO("[Q4E VerifyCpuMerge] build=%llu layer=%d pairs=%d groups=%d f=%.4f cum_pairs=%llu cum_groups=%llu cum_f=%.4f",
+                    AILA_LOG_DEBUG("[Q4E VerifyCpuMerge] build=%llu layer=%d pairs=%d groups=%d f=%.4f cum_pairs=%llu cum_groups=%llu cum_f=%.4f",
                         static_cast<unsigned long long>(merge_stat_builds_), layer, task_count, groups, window_f,
                         static_cast<unsigned long long>(merge_stat_pairs_),
                         static_cast<unsigned long long>(merge_stat_groups_), cum_f);
@@ -1019,7 +1019,7 @@ int Qwen4ExpExpertExecutor::StartArenaColdRows(const Qwen4ExpHostArena& arena, i
         stats_.cpu_tasks_dispatched += task_count;
         stats_.cpu_cached_tasks_dispatched += task_count;
         if (!arena_cold_rows_logged_) {
-            AILA_LOG_INFO("[Q4E ArenaColdRowsEnabled] rows=%d tasks=%d capacity=%d",
+            AILA_LOG_DEBUG("[Q4E ArenaColdRowsEnabled] rows=%d tasks=%d capacity=%d",
                 rows, task_count, ops::cpu::kMaxExpertBatchTasks);
             arena_cold_rows_logged_ = true;
         }
@@ -1261,7 +1261,7 @@ int Qwen4ExpExpertExecutor::StartArenaVerifyRows(const Qwen4ExpHostArena& arena,
         arena_verify_arena_ = &arena;
         cpu_worker_->submit_staged();
         if (!arena_verify_logged_) {
-            AILA_LOG_INFO("[Q4E ArenaVerifyRowsEnabled] layer=%d rows=%d topk=%d experts=%d capacity=%d",
+            AILA_LOG_DEBUG("[Q4E ArenaVerifyRowsEnabled] layer=%d rows=%d topk=%d experts=%d capacity=%d",
                 layer, rows, top_k_, experts, ops::cpu::kMaxExpertBatchTasks);
             arena_verify_logged_ = true;
         }

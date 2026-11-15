@@ -737,6 +737,15 @@ std::shared_ptr<LoadedModel> LoadedModel::Load(
     static const bool requestedMtp = aila::env::read_flag("AILA_Q4E_SERVER_MTP", false) ||
                                      aila::env::read_flag("AILA_Q4E_MTP_DRAFT", false);
     bool enableMtp = qwen4exp && requestedMtp;
+    if (qwen4exp && options.allowQuantizedKv) {
+#ifdef _WIN32
+        _putenv_s("AILA_KV_QUANT", "1");
+        _putenv_s("AILA_KV_QUANT_FORMAT", "int8");
+#else
+        setenv("AILA_KV_QUANT", "1", 1);
+        setenv("AILA_KV_QUANT_FORMAT", "int8", 1);
+#endif
+    }
     const bool quantizedCache = hybrid
         ? aila::env::read_scoped_kv_quant("AILA_VLM_KV_QUANT")
         : aila::env::read_flag("AILA_KV_QUANT", false);

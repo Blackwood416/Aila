@@ -51,7 +51,11 @@ struct AilaTTSStream {
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0";
+#ifdef AILA_VERSION
+constexpr const char* kVersion = AILA_VERSION;
+#else
+constexpr const char* kVersion = "0.3.0";
+#endif
 constexpr const char* kEmpty = "";
 
 std::mutex engine_registry_mutex;

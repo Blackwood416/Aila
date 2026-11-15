@@ -17,7 +17,9 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 - **⚡ Bitsandbytes 4-bit (NF4) inference** — run quantized models directly on Intel Arc with fused dequant+matmul kernels, hand-written GEMV decode, and fused gate+up+SiLU projection
 - **🔢 Bfloat16 inference** — dense (unquantized) models via oneDNN matmul primitives
 - **🏗️ Qwen3.5 Hybrid architecture** — full GPU acceleration for the dual attention (GQA + DeltaNet linear attention) architecture
+- **🧠 Qwen3.8-Flash-Next (MoE Hybrid)** — 48-layer Gated DeltaNet + Query-Sparse Attention (QSA) + 512 routed NF4 experts with GPU/CPU heterogeneous execution (`AdaptiveCache` + `HostArena`), automatic long-context INT8 KV + QSA KV streaming (`--kv-type auto`), and speculative Multi-Token Prediction (`--mtp`)
 - **📐 Qwen3 Dense architecture** — standard Transformer with GQA, QK-norm, and SwiGLU FFN
+- **🌐 OpenAI-compatible HTTP/SSE Server (`AilaServer.exe`)** — pure MSVC C++17 Drogon server with isolated `AilaWorker.exe` IPC, continuous decode batching (`--decode-batch-size 1..4`), streaming SSE, reasoning budget, and tool calling
 - **🧩 DiffusionGemma block diffusion** — text-only 256-token canvas denoising with recurrent self-conditioning and BNB NF4 MoE weights
 - 👁️ Vision (Qwen3.5) — image understanding with CPU preprocessing and GPU vision transformer
 - 🎯 **YOLO26 detection** — NMS-free n/s/m/l/x inference at 640×640 with FP16 oneDNN/SYCL execution, file/encoded/raw-pixel APIs, and UTF-8 class names
@@ -39,6 +41,7 @@ A high-performance LLM inference engine for **Intel Arc GPUs**, built with **SYC
 |-------|-------------|-------------|--------|-------------------|
 | [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
+| [Qwen3.8-Flash-Next](https://www.modelscope.cn/models/Blackwood416/Qwen3.8-Flash-Next-BNB-NF4-v2) | MoE Hybrid (GDN + QSA, 512E) | BNB NF4 | ❌ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | DiffusionGemma-26B-A4B-it | Block diffusion (Gemma 4 + MoE) | BNB NF4 | ❌ (text-only v1) | ❌ |
@@ -81,16 +84,20 @@ in release packages. See [YOLO26 preparation and validation](docs/YOLO26.md).
 The Windows release uses a split runtime layout:
 
 ```text
-integration_root/
-|-- AilaShared.dll
+Aila-vX.Y.Z-win64/
+|-- AilaServer.exe              # Pure MSVC HTTP/SSE server (no oneAPI DLL imports)
+|-- AilaShared.dll              # Legacy C ABI proxy
+|-- AilaInference.dll           # Async C ABI host proxy
+|-- <MSVC CRT host DLLs>
 `-- aila_runtime/
-    |-- AilaWorker.exe
-    |-- Aila.exe
-    `-- <oneAPI and other runtime DLLs>
+    |-- AilaWorker.exe          # Isolated SYCL/oneDNN inference worker
+    |-- Aila.exe                # Standalone CLI executable
+    |-- licenses/soxr/
+    `-- <oneAPI, SYCL, oneDNN, Level Zero, and third-party runtime DLLs>
 ```
 
-`AilaShared.dll` is a C ABI proxy without oneAPI inference imports. Each
-initialized engine runs inference in its own `AilaWorker.exe` worker process.
+`AilaServer.exe`, `AilaShared.dll`, and `AilaInference.dll` have **no oneAPI inference imports**. Each initialized engine or server runs inference inside an isolated `AilaWorker.exe` process residing in `aila_runtime/`.
+When running `AilaServer.exe` from the extracted release root, it automatically detects `aila_runtime\AilaWorker.exe` beside itself (no `--worker` flag needed).
 For C API embedding, set `AILA_RUNTIME_DLL_DIR=aila_runtime` before loading the
 proxy. Relative values resolve **relative to AilaShared.dll**; absolute paths are
 also accepted and are normalized internally. If the variable is unset or empty,
@@ -121,12 +128,15 @@ returns an `AilaTTSStream*`, and wait/destroy operate on that stream handle; see
 [docs/C_API.md](docs/C_API.md) for the migration.
 
 The worker uses the runtime directory as its working directory and receives an
-isolated child `PATH`. Missing `AilaWorker.exe`, proxy/worker build ID mismatch,
-startup timeout, and worker exit are returned by the existing C API error
-functions. Failed operations are not automatically retried. Keep
-`AilaShared.dll` and `AilaWorker.exe` from the same release; cross-version worker
-compatibility is not guaranteed. CLI examples below assume `Aila.exe` is run
-from `aila_runtime/` or is otherwise addressed by its full path.
+isolated child `PATH` (and SYCL/Level Zero runtime defaults such as
+`UR_L0_BATCH_SIZE=64` and copy-engine acceleration are configured automatically
+in code before first GPU initialization). Missing `AilaWorker.exe`,
+server/proxy/worker build ID mismatch, startup timeout, and worker exit are
+returned by the server or C API error functions. Failed operations are not
+automatically retried. Keep `AilaServer.exe`, `AilaShared.dll`,
+`AilaInference.dll`, and `AilaWorker.exe` from the same release; cross-version
+worker compatibility is not guaranteed. CLI examples below assume `Aila.exe` is
+run from `aila_runtime/` or is otherwise addressed by its full path.
 
 ASR and TTS stream handles retain shared ownership of their engine. Destroy ASR
 streams, and wait for or cancel then destroy TTS streams, before destroying
@@ -188,7 +198,27 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --bench-pp 512 --ben
 
 # Benchmark (sampling)
 Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
+
+# Qwen3.8-Flash-Next with auto INT8 KV / streaming past 64K + speculative MTP
+Aila.exe -m ./models/Qwen3.8-Flash-Next-BNB-NF4 -s 262144 --kv-type auto --mtp
 ```
+
+### 🌐 HTTP / SSE Server (`AilaServer.exe`)
+
+`AilaServer.exe` exposes an OpenAI-compatible local HTTP/1.1 API (`GET /health`, `GET /v1/models`, `POST /v1/chat/completions` with SSE streaming, `tools`, and reasoning budget). In the release layout it automatically finds `aila_runtime\AilaWorker.exe` beside itself:
+
+```powershell
+# Qwen3 NF4 (default backend: qwen3_nf4)
+.\AilaServer.exe --model .\models\qwen3-0.6B-bnb-nf4-offline --port 8080
+
+# Qwen3.5 Hybrid NF4 with continuous decode batching
+.\AilaServer.exe --backend qwen35_nf4 --model .\models\qwen3.5-4B-bnb-nf4-offline --sessions 4 --decode-batch-size 4 --port 8080
+
+# Qwen3.8-Flash-Next (262K context, auto INT8 KV + KV streaming, speculative MTP)
+.\AilaServer.exe --backend qwen4exp_nf4 --model .\models\Qwen3.8-Flash-Next-BNB-NF4 --context 262144 --kv-type auto --sessions 1 --mtp --port 8080
+```
+
+When running from source builds where `AilaServer.exe` and `AilaWorker.exe` are in separate directories, pass `--worker .\build-refactor\AilaWorker.exe` (or use `tools\server\start-qwen38.ps1`). See [docs/inference-server.md](docs/inference-server.md) for full HTTP API details.
 
 ### ⚙️ CLI Arguments
 
@@ -244,7 +274,11 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--asr-segment <sec>` | ASR segment split duration in seconds | 0.0 (disabled) |
 | `--asr-past` / `--no-asr-past` | Toggle past-text conditioning for ASR segments | no-asr-past |
 | `--q35-prefill-step <N>` | Qwen3.5 recurrent-state checkpoint interval | 64 |
-| `--kv-quant` | Enable FP8 E4M3 KV-cache quantization | off |
+| `--prefill-chunk <N>` | Prefill chunk size (`8192` for Qwen4Exp, `512` for Qwen3.5) | model default |
+| `--kv-type <type>` | KV cache precision (`auto`, `bf16`, `int8`; `auto` uses `int8` + streaming above 64K for Qwen4Exp) | `auto` |
+| `--kv-quant` | Enable FP8 E4M3 KV-cache quantization (Qwen3 / Qwen3.5) | off |
+| `--mtp` / `--no-mtp` | Enable or disable speculative MTP draft decoding (Qwen4Exp) | off |
+| `--mtp-max-context <N>` | Maximum context tracked by MTP before falling back to T1 decode | 32768 |
 | `-h, --help` | Show help | — |
 | `-v, --version` | Show version | — |
 
@@ -427,56 +461,77 @@ Requirements: `torch`, `transformers`, `bitsandbytes` with Intel XPU backend.
 ## 🛠️ Build from Source
 
 ```powershell
-# Requires: Intel oneAPI Base Toolkit 2026.1+, CMake 3.24+, Ninja
-.\build.ps1
+# Requires: Intel oneAPI Base Toolkit 2026.1+, MSVC (VS 2022+), CMake 3.24+, Ninja
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor
+
+# Build the pure MSVC HTTP/SSE server (first run also builds pinned Drogon/Trantor/JsonCpp deps)
+pwsh -NoProfile -File tools/server/build.ps1
+
+# Subsequent server rebuilds (skip dependency build)
+pwsh -NoProfile -File tools/server/build.ps1 -SkipDependencies
 
 # Clean build
-.\build.ps1 -Clean
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor -Clean
 
 # Debug build
-.\build.ps1 -Config Debug
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor -Config Debug
 ```
 
 Outputs:
 | File | Description |
 |------|-------------|
-| `build/Aila.exe` | CLI executable |
-| `build/AilaShared.dll` | Shared library (C API) |
-| `build/AilaWorker.exe` | Windows isolated inference worker |
-| `build/AilaLib.lib` | Static library |
-| `build/build_info.json` | Local build and oneAPI toolchain provenance |
+| `build-refactor/Aila.exe` | CLI executable |
+| `build-refactor/AilaShared.dll` | Legacy C ABI proxy library |
+| `build-refactor/AilaInference.dll` | Async C ABI host proxy library |
+| `build-refactor/AilaWorker.exe` | Windows isolated inference worker |
+| `build-refactor/AilaLib.lib` | Static library |
+| `build-refactor/build_info.json` | Local build and oneAPI toolchain provenance |
+| `build-refactor-server/AilaServer.exe` | Pure MSVC C++17 HTTP/SSE OpenAI-compatible server |
 
-On Windows, `cmake --build build --target release` stages the integration layout
-under `build/Release/bin`: only the proxy is at the root, and the CLI, worker,
-and runtime DLLs are under `aila_runtime/`. Build provenance remains in
-`build/build_info.json` and is not part of the release bundle.
+To assemble a complete Windows release bundle (including `AilaServer.exe`, `AilaShared.dll`, `AilaInference.dll`, `aila_runtime/`, standalone binaries, and `SHA256SUMS.txt`):
+
+```powershell
+pwsh -NoProfile -File tools/package-release.ps1
+```
+
+Or run `cmake --build build-refactor --target release` to stage only the core CMake integration layout under `build-refactor/Release/bin` (`build_info.json` is never packaged).
 
 ## 📁 Project Structure
 
 ```
 Aila/
 ├── include/
-│   ├── aila_api.h              # Public C API header
-│   └── engine/Engine.hpp       # InferenceEngine class
+│   ├── aila_api.h               # Public legacy C API header
+│   ├── aila_inference.h         # Public async C API header
+│   └── engine/Engine.hpp        # InferenceEngine class
 ├── src/
 │   ├── main.cpp                 # CLI entry point
 │   ├── api/aila_api.cpp         # C API implementation
 │   ├── cli/                     # CLI argument parsing & interactive loop
 │   ├── core/                    # SYCL context & tensor management
-│   ├── memory/                  # KV cache
-│   ├── models/                  # Model backends (Qwen3, Qwen3.5, BNB4)
-│   ├── ops/                     # SYCL kernels (attention, RMSNorm, Bnb4BitLinear, etc.)
+│   ├── engine/                  # Engine lifecycle & generation loop
+│   ├── inference/               # Shared LoadedModel, Session, Scheduler
+│   ├── ipc/                     # IPC v2 binary framing & Win32 pipes
+│   ├── memory/                  # KV cache & SessionMemory budgets
+│   ├── models/                  # Model backends (Qwen3, Qwen3.5, Qwen4Exp, DiffusionGemma)
+│   ├── ops/                     # SYCL & CPU AVX2 kernels
 │   ├── profile/                 # Logging, profiling & device info
+│   ├── runtime/                 # Host InferenceClient & worker process launcher
+│   ├── server/                  # Pure MSVC Drogon HTTP/SSE server
 │   ├── audio/                   # Audio preprocessing (ASR) + speaker encoder (TTS voice cloning)
-│   ├── utils/                   # Tokenizer, SafeTensors, memory-mapped I/O
-│   └── vision/                  # Vision encoder (Qwen3.5)
+│   ├── utils/                   # Tokenizer, SafeTensors, DXGI memory, env defaults
+│   ├── vision/                  # Vision encoder (Qwen3.5) & YOLO26
+│   └── worker/                  # AilaWorker.exe IPC host
 ├── docs/
 │   ├── C_API.md                 # C API documentation
+│   ├── inference-server.md      # HTTP/SSE server documentation
+│   ├── Qwen38FlashNext_A770_Handoff.md
 │   └── Environment_Variables.md # Environment variable reference
-├── third_party/simdjson/        # JSON parsing
+├── tools/
+│   ├── verify-q4e.ps1           # 3-tier verification script
+│   ├── package-release.ps1      # Windows split-layout release bundler
+│   └── server/                  # Server dependency & build scripts
 ├── build.ps1                    # Build script
-├── bench.ps1                    # Benchmark script
-├── smoke.ps1                    # Smoke test script
 └── CMakeLists.txt
 ```
 

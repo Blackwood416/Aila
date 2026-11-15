@@ -13,6 +13,14 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'perf\PerfCommon.ps1')
 
 $repoRoot = Get-AilaRepoRoot
+$versionFile = Join-Path $repoRoot 'VERSION.txt'
+if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+    throw "Missing VERSION.txt file: $versionFile"
+}
+$ailaVersion = ([IO.File]::ReadAllText($versionFile)).Trim()
+if ($ailaVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Invalid VERSION.txt file contents: '$ailaVersion'"
+}
 $buildDirPath = Resolve-AilaPath -RepoRoot $repoRoot -Path $BuildDir
 $buildDirPath = Assert-AilaPathWithinRepo -RepoRoot $repoRoot -CandidatePath $buildDirPath
 $gitInfo = Get-AilaGitInfo -RepoRoot $repoRoot
@@ -77,8 +85,11 @@ finally {
 }
 
 $buildInfoPath = Join-Path $buildDirPath 'build_info.json'
+$buildId = "aila-$ailaVersion-abi1-$($gitInfo.fullCommit.ToLowerInvariant())"
 Write-AilaJsonFile -Path $buildInfoPath -Data ([ordered]@{
     schemaVersion  = 2
+    version        = $ailaVersion
+    buildId        = $buildId
     generatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
     git            = [ordered]@{
         shortCommit = $gitInfo.shortCommit

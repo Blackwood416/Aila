@@ -1,6 +1,5 @@
 void test_qwen38_window_quality(const std::string& directory) {
     std::cout << std::unitbuf << std::setprecision(10);
-    aila::ApplyQwen38A770Preset();
     const auto path = aila::env::read_string("AILA_Q4E_WINDOW_PROMPT_FILE", "");
     std::ifstream file(path); expect(bool(file), "R1 prompt file");
     const std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
@@ -49,7 +48,6 @@ void test_qwen38_window_quality(const std::string& directory) {
 // Focused R0 state/quality canary for the actual CLI's 41-token prompt.
 void test_qwen38_preset_checkpoint(const std::string& directory) {
     std::cout << std::unitbuf << std::setprecision(10);
-    aila::ApplyQwen38A770Preset();
     InferenceEngine engine;
     expect(engine.init(directory, 512), "R0 initialization failed");
     auto& ctx = Access::Ctx(engine);

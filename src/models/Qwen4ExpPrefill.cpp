@@ -90,7 +90,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                 buf_.attn_xs.data_as<float>(), y.data_as<bf16>())) {
                 ++attentionNf4Q8ProjectionCounts_[kind];
                 if (!attentionNf4Q8Logged_) {
-                    AILA_LOG_INFO("[Q4E Attention NF4Q8] actual_enabled=1 layer=%d projection=%d input=%d output=%d activation_block=64",
+                    AILA_LOG_DEBUG("[Q4E Attention NF4Q8] actual_enabled=1 layer=%d projection=%d input=%d output=%d activation_block=64",
                         L, kind, features, projection.out_features());
                     attentionNf4Q8Logged_ = true;
                 }
@@ -148,7 +148,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
             if (defer_history && layer.linear_o_proj.TryForwardDecodeCommitHistory(ctx, buf_.attn_out, output,
                 qkv_ptr, d_state.conv_state, layer.geom.qkv_dim, history_row)) {
                 if (gdnHistoryFusionCount_++ == 0)
-                    AILA_LOG_INFO("[Q4E GDN History Fused] actual_enabled=1 layer=%d channels=%d original_projection_math=1", L, layer.geom.qkv_dim);
+                    AILA_LOG_DEBUG("[Q4E GDN History Fused] actual_enabled=1 layer=%d channels=%d original_projection_math=1", L, layer.geom.qkv_dim);
             } else {
                 // Includes LoRA/nonpacked fallback: the deferred ring write
                 // still completes exactly once, before any subsequent reader.
@@ -838,7 +838,7 @@ void Qwen4ExpBnb4Backend::RunAttentionLayerTile(
                     (start_pos + count - 1 < 1024 || buf_.incr_scores.numel()>=2*24*((session.Capacity()+127)/128)*272) &&
                     !verify_rows_alignment_) {
                     static const bool logged=[] {
-                        AILA_LOG_INFO("[Q4E VerifyAttentionPair] active=1 rows=2 bf16_kv_reuse=1 phase_scratch_reuse=1");
+                        AILA_LOG_DEBUG("[Q4E VerifyAttentionPair] active=1 rows=2 bf16_kv_reuse=1 phase_scratch_reuse=1");
                         return true;
                     }();
                     (void)logged;

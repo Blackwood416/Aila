@@ -17,7 +17,9 @@
 - **⚡ Bitsandbytes 4-bit (NF4) 推理** — 融合反量化+矩阵乘 kernel、手写 GEMV 解码、融合 gate+up+SiLU 投影，直接在 Intel Arc 上运行量化模型
 - **🔢 Bfloat16 推理** — 通过 oneDNN 矩阵乘法原语支持密集（非量化）模型
 - **🏗️ Qwen3.5 Hybrid 架构** — 完整支持双重注意力（GQA + DeltaNet 线性注意力），GPU 加速 delta 循环计算
+- **🧠 Qwen3.8-Flash-Next (MoE Hybrid)** — 支持 48 层 Gated DeltaNet + Query-Sparse Attention (QSA) + 512 路由 NF4 专家的 GPU/CPU 异构推理（`AdaptiveCache` + `HostArena`）、长上下文自动 INT8 KV + QSA KV 流式卸载（`--kv-type auto`）以及投机 MTP 解码（`--mtp`）
 - **📐 Qwen3 Dense 架构** — 标准 Transformer，支持 GQA、QK-norm 和 SwiGLU FFN
+- **🌐 OpenAI 兼容 HTTP/SSE 服务 (`AilaServer.exe`)** — 纯 MSVC C++17 Drogon 服务，通过 IPC v2 隔离启动 `AilaWorker.exe`，支持连续批处理解码（`--decode-batch-size 1..4`）、流式 SSE、思考预算与工具调用
 - **🧩 DiffusionGemma 块扩散** — 支持文本模式的 256-token 画布去噪、循环自条件和 BNB NF4 MoE 权重
 - 👁️ 视觉理解 (Qwen3.5) — 支持图像输入，CPU 预处理 + GPU 视觉 Transformer
 - 🎯 **YOLO26 目标检测** — 支持 n/s/m/l/x、固定 640×640、NMS-free one-to-one head、FP16 oneDNN/SYCL 推理，以及 UTF-8 类名
@@ -39,6 +41,7 @@
 |------|------|------|------|------------------|
 | [Qwen3.5-0.8B](https://huggingface.co/Blackwood416/Qwen3.5-0.8B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
 | [Qwen3.5-4B](https://huggingface.co/Blackwood416/Qwen3.5-4B-BNB-NF4-with-vision) | Hybrid (GQA + DeltaNet) | BNB NF4, dense | ✅ | ❌ |
+| [Qwen3.8-Flash-Next](https://www.modelscope.cn/models/Blackwood416/Qwen3.8-Flash-Next-BNB-NF4-v2) | MoE Hybrid (GDN + QSA, 512E) | BNB NF4 | ❌ | ❌ |
 | [Qwen3-0.6B](https://huggingface.co/Blackwood416/Qwen3-0.6B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | [Qwen3-4B](https://huggingface.co/Blackwood416/Qwen3-4B-BNB-NF4) | Dense (GQA) | BNB NF4, dense | ❌ | ❌ |
 | DiffusionGemma-26B-A4B-it | Block diffusion (Gemma 4 + MoE) | BNB NF4 | ❌（v1 仅文本） | ❌ |
@@ -81,16 +84,20 @@ YOLO26 权重需要先转换为 Aila 稳定格式，发布包不会附带这些�
 Windows 发行包采用拆分运行时布局：
 
 ```text
-integration_root/
-|-- AilaShared.dll
+Aila-vX.Y.Z-win64/
+|-- AilaServer.exe              # 纯 MSVC HTTP/SSE 服务（无 oneAPI DLL 导入）
+|-- AilaShared.dll              # 兼容层 C ABI 转接层
+|-- AilaInference.dll           # 异步 C ABI 宿主转接层
+|-- <MSVC CRT 宿主 DLL>
 `-- aila_runtime/
-    |-- AilaWorker.exe
-    |-- Aila.exe
-    `-- <oneAPI 及其他运行时 DLL>
+    |-- AilaWorker.exe          # 隔离的 SYCL/oneDNN 推理工作进程
+    |-- Aila.exe                # 独立 CLI 可执行文件
+    |-- licenses/soxr/
+    `-- <oneAPI、SYCL、oneDNN、Level Zero 及第三方运行时 DLL>
 ```
 
-`AilaShared.dll` 是不导入 oneAPI 推理运行时的 C ABI 转接层。每个成功初始化
-的引擎都在独立的 `AilaWorker.exe` worker process（工作进程）中执行推理。
+`AilaServer.exe`、`AilaShared.dll` 与 `AilaInference.dll` 均**不导入 oneAPI 推理运行时**。每个成功初始化的引擎或 HTTP 服务都在位于 `aila_runtime/` 内的独立 `AilaWorker.exe` 工作进程中执行推理。
+在解压后的发行包根目录运行 `AilaServer.exe` 时，会自动探测同目录下的 `aila_runtime\AilaWorker.exe`（无需手动指定 `--worker`）。
 通过 C API 集成时，请在加载转接层前设置
 `AILA_RUNTIME_DLL_DIR=aila_runtime`。相对路径以 `AilaShared.dll` 所在目录为
 基准；也支持绝对路径，内部会统一规范化为绝对路径。如果变量未设置或为空，
@@ -118,12 +125,14 @@ ASR、强制对齐以及 Aila 自有内存释放接口保持源码兼容。0.1.7
 接口有一项 ABI 变更：现在返回 `AilaTTSStream*`，wait/destroy 也改为接收该
 stream handle；迁移方法见 [docs/C_API.md](docs/C_API.md)。
 
-工作进程以 runtime 目录作为工作目录，并使用隔离的子进程 `PATH`。缺少
-`AilaWorker.exe`、转接层与 worker build ID 不匹配、启动超时或工作进程退出
-时，现有 C API 错误接口会返回诊断信息；失败操作不会自动重试。请始终部署
-同一发行包中的 `AilaShared.dll` 与 `AilaWorker.exe`，不保证跨版本 worker
-兼容。下方 CLI 示例假定从 `aila_runtime/` 中运行 `Aila.exe`，或使用其完整
-路径。
+工作进程以 runtime 目录作为工作目录，并使用隔离的子进程 `PATH`（且代码在
+首次 GPU 初始化前自动配置 `UR_L0_BATCH_SIZE=64` 与 Copy Engine 等 SYCL /
+Level Zero 运行时默认参数）。缺少 `AilaWorker.exe`、服务端/转接层与
+worker build ID 不匹配、启动超时或工作进程退出时，服务或现有 C API 错误接口
+会返回诊断信息；失败操作不会自动重试。请始终部署同一发行包中的
+`AilaServer.exe`、`AilaShared.dll`、`AilaInference.dll` 与 `AilaWorker.exe`，
+不保证跨版本 worker 兼容。下方 CLI 示例假定从 `aila_runtime/` 中运行
+`Aila.exe`，或使用其完整路径。
 
 ASR 和 TTS stream handle 会共享其引擎的所有权。销毁 `AilaEngine` 前，应先
 销毁 ASR stream，并等待或取消后销毁 TTS stream；否则 worker 的关闭可能
@@ -184,7 +193,27 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --bench-pp 2048 --be
 
 # 性能基准测试（采样解码）
 Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
+
+# Qwen3.8-Flash-Next（262K 上下文自动 INT8 KV + KV 流式卸载 + 投机 MTP）
+Aila.exe -m ./models/Qwen3.8-Flash-Next-BNB-NF4 -s 262144 --kv-type auto --mtp
 ```
+
+### 🌐 HTTP / SSE 服务 (`AilaServer.exe`)
+
+`AilaServer.exe` 提供 OpenAI 兼容的本地 HTTP/1.1 API（`GET /health`、`GET /v1/models`、`POST /v1/chat/completions`，支持 SSE 流式输出、`tools` 工具调用与思考预算）。在发行包布局下会自动查找同级 `aila_runtime\AilaWorker.exe`：
+
+```powershell
+# Qwen3 NF4（默认后端：qwen3_nf4）
+.\AilaServer.exe --model .\models\qwen3-0.6B-bnb-nf4-offline --port 8080
+
+# Qwen3.5 Hybrid NF4（开启连续批处理解码）
+.\AilaServer.exe --backend qwen35_nf4 --model .\models\qwen3.5-4B-bnb-nf4-offline --sessions 4 --decode-batch-size 4 --port 8080
+
+# Qwen3.8-Flash-Next（262K 上下文，自动 INT8 KV + KV 流式卸载 + 投机 MTP）
+.\AilaServer.exe --backend qwen4exp_nf4 --model .\models\Qwen3.8-Flash-Next-BNB-NF4 --context 262144 --kv-type auto --sessions 1 --mtp --port 8080
+```
+
+在源码构建目录运行（`AilaServer.exe` 与 `AilaWorker.exe` 分处不同构建目录）时，请显式传入 `--worker .\build-refactor\AilaWorker.exe`（或直接使用 `tools\server\start-qwen38.ps1`）。完整 HTTP API 说明见 [docs/inference-server.md](docs/inference-server.md)。
 
 ### ⚙️ CLI 参数
 
@@ -240,7 +269,11 @@ Aila.exe -m ./models/Qwen3.5-4B-BNB-NF4-with-vision --bench --sample
 | `--asr-segment <sec>` | ASR 音频分段切片秒数大小 | 0.0 (禁用) |
 | `--asr-past` / `--no-asr-past` | 启用/禁用 ASR 分段上文偏置（past-text conditioning） | no-asr-past |
 | `--q35-prefill-step <N>` | Qwen3.5 循环状态 checkpoint 间隔 | 64 |
-| `--kv-quant` | 启用 FP8 E4M3 KV cache 量化 | 关闭 |
+| `--prefill-chunk <N>` | Prefill 分块大小（`Qwen4Exp` 默认 `8192`，`Qwen3.5` 默认 `512`） | 模型默认 |
+| `--kv-type <type>` | KV cache 精度（`auto`、`bf16`、`int8`；`Qwen4Exp` 在 `>64K` 时由 `auto` 自动启用 `int8` + 流式卸载） | `auto` |
+| `--kv-quant` | 启用 FP8 E4M3 KV cache 量化（Qwen3 / Qwen3.5） | 关闭 |
+| `--mtp` / `--no-mtp` | 启用或禁用投机 MTP 草稿解码（Qwen4Exp） | 关闭 |
+| `--mtp-max-context <N>` | MTP 跟踪的最大上下文长度（超出后自动回退到 T1 解码） | 32768 |
 | `-h, --help` | 显示帮助 | — |
 | `-v, --version` | 显示版本 | — |
 
@@ -421,55 +454,77 @@ python export_bnb_nf4.py \
 ## 🛠️ 从源码构建
 
 ```powershell
-# 需要：Intel oneAPI Base Toolkit 2026.1+、CMake 3.24+、Ninja
-.\build.ps1
+# 需要：Intel oneAPI Base Toolkit 2026.1+、MSVC (VS 2022+)、CMake 3.24+、Ninja
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor
+
+# 构建纯 MSVC HTTP/SSE 服务（首次会自动编译固定的 Drogon/Trantor/JsonCpp 依赖）
+pwsh -NoProfile -File tools/server/build.ps1
+
+# 后续增量重建服务端（跳过依赖构建）
+pwsh -NoProfile -File tools/server/build.ps1 -SkipDependencies
 
 # 清理构建
-.\build.ps1 -Clean
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor -Clean
 
 # Debug 构建
-.\build.ps1 -Config Debug
+pwsh -NoProfile -File build.ps1 -BuildDir build-refactor -Config Debug
 ```
 
 输出：
 | 文件 | 说明 |
 |------|------|
-| `build/Aila.exe` | CLI 可执行文件 |
-| `build/AilaShared.dll` | 动态链接库（C API） |
-| `build/AilaWorker.exe` | Windows 隔离推理工作进程 |
-| `build/AilaLib.lib` | 静态库 |
-| `build/build_info.json` | 本地构建与 oneAPI 工具链来源信息 |
+| `build-refactor/Aila.exe` | CLI 可执行文件 |
+| `build-refactor/AilaShared.dll` | 兼容层 C ABI 转接库 |
+| `build-refactor/AilaInference.dll` | 异步 C ABI 宿主转接库 |
+| `build-refactor/AilaWorker.exe` | Windows 隔离推理工作进程 |
+| `build-refactor/AilaLib.lib` | 静态库 |
+| `build-refactor/build_info.json` | 本地构建与 oneAPI 工具链来源信息 |
+| `build-refactor-server/AilaServer.exe` | 纯 MSVC C++17 HTTP/SSE OpenAI 兼容服务 |
 
-在 Windows 上，`cmake --build build --target release` 会把集成布局 staging
-到 `build/Release/bin`：根目录只包含转接层，CLI、工作进程与运行时 DLL 位于
-`aila_runtime/`。构建来源信息仍保存在 `build/build_info.json`，不属于发行包。
+如需打包完整 Windows 发行压缩包（包含根目录 `AilaServer.exe`、`AilaShared.dll`、`AilaInference.dll` 与 `aila_runtime/` 隔离运行时，以及单文件与 `SHA256SUMS.txt`）：
+
+```powershell
+pwsh -NoProfile -File tools/package-release.ps1
+```
+
+也可直接运行 `cmake --build build-refactor --target release` 仅在 `build-refactor/Release/bin` 暂存核心 CMake 集成布局（`build_info.json` 不会打入发行包）。
 
 ## 📁 项目结构
 
 ```
 Aila/
 ├── include/
-│   ├── aila_api.h              # 公共 C API 头文件
-│   └── engine/Engine.hpp       # InferenceEngine 类
+│   ├── aila_api.h               # 公共兼容层 C API 头文件
+│   ├── aila_inference.h         # 公共异步 C API 头文件
+│   └── engine/Engine.hpp        # InferenceEngine 类
 ├── src/
 │   ├── main.cpp                 # CLI 入口
 │   ├── api/aila_api.cpp         # C API 实现
 │   ├── cli/                     # CLI 参数解析和交互循环
 │   ├── core/                    # SYCL 上下文和张量管理
-│   ├── memory/                  # KV 缓存
-│   ├── models/                  # 模型后端（Qwen3、Qwen3.5、BNB4）
-│   ├── ops/                     # SYCL kernel（注意力、RMSNorm、Bnb4BitLinear 等）
+│   ├── engine/                  # 引擎生命周期与生成主循环
+│   ├── inference/               # 共享 LoadedModel、Session 与 Scheduler
+│   ├── ipc/                     # IPC v2 二进制帧协议与 Win32 命名管道
+│   ├── memory/                  # KV 缓存与 SessionMemory 预算
+│   ├── models/                  # 模型后端（Qwen3、Qwen3.5、Qwen4Exp、DiffusionGemma）
+│   ├── ops/                     # SYCL 与 CPU AVX2 kernel
 │   ├── profile/                 # 日志、性能分析和设备信息
+│   ├── runtime/                 # 宿主 InferenceClient 与工作进程启动器
+│   ├── server/                  # 纯 MSVC Drogon HTTP/SSE 服务
 │   ├── audio/                   # 音频预处理（ASR）+ 说话人编码器（TTS 语音克隆）
-│   ├── utils/                   # 分词器、SafeTensors、内存映射 I/O
-│   └── vision/                  # 视觉编码器（Qwen3.5）
+│   ├── utils/                   # 分词器、SafeTensors、DXGI 内存、环境变量默认配置
+│   ├── vision/                  # 视觉编码器（Qwen3.5）与 YOLO26
+│   └── worker/                  # AilaWorker.exe IPC 宿主
 ├── docs/
 │   ├── C_API.md                 # C API 文档
+│   ├── inference-server.md      # HTTP/SSE 服务文档
+│   ├── Qwen38FlashNext_A770_Handoff.md
 │   └── Environment_Variables.md # 环境变量参考
-├── third_party/simdjson/        # JSON 解析
+├── tools/
+│   ├── verify-q4e.ps1           # 三层回归验证脚本
+│   ├── package-release.ps1      # Windows 拆分布局发行打包脚本
+│   └── server/                  # 服务端依赖与构建脚本
 ├── build.ps1                    # 构建脚本
-├── bench.ps1                    # 基准测试脚本
-├── smoke.ps1                    # 冒烟测试脚本
 └── CMakeLists.txt
 ```
 

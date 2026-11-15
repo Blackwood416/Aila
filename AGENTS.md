@@ -186,7 +186,7 @@ To keep the codebase lean, deterministic, and free of dead experimental baggage,
 1. **Mandatory Verification Tiers (`tools/verify-q4e.ps1`)**:
    - Run `-Tier fast` during inner-loop operator/kernel iteration.
    - Run `-Tier ctest` (`qwen4_exp` + `cpu|abi` 100% green) before every code commit.
-   - Run `-Tier real` (real-model E2E tolerance + `--preset-model` checkpoint parity + `tools/prefill-bench.ps1` back-to-back A/B) before changing any production default or `Qwen38A770Preset.hpp` entry.
+   - Run `-Tier real` (real-model E2E tolerance + `--preset-model` checkpoint parity + `tools/prefill-bench.ps1` back-to-back A/B) before changing any production default.
 2. **Zero Dead-Experiment Retention (Test-Then-Prune)**:
    - Develop candidate kernels or schedules behind a default-OFF flag or inside the subsystem's existing `--bench` harness (`AilaBnb4BitLinearKernelTests`, `AilaGdnChunkTests`, `AilaMoeExpertXmxTests`, `AilaQsaAttentionProbe`).
    - Measure paired back-to-back A/B in a single session. If a candidate wins and passes Tier 2 + Tier 3, promote it and **delete the superseded branch**. If it is neutral or negative, **revert/delete it immediately**—never leave losing or superseded kernel modes parked behind environment flags in production files.
@@ -197,9 +197,9 @@ To keep the codebase lean, deterministic, and free of dead experimental baggage,
    - `docs/Qwen38FlashNext_A770_Handoff.md` is the **single authoritative architecture and performance reference** for `Qwen4Exp`.
    - `docs/Environment_Variables.md` is the **single authoritative registry** of active environment variables.
    - Do not create chronological session diaries, process plans, or JSON result dumps in `docs/plans/`. Update the authoritative reference in place when architecture or scoreboard numbers change.
-5. **Environment Variable & Preset Precedence Discipline**:
-   - Effective precedence is strictly: `Explicit Environment Variable > Qwen38A770Preset.hpp > Code Default`.
-   - Before modifying a code default, check whether `src/utils/Qwen38A770Preset.hpp` pins that variable. Any flag promotion or retirement must update the code default, `Qwen38A770Preset.hpp`, and `docs/Environment_Variables.md` in the same commit.
+5. **Environment Variable Precedence Discipline**:
+   - Effective precedence is strictly: `Explicit Environment Variable > CLI / Server Flag > Code Default`.
+   - Before modifying a code default, verify all call sites and update `docs/Environment_Variables.md` in the same commit.
 6. **Hardware & Numeric Safety Invariants**:
    - **VRAM Headroom**: Maintain 1.0–1.5 GB actual free VRAM headroom at peak 8K prefill on 16 GB Arc A770 (`AILA_Q4E_VRAM_RESERVE_MB=1400`, `AILA_Q4E_MAX_GPU_SLOTS=3360` with multi-phase `buf_.phase_scratch` aliasing); never pre-allocate full-context scratch buffers at model load (`AILA_Q4E_RUNTIME_MIN_CAP` causes severe WDDM eviction stalls).
    - **Two-Level SLM Reductions**: Any two-level reduction staged through SLM must include an explicit `item.barrier(sycl::access::fence_space::local_space)` between the per-subgroup write and the second-level read.

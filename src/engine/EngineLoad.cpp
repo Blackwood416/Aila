@@ -318,6 +318,23 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
         }
 
         // 5. Initialize backend
+        if (model_spec_.family == ModelFamily::Qwen4Exp &&
+            max_seq_len > 65536 &&
+            !aila::env::g_kv_quant_override &&
+            aila::env::read_string("AILA_KV_QUANT", "").empty()) {
+#ifdef _WIN32
+            _putenv_s("AILA_KV_QUANT", "1");
+            if (aila::env::read_string("AILA_KV_QUANT_FORMAT", "").empty()) {
+                _putenv_s("AILA_KV_QUANT_FORMAT", "int8");
+            }
+#else
+            setenv("AILA_KV_QUANT", "1", 1);
+            if (aila::env::read_string("AILA_KV_QUANT_FORMAT", "").empty()) {
+                setenv("AILA_KV_QUANT_FORMAT", "int8", 1);
+            }
+#endif
+            AILA_LOG_INFO("[Qwen4Exp] Context %d > 65536: auto-selecting INT8 KV cache", max_seq_len);
+        }
         if (model_spec_.family == ModelFamily::Qwen3TTS) {
             backend_ = std::make_unique<Qwen3TTSBackend>();
         } else if (model_spec_.family == ModelFamily::Qwen3ASR) {
@@ -684,7 +701,7 @@ bool InferenceEngine::init(const std::string& model_dir, int max_seq_len,
                     mtp_state_->valid = true;
                 }
 
-                AILA_LOG_INFO("[Warmup Manifest] reached: %d-token prefill (gemm, score buf), prefill kernel warmup, 1-token decode (gemv, decode attn, moe), state reset", warmup_prefill_len);
+                AILA_LOG_DEBUG("[Warmup Manifest] reached: %d-token prefill (gemm, score buf), prefill kernel warmup, 1-token decode (gemv, decode attn, moe), state reset", warmup_prefill_len);
             } catch (const std::exception& e) {
                 AILA_LOG_ERROR("[Warmup] Lightweight warmup failed: %s", e.what());
                 try { ctx_->queue().wait_and_throw(); } catch (...) {}
