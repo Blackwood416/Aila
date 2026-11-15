@@ -2459,17 +2459,6 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 if (resident_probe_) resident_probe_(resident_probe_data_, *this, layer);
                 return last;
             }
-            // Release all queued GPU expert kernels across the entire multi-row
-            // window before blocking on the single batched CPU job, so row 1..N
-            // GPU hot experts execute concurrently with the CPU worker instead
-            // of waiting in the host batch behind row 0's CPU join.
-            if (s_join_release) {
-                if (last == sycl::event{}) {
-                    last = ctx.queue().ext_oneapi_submit_barrier();
-                }
-                try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
-                catch (...) {}
-            }
             static const bool s_defer_cpu_join_batch = [] {
                 const int l0_batch = std::max(
                     aila::env::read_int_raw("UR_L0_BATCH_SIZE", 0),
@@ -2477,8 +2466,22 @@ sycl::event Qwen4ExpBnb4Backend::RunResidentDecode(Context& ctx, int layer, bool
                 return l0_batch >= 32 &&
                     aila::env::read_flag("AILA_Q4E_DECODE_DEFER_CPU_JOIN", true);
             }();
-            if (s_defer_cpu_join_batch && s_join_release && !batch_any_staging &&
-                !resident_probe_ && expert_executor_.CanDeferArenaColdRowsHostRead()) {
+            const bool defer_cpu_join_batch_now = s_defer_cpu_join_batch && s_join_release &&
+                !batch_any_staging && !resident_probe_ &&
+                expert_executor_.CanDeferArenaColdRowsHostRead();
+            // Release all queued GPU expert kernels across the entire multi-row
+            // window before blocking on the single batched CPU job, so row 1..N
+            // GPU hot experts execute concurrently with the CPU worker instead
+            // of waiting in the host batch behind row 0's CPU join. When
+            // deferring with zero GPU device work, skip an empty barrier flush.
+            if (s_join_release && (batch_any_device_live || !defer_cpu_join_batch_now)) {
+                if (last == sycl::event{}) {
+                    last = ctx.queue().ext_oneapi_submit_barrier();
+                }
+                try { (void)last.get_info<sycl::info::event::command_execution_status>(); }
+                catch (...) {}
+            }
+            if (defer_cpu_join_batch_now) {
                 const sycl::event gpu_hot_done = last;
                 const bool gpu_hot_live = batch_any_device_live;
                 std::array<ops::MoeCpuHostDownRows, 4> deferred_rows_batch{};

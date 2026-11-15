@@ -848,11 +848,12 @@ sycl::event hc_decode_up_mix_impl(
     const size_t num_wgs = (static_cast<size_t>(group_dim) + dims_per_wg - 1) / dims_per_wg;
     const float inv_groups = 1.0f / static_cast<float>(groups);
 
-    if (Batched && rows >= 3 && rows <= 4 && lowrank == 320 && groups == 4 &&
+    if (Batched && rows >= 2 && rows <= 4 && lowrank == 320 && groups == 4 &&
         (group_dim % 8 == 0) &&
         (reinterpret_cast<uintptr_t>(act) % 16 == 0) &&
         (reinterpret_cast<uintptr_t>(w_up) % 16 == 0)) {
         switch (rows) {
+        case 2: return hc_decode_up_mix_k320_rows_impl<2>(ctx, act, w_up, N, x, group_dim, groups);
         case 3: return hc_decode_up_mix_k320_rows_impl<3>(ctx, act, w_up, N, x, group_dim, groups);
         default: return hc_decode_up_mix_k320_rows_impl<4>(ctx, act, w_up, N, x, group_dim, groups);
         }
